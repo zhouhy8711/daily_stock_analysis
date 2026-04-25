@@ -1,19 +1,62 @@
 import type React from 'react';
 import { useCallback, useEffect, useMemo, useState } from 'react';
+import { RefreshCw, X } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
+import { systemConfigApi } from '../api/systemConfig';
 import { ApiErrorAlert, ConfirmDialog, Button, EmptyState, InlineAlert } from '../components/common';
+import { useShellSidebarAction } from '../components/layout/ShellSidebarActionContext';
 import { DashboardStateBlock } from '../components/dashboard';
 import { StockAutocomplete } from '../components/StockAutocomplete';
 import { HistoryList } from '../components/history';
 import { ReportMarkdown, ReportSummary } from '../components/report';
-import { TaskPanel } from '../components/tasks';
+import { WatchlistBoard, type WatchlistItem } from '../components/watchlist';
 import { useDashboardLifecycle, useHomeDashboardState } from '../hooks';
 import { getReportText, normalizeReportLanguage } from '../utils/reportLanguage';
 
+const normalizeWatchlistCode = (stockCode: string) => stockCode.trim().toUpperCase();
+
+const getWatchlistLookupKeys = (stockCode: string): string[] => {
+  const code = normalizeWatchlistCode(stockCode);
+  const keys = new Set<string>([code]);
+  const [base] = code.split('.');
+  if (base) {
+    keys.add(base);
+  }
+  if (code.startsWith('HK') && code.length > 2) {
+    keys.add(code.slice(2));
+  }
+  if (/^\d{5}$/.test(code)) {
+    keys.add(`HK${code}`);
+    keys.add(`${code}.HK`);
+  }
+  return Array.from(keys).filter(Boolean);
+};
+
+const parseWatchlistValue = (value: string): string[] => {
+  const seen = new Set<string>();
+  return value
+    .split(/[,\n\r\t ]+/)
+    .map(normalizeWatchlistCode)
+    .filter((code) => {
+      if (!code || seen.has(code)) {
+        return false;
+      }
+      seen.add(code);
+      return true;
+    });
+};
+
 const HomePage: React.FC = () => {
   const navigate = useNavigate();
+  const { setSidebarAction } = useShellSidebarAction();
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
+  const [reportOverlayOpen, setReportOverlayOpen] = useState(false);
+  const [watchlistCodes, setWatchlistCodes] = useState<string[]>([]);
+  const [selectedWatchlistCodes, setSelectedWatchlistCodes] = useState<string[]>([]);
+  const [isLoadingWatchlist, setIsLoadingWatchlist] = useState(false);
+  const [watchlistError, setWatchlistError] = useState<string | null>(null);
+  const [reportHistoryStockCode, setReportHistoryStockCode] = useState<string | null>(null);
 
   const {
     query,
@@ -38,7 +81,6 @@ const HomePage: React.FC = () => {
     loadMoreHistory,
     selectHistoryItem,
     toggleHistorySelection,
-    toggleSelectAllVisible,
     deleteSelectedHistory,
     submitAnalysis,
     notify,
@@ -58,6 +100,96 @@ const HomePage: React.FC = () => {
   const reportLanguage = normalizeReportLanguage(selectedReport?.meta.reportLanguage);
   const reportText = getReportText(reportLanguage);
 
+  const loadWatchlist = useCallback(async () => {
+    setIsLoadingWatchlist(true);
+    setWatchlistError(null);
+    try {
+      const config = await systemConfigApi.getConfig(false);
+      const stockList = config.items.find((item) => item.key === 'STOCK_LIST')?.value ?? '';
+      setWatchlistCodes(parseWatchlistValue(stockList));
+    } catch (error) {
+      setWatchlistError(error instanceof Error ? error.message : '自选股配置加载失败');
+    } finally {
+      setIsLoadingWatchlist(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void loadWatchlist();
+  }, [loadWatchlist]);
+
+  const latestHistoryByCode = useMemo(() => {
+    const map = new Map<string, typeof historyItems[number]>();
+    for (const item of historyItems) {
+      for (const key of getWatchlistLookupKeys(item.stockCode)) {
+        if (!key || map.has(key)) {
+          continue;
+        }
+        map.set(key, item);
+      }
+    }
+    return map;
+  }, [historyItems]);
+
+  const watchlistItems = useMemo<WatchlistItem[]>(() => {
+    const sourceCodes = watchlistCodes.length > 0
+      ? watchlistCodes
+      : historyItems.reduce<string[]>((codes, item) => {
+        const code = normalizeWatchlistCode(item.stockCode);
+        if (code && !codes.includes(code)) {
+          codes.push(code);
+        }
+        return codes;
+      }, []);
+
+    return sourceCodes.map((code) => {
+      const history = getWatchlistLookupKeys(code)
+        .map((key) => latestHistoryByCode.get(key))
+        .find((item) => item !== undefined);
+      return {
+        stockCode: history?.stockCode || code,
+        stockName: history?.stockName,
+        recordId: history?.id,
+        currentPrice: history?.currentPrice,
+        changePct: history?.changePct,
+        sentimentScore: history?.sentimentScore,
+        operationAdvice: history?.operationAdvice,
+        createdAt: history?.createdAt,
+        source: watchlistCodes.length > 0 ? 'config' : 'history',
+      };
+    });
+  }, [historyItems, latestHistoryByCode, watchlistCodes]);
+
+  const selectedWatchlistSet = useMemo(
+    () => new Set(selectedWatchlistCodes),
+    [selectedWatchlistCodes],
+  );
+
+  const selectedWatchlistTargets = useMemo(
+    () => watchlistItems
+      .filter((item) => selectedWatchlistSet.has(item.stockCode))
+      .map((item) => ({
+        stockCode: item.stockCode,
+        stockName: item.stockName,
+      })),
+    [selectedWatchlistSet, watchlistItems],
+  );
+
+  const reanalyzeButtonText = selectedWatchlistTargets.length > 1
+    ? `${reportText.reanalyze} (${selectedWatchlistTargets.length})`
+    : reportText.reanalyze;
+
+  const reportHistoryFilterCode = reportHistoryStockCode || selectedReport?.meta.stockCode || '';
+  const reportHistoryItems = useMemo(() => {
+    const filterKeys = new Set(getWatchlistLookupKeys(reportHistoryFilterCode));
+    if (filterKeys.size === 0) {
+      return [];
+    }
+    return historyItems.filter((item) => (
+      getWatchlistLookupKeys(item.stockCode).some((key) => filterKeys.has(key))
+    ));
+  }, [historyItems, reportHistoryFilterCode]);
+
   useDashboardLifecycle({
     loadInitialHistory,
     refreshHistory,
@@ -68,9 +200,70 @@ const HomePage: React.FC = () => {
   });
 
   const handleHistoryItemClick = useCallback((recordId: number) => {
+    const item = historyItems.find((historyItem) => historyItem.id === recordId);
+    if (item) {
+      setReportHistoryStockCode(item.stockCode);
+    }
+    setReportOverlayOpen(true);
     void selectHistoryItem(recordId);
     setSidebarOpen(false);
-  }, [selectHistoryItem]);
+  }, [historyItems, selectHistoryItem]);
+
+  const handleCloseReportOverlay = useCallback(() => {
+    setReportOverlayOpen(false);
+    setSidebarOpen(false);
+    closeMarkdownDrawer();
+  }, [closeMarkdownDrawer]);
+
+  useEffect(() => {
+    if (!reportOverlayOpen) {
+      return undefined;
+    }
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') {
+        return;
+      }
+      event.preventDefault();
+      handleCloseReportOverlay();
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [handleCloseReportOverlay, reportOverlayOpen]);
+
+  const handleWatchlistItemOpen = useCallback((item: WatchlistItem) => {
+    if (item.recordId === undefined) {
+      void submitAnalysis({
+        stockCode: item.stockCode,
+        stockName: item.stockName,
+        originalQuery: item.stockCode,
+        selectionSource: 'manual',
+      });
+      return;
+    }
+
+    setReportHistoryStockCode(item.stockCode);
+    setReportOverlayOpen(true);
+    void selectHistoryItem(item.recordId);
+  }, [selectHistoryItem, submitAnalysis]);
+
+  const toggleWatchlistSelection = useCallback((stockCode: string) => {
+    setSelectedWatchlistCodes((current) => {
+      if (current.includes(stockCode)) {
+        return current.filter((code) => code !== stockCode);
+      }
+      return [...current, stockCode];
+    });
+  }, []);
+
+  const selectVisibleWatchlist = useCallback((stockCodes: string[]) => {
+    setSelectedWatchlistCodes((current) => Array.from(new Set([...current, ...stockCodes])));
+  }, []);
+
+  const clearWatchlistSelection = useCallback(() => {
+    setSelectedWatchlistCodes([]);
+  }, []);
 
   const handleSubmitAnalysis = useCallback(
     (
@@ -99,19 +292,98 @@ const HomePage: React.FC = () => {
     navigate(`/chat?stock=${encodeURIComponent(code)}&name=${encodeURIComponent(name)}&recordId=${rid}`);
   }, [navigate, selectedReport]);
 
-  const handleReanalyze = useCallback(() => {
-    if (!selectedReport) {
+  const handleReanalyzeWatchlist = useCallback(() => {
+    if (selectedWatchlistTargets.length === 0) {
       return;
     }
 
-    void submitAnalysis({
-      stockCode: selectedReport.meta.stockCode,
-      stockName: selectedReport.meta.stockName,
-      originalQuery: selectedReport.meta.stockCode,
-      selectionSource: 'manual',
-      forceRefresh: true,
+    selectedWatchlistTargets.forEach((target) => {
+      void submitAnalysis({
+        stockCode: target.stockCode,
+        stockName: target.stockName,
+        originalQuery: target.stockCode,
+        selectionSource: 'manual',
+        forceRefresh: true,
+      });
     });
-  }, [selectedReport, submitAnalysis]);
+  }, [selectedWatchlistTargets, submitAnalysis]);
+
+  const sidebarProgressTasks = useMemo(
+    () => activeTasks.filter((task) => task.status === 'pending' || task.status === 'processing'),
+    [activeTasks],
+  );
+
+  const sidebarProgressAction = useMemo(() => {
+    if (sidebarProgressTasks.length === 0) {
+      return null;
+    }
+
+    return (
+      <div className="space-y-2" data-testid="home-sidebar-progress">
+        <div className="flex items-center justify-between gap-1 text-[11px] font-semibold text-foreground">
+          <span className="inline-flex min-w-0 items-center gap-1">
+            <RefreshCw className="h-3.5 w-3.5 shrink-0 text-primary" />
+            <span className="truncate">分析进度</span>
+          </span>
+          <span className="shrink-0 rounded-full bg-primary/10 px-1.5 py-0.5 text-[10px] text-primary">
+            {sidebarProgressTasks.length}
+          </span>
+        </div>
+        <div className="max-h-[24rem] space-y-2 overflow-y-auto">
+          {sidebarProgressTasks.map((task) => {
+            const progress = Math.max(0, Math.min(100, task.progress || 0));
+            const statusLabel = task.status === 'processing' ? '分析中' : '等待中';
+            return (
+              <div key={task.taskId} className="rounded-xl border border-subtle bg-surface/70 p-2">
+                <div className="truncate text-[11px] font-semibold text-foreground">
+                  {task.stockName || task.stockCode}
+                </div>
+                <div className="mt-0.5 truncate font-mono text-[10px] text-muted-text">
+                  {task.stockCode}
+                </div>
+                <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-white/8">
+                  <div
+                    className="h-full rounded-full bg-cyan transition-[width] duration-300 ease-out"
+                    style={{ width: `${progress}%` }}
+                  />
+                </div>
+                <div className="mt-1 flex items-center justify-between gap-1 text-[10px] text-muted-text">
+                  <span className="truncate">{statusLabel}</span>
+                  <span className="shrink-0 tabular-nums">{progress}%</span>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    );
+  }, [sidebarProgressTasks]);
+
+  useEffect(() => {
+    setSidebarAction(sidebarProgressAction);
+    return () => setSidebarAction(null);
+  }, [setSidebarAction, sidebarProgressAction]);
+
+  const handleToggleReportHistorySelectAll = useCallback(() => {
+    const visibleIds = reportHistoryItems.map((item) => item.id);
+    const allVisibleSelected = visibleIds.length > 0 && visibleIds.every((id) => selectedIds.has(id));
+    visibleIds.forEach((id) => {
+      if (allVisibleSelected || !selectedIds.has(id)) {
+        toggleHistorySelection(id);
+      }
+    });
+  }, [reportHistoryItems, selectedIds, toggleHistorySelection]);
+
+  useEffect(() => {
+    if (!reportOverlayOpen || !reportHistoryFilterCode) {
+      return;
+    }
+
+    const visibleIds = new Set(reportHistoryItems.map((item) => item.id));
+    Array.from(selectedIds)
+      .filter((id) => !visibleIds.has(id))
+      .forEach((id) => toggleHistorySelection(id));
+  }, [reportHistoryFilterCode, reportHistoryItems, reportOverlayOpen, selectedIds, toggleHistorySelection]);
 
   const handleDeleteSelectedHistory = useCallback(() => {
     void deleteSelectedHistory();
@@ -121,9 +393,8 @@ const HomePage: React.FC = () => {
   const sidebarContent = useMemo(
     () => (
       <div className="flex min-h-0 h-full flex-col gap-3 overflow-hidden">
-        <TaskPanel tasks={activeTasks} />
         <HistoryList
-          items={historyItems}
+          items={reportHistoryItems}
           isLoading={isLoadingHistory}
           isLoadingMore={isLoadingMore}
           hasMore={hasMore}
@@ -133,25 +404,24 @@ const HomePage: React.FC = () => {
           onItemClick={handleHistoryItemClick}
           onLoadMore={() => void loadMoreHistory()}
           onToggleItemSelection={toggleHistorySelection}
-          onToggleSelectAll={toggleSelectAllVisible}
+          onToggleSelectAll={handleToggleReportHistorySelectAll}
           onDeleteSelected={() => setShowDeleteConfirm(true)}
           className="flex-1 overflow-hidden"
         />
       </div>
     ),
     [
-      activeTasks,
       hasMore,
-      historyItems,
       isDeletingHistory,
       isLoadingHistory,
       isLoadingMore,
       handleHistoryItemClick,
+      handleToggleReportHistorySelectAll,
       loadMoreHistory,
+      reportHistoryItems,
       selectedIds,
       selectedReport?.meta.id,
       toggleHistorySelection,
-      toggleSelectAllVisible,
     ],
   );
 
@@ -160,18 +430,9 @@ const HomePage: React.FC = () => {
       data-testid="home-dashboard"
       className="flex h-[calc(100vh-5rem)] w-full flex-col overflow-hidden md:flex-row sm:h-[calc(100vh-5.5rem)] lg:h-[calc(100vh-2rem)]"
     >
-      <div className="flex-1 flex flex-col min-h-0 min-w-0 max-w-full lg:max-w-6xl mx-auto w-full">
+      <div className="flex min-h-0 min-w-0 flex-1 flex-col w-full">
         <header className="flex min-w-0 flex-shrink-0 items-center overflow-hidden px-3 py-3 md:px-4 md:py-4">
           <div className="flex min-w-0 flex-1 flex-wrap items-center gap-2.5 md:flex-nowrap">
-            <button
-              onClick={() => setSidebarOpen(true)}
-              className="md:hidden -ml-1 flex-shrink-0 rounded-lg p-1.5 text-secondary-text transition-colors hover:bg-hover hover:text-foreground"
-              aria-label="历史记录"
-            >
-              <svg className="h-5 w-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6h16M4 12h16M4 18h16" />
-              </svg>
-            </button>
             <div className="relative min-w-0 flex-1">
               <StockAutocomplete
                 value={query}
@@ -235,93 +496,126 @@ const HomePage: React.FC = () => {
           </div>
         ) : null}
 
-        <div className="flex-1 flex min-h-0 overflow-hidden">
-          <div className="hidden min-h-0 w-64 shrink-0 flex-col overflow-hidden pl-4 pb-4 md:flex lg:w-72">
-            {sidebarContent}
-          </div>
-
-          {sidebarOpen ? (
-            <div className="fixed inset-0 z-40 md:hidden" onClick={() => setSidebarOpen(false)}>
-              <div className="page-drawer-overlay absolute inset-0" />
-              <div
-                className="dashboard-card absolute bottom-0 left-0 top-0 flex w-72 flex-col overflow-hidden !rounded-none !rounded-r-xl p-3 shadow-2xl"
-                onClick={(event) => event.stopPropagation()}
-              >
-                {sidebarContent}
-              </div>
-            </div>
+        <section className="flex-1 min-w-0 min-h-0 overflow-hidden px-3 pb-4 md:px-6 touch-pan-y">
+          {error ? (
+            <ApiErrorAlert
+              error={error}
+              className="mb-3"
+              onDismiss={clearError}
+            />
           ) : null}
-
-          <section className="flex-1 min-w-0 min-h-0 overflow-x-auto overflow-y-auto px-3 pb-4 md:px-6 touch-pan-y">
-            {error ? (
-              <ApiErrorAlert
-                error={error}
-                className="mb-3"
-                onDismiss={clearError}
-              />
-            ) : null}
-            {isLoadingReport ? (
-              <div className="flex h-full flex-col items-center justify-center">
-                <DashboardStateBlock title="加载报告中..." loading />
-              </div>
-            ) : selectedReport ? (
-              <div className="max-w-4xl space-y-4 pb-8">
-                <div className="flex flex-wrap items-center justify-end gap-2">
-                  <Button
-                    variant="home-action-ai"
-                    size="sm"
-                    disabled={isAnalyzing || selectedReport.meta.id === undefined}
-                    onClick={handleReanalyze}
-                  >
-                    <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
-                    </svg>
-                    {reportText.reanalyze}
-                  </Button>
-                  <Button
-                    variant="home-action-ai"
-                    size="sm"
-                    disabled={selectedReport.meta.id === undefined}
-                    onClick={handleAskFollowUp}
-                  >
-                    <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z" />
-                    </svg>
-                    追问 AI
-                  </Button>
-                  <Button
-                    variant="home-action-ai"
-                    size="sm"
-                    disabled={selectedReport.meta.id === undefined}
-                    onClick={openMarkdownDrawer}
-                  >
-                    <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
-                    </svg>
-                    {reportText.fullReport}
-                  </Button>
-                </div>
-                <ReportSummary data={selectedReport} isHistory />
-              </div>
-            ) : (
-              <div className="flex h-full items-center justify-center">
-                <EmptyState
-                  title="开始分析"
-                  description="输入股票代码进行分析，或从左侧选择历史报告查看。"
-                  className="max-w-xl border-dashed"
-                  icon={(
-                    <svg className="h-6 w-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" />
-                    </svg>
-                  )}
-                />
-              </div>
-            )}
-          </section>
-        </div>
+          <div className="flex h-full min-h-0 flex-col gap-4">
+            <WatchlistBoard
+              items={watchlistItems}
+              selectedCodes={selectedWatchlistSet}
+              isLoading={isLoadingWatchlist || isLoadingHistory}
+              loadError={watchlistError}
+              reanalyzeLabel={reanalyzeButtonText}
+              reanalyzeDisabled={selectedWatchlistTargets.length === 0}
+              onRefresh={() => {
+                void loadWatchlist();
+                void refreshHistory(true);
+              }}
+              onReanalyzeSelected={handleReanalyzeWatchlist}
+              onOpenItem={handleWatchlistItemOpen}
+              onToggleSelection={toggleWatchlistSelection}
+              onSelectVisible={selectVisibleWatchlist}
+              onClearSelection={clearWatchlistSelection}
+            />
+          </div>
+        </section>
       </div>
 
-      {markdownDrawerOpen && selectedReport?.meta.id ? (
+      {reportOverlayOpen ? (
+        <div
+          data-testid="report-overlay"
+          className="fixed inset-0 z-50 flex items-stretch justify-center bg-background/70 p-2 backdrop-blur-sm md:p-5"
+        >
+          <div className="glass-card flex h-full w-full max-w-7xl flex-col overflow-hidden shadow-2xl">
+            <div className="flex flex-shrink-0 items-center justify-between gap-3 border-b border-subtle px-3 py-3 md:px-4">
+              <div className="flex min-w-0 items-center gap-2">
+                <button
+                  onClick={() => setSidebarOpen(true)}
+                  className="md:hidden flex-shrink-0 rounded-lg p-1.5 text-secondary-text transition-colors hover:bg-hover hover:text-foreground"
+                  aria-label="历史记录"
+                >
+                  <svg className="h-5 w-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6h16M4 12h16M4 18h16" />
+                  </svg>
+                </button>
+                <span className="truncate text-sm font-semibold text-foreground">分析报告</span>
+              </div>
+              <Button variant="ghost" size="sm" onClick={handleCloseReportOverlay} aria-label="关闭报告浮窗">
+                <X className="h-4 w-4" />
+              </Button>
+            </div>
+
+            <div className="flex min-h-0 flex-1 overflow-hidden">
+              <div className="hidden min-h-0 w-64 shrink-0 flex-col overflow-hidden border-r border-subtle p-3 md:flex lg:w-72">
+                {sidebarContent}
+              </div>
+
+              {sidebarOpen ? (
+                <div className="fixed inset-0 z-[60] md:hidden" onClick={() => setSidebarOpen(false)}>
+                  <div className="page-drawer-overlay absolute inset-0" />
+                  <div
+                    className="dashboard-card absolute bottom-0 left-0 top-0 flex w-72 flex-col overflow-hidden !rounded-none !rounded-r-xl p-3 shadow-2xl"
+                    onClick={(event) => event.stopPropagation()}
+                  >
+                    {sidebarContent}
+                  </div>
+                </div>
+              ) : null}
+
+              <section className="min-h-0 min-w-0 flex-1 overflow-x-auto overflow-y-auto px-3 pb-4 pt-3 md:px-6">
+                {isLoadingReport ? (
+                  <div className="flex h-full flex-col items-center justify-center">
+                    <DashboardStateBlock title="加载报告中..." loading />
+                  </div>
+                ) : selectedReport ? (
+                  <div className="mx-auto max-w-4xl space-y-4 pb-8">
+                    <div className="flex flex-wrap items-center justify-end gap-2">
+                      <Button
+                        variant="home-action-ai"
+                        size="sm"
+                        disabled={selectedReport.meta.id === undefined}
+                        onClick={handleAskFollowUp}
+                      >
+                        <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z" />
+                        </svg>
+                        追问 AI
+                      </Button>
+                      <Button
+                        variant="home-action-ai"
+                        size="sm"
+                        disabled={selectedReport.meta.id === undefined}
+                        onClick={openMarkdownDrawer}
+                      >
+                        <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                        </svg>
+                        {reportText.fullReport}
+                      </Button>
+                    </div>
+                    <ReportSummary data={selectedReport} isHistory />
+                  </div>
+                ) : (
+                  <div className="flex h-full items-center justify-center">
+                    <EmptyState
+                      title="暂无报告"
+                      description="选择有历史记录的监控股票查看报告，或先发起一次分析。"
+                      className="max-w-xl border-dashed"
+                    />
+                  </div>
+                )}
+              </section>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {reportOverlayOpen && markdownDrawerOpen && selectedReport?.meta.id ? (
         <ReportMarkdown
           recordId={selectedReport.meta.id}
           stockName={selectedReport.meta.stockName || ''}

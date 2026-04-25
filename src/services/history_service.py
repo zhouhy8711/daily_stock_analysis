@@ -114,12 +114,16 @@ class HistoryService:
             # Convert to response format
             items = []
             for record in records:
+                raw_result = parse_json_field(record.raw_result) if record.raw_result else {}
+                raw_result = raw_result if isinstance(raw_result, dict) else {}
                 items.append({
                     "id": record.id,
                     "query_id": record.query_id,
                     "stock_code": record.code,
                     "stock_name": record.name,
                     "report_type": record.report_type,
+                    "current_price": raw_result.get("current_price"),
+                    "change_pct": raw_result.get("change_pct"),
                     "sentiment_score": record.sentiment_score,
                     "operation_advice": record.operation_advice,
                     "created_at": record.created_at.isoformat() if record.created_at else None,

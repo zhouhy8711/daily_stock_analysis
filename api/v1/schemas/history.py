@@ -22,6 +22,8 @@ class HistoryItem(BaseModel):
     stock_code: str = Field(..., description="股票代码")
     stock_name: Optional[str] = Field(None, description="股票名称")
     report_type: Optional[str] = Field(None, description="报告类型")
+    current_price: Optional[float] = Field(None, description="分析时股价")
+    change_pct: Optional[float] = Field(None, description="分析时涨跌幅(%)")
     sentiment_score: Optional[int] = Field(
         None,
         description="情绪评分（历史数据可能超出 0-100 范围，读取时不做约束）",
@@ -37,6 +39,8 @@ class HistoryItem(BaseModel):
                 "stock_code": "600519",
                 "stock_name": "贵州茅台",
                 "report_type": "detailed",
+                "current_price": 1800.0,
+                "change_pct": 1.23,
                 "sentiment_score": 75,
                 "operation_advice": "持有",
                 "created_at": "2024-01-01T12:00:00"

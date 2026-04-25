@@ -43,6 +43,7 @@ English | [简体中文](../README.md) | [繁體中文](README_CHT.md)
 | Analysis | Multi-dimensional Analysis | Technicals + chip distribution + sentiment + real-time quotes |
 | Market | Global Markets | A-shares, Hong Kong stocks, US stocks |
 | Search | Smart Autocomplete (MVP) | **[Beta]** Home search supports code/name/pinyin/aliases; the local index now covers A-shares, Hong Kong, and US stocks and can be refreshed from Tushare or AkShare data |
+| Home | Watchlist Monitor | The Home page defaults to a `STOCK_LIST` watchlist monitor (falling back to recent history when unset), supports multi-select, batches selected stocks from the watchlist Reanalyze action, shows analysis progress in the left sidebar action area, and opens reports in an Esc-closeable overlay |
 | Review | Market Review | Daily overview, sectors, northbound capital flow |
 | Intel | Announcement + Capital Flow Intelligence | IntelAgent now also pulls listed-company announcements (SSE/SZSE/CNINFO) and A-share main-force capital flow, and exposes `capital_flow_signal` (`inflow/outflow/neutral/not_available`) for flow direction context |
 | Backtest | AI Backtest Validation | Auto-evaluate historical analysis accuracy, with a 1-day next-session validation view for AI prediction vs actual move and accuracy |
@@ -144,6 +145,7 @@ Go to your forked repo → `Settings` → `Secrets and variables` → `Actions` 
 | `BRAVE_API_KEYS` | [Brave Search](https://brave.com/search/api/) API (privacy-focused, US stocks optimized) | Optional |
 | `SERPAPI_API_KEYS` | [SerpAPI](https://serpapi.com/baidu-search-api?utm_source=github_daily_stock_analysis) Backup search | Optional |
 | `BOCHA_API_KEYS` | [Bocha Search](https://open.bocha.cn/) Web Search API (Chinese search optimized, supports AI summaries, multiple keys comma-separated) | Optional |
+| `PUBLIC_FINANCE_NEWS_ENABLED` | Keyless public finance news source (default `true`; used when no search API key is configured, via AkShare/Eastmoney stock news, announcements, and finance flash feeds) | Optional |
 | `SEARXNG_BASE_URLS` | SearXNG self-hosted instances (quota-free fallback, enable format: json in settings.yml); when empty the app auto-discovers public instances | Optional |
 | `SEARXNG_PUBLIC_INSTANCES_ENABLED` | Auto-discover public SearXNG instances from `searx.space` when `SEARXNG_BASE_URLS` is empty (default `true`) | Optional |
 | `TUSHARE_TOKEN` | [Tushare Pro](https://tushare.pro/weborder/#/login?reg=834638 ) Token | Optional |

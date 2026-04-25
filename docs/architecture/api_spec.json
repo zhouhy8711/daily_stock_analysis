@@ -1177,6 +1177,14 @@
           "report_type": {
             "type": "string"
           },
+          "current_price": {
+            "type": "number",
+            "description": "分析时股价"
+          },
+          "change_pct": {
+            "type": "number",
+            "description": "分析时涨跌幅(%)"
+          },
           "sentiment_score": {
             "type": "integer",
             "minimum": 0,

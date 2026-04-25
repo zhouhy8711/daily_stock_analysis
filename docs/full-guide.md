@@ -128,6 +128,7 @@ daily_stock_analysis/
 | `BOCHA_API_KEYS` | [博查搜索](https://open.bocha.cn/) Web Search API（中文搜索优化，支持AI摘要，多个key用逗号分隔） | 可选 |
 | `BRAVE_API_KEYS` | [Brave Search](https://brave.com/search/api/) API（隐私优先，美股优化，多个key用逗号分隔） | 可选 |
 | `SERPAPI_API_KEYS` | [SerpAPI](https://serpapi.com/baidu-search-api?utm_source=github_daily_stock_analysis) 备用搜索 | 可选 |
+| `PUBLIC_FINANCE_NEWS_ENABLED` | 免 Key 公开财经资讯源（默认 `true`，未配置搜索 API Key 时通过 AkShare/东方财富个股新闻、公告和财经快讯为相关资讯兜底） | 可选 |
 | `SEARXNG_BASE_URLS` | SearXNG 自建实例（无配额兜底，需在 settings.yml 启用 format: json）；留空时默认自动发现公共实例 | 可选 |
 | `SEARXNG_PUBLIC_INSTANCES_ENABLED` | 是否在 `SEARXNG_BASE_URLS` 为空时自动从 `searx.space` 获取公共实例（默认 `true`） | 可选 |
 | `TUSHARE_TOKEN` | [Tushare Pro](https://tushare.pro/weborder/#/login?reg=834638 ) Token | 可选 |
@@ -272,6 +273,7 @@ daily_stock_analysis/
 | `BOCHA_API_KEYS` | 博查搜索 API Key（中文优化） | 可选 |
 | `BRAVE_API_KEYS` | Brave Search API Key（美股优化） | 可选 |
 | `SERPAPI_API_KEYS` | SerpAPI 备用搜索 | 可选 |
+| `PUBLIC_FINANCE_NEWS_ENABLED` | 免 Key 公开财经资讯源（默认 `true`，未配置搜索 API Key 时通过 AkShare/东方财富个股新闻、公告和财经快讯为相关资讯兜底） | 可选 |
 | `SOCIAL_SENTIMENT_API_KEY` | Stock Sentiment API Key（Reddit / X / Polymarket，可选） | 可选 |
 | `SOCIAL_SENTIMENT_API_URL` | Stock Sentiment API 地址（默认 `https://api.adanos.org`） | 可选 |
 | `SEARXNG_BASE_URLS` | SearXNG 自建实例（无配额兜底，需在 settings.yml 启用 format: json）；留空时默认自动发现公共实例 | 可选 |
@@ -1054,6 +1056,7 @@ FastAPI 提供 RESTful API 服务，支持配置管理和触发分析。
 ### 功能特性
 
 - 📝 **配置管理** - 查看/修改自选股列表
+- 🧭 **自选监控首页** - 首页默认展示 `STOCK_LIST` 自选股监控列表（未配置时回退最近历史股票），支持多选；自选区“重新分析”会批量分析已选股票，分析进度展示在左侧边栏空白区，点击股票以浮窗打开报告，浮窗左侧仅展示当前股票历史，并支持 Esc 关闭
 - 🚀 **快速分析** - 通过 API 接口触发分析
 - 📊 **实时进度** - 分析任务状态实时更新，支持多任务并行；普通分析链路在进入 LLM 阶段后会优先尝试 LiteLLM 流式生成，并通过任务 SSE 回灌更细粒度的 `message/progress`
 - 📈 **回测验证** - 评估历史分析准确率，查询方向胜率与模拟收益

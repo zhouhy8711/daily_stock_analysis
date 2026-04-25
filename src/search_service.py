@@ -6,7 +6,7 @@ A股自选股智能分析系统 - 搜索服务模块
 
 职责：
 1. 提供统一的新闻搜索接口
-2. 支持 Bocha、Tavily、Brave、SerpAPI、SearXNG 多种搜索引擎
+2. 支持 Bocha、Tavily、Brave、SerpAPI、SearXNG、公开财经源等多种搜索引擎
 3. 多 Key 负载均衡和故障转移
 4. 搜索结果缓存和格式化
 """
@@ -15,6 +15,9 @@ import logging
 import re
 import threading
 import time
+import contextlib
+import importlib
+import io
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
@@ -2082,6 +2085,447 @@ class SearXNGSearchProvider(BaseSearchProvider):
         )
 
 
+class PublicFinanceNewsProvider(BaseSearchProvider):
+    """
+    Keyless finance-news provider backed by public finance SDK/crawler sources.
+
+    This provider is intentionally scoped to finance feeds rather than general web
+    search. It keeps the app useful when no Tavily/SerpAPI/Bocha-style key is
+    configured, and avoids depending solely on public SearXNG instances.
+    """
+
+    _CODE_PATTERNS = (
+        re.compile(r"\b(?:SH|SZ|BJ)?(?P<a>\d{6})(?:\.(?:SH|SZ|BJ))?\b", re.IGNORECASE),
+        re.compile(r"\b(?P<hk1>HK\d{4,5})\b", re.IGNORECASE),
+        re.compile(r"\b(?P<hk2>\d{4,5})\.HK\b", re.IGNORECASE),
+        re.compile(r"\b(?P<us>[A-Z]{1,5}(?:\.[A-Z])?)\b"),
+    )
+    _US_STOPWORDS = {
+        "NEWS",
+        "STOCK",
+        "EVENT",
+        "EVENTS",
+        "RISK",
+        "PRICE",
+        "REPORT",
+        "RATING",
+        "TARGET",
+    }
+    _QUERY_STOPWORDS = {
+        "股票",
+        "最新",
+        "新闻",
+        "重大",
+        "事件",
+        "公司公告",
+        "重要公告",
+        "公告",
+        "上交所",
+        "深交所",
+        "cninfo",
+        "研报",
+        "目标价",
+        "评级",
+        "深度分析",
+        "减持",
+        "处罚",
+        "违规",
+        "诉讼",
+        "利空",
+        "风险",
+        "业绩预告",
+        "财报",
+        "营收",
+        "净利润",
+        "同比增长",
+        "所在行业",
+        "竞争对手",
+        "市场份额",
+        "行业前景",
+        "latest",
+        "news",
+        "events",
+        "stock",
+        "analyst",
+        "rating",
+        "target",
+        "price",
+        "report",
+        "risk",
+        "earnings",
+        "revenue",
+        "profit",
+        "growth",
+        "forecast",
+        "industry",
+        "competitors",
+        "market",
+        "share",
+        "outlook",
+    }
+    _ANNOUNCEMENT_HINTS = (
+        "公告",
+        "cninfo",
+        "上交所",
+        "深交所",
+        "减持",
+        "处罚",
+        "违规",
+        "诉讼",
+        "风险",
+        "业绩",
+        "财报",
+        "营收",
+        "净利润",
+    )
+    _ANNOUNCEMENT_TYPES = {
+        "risk": ("风险提示", "持股变动", "重大事项"),
+        "earnings": ("财务报告", "业绩预告", "业绩快报", "重大事项"),
+        "announcement": ("重大事项", "财务报告", "风险提示", "持股变动", "信息变更", "资产重组"),
+    }
+    _GLOBAL_FEEDS = (
+        ("stock_info_global_em", "东方财富快讯", ("标题",), ("摘要",), "发布时间", "链接"),
+        ("stock_info_global_sina", "新浪财经快讯", ("内容",), ("内容",), "时间", None),
+        ("stock_info_global_futu", "富途快讯", ("标题", "内容"), ("内容", "摘要"), "发布时间", "链接"),
+        ("stock_info_global_cls", "财联社电报", ("标题", "内容"), ("内容", "摘要"), "发布时间", "链接"),
+    )
+    _GLOBAL_FEED_CACHE_TTL_SECONDS = 90
+    _global_feed_cache: Dict[str, Tuple[float, Any]] = {}
+    _global_feed_cache_lock = threading.RLock()
+
+    def __init__(self, enabled: bool = True):
+        super().__init__([], "PublicFinance")
+        self._enabled = enabled
+
+    @property
+    def is_available(self) -> bool:
+        return self._enabled and importlib.util.find_spec("akshare") is not None
+
+    def _do_search(self, query: str, api_key: str, max_results: int, days: int = 7) -> SearchResponse:
+        raise NotImplementedError("PublicFinanceNewsProvider.search handles keyless execution directly")
+
+    def search(self, query: str, max_results: int = 5, days: int = 7) -> SearchResponse:
+        start_time = time.time()
+        if not self.is_available:
+            return SearchResponse(
+                query=query,
+                results=[],
+                provider=self.name,
+                success=False,
+                error_message="akshare 未安装或公开财经源已禁用",
+            )
+
+        try:
+            stock_code = self._extract_stock_code(query)
+            results: List[SearchResult] = []
+            if stock_code:
+                results.extend(self._search_eastmoney_stock_news(stock_code, max_results=max(max_results * 2, 10)))
+                if self._is_a_share_code(stock_code):
+                    results.extend(
+                        self._search_eastmoney_announcements(
+                            stock_code,
+                            query=query,
+                            days=days,
+                            max_results=max(max_results, 5),
+                        )
+                    )
+
+            match_terms = self._build_match_terms(query, stock_code)
+            if len(results) < max_results and match_terms:
+                results.extend(self._search_global_feeds(match_terms, max_results=max(max_results * 2, 10)))
+
+            results = self._dedupe_results(results)
+            results = self._rank_results(results, query=query, terms=match_terms)
+
+            response_limit = max(max_results * 3, 20)
+            return SearchResponse(
+                query=query,
+                results=results[:response_limit],
+                provider=self.name,
+                success=True,
+                search_time=time.time() - start_time,
+            )
+        except Exception as exc:
+            logger.warning("[PublicFinance] 搜索失败: %s", exc, exc_info=True)
+            return SearchResponse(
+                query=query,
+                results=[],
+                provider=self.name,
+                success=False,
+                error_message=str(exc),
+                search_time=time.time() - start_time,
+            )
+
+    @classmethod
+    def _extract_stock_code(cls, query: str) -> Optional[str]:
+        for pattern in cls._CODE_PATTERNS:
+            for match in pattern.finditer(query):
+                value = next((v for v in match.groupdict().values() if v), "")
+                if not value:
+                    continue
+                upper = value.upper()
+                if upper in cls._US_STOPWORDS:
+                    continue
+                return value
+        return None
+
+    @classmethod
+    def _normalize_provider_symbol(cls, stock_code: str) -> str:
+        code = (stock_code or "").strip()
+        upper = code.upper()
+        a_match = re.search(r"(?:SH|SZ|BJ)?(\d{6})(?:\.(?:SH|SZ|BJ))?$", upper)
+        if a_match:
+            return a_match.group(1)
+
+        hk_prefix = re.match(r"HK(\d{4,5})$", upper)
+        if hk_prefix:
+            return f"hk{hk_prefix.group(1).zfill(5)}"
+
+        hk_suffix = re.match(r"(\d{4,5})\.HK$", upper)
+        if hk_suffix:
+            return hk_suffix.group(1).zfill(5)
+
+        return upper
+
+    @classmethod
+    def _is_a_share_code(cls, stock_code: str) -> bool:
+        return bool(re.search(r"(?:SH|SZ|BJ)?\d{6}(?:\.(?:SH|SZ|BJ))?$", (stock_code or "").strip(), re.IGNORECASE))
+
+    @classmethod
+    def _build_match_terms(cls, query: str, stock_code: Optional[str]) -> List[str]:
+        normalized_query = query
+        if stock_code:
+            normalized_query = re.sub(re.escape(stock_code), " ", normalized_query, flags=re.IGNORECASE)
+            provider_symbol = cls._normalize_provider_symbol(stock_code)
+            normalized_query = re.sub(re.escape(provider_symbol), " ", normalized_query, flags=re.IGNORECASE)
+
+        raw_terms = re.split(r"[\s,，、;；:：()（）/|]+", normalized_query)
+        terms: List[str] = []
+        seen: set[str] = set()
+        for raw in raw_terms:
+            term = raw.strip().strip("'\".")
+            if not term:
+                continue
+            lower = term.lower()
+            upper = term.upper()
+            if lower in cls._QUERY_STOPWORDS or term in cls._QUERY_STOPWORDS or upper in cls._US_STOPWORDS:
+                continue
+            if re.fullmatch(r"\d+(\.\d+)?", term):
+                continue
+            if len(term) < 2:
+                continue
+            key = lower
+            if key in seen:
+                continue
+            seen.add(key)
+            terms.append(term)
+
+        if stock_code:
+            for variant in {stock_code, cls._normalize_provider_symbol(stock_code)}:
+                if variant and variant.lower() not in seen:
+                    terms.append(variant)
+                    seen.add(variant.lower())
+        return terms[:6]
+
+    @classmethod
+    def _announcement_symbols_for_query(cls, query: str) -> List[str]:
+        lowered = query.lower()
+        if any(word in lowered for word in ("业绩", "财报", "营收", "净利润", "earnings", "revenue", "profit")):
+            return list(dict.fromkeys([*cls._ANNOUNCEMENT_TYPES["earnings"], "全部"]))
+        if any(word in lowered for word in ("减持", "处罚", "违规", "诉讼", "风险", "risk", "litigation")):
+            return list(dict.fromkeys([*cls._ANNOUNCEMENT_TYPES["risk"], "全部"]))
+        if any(word in lowered for word in cls._ANNOUNCEMENT_HINTS):
+            return list(dict.fromkeys(["全部", *cls._ANNOUNCEMENT_TYPES["announcement"]]))
+        return ["全部"]
+
+    @staticmethod
+    def _clean_text(value: Any) -> str:
+        if value is None:
+            return ""
+        try:
+            if value != value:
+                return ""
+        except Exception:
+            pass
+        return re.sub(r"\s+", " ", str(value)).strip()
+
+    @staticmethod
+    def _safe_akshare_call(func_name: str, **kwargs: Any) -> Any:
+        akshare = importlib.import_module("akshare")
+        func = getattr(akshare, func_name)
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            return func(**kwargs)
+
+    def _search_eastmoney_stock_news(self, stock_code: str, *, max_results: int) -> List[SearchResult]:
+        symbol = self._normalize_provider_symbol(stock_code)
+        try:
+            df = self._safe_akshare_call("stock_news_em", symbol=symbol)
+        except Exception as exc:
+            logger.info("[PublicFinance] 东方财富个股新闻失败: symbol=%s, error=%s", symbol, exc)
+            return []
+
+        results: List[SearchResult] = []
+        for _, row in df.head(max_results).iterrows():
+            title = self._clean_text(row.get("新闻标题"))
+            if not title:
+                continue
+            results.append(
+                SearchResult(
+                    title=title,
+                    snippet=self._clean_text(row.get("新闻内容"))[:500],
+                    url=self._clean_text(row.get("新闻链接")),
+                    source=self._clean_text(row.get("文章来源")) or "东方财富",
+                    published_date=self._clean_text(row.get("发布时间")),
+                )
+            )
+        return results
+
+    def _search_eastmoney_announcements(
+        self,
+        stock_code: str,
+        *,
+        query: str,
+        days: int,
+        max_results: int,
+    ) -> List[SearchResult]:
+        symbol = self._normalize_provider_symbol(stock_code)
+        today = datetime.now().date()
+        begin_date = (today - timedelta(days=max(0, int(days) - 1))).strftime("%Y%m%d")
+        end_date = (today + timedelta(days=1)).strftime("%Y%m%d")
+        symbols = self._announcement_symbols_for_query(query)
+
+        results: List[SearchResult] = []
+        seen_urls: set[str] = set()
+        for notice_type in symbols:
+            try:
+                df = self._safe_akshare_call(
+                    "stock_individual_notice_report",
+                    security=symbol,
+                    symbol=notice_type,
+                    begin_date=begin_date,
+                    end_date=end_date,
+                )
+            except Exception as exc:
+                logger.info(
+                    "[PublicFinance] 东方财富个股公告失败: symbol=%s, type=%s, error=%s",
+                    symbol,
+                    notice_type,
+                    exc,
+                )
+                continue
+
+            for _, row in df.head(max_results).iterrows():
+                title = self._clean_text(row.get("公告标题"))
+                url = self._clean_text(row.get("网址"))
+                if not title or url in seen_urls:
+                    continue
+                seen_urls.add(url)
+                notice_category = self._clean_text(row.get("公告类型"))
+                notice_date = self._clean_text(row.get("公告日期"))
+                snippet = f"{notice_category}；公告日期：{notice_date}" if notice_category else f"公告日期：{notice_date}"
+                results.append(
+                    SearchResult(
+                        title=title,
+                        snippet=snippet,
+                        url=url,
+                        source="东方财富公告",
+                        published_date=notice_date,
+                    )
+                )
+                if len(results) >= max_results:
+                    return results
+        return results
+
+    @classmethod
+    def _get_global_feed_frame(cls, func_name: str) -> Any:
+        now = time.time()
+        with cls._global_feed_cache_lock:
+            cached = cls._global_feed_cache.get(func_name)
+            if cached and now - cached[0] <= cls._GLOBAL_FEED_CACHE_TTL_SECONDS:
+                return cached[1]
+
+        df = cls._safe_akshare_call(func_name)
+        with cls._global_feed_cache_lock:
+            cls._global_feed_cache[func_name] = (now, df)
+        return df
+
+    def _search_global_feeds(self, terms: List[str], *, max_results: int) -> List[SearchResult]:
+        if not terms:
+            return []
+
+        lower_terms = [term.lower() for term in terms if len(term.strip()) >= 2]
+        results: List[SearchResult] = []
+        for func_name, source_name, title_keys, snippet_keys, date_key, url_key in self._GLOBAL_FEEDS:
+            try:
+                df = self._get_global_feed_frame(func_name)
+            except Exception as exc:
+                logger.info("[PublicFinance] %s 失败: %s", source_name, exc)
+                continue
+
+            for _, row in df.head(200).iterrows():
+                title = self._first_present(row, title_keys)
+                snippet = self._first_present(row, snippet_keys)
+                haystack = f"{title} {snippet}".lower()
+                if not any(term in haystack for term in lower_terms):
+                    continue
+                if not title:
+                    title = snippet[:80]
+                results.append(
+                    SearchResult(
+                        title=title,
+                        snippet=snippet[:500],
+                        url=self._clean_text(row.get(url_key)) if url_key else "",
+                        source=source_name,
+                        published_date=self._clean_text(row.get(date_key)),
+                    )
+                )
+                if len(results) >= max_results:
+                    return results
+        return results
+
+    @classmethod
+    def _first_present(cls, row: Any, keys: Tuple[str, ...]) -> str:
+        for key in keys:
+            if key in row:
+                value = cls._clean_text(row.get(key))
+                if value:
+                    return value
+        return ""
+
+    @staticmethod
+    def _dedupe_results(results: List[SearchResult]) -> List[SearchResult]:
+        deduped: List[SearchResult] = []
+        seen: set[str] = set()
+        for item in results:
+            key = item.url.strip() or f"{item.source}:{item.title}:{item.published_date or ''}"
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(item)
+        return deduped
+
+    @classmethod
+    def _rank_results(cls, results: List[SearchResult], *, query: str, terms: List[str]) -> List[SearchResult]:
+        lowered_query = query.lower()
+        relevant_terms = [term.lower() for term in terms if len(term) >= 2]
+
+        def score(item: SearchResult) -> Tuple[int, str]:
+            haystack = f"{item.title} {item.snippet}".lower()
+            value = 0
+            value += sum(3 for term in relevant_terms if term in haystack)
+            if "公告" in item.source:
+                value += 10
+            if any(word in lowered_query for word in ("公告", "cninfo", "announcement")) and "公告" in item.source:
+                value += 4
+            if any(word in lowered_query for word in ("减持", "处罚", "违规", "诉讼", "风险", "risk")):
+                value += sum(2 for word in ("减持", "处罚", "违规", "诉讼", "风险", "调查") if word in haystack)
+            if any(word in lowered_query for word in ("业绩", "财报", "营收", "净利润", "earnings")):
+                value += sum(2 for word in ("业绩", "财报", "营收", "净利润", "订单", "利润") if word in haystack)
+            return value, item.published_date or ""
+
+        return sorted(results, key=score, reverse=True)
+
+
 class SearchService:
     """
     搜索服务
@@ -2125,6 +2569,7 @@ class SearchService:
         brave_keys: Optional[List[str]] = None,
         serpapi_keys: Optional[List[str]] = None,
         minimax_keys: Optional[List[str]] = None,
+        public_finance_news_enabled: bool = True,
         searxng_base_urls: Optional[List[str]] = None,
         searxng_public_instances_enabled: bool = True,
         news_max_age_days: int = 3,
@@ -2140,6 +2585,7 @@ class SearchService:
             brave_keys: Brave Search API Key 列表
             serpapi_keys: SerpAPI Key 列表
             minimax_keys: MiniMax API Key 列表
+            public_finance_news_enabled: 是否启用免 Key 公开财经资讯源
             searxng_base_urls: SearXNG 实例地址列表（自建无配额兜底）
             searxng_public_instances_enabled: 未配置自建实例时，是否自动使用公共 SearXNG 实例
             news_max_age_days: 新闻最大时效（天）
@@ -2189,7 +2635,25 @@ class SearchService:
             self._providers.append(MiniMaxSearchProvider(minimax_keys))
             logger.info(f"已配置 MiniMax 搜索，共 {len(minimax_keys)} 个 API Key")
 
-        # 6. SearXNG（自建实例优先；未配置时可自动发现公共实例）
+        has_api_search_provider = bool(
+            bocha_keys
+            or tavily_keys
+            or brave_keys
+            or serpapi_keys
+            or minimax_keys
+            or anspire_keys
+        )
+
+        # 6. 公开财经源（免 Key，使用 AkShare SDK/公开财经接口抓取个股新闻与公告）
+        # 仅在未配置搜索 API Key 时自动启用，避免改变已配置专业搜索通道的优先行为。
+        public_finance_provider = PublicFinanceNewsProvider(
+            enabled=bool(public_finance_news_enabled and not has_api_search_provider)
+        )
+        if public_finance_provider.is_available:
+            self._providers.append(public_finance_provider)
+            logger.info("已启用 PublicFinance 免 Key 财经资讯源")
+
+        # 7. SearXNG（自建实例优先；未配置时可自动发现公共实例）
         searxng_provider = SearXNGSearchProvider(
             searxng_base_urls,
             use_public_instances=bool(searxng_public_instances_enabled and not searxng_base_urls),
@@ -2201,7 +2665,7 @@ class SearchService:
             else:
                 logger.info("已启用 SearXNG 公共实例自动发现模式")
 
-        # 7. Anspire Search（实时智能搜索优化）
+        # 8. Anspire Search（实时智能搜索优化）
         if anspire_keys:
             self._providers.insert(0, AnspireSearchProvider(anspire_keys))
             logger.info(f"已配置 Anspire Search 搜索，共 {len(anspire_keys)} 个 API Key")
@@ -2992,7 +3456,7 @@ class SearchService:
                 },
                 {
                     'name': 'market_analysis',
-                    'query': f"{stock_name} analyst rating target price report",
+                    'query': f"{stock_name} {stock_code} analyst rating target price report",
                     'desc': '机构分析',
                     'tavily_topic': None,
                     'strict_freshness': False,
@@ -3001,7 +3465,7 @@ class SearchService:
                     'name': 'risk_check',
                     'query': (
                         f"{stock_name} {stock_code} index performance outlook tracking error"
-                        if is_index_etf else f"{stock_name} risk insider selling lawsuit litigation"
+                        if is_index_etf else f"{stock_name} {stock_code} risk insider selling lawsuit litigation"
                     ),
                     'desc': '风险排查',
                     'tavily_topic': None if is_index_etf else 'news',
@@ -3011,7 +3475,7 @@ class SearchService:
                     'name': 'earnings',
                     'query': (
                         f"{stock_name} {stock_code} index performance composition outlook"
-                        if is_index_etf else f"{stock_name} earnings revenue profit growth forecast"
+                        if is_index_etf else f"{stock_name} {stock_code} earnings revenue profit growth forecast"
                     ),
                     'desc': '业绩预期',
                     'tavily_topic': None,
@@ -3021,7 +3485,7 @@ class SearchService:
                     'name': 'industry',
                     'query': (
                         f"{stock_name} {stock_code} index sector allocation holdings"
-                        if is_index_etf else f"{stock_name} industry competitors market share outlook"
+                        if is_index_etf else f"{stock_name} {stock_code} industry competitors market share outlook"
                     ),
                     'desc': '行业分析',
                     'tavily_topic': None,
@@ -3039,7 +3503,7 @@ class SearchService:
                 },
                 {
                     'name': 'market_analysis',
-                    'query': f"{stock_name} 研报 目标价 评级 深度分析",
+                    'query': f"{stock_name} {stock_code} 研报 目标价 评级 深度分析",
                     'desc': '机构分析',
                     'tavily_topic': None,
                     'strict_freshness': False,
@@ -3048,7 +3512,7 @@ class SearchService:
                     'name': 'risk_check',
                     'query': (
                         f"{stock_name} 指数走势 跟踪误差 净值 表现"
-                        if is_index_etf else f"{stock_name} 减持 处罚 违规 诉讼 利空 风险"
+                        if is_index_etf else f"{stock_name} {stock_code} 减持 处罚 违规 诉讼 利空 风险"
                     ),
                     'desc': '风险排查',
                     'tavily_topic': None if is_index_etf else 'news',
@@ -3068,7 +3532,7 @@ class SearchService:
                     'name': 'earnings',
                     'query': (
                         f"{stock_name} 指数成分 净值 跟踪表现"
-                        if is_index_etf else f"{stock_name} 业绩预告 财报 营收 净利润 同比增长"
+                        if is_index_etf else f"{stock_name} {stock_code} 业绩预告 财报 营收 净利润 同比增长"
                     ),
                     'desc': '业绩预期',
                     'tavily_topic': None,
@@ -3078,7 +3542,7 @@ class SearchService:
                     'name': 'industry',
                     'query': (
                         f"{stock_name} 指数成分股 行业配置 权重"
-                        if is_index_etf else f"{stock_name} 所在行业 竞争对手 市场份额 行业前景"
+                        if is_index_etf else f"{stock_name} {stock_code} 所在行业 竞争对手 市场份额 行业前景"
                     ),
                     'desc': '行业分析',
                     'tavily_topic': None,
@@ -3104,60 +3568,80 @@ class SearchService:
             provider_max_results,
         )
         
-        # 轮流使用不同的搜索引擎
+        # 轮流选择首选搜索引擎；单个维度失败或过滤为空时继续尝试下一个 provider。
         provider_index = 0
         
         for dim in search_dimensions:
             if search_count >= max_searches:
                 break
             
-            # 选择搜索引擎（轮流使用）
             available_providers = [p for p in self._providers if p.is_available]
             if not available_providers:
                 break
-            
-            provider = available_providers[provider_index % len(available_providers)]
-            provider_index += 1
-            
-            logger.info(f"[情报搜索] {dim['desc']}: 使用 {provider.name}")
 
-            if isinstance(provider, TavilySearchProvider) and dim.get('tavily_topic'):
-                response = provider.search(
-                    dim['query'],
-                    max_results=provider_max_results,
-                    days=search_days,
-                    topic=dim['tavily_topic'],
-                )
-            else:
-                response = provider.search(
-                    dim['query'],
-                    max_results=provider_max_results,
-                    days=search_days,
-                )
-            if dim['strict_freshness']:
-                filtered_response = self._filter_news_response(
-                    response,
-                    search_days=search_days,
-                    max_results=target_per_dimension,
-                    log_scope=f"{stock_code}:{provider.name}:{dim['name']}",
-                )
-            else:
-                filtered_response = self._normalize_and_limit_response(
-                    response,
-                    max_results=target_per_dimension,
-                )
-            results[dim['name']] = filtered_response
+            selected_response: Optional[SearchResponse] = None
+            for attempt in range(len(available_providers)):
+                provider = available_providers[(provider_index + attempt) % len(available_providers)]
+
+                logger.info(f"[情报搜索] {dim['desc']}: 使用 {provider.name}")
+
+                if isinstance(provider, TavilySearchProvider) and dim.get('tavily_topic'):
+                    response = provider.search(
+                        dim['query'],
+                        max_results=provider_max_results,
+                        days=search_days,
+                        topic=dim['tavily_topic'],
+                    )
+                else:
+                    response = provider.search(
+                        dim['query'],
+                        max_results=provider_max_results,
+                        days=search_days,
+                    )
+                if dim['strict_freshness']:
+                    filtered_response = self._filter_news_response(
+                        response,
+                        search_days=search_days,
+                        max_results=target_per_dimension,
+                        log_scope=f"{stock_code}:{provider.name}:{dim['name']}",
+                    )
+                else:
+                    filtered_response = self._normalize_and_limit_response(
+                        response,
+                        max_results=target_per_dimension,
+                    )
+
+                if response.success:
+                    logger.info(
+                        "[情报搜索] %s: provider=%s, 原始=%s条, 过滤后=%s条",
+                        dim['desc'],
+                        provider.name,
+                        len(response.results),
+                        len(filtered_response.results),
+                    )
+                else:
+                    logger.warning(f"[情报搜索] {dim['desc']}: 搜索失败 - {response.error_message}")
+
+                if filtered_response.success and filtered_response.results:
+                    selected_response = filtered_response
+                    provider_index = (provider_index + attempt + 1) % len(available_providers)
+                    break
+
+                if selected_response is None:
+                    selected_response = filtered_response
+                elif not selected_response.success and filtered_response.success:
+                    selected_response = filtered_response
+
+                if response.success and not filtered_response.results:
+                    logger.info(
+                        "[情报搜索] %s: provider=%s 过滤后无有效结果，尝试下一个 provider",
+                        dim['desc'],
+                        provider.name,
+                    )
+
+            if selected_response is not None:
+                results[dim['name']] = selected_response
             search_count += 1
-            
-            if response.success:
-                logger.info(
-                    "[情报搜索] %s: 原始=%s条, 过滤后=%s条",
-                    dim['desc'],
-                    len(response.results),
-                    len(filtered_response.results),
-                )
-            else:
-                logger.warning(f"[情报搜索] {dim['desc']}: 搜索失败 - {response.error_message}")
             
             # 短暂延迟避免请求过快
             time.sleep(0.5)
@@ -3442,6 +3926,7 @@ def get_search_service() -> SearchService:
                     brave_keys=config.brave_api_keys,
                     serpapi_keys=config.serpapi_keys,
                     minimax_keys=config.minimax_api_keys,
+                    public_finance_news_enabled=getattr(config, "public_finance_news_enabled", True),
                     searxng_base_urls=config.searxng_base_urls,
                     searxng_public_instances_enabled=config.searxng_public_instances_enabled,
                     news_max_age_days=config.news_max_age_days,

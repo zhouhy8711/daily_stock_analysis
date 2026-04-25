@@ -10,7 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 <!-- 新条目格式：- [类型] 描述（类型取值：新功能/改进/修复/文档/测试/chore）-->
-- [新功能] Web 首页历史报告区新增重新分析入口，支持基于原始 prompt 重做同一只股票同日期的分析
+- [新功能] Web 首页自选监控区新增重新分析入口，支持多选自选股票后批量重做，并将分析进度移入左侧边栏空白区
 <!-- 每条独立一行追加到本段末尾，无需分类标题，合并时冲突最小 -->
 - [修复] Pipeline Agent 5 个 K 线工具（get_daily_history / analyze_trend / calculate_ma / get_volume_analysis / analyze_pattern）改为 DB-first 加载，消除同一只股票 9x5=45 次重复 HTTP 请求 (Fixes #1066)
 - [修复] Pipeline Agent 执行前按需预热 240 天 K 线历史到 DB，正常情况下 K 线工具调用无需重复网络请求
@@ -20,6 +20,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [文档] 补充官方镜像拉取、`docker run` 用法与 `.env` / 数据目录映射说明，不再仅覆盖 Compose 部署路径
 - [新功能] 新增 Codex CLI 模型运行时，可通过本机 `codex exec` 登录态调用 `codex/<model>`，无需在项目配置中保存模型 API Key
 - [修复] Codex CLI 模式默认隔离用户配置、项目规则、插件和工具能力，并避免流式调用失败后重复执行导致分析任务长时间停留在 LLM 等待阶段
+- [新功能] 新增默认开启的免 Key 公开财经资讯源，通过 AkShare/东方财富个股新闻、公告和财经快讯为相关资讯面板提供兜底数据
+- [修复] 多维情报搜索在单个 provider 失败或过滤为空时继续尝试下一个 provider，避免公共 SearXNG 不稳定导致相关资讯全空
+- [改进] Web 首页默认展示自选监控股票列表，点击股票以浮窗打开分析报告，并让自选区“重新分析”联动多选股票批量重跑
+- [改进] Web 分析报告浮窗左侧历史列表改为仅展示当前打开股票的历史记录，避免混入其他股票
+- [改进] Web 首页分析进度与自选监控区改为铺满右侧工作区，报告浮窗支持按 Esc 关闭
+- [改进] 历史列表摘要补充分析时股价与涨跌幅字段，供首页自选监控列表展示最新分析价格状态
 
 ## [3.13.0] - 2026-04-21
 

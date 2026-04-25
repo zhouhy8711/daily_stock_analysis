@@ -43,6 +43,7 @@
 | 分析 | 多維度分析 | 技術面 + 籌碼分布 + 輿情情報 + 實時行情 |
 | 市場 | 全球市場 | 支援 A股、港股、美股 |
 | 補全 | 智慧補全 (MVP) | **[測試階段]** 首頁搜尋框支援代碼 / 名稱 / 拼音 / 別名聯想；本地索引已覆蓋 A股、港股、美股，並可透過 Tushare 或 AkShare 重新生成 |
+| 首頁 | 自選監控 | 首頁預設展示 `STOCK_LIST` 自選股監控列表（未配置時回退最近歷史股票），支援列表多選；自選區「重新分析」會批量分析已選股票，分析進度展示在左側邊欄空白區，點擊股票以浮窗開啟分析報告，浮窗支援 Esc 關閉 |
 | 復盤 | 大盤復盤 | 每日市場概覽、板塊漲跌、北向資金 |
 | 回測 | AI 回測驗證 | 自動評估歷史分析準確率，方向勝率、止盈止損命中率 |
 | **Agent 問股** | **策略對話** | **多輪策略問答，支援 11 種內建策略（Web/Bot/API）** |
@@ -140,6 +141,7 @@
 | `BOCHA_API_KEYS` | [博查搜索](https://open.bocha.cn/) Web Search API（中文搜索優化，支持AI摘要，多個key用逗號分隔） | 可選 |
 | `BRAVE_API_KEYS` | [Brave Search](https://brave.com/search/api/) API（隱私優先，美股優化，多個key用逗號分隔） | 可選 |
 | `SERPAPI_API_KEYS` | [SerpAPI](https://serpapi.com/baidu-search-api?utm_source=github_daily_stock_analysis) 備用搜索 | 可選 |
+| `PUBLIC_FINANCE_NEWS_ENABLED` | 免 Key 公開財經資訊源（預設 `true`，未配置搜索 API Key 時透過 AkShare/東方財富個股新聞、公告和財經快訊為相關資訊兜底） | 可選 |
 | `SEARXNG_BASE_URLS` | SearXNG 自建實例（無配額兜底，需在 settings.yml 啟用 format: json）；留空時預設自動發現公共實例 | 可選 |
 | `SEARXNG_PUBLIC_INSTANCES_ENABLED` | 是否在 `SEARXNG_BASE_URLS` 為空時自動從 `searx.space` 取得公共實例（預設 `true`） | 可選 |
 | `TUSHARE_TOKEN` | [Tushare Pro](https://tushare.pro/weborder/#/login?reg=834638 ) Token | 可選 |

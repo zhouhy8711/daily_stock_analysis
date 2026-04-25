@@ -214,9 +214,9 @@ export const useStockPoolStore = create<StockPoolState>((set, get) => ({
 
   selectHistoryItem: async (recordId) => {
     const requestId = ++reportRequestSeq;
-    const shouldShowInitialLoading = !get().selectedReport;
+    const shouldShowLoading = get().selectedReport?.meta.id !== recordId;
 
-    if (shouldShowInitialLoading) {
+    if (shouldShowLoading) {
       set({ isLoadingReport: true });
     }
 

@@ -122,6 +122,7 @@ Go to your forked repo → `Settings` → `Secrets and variables` → `Actions` 
 | `MINIMAX_API_KEYS` | [MiniMax](https://platform.minimaxi.com/) Coding Plan Web Search (structured search results) | Optional |
 | `BOCHA_API_KEYS` | [Bocha Search](https://open.bocha.cn/) Web Search API (Chinese search optimized, supports AI summaries, multiple keys comma-separated) | Optional |
 | `SERPAPI_API_KEYS` | [SerpAPI](https://serpapi.com/baidu-search-api?utm_source=github_daily_stock_analysis) Backup search | Optional |
+| `PUBLIC_FINANCE_NEWS_ENABLED` | Keyless public finance news source (default `true`; used when no search API key is configured, via AkShare/Eastmoney stock news, announcements, and finance flash feeds) | Optional |
 | `SEARXNG_BASE_URLS` | SearXNG self-hosted instances (quota-free fallback, enable format: json in settings.yml); when empty the app auto-discovers public instances | Optional |
 | `SEARXNG_PUBLIC_INSTANCES_ENABLED` | Auto-discover public SearXNG instances from `searx.space` when `SEARXNG_BASE_URLS` is empty (default `true`) | Optional |
 | `TUSHARE_TOKEN` | [Tushare Pro](https://tushare.pro/weborder/#/login?reg=834638) Token | Optional |
@@ -245,6 +246,7 @@ Default schedule: Every weekday at **18:00 (Beijing Time)** automatic execution.
 | `BOCHA_API_KEYS` | Bocha Search API Key (Chinese optimized) | Optional |
 | `BRAVE_API_KEYS` | Brave Search API Key (US stocks optimized) | Optional |
 | `SERPAPI_API_KEYS` | SerpAPI Backup search | Optional |
+| `PUBLIC_FINANCE_NEWS_ENABLED` | Keyless public finance news source (default `true`; used when no search API key is configured, via AkShare/Eastmoney stock news, announcements, and finance flash feeds) | Optional |
 | `SOCIAL_SENTIMENT_API_KEY` | Stock Sentiment API Key (Reddit / X / Polymarket, US stocks optional) | Optional |
 | `SOCIAL_SENTIMENT_API_URL` | Stock Sentiment API endpoint (default `https://api.adanos.org`) | Optional |
 | `SEARXNG_BASE_URLS` | SearXNG self-hosted instances (quota-free fallback, enable format: json in settings.yml); when empty the app auto-discovers public instances | Optional |
@@ -890,6 +892,7 @@ FastAPI provides RESTful API service for configuration management and triggering
 ### Features
 
 - **Configuration Management** - View/modify watchlist
+- **Watchlist Monitor Home** - The Home page defaults to a `STOCK_LIST` watchlist monitor (falling back to recent history when unset), supports multi-select, batches selected stocks from the watchlist Reanalyze action, shows analysis progress in the left sidebar action area, and opens reports in an Esc-closeable overlay whose sidebar only shows the current stock's history
 - **Quick Analysis** - Trigger analysis via API
 - **Real-time Progress** - Analysis task status updates in real-time, supports parallel tasks; the regular stock-analysis path now prefers LiteLLM streaming during the LLM stage and pushes finer-grained `message/progress` updates through task SSE
 - **Backtest Validation** - Evaluate historical analysis accuracy, query direction win rate and simulated returns

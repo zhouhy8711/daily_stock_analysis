@@ -521,6 +521,7 @@ class Config:
     tavily_api_keys: List[str] = field(default_factory=list)  # Tavily API Keys
     brave_api_keys: List[str] = field(default_factory=list)  # Brave Search API Keys
     serpapi_keys: List[str] = field(default_factory=list)  # SerpAPI Keys
+    public_finance_news_enabled: bool = True  # Keyless public finance news/announcement provider
     searxng_base_urls: List[str] = field(default_factory=list)  # SearXNG instance URLs (self-hosted, no quota)
     searxng_public_instances_enabled: bool = True  # Auto-discover public SearXNG instances when base URLs are absent
 
@@ -1089,6 +1090,10 @@ class Config:
             os.getenv('SEARXNG_PUBLIC_INSTANCES_ENABLED'),
             default=True,
         )
+        public_finance_news_enabled = parse_env_bool(
+            os.getenv('PUBLIC_FINANCE_NEWS_ENABLED'),
+            default=True,
+        )
 
         # 企微消息类型与最大字节数逻辑
         wechat_msg_type = os.getenv('WECHAT_MSG_TYPE', 'markdown')
@@ -1199,6 +1204,7 @@ class Config:
             tavily_api_keys=tavily_api_keys,
             brave_api_keys=brave_api_keys,
             serpapi_keys=serpapi_keys,
+            public_finance_news_enabled=public_finance_news_enabled,
             searxng_base_urls=searxng_base_urls,
             searxng_public_instances_enabled=searxng_public_instances_enabled,
             social_sentiment_api_key=os.getenv('SOCIAL_SENTIMENT_API_KEY') or None,
@@ -1953,6 +1959,7 @@ class Config:
             or self.tavily_api_keys
             or self.brave_api_keys
             or self.serpapi_keys
+            or self.public_finance_news_enabled
             or self.has_searxng_enabled()
         )
 
