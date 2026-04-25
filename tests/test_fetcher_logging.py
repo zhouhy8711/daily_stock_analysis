@@ -55,6 +55,21 @@ class _FailureFetcher(BaseFetcher):
         return df
 
 
+class _NamedDailyFetcher:
+    def __init__(self, name: str, priority: int, result=None, error: Exception | None = None):
+        self.name = name
+        self.priority = priority
+        self._result = result
+        self._error = error
+        self.calls = 0
+
+    def get_daily_data(self, *args, **kwargs):
+        self.calls += 1
+        if self._error is not None:
+            raise self._error
+        return self._result
+
+
 class TestFetcherLogging(unittest.TestCase):
     def test_base_fetcher_logs_start_and_success(self):
         fetcher = _SuccessFetcher()
@@ -105,6 +120,61 @@ class TestFetcherLogging(unittest.TestCase):
         self.assertIn("endpoint=push2his.eastmoney.com/api/qt/stock/kline/get", log_text)
         self.assertIn("category=remote_disconnect", log_text)
         self.assertIn("[EfinanceFetcher] 601006 获取失败:", log_text)
+
+    def test_efinance_daily_data_supports_us_stock_history(self):
+        fetcher = EfinanceFetcher()
+        captured_kwargs = {}
+        fake_df = pd.DataFrame(
+            {
+                "股票名称": ["阿里巴巴", "阿里巴巴"],
+                "股票代码": ["BABA", "BABA"],
+                "日期": ["2026-04-23", "2026-04-24"],
+                "开盘": [132.0, 133.68],
+                "收盘": [134.5, 135.82],
+                "最高": [135.0, 136.2],
+                "最低": [131.5, 133.0],
+                "成交量": [8000000, 9046794],
+                "成交额": [1076000000.0, 1229000000.0],
+                "涨跌幅": [1.2, 0.98],
+            }
+        )
+
+        def fake_get_quote_history(**kwargs):
+            captured_kwargs.update(kwargs)
+            return fake_df
+
+        fake_efinance = types.SimpleNamespace(
+            stock=types.SimpleNamespace(get_quote_history=fake_get_quote_history)
+        )
+
+        with patch.dict(sys.modules, {"efinance": fake_efinance}):
+            with patch.object(fetcher, "_set_random_user_agent", return_value=None), patch.object(
+                fetcher, "_enforce_rate_limit", return_value=None
+            ):
+                df = fetcher.get_daily_data("BABA", start_date="2026-04-01", end_date="2026-04-25")
+
+        self.assertFalse(df.empty)
+        self.assertEqual(captured_kwargs["stock_codes"], "BABA")
+        self.assertEqual(list(df["code"].unique()), ["BABA"])
+        self.assertAlmostEqual(df.iloc[-1]["close"], 135.82)
+
+    def test_us_stock_history_uses_efinance_as_yfinance_fallback(self):
+        yfinance = _NamedDailyFetcher(
+            "YfinanceFetcher",
+            4,
+            error=DataFetchError("Yahoo Finance rate limited"),
+        )
+        efinance = _NamedDailyFetcher("EfinanceFetcher", 0, result=_sample_df())
+        longbridge = _NamedDailyFetcher("LongbridgeFetcher", 5, result=_sample_df())
+        manager = DataFetcherManager(fetchers=[efinance, yfinance, longbridge])
+
+        df, source = manager.get_daily_data("BABA", start_date="2026-04-01", end_date="2026-04-25")
+
+        self.assertFalse(df.empty)
+        self.assertEqual(source, "EfinanceFetcher")
+        self.assertEqual(yfinance.calls, 1)
+        self.assertEqual(efinance.calls, 1)
+        self.assertEqual(longbridge.calls, 0)
 
 
 if __name__ == "__main__":

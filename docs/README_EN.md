@@ -43,7 +43,7 @@ English | [简体中文](../README.md) | [繁體中文](README_CHT.md)
 | Analysis | Multi-dimensional Analysis | Technicals + chip distribution + sentiment + real-time quotes |
 | Market | Global Markets | A-shares, Hong Kong stocks, US stocks |
 | Search | Smart Autocomplete (MVP) | **[Beta]** Home search supports code/name/pinyin/aliases; the local index now covers A-shares, Hong Kong, and US stocks and can be refreshed from Tushare or AkShare data |
-| Home | Watchlist Monitor | The Home page defaults to a `STOCK_LIST` watchlist monitor (falling back to recent history when unset), supports multi-select, batches selected stocks from the watchlist Reanalyze action, shows analysis progress in the left sidebar action area, and opens reports in an Esc-closeable overlay |
+| Home | Watchlist Monitor | The Home page defaults to a `STOCK_LIST` watchlist monitor (falling back to recent history when unset), supports multi-select, batches selected stocks from the watchlist Reanalyze action, shows analysis progress in the left sidebar action area, and opens reports in an Esc-closeable overlay with an indicator modal for real-time quote, K-line, volume, and moving-average data |
 | Review | Market Review | Daily overview, sectors, northbound capital flow |
 | Intel | Announcement + Capital Flow Intelligence | IntelAgent now also pulls listed-company announcements (SSE/SZSE/CNINFO) and A-share main-force capital flow, and exposes `capital_flow_signal` (`inflow/outflow/neutral/not_available`) for flow direction context |
 | Backtest | AI Backtest Validation | Auto-evaluate historical analysis accuracy, with a 1-day next-session validation view for AI prediction vs actual move and accuracy |

@@ -340,7 +340,7 @@ class EfinanceFetcher(BaseFetcher):
         从 efinance 获取原始数据
         
         根据代码类型自动选择 API：
-        - 美股：不支持，抛出异常让 DataFetcherManager 切换到其他数据源
+        - 美股：使用 ef.stock.get_quote_history() 作为免 Key 兜底
         - 普通股票：使用 ef.stock.get_quote_history()
         - ETF 基金：使用 ef.stock.get_quote_history()（ETF 是交易所证券，使用股票 K 线接口）
         
@@ -351,10 +351,6 @@ class EfinanceFetcher(BaseFetcher):
         4. 调用对应的 efinance API
         5. 处理返回数据
         """
-        # 美股不支持，抛出异常让 DataFetcherManager 切换到 AkshareFetcher/YfinanceFetcher
-        if _is_us_code(stock_code):
-            raise DataFetchError(f"EfinanceFetcher 不支持美股 {stock_code}，请使用 AkshareFetcher 或 YfinanceFetcher")
-        
         # 根据代码类型选择不同的获取方法
         if _is_etf_code(stock_code):
             return self._fetch_etf_data(stock_code, start_date, end_date)

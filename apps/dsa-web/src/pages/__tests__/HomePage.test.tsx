@@ -5,6 +5,7 @@ import { MemoryRouter } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { analysisApi, DuplicateTaskError } from '../../api/analysis';
 import { historyApi } from '../../api/history';
+import { stocksApi } from '../../api/stocks';
 import { systemConfigApi } from '../../api/systemConfig';
 import { ShellSidebarActionProvider } from '../../components/layout/ShellSidebarActionContext';
 import { useStockPoolStore } from '../../stores';
@@ -44,6 +45,13 @@ vi.mock('../../api/analysis', async () => {
 vi.mock('../../api/systemConfig', () => ({
   systemConfigApi: {
     getConfig: vi.fn(),
+  },
+}));
+
+vi.mock('../../api/stocks', () => ({
+  stocksApi: {
+    getQuote: vi.fn(),
+    getHistory: vi.fn(),
   },
 }));
 
@@ -112,6 +120,26 @@ describe('HomePage', () => {
       maskToken: '******',
       items: [{ key: 'STOCK_LIST', value: '', rawValueExists: false, isMasked: false }],
     });
+    vi.mocked(stocksApi.getHistory).mockResolvedValue({
+      stockCode: '600519',
+      stockName: '贵州茅台',
+      period: 'daily',
+      data: [],
+    });
+    vi.mocked(stocksApi.getQuote).mockResolvedValue({
+      stockCode: '600519',
+      stockName: '贵州茅台',
+      currentPrice: 123,
+      change: 1.2,
+      changePercent: 1,
+      open: 121,
+      high: 125,
+      low: 120,
+      prevClose: 121.8,
+      volume: 1000000,
+      amount: 120000000,
+      updateTime: '2026-04-25T15:00:00',
+    });
   });
 
   it('renders the watchlist workspace and opens the selected report as an overlay', async () => {
@@ -179,6 +207,71 @@ describe('HomePage', () => {
     await waitFor(() => {
       expect(screen.queryByTestId('report-overlay')).not.toBeInTheDocument();
     });
+  });
+
+  it('opens indicator analysis and closes it with Escape without closing the report overlay', async () => {
+    vi.mocked(historyApi.getList).mockResolvedValue({
+      total: 1,
+      page: 1,
+      limit: 20,
+      items: [historyItem],
+    });
+    vi.mocked(historyApi.getDetail).mockResolvedValue(historyReport);
+    vi.mocked(stocksApi.getHistory).mockResolvedValue({
+      stockCode: '600519',
+      stockName: '贵州茅台',
+      period: 'daily',
+      data: Array.from({ length: 24 }, (_, index) => {
+        const close = 100 + index;
+        return {
+          date: `2026-03-${String(index + 1).padStart(2, '0')}`,
+          open: close - 1,
+          high: close + 2,
+          low: close - 3,
+          close,
+          volume: 1000000 + index * 10000,
+          amount: 100000000 + index * 1000000,
+          changePercent: 1,
+        };
+      }),
+    });
+    vi.mocked(stocksApi.getQuote).mockResolvedValue({
+      stockCode: '600519',
+      stockName: '贵州茅台',
+      currentPrice: 124,
+      change: 1,
+      changePercent: 0.8,
+      open: 122,
+      high: 126,
+      low: 121,
+      prevClose: 123,
+      volume: 1240000,
+      amount: 152000000,
+      updateTime: '2026-04-25T15:00:00',
+    });
+
+    render(
+      <MemoryRouter>
+        <HomePage />
+      </MemoryRouter>,
+    );
+
+    fireEvent.click(await screen.findByRole('button', { name: '查看 贵州茅台 报告' }));
+    const overlay = await screen.findByTestId('report-overlay');
+    fireEvent.click(within(overlay).getByRole('button', { name: '指标分析' }));
+
+    expect(await screen.findByTestId('indicator-analysis-modal')).toBeInTheDocument();
+    expect(stocksApi.getHistory).toHaveBeenCalledWith('600519', 120);
+    expect(stocksApi.getQuote).toHaveBeenCalledWith('600519');
+    expect(await screen.findByText('MA5 / MA10 / MA20')).toBeInTheDocument();
+    expect(await screen.findByText('昨收 / 涨跌额')).toBeInTheDocument();
+
+    fireEvent.keyDown(window, { key: 'Escape' });
+
+    await waitFor(() => {
+      expect(screen.queryByTestId('indicator-analysis-modal')).not.toBeInTheDocument();
+    });
+    expect(screen.getByTestId('report-overlay')).toBeInTheDocument();
   });
 
   it('shows the empty report workspace when history is empty', async () => {

@@ -892,7 +892,7 @@ FastAPI provides RESTful API service for configuration management and triggering
 ### Features
 
 - **Configuration Management** - View/modify watchlist
-- **Watchlist Monitor Home** - The Home page defaults to a `STOCK_LIST` watchlist monitor (falling back to recent history when unset), supports multi-select, batches selected stocks from the watchlist Reanalyze action, shows analysis progress in the left sidebar action area, and opens reports in an Esc-closeable overlay whose sidebar only shows the current stock's history
+- **Watchlist Monitor Home** - The Home page defaults to a `STOCK_LIST` watchlist monitor (falling back to recent history when unset), supports multi-select, batches selected stocks from the watchlist Reanalyze action, shows analysis progress in the left sidebar action area, and opens reports in an Esc-closeable overlay whose sidebar only shows the current stock's history; the report overlay also provides an indicator modal for real-time quote, K-line, volume, moving averages, and key price levels
 - **Quick Analysis** - Trigger analysis via API
 - **Real-time Progress** - Analysis task status updates in real-time, supports parallel tasks; the regular stock-analysis path now prefers LiteLLM streaming during the LLM stage and pushes finer-grained `message/progress` updates through task SSE
 - **Backtest Validation** - Evaluate historical analysis accuracy, query direction win rate and simulated returns

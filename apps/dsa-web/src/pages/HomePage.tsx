@@ -1,6 +1,6 @@
 import type React from 'react';
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { RefreshCw, X } from 'lucide-react';
+import { BarChart3, RefreshCw, X } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 import { systemConfigApi } from '../api/systemConfig';
 import { ApiErrorAlert, ConfirmDialog, Button, EmptyState, InlineAlert } from '../components/common';
@@ -8,7 +8,7 @@ import { useShellSidebarAction } from '../components/layout/ShellSidebarActionCo
 import { DashboardStateBlock } from '../components/dashboard';
 import { StockAutocomplete } from '../components/StockAutocomplete';
 import { HistoryList } from '../components/history';
-import { ReportMarkdown, ReportSummary } from '../components/report';
+import { IndicatorAnalysisModal, ReportMarkdown, ReportSummary } from '../components/report';
 import { WatchlistBoard, type WatchlistItem } from '../components/watchlist';
 import { useDashboardLifecycle, useHomeDashboardState } from '../hooks';
 import { getReportText, normalizeReportLanguage } from '../utils/reportLanguage';
@@ -52,6 +52,7 @@ const HomePage: React.FC = () => {
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
   const [reportOverlayOpen, setReportOverlayOpen] = useState(false);
+  const [indicatorAnalysisOpen, setIndicatorAnalysisOpen] = useState(false);
   const [watchlistCodes, setWatchlistCodes] = useState<string[]>([]);
   const [selectedWatchlistCodes, setSelectedWatchlistCodes] = useState<string[]>([]);
   const [isLoadingWatchlist, setIsLoadingWatchlist] = useState(false);
@@ -211,6 +212,7 @@ const HomePage: React.FC = () => {
 
   const handleCloseReportOverlay = useCallback(() => {
     setReportOverlayOpen(false);
+    setIndicatorAnalysisOpen(false);
     setSidebarOpen(false);
     closeMarkdownDrawer();
   }, [closeMarkdownDrawer]);
@@ -224,13 +226,16 @@ const HomePage: React.FC = () => {
       if (event.key !== 'Escape') {
         return;
       }
+      if (indicatorAnalysisOpen) {
+        return;
+      }
       event.preventDefault();
       handleCloseReportOverlay();
     };
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [handleCloseReportOverlay, reportOverlayOpen]);
+  }, [handleCloseReportOverlay, indicatorAnalysisOpen, reportOverlayOpen]);
 
   const handleWatchlistItemOpen = useCallback((item: WatchlistItem) => {
     if (item.recordId === undefined) {
@@ -579,6 +584,15 @@ const HomePage: React.FC = () => {
                         variant="home-action-ai"
                         size="sm"
                         disabled={selectedReport.meta.id === undefined}
+                        onClick={() => setIndicatorAnalysisOpen(true)}
+                      >
+                        <BarChart3 className="h-4 w-4" />
+                        指标分析
+                      </Button>
+                      <Button
+                        variant="home-action-ai"
+                        size="sm"
+                        disabled={selectedReport.meta.id === undefined}
                         onClick={handleAskFollowUp}
                       >
                         <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -613,6 +627,16 @@ const HomePage: React.FC = () => {
             </div>
           </div>
         </div>
+      ) : null}
+
+      {reportOverlayOpen && indicatorAnalysisOpen && selectedReport ? (
+        <IndicatorAnalysisModal
+          stockCode={selectedReport.meta.stockCode}
+          stockName={selectedReport.meta.stockName || selectedReport.meta.stockCode}
+          reportCurrentPrice={selectedReport.meta.currentPrice}
+          reportChangePct={selectedReport.meta.changePct}
+          onClose={() => setIndicatorAnalysisOpen(false)}
+        />
       ) : null}
 
       {reportOverlayOpen && markdownDrawerOpen && selectedReport?.meta.id ? (
