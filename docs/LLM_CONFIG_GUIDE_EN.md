@@ -12,7 +12,8 @@ This project exposes a unified AI model access flow that supports official APIs,
 2. **[Advanced Users]** "I have several Keys, want to configure fallback models, and define custom Base URLs." -> [Go to Method 2: Channels Mode Config](#method-2-channels-mode-config-advancedmulti-model)
 3. **[Veterans]** "I want complex load balancing, request routing, and enterprise-level high availability!" -> [Go to Method 3: Advanced YAML Config](#method-3-advanced-yaml-config-expert-setup)
 4. **[Local Models]** "I want to use Ollama local models!" -> [Go to Example 4: Using Ollama Local Models](#example-4-using-ollama-local-models)
-5. **[Vision Models]** "I want to extract stock codes from images!" -> [Go to Vision Model Config](#advanced-feature-vision-model-config)
+5. **[Codex CLI]** "I do not want to store API keys and want to use local codex exec!" -> [Go to Example 5: Using Codex CLI](#example-5-using-codex-cli-no-api-key)
+6. **[Vision Models]** "I want to extract stock codes from images!" -> [Go to Vision Model Config](#advanced-feature-vision-model-config)
 
 ---
 
@@ -56,6 +57,35 @@ LITELLM_MODEL=ollama/qwen3:8b
 ```
 
 > **Important**: Ollama must be configured with `OLLAMA_API_BASE`. **Do not** use `OPENAI_BASE_URL`, or the system will concatenate URLs incorrectly (e.g. 404, `api/generate/api/show`). For remote Ollama, set `OLLAMA_API_BASE` to the actual address (e.g. `http://192.168.1.100:11434`). Current dependency requirement is LiteLLM ≥1.80.10 (matches requirements.txt).
+
+### Example 5: Using Codex CLI (No API Key)
+If Codex CLI is installed and authenticated locally, the project can call models through `codex exec` without storing model API tokens in `.env`:
+
+```env
+CODEX_EXEC_ENABLED=true
+CODEX_EXEC_MODEL=gpt-5.4
+CODEX_EXEC_ARGS=--dangerously-bypass-approvals-and-sandbox --ignore-user-config --ignore-rules --skip-git-repo-check --ephemeral --disable plugins --disable apps --disable browser_use --disable computer_use --disable in_app_browser --disable shell_tool --disable tool_search --disable web_search_cached --disable web_search_request --disable general_analytics -c 'model_reasoning_effort="low"' -c 'support_websocket=false'
+CODEX_EXEC_TIMEOUT_SECONDS=180
+```
+
+You can also select it directly as the primary model:
+
+```env
+LITELLM_MODEL=codex/gpt-5.4
+```
+
+The runtime command is shaped like:
+
+```bash
+codex exec --dangerously-bypass-approvals-and-sandbox -m gpt-5.4 "What model are you?"
+```
+
+Optional settings:
+- `CODEX_EXEC_COMMAND`: defaults to `codex`; set it only when the binary is not on PATH.
+- `CODEX_EXEC_ARGS`: defaults to `--dangerously-bypass-approvals-and-sandbox` plus isolation flags for user config, project rules, plugins, and tools, so analysis prompts are not treated as full Codex agent tasks. You can replace it with other Codex CLI sandbox flags.
+- `CODEX_EXEC_TIMEOUT_SECONDS`: per-call timeout, default 180 seconds.
+
+> Note: Codex CLI mode uses the local login session and local command execution environment. Enable it only in a trusted, isolated local or self-hosted environment. Vision/image extraction still requires a separate vision-capable API model.
 
 > **Congratulations! If you're a beginner, you can stop reading here and run the program!**
 > Want to test the connection? Open your terminal in the root directory and run: `python test_env.py --llm`
@@ -111,6 +141,16 @@ LLM_OLLAMA_MODELS=qwen3:8b,llama3.2
 # 3. Specify primary model
 LITELLM_MODEL=ollama/qwen3:8b
 ```
+
+### Example: Codex CLI Channel Mode (No API Key)
+```env
+LLM_CHANNELS=codex
+LLM_CODEX_PROTOCOL=codex
+LLM_CODEX_MODELS=gpt-5.4
+LITELLM_MODEL=codex/gpt-5.4
+```
+
+This path does not read `LLM_CODEX_API_KEY`; it uses the local `codex exec` authenticated session.
 
 ### MiniMax Model Naming in Channel Mode
 

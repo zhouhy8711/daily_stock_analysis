@@ -5,7 +5,7 @@ import { getParsedApiError } from '../../api/error';
 import { systemConfigApi } from '../../api/systemConfig';
 import { ApiErrorAlert, Badge, Button, InlineAlert, Input, Select, StatusDot, Tooltip } from '../common';
 
-type ChannelProtocol = 'openai' | 'deepseek' | 'gemini' | 'anthropic' | 'vertex_ai' | 'ollama';
+type ChannelProtocol = 'openai' | 'deepseek' | 'gemini' | 'anthropic' | 'vertex_ai' | 'ollama' | 'codex';
 
 interface ChannelPreset {
   label: string;
@@ -81,6 +81,12 @@ const CHANNEL_PRESETS: Record<string, ChannelPreset> = {
     baseUrl: 'http://127.0.0.1:11434',
     placeholder: 'llama3.2,qwen2.5',
   },
+  codex: {
+    label: 'Codex CLI（本机登录）',
+    protocol: 'codex',
+    baseUrl: '',
+    placeholder: 'gpt-5.4',
+  },
   custom: {
     label: '自定义渠道',
     protocol: 'openai',
@@ -96,6 +102,7 @@ const PROTOCOL_OPTIONS: Array<{ value: ChannelProtocol; label: string }> = [
   { value: 'anthropic', label: 'Anthropic' },
   { value: 'vertex_ai', label: 'Vertex AI' },
   { value: 'ollama', label: 'Ollama' },
+  { value: 'codex', label: 'Codex CLI' },
 ];
 
 const MODEL_PLACEHOLDERS: Record<ChannelProtocol, string> = {
@@ -105,6 +112,7 @@ const MODEL_PLACEHOLDERS: Record<ChannelProtocol, string> = {
   anthropic: 'claude-3-5-sonnet-20241022',
   vertex_ai: 'gemini-2.5-flash',
   ollama: 'llama3.2,qwen2.5',
+  codex: 'gpt-5.4',
 };
 
 const KNOWN_MODEL_PREFIXES = new Set([
@@ -115,6 +123,7 @@ const KNOWN_MODEL_PREFIXES = new Set([
   'deepseek',
   'minimax',
   'ollama',
+  'codex',
   'cohere',
   'huggingface',
   'bedrock',
@@ -210,6 +219,7 @@ const ChannelRow: React.FC<ChannelRowProps> = ({
   );
   const modelCount = selectedModels.length;
   const hasKey = channel.apiKey.length > 0;
+  const keyOptional = channel.protocol === 'ollama' || channel.protocol === 'codex';
   const statusVariant = testState?.status === 'success'
     ? 'success'
     : testState?.status === 'error'
@@ -277,7 +287,7 @@ const ChannelRow: React.FC<ChannelRowProps> = ({
               </span>
             </Tooltip>
           ) : null}
-          {!hasKey && channel.protocol !== 'ollama' ? <Badge variant="warning">未填 Key</Badge> : null}
+          {!hasKey && !keyOptional ? <Badge variant="warning">未填 Key</Badge> : null}
           {testState?.status !== 'idle' ? (
             <Badge variant={statusVariant}>
               {testState?.status === 'success' ? '连接正常' : testState?.status === 'error' ? '连接失败' : '测试中'}
@@ -332,7 +342,9 @@ const ChannelRow: React.FC<ChannelRowProps> = ({
             disabled={busy}
             onChange={(e) => onUpdate(index, 'baseUrl', e.target.value)}
             placeholder={
-              channel.protocol === 'gemini' || channel.protocol === 'anthropic'
+              channel.protocol === 'codex'
+                ? 'Codex CLI 不使用 Base URL'
+                : channel.protocol === 'gemini' || channel.protocol === 'anthropic'
                 ? '官方接口可留空'
                 : preset?.baseUrl || 'https://api.example.com/v1'
             }
@@ -348,7 +360,13 @@ const ChannelRow: React.FC<ChannelRowProps> = ({
             value={channel.apiKey}
             disabled={busy}
             onChange={(e) => onUpdate(index, 'apiKey', e.target.value)}
-            placeholder={channel.protocol === 'ollama' ? '本地 Ollama 可留空' : '支持多个 Key 逗号分隔'}
+            placeholder={
+              channel.protocol === 'codex'
+                ? 'Codex CLI 使用本机登录态，可留空'
+                : channel.protocol === 'ollama'
+                  ? '本地 Ollama 可留空'
+                  : '支持多个 Key 逗号分隔'
+            }
           />
 
           <div className="space-y-3 rounded-xl border border-[var(--settings-border)] bg-[var(--settings-surface-hover)] p-3">
@@ -358,7 +376,7 @@ const ChannelRow: React.FC<ChannelRowProps> = ({
                 variant="settings-secondary"
                 size="sm"
                 className="px-3 text-[11px] shadow-none"
-                disabled={busy}
+                disabled={busy || channel.protocol === 'codex'}
                 onClick={() => onDiscoverModels(channel)}
               >
                 {discoveryState?.status === 'loading' ? '获取中...' : '获取模型'}
@@ -371,7 +389,11 @@ const ChannelRow: React.FC<ChannelRowProps> = ({
                     : 'text-muted-text'
               }`}
               >
-                {discoveryState?.text || '支持 `/models` 的 OpenAI Compatible 渠道可自动拉取模型。'}
+                {discoveryState?.text || (
+                  channel.protocol === 'codex'
+                    ? 'Codex CLI 不支持自动拉取模型，请手动填写模型名。'
+                    : '支持 `/models` 的 OpenAI Compatible 渠道可自动拉取模型。'
+                )}
               </span>
             </div>
 
@@ -473,6 +495,9 @@ function normalizeProtocol(value: string): ChannelProtocol {
   if (normalized === 'ollama') {
     return 'ollama';
   }
+  if (normalized === 'codex' || normalized === 'codex_cli' || normalized === 'codex_exec') {
+    return 'codex';
+  }
   return 'openai';
 }
 
@@ -570,6 +595,8 @@ const PROTOCOL_ALIASES: Record<string, string> = {
   google: 'gemini',
   openai_compatible: 'openai',
   openai_compat: 'openai',
+  codex_cli: 'codex',
+  codex_exec: 'codex',
 };
 
 function normalizeModelForRuntime(model: string, protocol: ChannelProtocol): string {

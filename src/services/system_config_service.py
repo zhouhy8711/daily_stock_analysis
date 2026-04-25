@@ -29,6 +29,7 @@ from src.config import (
     resolve_llm_channel_protocol,
     setup_env,
 )
+from src.codex_exec import CodexExecClient, is_codex_exec_model
 from src.core.config_manager import ConfigManager
 from src.core.config_registry import (
     build_schema_response,
@@ -425,6 +426,32 @@ class SystemConfigService:
             call_kwargs["api_base"] = base_url.strip()
 
         try:
+            if resolved_protocol == "codex" or is_codex_exec_model(resolved_model):
+                started_at = time.perf_counter()
+                content = CodexExecClient(Config.get_instance()).complete_messages(
+                    [{"role": "user", "content": "Reply with OK"}],
+                    model=resolved_model,
+                    timeout=max(5.0, float(timeout_seconds)),
+                ).strip()
+                latency_ms = int((time.perf_counter() - started_at) * 1000)
+                if not content:
+                    return {
+                        "success": False,
+                        "message": "LLM channel returned an empty response",
+                        "error": "Empty response",
+                        "resolved_protocol": resolved_protocol or None,
+                        "resolved_model": resolved_model,
+                        "latency_ms": latency_ms,
+                    }
+                return {
+                    "success": True,
+                    "message": "LLM channel test succeeded",
+                    "error": None,
+                    "resolved_protocol": resolved_protocol or None,
+                    "resolved_model": resolved_model,
+                    "latency_ms": latency_ms,
+                }
+
             import litellm
             from src.agent.llm_adapter import LLMToolAdapter
 

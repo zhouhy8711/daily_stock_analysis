@@ -61,8 +61,9 @@ daily_stock_analysis/
 | `OPENAI_API_KEY` | OpenAI 兼容 API Key（支持 DeepSeek、通义千问等） | 可选 |
 | `OPENAI_BASE_URL` | OpenAI 兼容 API 地址（如 `https://api.deepseek.com/v1`） | 可选 |
 | `OPENAI_MODEL` | 模型名称（如 `gemini-3.1-pro-preview`、`deepseek-chat`、`gpt-5.2`） | 可选 |
+| `CODEX_EXEC_ENABLED` / `CODEX_EXEC_MODEL` | 本地/自托管可选：使用已登录的 Codex CLI，无需模型 API Key | 可选 |
 
-> *注：`GEMINI_API_KEY` 和 `OPENAI_API_KEY` 至少配置一个
+> *注：GitHub Actions 通常仍建议使用 API Key；本地/自托管环境可改用 `CODEX_EXEC_ENABLED=true` + `CODEX_EXEC_MODEL` 或 `LITELLM_MODEL=codex/<model>`。
 
 #### 通知渠道配置（可同时配置多个，全部推送）
 
@@ -152,7 +153,7 @@ daily_stock_analysis/
 
 如果你想快速开始，最少需要配置以下项：
 
-1. **AI 模型**：`AIHUBMIX_KEY`（[AIHubmix](https://aihubmix.com/?aff=CfMq)，一 Key 多模型）、`GEMINI_API_KEY` 或 `OPENAI_API_KEY`
+1. **AI 模型**：`AIHUBMIX_KEY`（[AIHubmix](https://aihubmix.com/?aff=CfMq)，一 Key 多模型）、`GEMINI_API_KEY`、`OPENAI_API_KEY`，或本地/自托管的 `CODEX_EXEC_ENABLED=true` + `CODEX_EXEC_MODEL`
 2. **通知渠道**：至少配置一个，如 `WECHAT_WEBHOOK_URL` 或 `EMAIL_SENDER` + `EMAIL_PASSWORD`
 3. **股票列表**：`STOCK_LIST`（必填）
 4. **搜索 API**：`TAVILY_API_KEYS`（强烈推荐，用于新闻搜索）
@@ -192,6 +193,10 @@ daily_stock_analysis/
 | `LITELLM_FALLBACK_MODELS` | 备选模型，逗号分隔 | - | 否 |
 | `LLM_CHANNELS` | 渠道名称列表（逗号分隔），配合 `LLM_{NAME}_*` 使用，详见 [LLM 配置指南](LLM_CONFIG_GUIDE.md) | - | 否 |
 | `LITELLM_CONFIG` | 高级模型路由 YAML 配置文件路径（高级） | - | 否 |
+| `CODEX_EXEC_ENABLED` | 启用本机 Codex CLI 运行时（无需模型 API Key） | `false` | 可选 |
+| `CODEX_EXEC_MODEL` | 传给 `codex exec -m` 的模型名；启用后可自动作为 `codex/<model>` 主模型 | - | 可选 |
+| `CODEX_EXEC_ARGS` | 传给 `codex exec` 的附加参数，默认包含跳过审批/沙箱、隔离用户配置/项目规则/插件/工具能力 | 内置隔离参数集 | 可选 |
+| `CODEX_EXEC_TIMEOUT_SECONDS` | 单次 Codex CLI 调用超时秒数 | `180` | 可选 |
 | `AIHUBMIX_KEY` | [AIHubmix](https://aihubmix.com/?aff=CfMq) API Key，一 Key 切换使用全系模型，无需额外配置 Base URL | - | 可选 |
 | `GEMINI_API_KEY` | Google Gemini API Key | - | 可选 |
 | `GEMINI_MODEL` | 主模型名称（legacy，`LITELLM_MODEL` 优先） | `gemini-3-flash-preview` | 否 |
@@ -205,7 +210,7 @@ daily_stock_analysis/
 | `ANTHROPIC_TEMPERATURE` | Claude 温度参数（0.0-1.0） | `0.7` | 可选 |
 | `ANTHROPIC_MAX_TOKENS` | Claude 响应最大 token 数 | `8192` | 可选 |
 
-> *注：`AIHUBMIX_KEY`、`GEMINI_API_KEY`、`ANTHROPIC_API_KEY`、`OPENAI_API_KEY` 或 `OLLAMA_API_BASE` 至少配置一个。`AIHUBMIX_KEY` 无需配置 `OPENAI_BASE_URL`，系统自动适配。
+> *注：`AIHUBMIX_KEY`、`GEMINI_API_KEY`、`ANTHROPIC_API_KEY`、`OPENAI_API_KEY`、`OLLAMA_API_BASE`，或 `CODEX_EXEC_ENABLED=true` + `CODEX_EXEC_MODEL` 至少配置一种模型运行时。`AIHUBMIX_KEY` 无需配置 `OPENAI_BASE_URL`，系统自动适配。
 
 ### 通知渠道配置
 
@@ -898,6 +903,25 @@ OPENAI_BASE_URL=https://api.deepseek.com/v1
 OPENAI_MODEL=deepseek-chat
 # 思考模式：deepseek-reasoner、deepseek-r1、qwq 等自动识别；deepseek-chat 系统按模型名自动启用
 ```
+
+### Codex CLI 无 Key 模式
+
+本地或自托管环境中，如果已经安装并登录 Codex CLI，可使用本机登录态调用模型：
+
+```env
+CODEX_EXEC_ENABLED=true
+CODEX_EXEC_MODEL=gpt-5.4
+CODEX_EXEC_ARGS=--dangerously-bypass-approvals-and-sandbox --ignore-user-config --ignore-rules --skip-git-repo-check --ephemeral --disable plugins --disable apps --disable browser_use --disable computer_use --disable in_app_browser --disable shell_tool --disable tool_search --disable web_search_cached --disable web_search_request --disable general_analytics -c 'model_reasoning_effort="low"' -c 'support_websocket=false'
+CODEX_EXEC_TIMEOUT_SECONDS=180
+```
+
+也可以直接指定：
+
+```env
+LITELLM_MODEL=codex/gpt-5.4
+```
+
+底层执行形态类似 `codex exec --dangerously-bypass-approvals-and-sandbox -m gpt-5.4 "..."`，默认会额外隔离用户配置、项目规则、插件和工具能力，避免分析请求被当成 Codex 代理任务去联网或读写仓库。该模式不适用于图片识别（Vision），图片功能仍需单独配置支持 Vision 的 API 模型。
 
 ### 高级模型路由（底层由 LiteLLM 驱动）
 

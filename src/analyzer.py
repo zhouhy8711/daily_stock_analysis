@@ -31,6 +31,7 @@ from src.config import (
     get_configured_llm_models,
     resolve_news_window_days,
 )
+from src.codex_exec import CodexExecClient, filter_codex_exec_model_list, is_codex_exec_model
 from src.storage import persist_llm_usage
 from src.data.stock_mapping import STOCK_NAME_MAP
 from src.report_language import (
@@ -944,14 +945,15 @@ class GeminiAnalyzer:
 
         # --- Channel / YAML path: build Router from pre-built model_list ---
         if self._has_channel_config(config):
-            model_list = config.llm_model_list
-            self._router = Router(
-                model_list=model_list,
-                routing_strategy="simple-shuffle",
-                num_retries=2,
-            )
+            model_list = filter_codex_exec_model_list(config.llm_model_list)
+            if model_list:
+                self._router = Router(
+                    model_list=model_list,
+                    routing_strategy="simple-shuffle",
+                    num_retries=2,
+                )
             unique_models = list(dict.fromkeys(
-                e['litellm_params']['model'] for e in model_list
+                e['litellm_params']['model'] for e in config.llm_model_list
             ))
             logger.info(
                 f"Analyzer LLM: Router initialized from channels/YAML — "
@@ -1008,6 +1010,12 @@ class GeminiAnalyzer:
     ) -> Any:
         """Dispatch a LiteLLM completion through router or direct fallback."""
         effective_kwargs = dict(call_kwargs)
+        if is_codex_exec_model(model):
+            return CodexExecClient(config).complete_messages(
+                effective_kwargs.get("messages") or [],
+                model=model,
+                timeout=effective_kwargs.get("timeout"),
+            )
         if use_channel_router and self._router and model in router_model_names:
             return self._router.completion(**effective_kwargs)
         if self._router and model == config.litellm_model and not use_channel_router:
@@ -1161,6 +1169,7 @@ class GeminiAnalyzer:
         router_model_names = set(get_configured_llm_models(config.llm_model_list))
         for model in models_to_try:
             try:
+                is_codex_model = is_codex_exec_model(model)
                 model_short = model.split("/")[-1] if "/" in model else model
                 call_kwargs: Dict[str, Any] = {
                     "model": model,
@@ -1175,7 +1184,7 @@ class GeminiAnalyzer:
                 if extra:
                     call_kwargs["extra_body"] = extra
 
-                if stream:
+                if stream and not is_codex_model:
                     try:
                         stream_response = self._dispatch_litellm_completion(
                             model,
@@ -1184,6 +1193,16 @@ class GeminiAnalyzer:
                             use_channel_router=use_channel_router,
                             router_model_names=router_model_names,
                         )
+                        if isinstance(stream_response, str):
+                            response_text = stream_response.strip()
+                            if not response_text:
+                                raise _LiteLLMStreamError(
+                                    f"{model} stream returned empty response",
+                                    partial_received=False,
+                                )
+                            if stream_progress_callback:
+                                stream_progress_callback(len(response_text))
+                            return response_text, model, {}
                         response_text, usage = self._consume_litellm_stream(
                             stream_response,
                             model=model,
@@ -1218,6 +1237,11 @@ class GeminiAnalyzer:
                     use_channel_router=use_channel_router,
                     router_model_names=router_model_names,
                 )
+
+                if isinstance(response, str):
+                    if response.strip():
+                        return response.strip(), model, {}
+                    raise ValueError("Codex exec returned empty response")
 
                 if response and response.choices and response.choices[0].message.content:
                     usage = self._normalize_usage(getattr(response, "usage", None))
@@ -1327,10 +1351,10 @@ class GeminiAnalyzer:
                 trend_prediction='Sideways' if report_language == "en" else '震荡',
                 operation_advice='Hold' if report_language == "en" else '持有',
                 confidence_level='Low' if report_language == "en" else '低',
-                analysis_summary='AI analysis is unavailable because no API key is configured.' if report_language == "en" else 'AI 分析功能未启用（未配置 API Key）',
-                risk_warning='Configure an LLM API key (GEMINI_API_KEY/ANTHROPIC_API_KEY/OPENAI_API_KEY) and retry.' if report_language == "en" else '请配置 LLM API Key（GEMINI_API_KEY/ANTHROPIC_API_KEY/OPENAI_API_KEY）后重试',
+                analysis_summary='AI analysis is unavailable because no LLM runtime is configured.' if report_language == "en" else 'AI 分析功能未启用（未配置模型运行时）',
+                risk_warning='Configure an LLM API key or Codex CLI runtime and retry.' if report_language == "en" else '请配置 LLM API Key 或 Codex CLI 运行时后重试',
                 success=False,
-                error_message='LLM API key is not configured' if report_language == "en" else 'LLM API Key 未配置',
+                error_message='LLM runtime is not configured' if report_language == "en" else 'LLM 运行时未配置',
                 model_used=None,
                 report_language=report_language,
             )
@@ -1358,7 +1382,10 @@ class GeminiAnalyzer:
             }
 
             logger.info(f"[LLM调用] 开始调用 {model_name}...")
-            _emit_progress(68, f"{name}：LLM 已接收请求，等待响应")
+            if is_codex_exec_model(model_name):
+                _emit_progress(70, f"{name}：Codex CLI 非流式生成中，通常需要 2-3 分钟")
+            else:
+                _emit_progress(68, f"{name}：LLM 已接收请求，等待响应")
 
             # 使用 litellm 调用（支持完整性校验重试）
             current_prompt = prompt

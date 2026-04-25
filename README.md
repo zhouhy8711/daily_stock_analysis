@@ -68,7 +68,7 @@
 
 | 类型 | 支持 |
 |------|------|
-| AI 模型 | [AIHubMix](https://aihubmix.com/?aff=CfMq)、Gemini、OpenAI 兼容、DeepSeek、通义千问、Claude、Ollama 本地模型 等（统一通过 [LiteLLM](https://github.com/BerriAI/litellm) 调用，支持多 Key 负载均衡）|
+| AI 模型 | [AIHubMix](https://aihubmix.com/?aff=CfMq)、Gemini、OpenAI 兼容、DeepSeek、通义千问、Claude、Ollama 本地模型、Codex CLI 等（默认通过 [LiteLLM](https://github.com/BerriAI/litellm) 调用；Codex CLI 为可选本机登录态运行时）|
 | 行情数据 | AkShare、Tushare、Pytdx、Baostock、YFinance、[Longbridge](https://open.longbridge.com/)（美股/港股首选数据源） |
 | 新闻搜索 | Anspire、Tavily、SerpAPI、Bocha、Brave、MiniMax |
 | 社交舆情 | [Stock Sentiment API](https://api.adanos.org/docs)（Reddit / X / Polymarket，仅美股，可选） |
@@ -121,8 +121,9 @@
 | `OPENAI_MODEL` | 模型名称（如 `gemini-3.1-pro-preview`、`gemini-3-flash-preview`、`gpt-5.2`） | 可选 |
 | `OPENAI_VISION_MODEL` | 图片识别专用模型（部分第三方模型不支持图像；不填则用 `OPENAI_MODEL`） | 可选 |
 | `OLLAMA_API_BASE` | Ollama 本地服务地址（如 `http://localhost:11434`），本地/Docker 部署时使用，**不要**用 `OPENAI_BASE_URL` 配置 Ollama，详见 [LLM 配置指南 - Ollama](docs/LLM_CONFIG_GUIDE.md#示例-4使用-ollama-本地模型) | 可选 |
+| `CODEX_EXEC_ENABLED` / `CODEX_EXEC_MODEL` | 本地/自托管环境可选：使用本机已登录的 `codex exec` 作为无 API Key 模型运行时（如 `CODEX_EXEC_MODEL=gpt-5.4`），详见 [LLM 配置指南 - Codex CLI](docs/LLM_CONFIG_GUIDE.md#示例-5使用-codex-cli无需-api-key) | 可选 |
 
-> 注：AI 优先级 Gemini > Anthropic > OpenAI（含 AIHubmix）> Ollama，至少配置一个。`AIHUBMIX_KEY` 无需配置 `OPENAI_BASE_URL`，系统自动适配。图片识别需 Vision 能力模型。DeepSeek 思考模式（deepseek-reasoner、deepseek-r1、qwq、deepseek-chat）按模型名自动识别，无需额外配置。**Ollama 本地模型**（无需 API Key）必须使用 `OLLAMA_API_BASE`，误用 `OPENAI_BASE_URL` 会导致 404。
+> 注：AI 优先级 Gemini > Anthropic > OpenAI（含 AIHubmix）> Ollama，至少配置一个；若启用 `CODEX_EXEC_ENABLED=true` 或设置 `LITELLM_MODEL=codex/<model>`，则可不配置模型 API Key，改用本机 Codex CLI 登录态。`AIHUBMIX_KEY` 无需配置 `OPENAI_BASE_URL`，系统自动适配。图片识别需 Vision 能力模型。DeepSeek 思考模式（deepseek-reasoner、deepseek-r1、qwq、deepseek-chat）按模型名自动识别，无需额外配置。**Ollama 本地模型**（无需 API Key）必须使用 `OLLAMA_API_BASE`，误用 `OPENAI_BASE_URL` 会导致 404。
 
 <details>
 <summary><b>通知渠道配置</b>（点击展开，至少配置一个）</summary>
@@ -289,6 +290,23 @@ LITELLM_MODEL=openai/deepseek-chat
 ```
 
 保存后也可以在 Web 设置页继续编辑同一组字段；不会要求额外配置文件。
+
+如果你本机已经安装并登录 Codex CLI，也可以不填模型 API Key，直接使用：
+
+```env
+CODEX_EXEC_ENABLED=true
+CODEX_EXEC_MODEL=gpt-5.4
+CODEX_EXEC_ARGS=--dangerously-bypass-approvals-and-sandbox --ignore-user-config --ignore-rules --skip-git-repo-check --ephemeral --disable plugins --disable apps --disable browser_use --disable computer_use --disable in_app_browser --disable shell_tool --disable tool_search --disable web_search_cached --disable web_search_request --disable general_analytics -c 'model_reasoning_effort="low"' -c 'support_websocket=false'
+CODEX_EXEC_TIMEOUT_SECONDS=180
+```
+
+或显式选择主模型：
+
+```env
+LITELLM_MODEL=codex/gpt-5.4
+```
+
+这会以类似 `codex exec --dangerously-bypass-approvals-and-sandbox -m gpt-5.4 "..."` 的方式调用模型；默认额外隔离用户配置、项目规则、插件和工具能力，避免股票分析任务被 Codex 当成代理任务执行。只建议在你信任且已隔离的本地/自托管环境使用。
 
 如果同时启用了高级模型路由 YAML（`LITELLM_CONFIG`），YAML 主要用于定义可用模型和路由规则（`model_list`）；运行时主模型 / 备选模型 / Vision / Temperature 仍由 `LITELLM_MODEL`、`LITELLM_FALLBACK_MODELS`、`VISION_MODEL`、`LLM_TEMPERATURE` 等字段决定。渠道编辑器只保存渠道条目，不会覆盖这些运行时字段的选择。
 

@@ -14,8 +14,10 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 import litellm
+from json_repair import repair_json
 from litellm import Router
 
+from src.codex_exec import CodexExecClient, filter_codex_exec_model_list, is_codex_exec_model
 from src.config import (
     extra_litellm_params,
     get_api_keys_for_model,
@@ -181,14 +183,15 @@ class LLMToolAdapter:
 
         # --- Channel / YAML path ---
         if self._has_channel_config():
-            model_list = config.llm_model_list
-            self._router = Router(
-                model_list=model_list,
-                routing_strategy="simple-shuffle",
-                num_retries=2,
-            )
+            model_list = filter_codex_exec_model_list(config.llm_model_list)
+            if model_list:
+                self._router = Router(
+                    model_list=model_list,
+                    routing_strategy="simple-shuffle",
+                    num_retries=2,
+                )
             unique_models = list(dict.fromkeys(
-                e['litellm_params']['model'] for e in model_list
+                e['litellm_params']['model'] for e in config.llm_model_list
             ))
             logger.info(
                 f"Agent LLM: Router initialized from channels/YAML — "
@@ -396,6 +399,24 @@ class LLMToolAdapter:
         if tools:
             call_kwargs["tools"] = tools
 
+        if is_codex_exec_model(model):
+            raw_text = CodexExecClient(self._config).complete_messages(
+                openai_messages,
+                model=model,
+                tools=tools or None,
+                timeout=timeout,
+            )
+            if tools:
+                return self._parse_codex_exec_tool_response(raw_text, model)
+            return LLMResponse(
+                content=raw_text,
+                tool_calls=[],
+                usage={},
+                provider="codex",
+                model=model,
+                raw=raw_text,
+            )
+
         # Use Router for primary model (multi-key), direct litellm for others
         use_channel_router = self._has_channel_config()
         _router_model_names = set(get_configured_llm_models(self._config.llm_model_list))
@@ -417,6 +438,90 @@ class LLMToolAdapter:
             response = litellm.completion(**call_kwargs)
 
         return self._parse_litellm_response(response, model)
+
+    def _parse_codex_exec_tool_response(self, raw_text: str, model: str) -> LLMResponse:
+        """Parse Codex CLI JSON tool-call protocol into ``LLMResponse``."""
+        payload: Any = None
+        cleaned = (raw_text or "").strip()
+        for prefix in ("```json", "```"):
+            if cleaned.startswith(prefix):
+                cleaned = cleaned[len(prefix):].strip()
+                break
+        if cleaned.endswith("```"):
+            cleaned = cleaned[:-3].strip()
+
+        candidates = [cleaned]
+        start = cleaned.find("{")
+        end = cleaned.rfind("}")
+        if start >= 0 and end > start:
+            candidates.append(cleaned[start:end + 1])
+
+        for candidate in candidates:
+            if not candidate:
+                continue
+            try:
+                payload = json.loads(candidate)
+                break
+            except json.JSONDecodeError:
+                try:
+                    payload = repair_json(candidate, return_objects=True)
+                    break
+                except Exception:
+                    payload = None
+
+        if not isinstance(payload, dict):
+            return LLMResponse(
+                content=raw_text,
+                tool_calls=[],
+                usage={},
+                provider="codex",
+                model=model,
+                raw=raw_text,
+            )
+
+        tool_calls: List[ToolCall] = []
+        raw_tool_calls = payload.get("tool_calls") or []
+        if isinstance(raw_tool_calls, list):
+            for index, raw_call in enumerate(raw_tool_calls):
+                if not isinstance(raw_call, dict):
+                    continue
+                function_payload = raw_call.get("function")
+                if isinstance(function_payload, dict):
+                    name = function_payload.get("name")
+                    arguments = function_payload.get("arguments", {})
+                else:
+                    name = raw_call.get("name")
+                    arguments = raw_call.get("arguments", {})
+                if not isinstance(name, str) or not name.strip():
+                    continue
+                if isinstance(arguments, str):
+                    try:
+                        arguments = json.loads(arguments)
+                    except json.JSONDecodeError:
+                        try:
+                            arguments = repair_json(arguments, return_objects=True)
+                        except Exception:
+                            arguments = {"raw": arguments}
+                if not isinstance(arguments, dict):
+                    arguments = {"value": arguments}
+                tool_calls.append(ToolCall(
+                    id=str(raw_call.get("id") or f"codex_call_{index + 1}"),
+                    name=name.strip(),
+                    arguments=arguments,
+                ))
+
+        content = payload.get("content")
+        if content is not None and not isinstance(content, str):
+            content = json.dumps(content, ensure_ascii=False)
+
+        return LLMResponse(
+            content=content,
+            tool_calls=tool_calls,
+            usage={},
+            provider="codex",
+            model=model,
+            raw=raw_text,
+        )
 
     def _get_temperature(self, model: str) -> float:
         """Return unified temperature from config."""

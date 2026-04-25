@@ -19,6 +19,7 @@ import sys
 import time
 from typing import List, Optional, Tuple
 
+from src.codex_exec import is_codex_exec_model
 from src.config import Config, get_config
 
 logger = logging.getLogger(__name__)
@@ -211,7 +212,9 @@ def _resolve_vision_model() -> str:
     """Determine the litellm model to use for vision, with gemini-3 downgrade."""
     cfg = get_config()
     # Prefer explicit vision model, then OPENAI_VISION_MODEL alias, then primary litellm model
-    model = (cfg.vision_model or cfg.openai_vision_model or cfg.litellm_model or "").strip()
+    model = (cfg.vision_model or cfg.openai_vision_model or "").strip()
+    if not model and not is_codex_exec_model(cfg.litellm_model):
+        model = (cfg.litellm_model or "").strip()
     if not model:
         # Fallback: infer from available keys
         if cfg.gemini_api_keys:

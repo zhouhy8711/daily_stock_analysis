@@ -56,7 +56,7 @@ English | [简体中文](../README.md) | [繁體中文](README_CHT.md)
 
 | Type | Supported |
 |------|----------|
-| LLMs | Gemini (free), OpenAI-compatible, DeepSeek, Qwen, Claude, Ollama |
+| LLMs | Gemini (free), OpenAI-compatible, DeepSeek, Qwen, Claude, Ollama, Codex CLI |
 | Market Data | AkShare, Tushare, Pytdx, Baostock, YFinance, [Longbridge](https://open.longbridge.com/) (primary for US/HK when configured) |
 | News Search | Tavily, Anspire、SerpAPI, Bocha, Brave, MiniMax |
 
@@ -96,8 +96,9 @@ Go to your forked repo → `Settings` → `Secrets and variables` → `Actions` 
 | `OPENAI_BASE_URL` | OpenAI-compatible API endpoint (e.g., `https://api.deepseek.com/v1`) | Optional |
 | `OPENAI_MODEL` | Model name (e.g., `deepseek-chat`) | Optional |
 | `OLLAMA_API_BASE` | Ollama local service address (e.g. `http://localhost:11434`), for local/Docker deployment; **do not** use `OPENAI_BASE_URL` for Ollama, see [LLM Config Guide - Ollama](LLM_CONFIG_GUIDE_EN.md#example-4-using-ollama-local-models) | Optional |
+| `CODEX_EXEC_ENABLED` / `CODEX_EXEC_MODEL` | Local/self-hosted only: use authenticated Codex CLI without model API keys | Optional |
 
-> *Note: Configure at least one of `GEMINI_API_KEY`, `OPENAI_API_KEY`, or `OLLAMA_API_BASE` (local). **Ollama** requires `OLLAMA_API_BASE`; using `OPENAI_BASE_URL` causes 404.
+> *Note: Configure at least one model runtime: `GEMINI_API_KEY`, `OPENAI_API_KEY`, `OLLAMA_API_BASE` (local), or local/self-hosted `CODEX_EXEC_ENABLED=true` + `CODEX_EXEC_MODEL`. **Ollama** requires `OLLAMA_API_BASE`; using `OPENAI_BASE_URL` causes 404.
 
 <details>
 <summary><b>Notification channels</b> (expand, choose at least one)</summary>

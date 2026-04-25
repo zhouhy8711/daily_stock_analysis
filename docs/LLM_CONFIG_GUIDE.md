@@ -12,7 +12,8 @@
 2. **【进阶用户】** "我有好几个 Key，想配置备用模型，还要改自定义网址(Base URL)。" -> [指路【方式二：渠道(Channels)模式配置】](#方式二渠道channels模式配置适合进阶多模型)
 3. **【高玩老手】** "我要做复杂的负载均衡、请求路由、甚至多异构平台高可用！" -> [指路【方式三：YAML 高级配置】](#方式三yaml高级配置适合老手自定义)
 4. **【本地模型】** "我想用 Ollama 本地模型！" -> [指路【示例 4：使用 Ollama 本地模型】](#示例-4使用-ollama-本地模型)
-5. **【视觉模型】** "我想用图片识别股票代码！" -> [指路【扩展功能：看图模型(Vision)配置】](#扩展功能看图模型vision配置)
+5. **【Codex CLI】** "我不想填 API Key，想直接用本机 codex exec！" -> [指路【示例 5：使用 Codex CLI】](#示例-5使用-codex-cli无需-api-key)
+6. **【视觉模型】** "我想用图片识别股票代码！" -> [指路【扩展功能：看图模型(Vision)配置】](#扩展功能看图模型vision配置)
 
 ---
 
@@ -56,6 +57,35 @@ LITELLM_MODEL=ollama/qwen3:8b
 ```
 
 > **重要**：Ollama 必须使用 `OLLAMA_API_BASE` 配置，**不要**使用 `OPENAI_BASE_URL`，否则系统会错误拼接 URL（如 404、`api/generate/api/show`）。远程 Ollama 时，将 `OLLAMA_API_BASE` 设为实际地址（如 `http://192.168.1.100:11434`）。当前依赖要求 LiteLLM ≥1.80.10（与 requirements.txt 一致）。
+
+### 示例 5：使用 Codex CLI（无需 API Key）
+如果本机已经安装并登录了 Codex CLI，可以让项目直接通过 `codex exec` 调用模型，不再在 `.env` 中保存模型 API Token：
+
+```env
+CODEX_EXEC_ENABLED=true
+CODEX_EXEC_MODEL=gpt-5.4
+CODEX_EXEC_ARGS=--dangerously-bypass-approvals-and-sandbox --ignore-user-config --ignore-rules --skip-git-repo-check --ephemeral --disable plugins --disable apps --disable browser_use --disable computer_use --disable in_app_browser --disable shell_tool --disable tool_search --disable web_search_cached --disable web_search_request --disable general_analytics -c 'model_reasoning_effort="low"' -c 'support_websocket=false'
+CODEX_EXEC_TIMEOUT_SECONDS=180
+```
+
+也可以直接把主模型写成：
+
+```env
+LITELLM_MODEL=codex/gpt-5.4
+```
+
+实际执行形态类似：
+
+```bash
+codex exec --dangerously-bypass-approvals-and-sandbox -m gpt-5.4 "你是什么模型"
+```
+
+可选项：
+- `CODEX_EXEC_COMMAND`：默认 `codex`，当命令不在 PATH 时可改成绝对路径或包装命令。
+- `CODEX_EXEC_ARGS`：默认使用 `--dangerously-bypass-approvals-and-sandbox`，并额外隔离用户配置、项目规则、插件和工具能力，避免模型分析请求被当成 Codex 代理任务执行；如果你希望更保守，可改成 Codex CLI 支持的其他 sandbox 参数。
+- `CODEX_EXEC_TIMEOUT_SECONDS`：单次调用超时时间，默认 180 秒。
+
+> 注意：Codex CLI 模式使用本机登录态和本机命令执行环境；请只在你信任且已隔离的本地/自托管环境中启用。图片识别（Vision）仍需单独配置支持图片的 API 模型。
 
 > **恭喜！小白读到这里就可以去运行程序了！**
 > 想测测看通没通？在主目录打开命令行输入：`python test_env.py --llm`
@@ -111,6 +141,16 @@ LLM_OLLAMA_MODELS=qwen3:8b,llama3.2
 # 3. 指定主模型
 LITELLM_MODEL=ollama/qwen3:8b
 ```
+
+### 示例：Codex CLI 渠道模式（无需 API Key）
+```env
+LLM_CHANNELS=codex
+LLM_CODEX_PROTOCOL=codex
+LLM_CODEX_MODELS=gpt-5.4
+LITELLM_MODEL=codex/gpt-5.4
+```
+
+这一路径不会读取 `LLM_CODEX_API_KEY`；底层使用本机 `codex exec` 登录态。
 
 ### MiniMax 渠道模型填写说明
 

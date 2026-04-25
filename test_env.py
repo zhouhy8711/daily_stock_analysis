@@ -212,30 +212,36 @@ def test_data_fetch(stock_code: str = "600519"):
 
 def test_llm():
     """测试 LLM 调用"""
-    print_header("4. LLM (Gemini) 调用测试")
+    print_header("4. LLM 调用测试")
     
     from src.analyzer import GeminiAnalyzer
     from src.config import get_config
+    from src.codex_exec import is_codex_exec_model
     import time
     
     config = get_config()
     
     print_section("模型配置")
-    print(f"  主模型: {config.gemini_model}")
-    print(f"  备选模型: {config.gemini_model_fallback}")
+    print(f"  主模型: {config.litellm_model or '未配置'}")
+    print(f"  备选模型: {', '.join(config.litellm_fallback_models) if config.litellm_fallback_models else '未配置'}")
     
     # 检查网络连接
     print_section("网络连接检查")
-    try:
-        import socket
-        socket.setdefaulttimeout(10)
-        socket.socket(socket.AF_INET, socket.SOCK_STREAM).connect(("generativelanguage.googleapis.com", 443))
-        print(f"  ✓ 可以连接到 Google API 服务器")
-    except Exception as e:
-        print(f"  ✗ 无法连接到 Google API 服务器: {e}")
-        print(f"  提示: 请检查网络连接或配置代理")
-        print(f"  提示: 可以设置环境变量 HTTPS_PROXY=http://your-proxy:port")
-        return False
+    if is_codex_exec_model(config.litellm_model):
+        print("  · Codex CLI 模式使用本机登录态，跳过 Google API 连通性检查")
+    elif not (config.litellm_model or "").startswith(("gemini/", "vertex_ai/")):
+        print("  · 当前不是 Gemini/Vertex 模型，跳过 Google API 连通性检查")
+    else:
+        try:
+            import socket
+            socket.setdefaulttimeout(10)
+            socket.socket(socket.AF_INET, socket.SOCK_STREAM).connect(("generativelanguage.googleapis.com", 443))
+            print(f"  ✓ 可以连接到 Google API 服务器")
+        except Exception as e:
+            print(f"  ✗ 无法连接到 Google API 服务器: {e}")
+            print(f"  提示: 请检查网络连接或配置代理")
+            print(f"  提示: 可以设置环境变量 HTTPS_PROXY=http://your-proxy:port")
+            return False
     
     analyzer = GeminiAnalyzer()
     
@@ -270,7 +276,7 @@ def test_llm():
     
     print_section("发送测试请求")
     print(f"  测试股票: 贵州茅台 (600519)")
-    print(f"  正在调用 Gemini API（超时: 60秒）...")
+    print(f"  正在调用 LLM（超时: 60秒）...")
     
     start_time = time.time()
     
@@ -308,7 +314,7 @@ def test_llm():
         elif 'invalid' in error_str or 'api key' in error_str:
             print(f"\n  诊断: API Key 可能无效")
         elif 'model' in error_str:
-            print(f"\n  诊断: 模型名称可能不正确，尝试修改 .env 中的 GEMINI_MODEL")
+            print(f"\n  诊断: 模型名称可能不正确，尝试修改 .env 中的 LITELLM_MODEL 或 CODEX_EXEC_MODEL")
         
         return False
 

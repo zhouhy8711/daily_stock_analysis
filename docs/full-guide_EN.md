@@ -61,8 +61,9 @@ Go to your forked repo → `Settings` → `Secrets and variables` → `Actions` 
 | `OPENAI_API_KEY` | OpenAI-compatible API Key (supports DeepSeek, Qwen, etc.) | Optional |
 | `OPENAI_BASE_URL` | OpenAI-compatible API endpoint (e.g., `https://api.deepseek.com/v1`) | Optional |
 | `OPENAI_MODEL` | Model name (e.g., `deepseek-chat`) | Optional |
+| `CODEX_EXEC_ENABLED` / `CODEX_EXEC_MODEL` | Optional for local/self-hosted runs: use authenticated Codex CLI without model API keys | Optional |
 
-> *Note: Configure at least one of `GEMINI_API_KEY` or `OPENAI_API_KEY`
+> *Note: GitHub Actions generally should still use API keys. Local/self-hosted runs can use `CODEX_EXEC_ENABLED=true` + `CODEX_EXEC_MODEL` or `LITELLM_MODEL=codex/<model>`.
 
 #### Notification Channels (Multiple can be configured, all will receive notifications)
 
@@ -130,7 +131,7 @@ Go to your forked repo → `Settings` → `Secrets and variables` → `Actions` 
 
 To get started quickly, you need at minimum:
 
-1. **AI Model**: `GEMINI_API_KEY` (recommended) or `OPENAI_API_KEY`
+1. **AI Model**: `GEMINI_API_KEY` (recommended), `OPENAI_API_KEY`, or local/self-hosted `CODEX_EXEC_ENABLED=true` + `CODEX_EXEC_MODEL`
 2. **Notification Channel**: At least one, e.g., `WECHAT_WEBHOOK_URL` or `EMAIL_SENDER` + `EMAIL_PASSWORD`
 3. **Stock List**: `STOCK_LIST` (required)
 4. **Search API**: `TAVILY_API_KEYS` (strongly recommended for news search)
@@ -170,6 +171,10 @@ Default schedule: Every weekday at **18:00 (Beijing Time)** automatic execution.
 | `LITELLM_FALLBACK_MODELS` | Fallback models, comma-separated | - | No |
 | `LLM_CHANNELS` | Channel names (comma-separated), use with `LLM_{NAME}_*`, see [LLM Config Guide](LLM_CONFIG_GUIDE_EN.md) | - | No |
 | `LITELLM_CONFIG` | Advanced model routing YAML path (expert use) | - | No |
+| `CODEX_EXEC_ENABLED` | Enable local Codex CLI runtime without model API keys | `false` | Optional |
+| `CODEX_EXEC_MODEL` | Model passed to `codex exec -m`; can auto-select `codex/<model>` as the primary model | - | Optional |
+| `CODEX_EXEC_ARGS` | Extra arguments passed to `codex exec`; defaults include approval/sandbox bypass plus isolation for user config, project rules, plugins, and tools | Built-in isolated args | Optional |
+| `CODEX_EXEC_TIMEOUT_SECONDS` | Per-call Codex CLI timeout in seconds | `180` | Optional |
 | `GEMINI_API_KEY` | Google Gemini API Key | - | Optional |
 | `GEMINI_MODEL` | Primary model name (legacy, `LITELLM_MODEL` preferred) | `gemini-3-flash-preview` | No |
 | `GEMINI_MODEL_FALLBACK` | Fallback model (legacy) | `gemini-2.5-flash` | No |
@@ -178,7 +183,7 @@ Default schedule: Every weekday at **18:00 (Beijing Time)** automatic execution.
 | `OLLAMA_API_BASE` | Ollama local service address (e.g. `http://localhost:11434`), see [LLM Config Guide](LLM_CONFIG_GUIDE_EN.md) | - | Optional |
 | `OPENAI_MODEL` | OpenAI model name (legacy) | `gpt-4o` | Optional |
 
-> *Note: Configure at least one of `GEMINI_API_KEY`, `OPENAI_API_KEY`, `OLLAMA_API_BASE`, or `LLM_CHANNELS` / `LITELLM_CONFIG`
+> *Note: Configure at least one model runtime: `GEMINI_API_KEY`, `OPENAI_API_KEY`, `OLLAMA_API_BASE`, `LLM_CHANNELS` / `LITELLM_CONFIG`, or `CODEX_EXEC_ENABLED=true` + `CODEX_EXEC_MODEL`.
 
 ### Notification Channel Configuration
 
@@ -754,6 +759,25 @@ OPENAI_BASE_URL=https://api.deepseek.com/v1
 OPENAI_MODEL=deepseek-chat
 # Thinking mode: deepseek-reasoner, deepseek-r1, qwq auto-detected; deepseek-chat enabled by model name
 ```
+
+### Codex CLI Mode Without API Keys
+
+For local or self-hosted environments where Codex CLI is installed and authenticated, you can use the local login session as the model runtime:
+
+```env
+CODEX_EXEC_ENABLED=true
+CODEX_EXEC_MODEL=gpt-5.4
+CODEX_EXEC_ARGS=--dangerously-bypass-approvals-and-sandbox --ignore-user-config --ignore-rules --skip-git-repo-check --ephemeral --disable plugins --disable apps --disable browser_use --disable computer_use --disable in_app_browser --disable shell_tool --disable tool_search --disable web_search_cached --disable web_search_request --disable general_analytics -c 'model_reasoning_effort="low"' -c 'support_websocket=false'
+CODEX_EXEC_TIMEOUT_SECONDS=180
+```
+
+You can also select it directly:
+
+```env
+LITELLM_MODEL=codex/gpt-5.4
+```
+
+The underlying command is shaped like `codex exec --dangerously-bypass-approvals-and-sandbox -m gpt-5.4 "..."`. By default the runtime also isolates user config, project rules, plugins, and tools so analysis prompts are not treated as full Codex agent tasks that browse the web or read/write the repository. This mode does not cover Vision/image extraction; image features still need a separate vision-capable API model.
 
 ### Advanced Model Routing (Powered by LiteLLM)
 

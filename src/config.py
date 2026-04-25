@@ -20,6 +20,13 @@ from urllib.parse import urlparse
 from dotenv import load_dotenv, dotenv_values
 from dataclasses import dataclass, field
 
+from src.codex_exec import (
+    DEFAULT_CODEX_EXEC_ARGS,
+    DEFAULT_CODEX_EXEC_COMMAND,
+    DEFAULT_CODEX_EXEC_TIMEOUT_SECONDS,
+    is_codex_exec_model,
+    normalize_codex_exec_model,
+)
 from src.report_language import (
     is_supported_report_language_value,
     normalize_report_language,
@@ -48,7 +55,7 @@ class ConfigIssue:
 
 
 _MANAGED_LITELLM_KEY_PROVIDERS = {"gemini", "vertex_ai", "anthropic", "openai", "deepseek"}
-SUPPORTED_LLM_CHANNEL_PROTOCOLS = ("openai", "anthropic", "gemini", "vertex_ai", "deepseek", "ollama")
+SUPPORTED_LLM_CHANNEL_PROTOCOLS = ("openai", "anthropic", "gemini", "vertex_ai", "deepseek", "ollama", "codex")
 _FALSEY_ENV_VALUES = {"0", "false", "no", "off"}
 AGENT_MAX_STEPS_DEFAULT = 10
 NEWS_STRATEGY_WINDOWS: Dict[str, int] = {
@@ -182,6 +189,8 @@ def canonicalize_llm_channel_protocol(value: Optional[str]) -> str:
         "google": "gemini",
         "vertex": "vertex_ai",
         "vertexai": "vertex_ai",
+        "codex_cli": "codex",
+        "codex_exec": "codex",
     }
     return aliases.get(candidate, candidate)
 
@@ -225,7 +234,7 @@ def resolve_llm_channel_protocol(
 def channel_allows_empty_api_key(protocol: Optional[str], base_url: Optional[str]) -> bool:
     """Return True when a channel can run without an API key."""
     resolved_protocol = resolve_llm_channel_protocol(protocol, base_url=base_url)
-    if resolved_protocol == "ollama":
+    if resolved_protocol in {"ollama", "codex"}:
         return True
     parsed = urlparse(base_url or "")
     return parsed.hostname in {"127.0.0.1", "localhost", "0.0.0.0"}
@@ -450,6 +459,13 @@ class Config:
 
     # Unified temperature for all LLM calls (LLM_TEMPERATURE); legacy per-provider temps are fallback only
     llm_temperature: float = 0.7
+
+    # --- Codex CLI LLM runtime (optional, tokenless local auth path) ---
+    codex_exec_enabled: bool = False
+    codex_exec_model: str = ""
+    codex_exec_command: str = DEFAULT_CODEX_EXEC_COMMAND
+    codex_exec_args: str = DEFAULT_CODEX_EXEC_ARGS
+    codex_exec_timeout_seconds: int = DEFAULT_CODEX_EXEC_TIMEOUT_SECONDS
 
     # --- Multi-channel LLM config (new) ---
     # LITELLM_CONFIG: path to a standard litellm_config.yaml file (most powerful)
@@ -932,13 +948,26 @@ class Config:
             if _single_deepseek:
                 deepseek_api_keys = [_single_deepseek]
 
+        codex_exec_enabled = parse_env_bool(os.getenv('CODEX_EXEC_ENABLED'), default=False)
+        codex_exec_model = os.getenv('CODEX_EXEC_MODEL', '').strip()
+        codex_exec_command = os.getenv('CODEX_EXEC_COMMAND', DEFAULT_CODEX_EXEC_COMMAND).strip() or DEFAULT_CODEX_EXEC_COMMAND
+        codex_exec_args = os.getenv('CODEX_EXEC_ARGS', DEFAULT_CODEX_EXEC_ARGS)
+        codex_exec_timeout_seconds = parse_env_int(
+            os.getenv('CODEX_EXEC_TIMEOUT_SECONDS'),
+            DEFAULT_CODEX_EXEC_TIMEOUT_SECONDS,
+            field_name='CODEX_EXEC_TIMEOUT_SECONDS',
+            minimum=1,
+        )
+
         # LITELLM_MODEL: explicit config takes precedence; else infer from available keys
         litellm_model = os.getenv('LITELLM_MODEL', '').strip()
         if not litellm_model:
             _gemini_model_name = os.getenv('GEMINI_MODEL', 'gemini-3-flash-preview').strip()
             _anthropic_model_name = os.getenv('ANTHROPIC_MODEL', 'claude-3-5-sonnet-20241022').strip()
             _openai_model_name = os.getenv('OPENAI_MODEL', 'gpt-4o-mini').strip()
-            if gemini_api_keys:
+            if codex_exec_enabled and codex_exec_model:
+                litellm_model = f'codex/{codex_exec_model}'
+            elif gemini_api_keys:
                 litellm_model = f'gemini/{_gemini_model_name}'
             elif anthropic_api_keys:
                 litellm_model = f'anthropic/{_anthropic_model_name}'
@@ -950,6 +979,8 @@ class Config:
                     litellm_model = f'openai/{_openai_model_name}'
                 else:
                     litellm_model = _openai_model_name
+        elif is_codex_exec_model(litellm_model):
+            litellm_model = normalize_codex_exec_model(litellm_model)
 
         # LITELLM_FALLBACK_MODELS: comma-separated list of fallback models
         _fallback_str = os.getenv('LITELLM_FALLBACK_MODELS', '')
@@ -1118,6 +1149,11 @@ class Config:
             litellm_model=litellm_model,
             litellm_fallback_models=litellm_fallback_models,
             llm_temperature=resolve_unified_llm_temperature(litellm_model),
+            codex_exec_enabled=codex_exec_enabled,
+            codex_exec_model=codex_exec_model,
+            codex_exec_command=codex_exec_command,
+            codex_exec_args=codex_exec_args,
+            codex_exec_timeout_seconds=codex_exec_timeout_seconds,
             litellm_config_path=litellm_config_path,
             llm_models_source=llm_models_source,
             llm_channels=llm_channels,
@@ -2045,6 +2081,15 @@ class Config:
         # Other LiteLLM-native providers (for example cohere/*) run through the
         # direct litellm env path and therefore do not populate llm_model_list.
         has_direct_env_model = bool(self.litellm_model) and _uses_direct_env_provider(self.litellm_model)
+        if self.codex_exec_enabled and not self.codex_exec_model and not is_codex_exec_model(self.litellm_model):
+            issues.append(ConfigIssue(
+                severity="error",
+                message=(
+                    "已启用 Codex CLI 模型运行时，但未配置 CODEX_EXEC_MODEL，"
+                    "也未设置 LITELLM_MODEL=codex/<model>"
+                ),
+                field="CODEX_EXEC_MODEL",
+            ))
         if not self.llm_model_list and not has_direct_env_model:
             issues.append(ConfigIssue(
                 severity="error",

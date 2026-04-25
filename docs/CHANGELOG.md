@@ -18,6 +18,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [修复] 修复 Windows 桌面端转抄后端 stdout/stderr 时中文日志可能乱码的问题，统一优先使用 UTF-8 并兼容本地代码页回退
 - [改进] Docker 发布工作流收敛为更清晰的正式发布与手动补发链路，并统一官方 Docker Hub 镜像名为 `zhulinsen/daily_stock_analysis`
 - [文档] 补充官方镜像拉取、`docker run` 用法与 `.env` / 数据目录映射说明，不再仅覆盖 Compose 部署路径
+- [新功能] 新增 Codex CLI 模型运行时，可通过本机 `codex exec` 登录态调用 `codex/<model>`，无需在项目配置中保存模型 API Key
+- [修复] Codex CLI 模式默认隔离用户配置、项目规则、插件和工具能力，并避免流式调用失败后重复执行导致分析任务长时间停留在 LLM 等待阶段
 
 ## [3.13.0] - 2026-04-21
 

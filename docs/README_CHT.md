@@ -53,7 +53,7 @@
 
 | 類型 | 支援 |
 |------|------|
-| AI 模型 | Gemini（免費）、OpenAI 兼容、DeepSeek、通義千問、Claude、Ollama |
+| AI 模型 | Gemini（免費）、OpenAI 兼容、DeepSeek、通義千問、Claude、Ollama、Codex CLI |
 | 行情數據 | AkShare、Tushare、Pytdx、Baostock、YFinance、[Longbridge](https://open.longbridge.com/)（美股/港股首選數據源） |
 | 新聞搜索 | Tavily、Anspire、SerpAPI、Bocha、Brave、MiniMax |
 
@@ -92,8 +92,9 @@
 | `OPENAI_API_KEY` | OpenAI 兼容 API Key（支持 DeepSeek、通義千問等） | 可選 |
 | `OPENAI_BASE_URL` | OpenAI 兼容 API 地址（如 `https://api.deepseek.com/v1`） | 可選 |
 | `OPENAI_MODEL` | 模型名稱（如 `deepseek-chat`） | 可選 |
+| `CODEX_EXEC_ENABLED` / `CODEX_EXEC_MODEL` | 本地／自託管可選：使用已登入的 Codex CLI，無需模型 API Key | 可選 |
 
-> *注：`GEMINI_API_KEY` 和 `OPENAI_API_KEY` 至少配置一個
+> *注：至少配置一種模型運行時：`GEMINI_API_KEY`、`OPENAI_API_KEY`，或本地／自託管的 `CODEX_EXEC_ENABLED=true` + `CODEX_EXEC_MODEL`。
 
 <details>
 <summary><b>通知渠道配置</b>（點擊展開，至少配置一個）</summary>
