@@ -344,11 +344,9 @@ class AkshareFetcher(BaseFetcher):
         """
         # 根据代码类型选择不同的获取方法
         if _is_us_code(stock_code):
-            # 美股：akshare 的 stock_us_daily 接口复权存在已知问题（参见 Issue #311）
-            # 交由 YfinanceFetcher 处理，确保复权价格一致
-            raise DataFetchError(
-                f"AkshareFetcher 不支持美股 {stock_code}，请使用 YfinanceFetcher 获取正确的复权价格"
-            )
+            # 美股：仅作为 DataFetcherManager 中 YFinance / Longbridge /
+            # Efinance 均失败后的最后兜底，避免临时限流导致 Web 指标分析无图。
+            return self._fetch_us_data(stock_code, start_date, end_date)
         elif _is_hk_code(stock_code):
             return self._fetch_hk_data(stock_code, start_date, end_date)
         elif _is_etf_code(stock_code):

@@ -1,6 +1,6 @@
 import type React from 'react';
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { BarChart3, RefreshCw, X } from 'lucide-react';
+import { RefreshCw, X } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 import { systemConfigApi } from '../api/systemConfig';
 import { ApiErrorAlert, ConfirmDialog, Button, EmptyState, InlineAlert } from '../components/common';
@@ -14,6 +14,13 @@ import { useDashboardLifecycle, useHomeDashboardState } from '../hooks';
 import { getReportText, normalizeReportLanguage } from '../utils/reportLanguage';
 
 const normalizeWatchlistCode = (stockCode: string) => stockCode.trim().toUpperCase();
+
+type IndicatorAnalysisTarget = {
+  stockCode: string;
+  stockName: string;
+  currentPrice?: number;
+  changePct?: number;
+};
 
 const getWatchlistLookupKeys = (stockCode: string): string[] => {
   const code = normalizeWatchlistCode(stockCode);
@@ -52,7 +59,7 @@ const HomePage: React.FC = () => {
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
   const [reportOverlayOpen, setReportOverlayOpen] = useState(false);
-  const [indicatorAnalysisOpen, setIndicatorAnalysisOpen] = useState(false);
+  const [indicatorAnalysisTarget, setIndicatorAnalysisTarget] = useState<IndicatorAnalysisTarget | null>(null);
   const [watchlistCodes, setWatchlistCodes] = useState<string[]>([]);
   const [selectedWatchlistCodes, setSelectedWatchlistCodes] = useState<string[]>([]);
   const [isLoadingWatchlist, setIsLoadingWatchlist] = useState(false);
@@ -212,7 +219,7 @@ const HomePage: React.FC = () => {
 
   const handleCloseReportOverlay = useCallback(() => {
     setReportOverlayOpen(false);
-    setIndicatorAnalysisOpen(false);
+    setIndicatorAnalysisTarget(null);
     setSidebarOpen(false);
     closeMarkdownDrawer();
   }, [closeMarkdownDrawer]);
@@ -226,7 +233,7 @@ const HomePage: React.FC = () => {
       if (event.key !== 'Escape') {
         return;
       }
-      if (indicatorAnalysisOpen) {
+      if (indicatorAnalysisTarget) {
         return;
       }
       event.preventDefault();
@@ -235,7 +242,7 @@ const HomePage: React.FC = () => {
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [handleCloseReportOverlay, indicatorAnalysisOpen, reportOverlayOpen]);
+  }, [handleCloseReportOverlay, indicatorAnalysisTarget, reportOverlayOpen]);
 
   const handleWatchlistItemOpen = useCallback((item: WatchlistItem) => {
     if (item.recordId === undefined) {
@@ -252,6 +259,15 @@ const HomePage: React.FC = () => {
     setReportOverlayOpen(true);
     void selectHistoryItem(item.recordId);
   }, [selectHistoryItem, submitAnalysis]);
+
+  const handleOpenIndicatorAnalysis = useCallback((item: WatchlistItem) => {
+    setIndicatorAnalysisTarget({
+      stockCode: item.stockCode,
+      stockName: item.stockName || item.stockCode,
+      currentPrice: item.currentPrice,
+      changePct: item.changePct,
+    });
+  }, []);
 
   const toggleWatchlistSelection = useCallback((stockCode: string) => {
     setSelectedWatchlistCodes((current) => {
@@ -523,6 +539,7 @@ const HomePage: React.FC = () => {
               }}
               onReanalyzeSelected={handleReanalyzeWatchlist}
               onOpenItem={handleWatchlistItemOpen}
+              onOpenIndicatorAnalysis={handleOpenIndicatorAnalysis}
               onToggleSelection={toggleWatchlistSelection}
               onSelectVisible={selectVisibleWatchlist}
               onClearSelection={clearWatchlistSelection}
@@ -584,15 +601,6 @@ const HomePage: React.FC = () => {
                         variant="home-action-ai"
                         size="sm"
                         disabled={selectedReport.meta.id === undefined}
-                        onClick={() => setIndicatorAnalysisOpen(true)}
-                      >
-                        <BarChart3 className="h-4 w-4" />
-                        指标分析
-                      </Button>
-                      <Button
-                        variant="home-action-ai"
-                        size="sm"
-                        disabled={selectedReport.meta.id === undefined}
                         onClick={handleAskFollowUp}
                       >
                         <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -629,13 +637,13 @@ const HomePage: React.FC = () => {
         </div>
       ) : null}
 
-      {reportOverlayOpen && indicatorAnalysisOpen && selectedReport ? (
+      {indicatorAnalysisTarget ? (
         <IndicatorAnalysisModal
-          stockCode={selectedReport.meta.stockCode}
-          stockName={selectedReport.meta.stockName || selectedReport.meta.stockCode}
-          reportCurrentPrice={selectedReport.meta.currentPrice}
-          reportChangePct={selectedReport.meta.changePct}
-          onClose={() => setIndicatorAnalysisOpen(false)}
+          stockCode={indicatorAnalysisTarget.stockCode}
+          stockName={indicatorAnalysisTarget.stockName}
+          reportCurrentPrice={indicatorAnalysisTarget.currentPrice}
+          reportChangePct={indicatorAnalysisTarget.changePct}
+          onClose={() => setIndicatorAnalysisTarget(null)}
         />
       ) : null}
 

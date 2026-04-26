@@ -9,6 +9,7 @@ export interface ChatStreamOptions {
 export interface ChatRequest {
   message: string;
   skills?: string[];
+  codex_skill_id?: string;
 }
 
 export interface ChatStreamRequest extends ChatRequest {
@@ -32,6 +33,18 @@ export interface SkillInfo {
 export interface SkillsResponse {
   skills: SkillInfo[];
   default_skill_id: string;
+}
+
+export interface CodexSkillInfo {
+  id: string;
+  name: string;
+  description: string;
+  source: string;
+  relative_path: string;
+}
+
+export interface CodexSkillsResponse {
+  skills: CodexSkillInfo[];
 }
 
 export interface ChatSessionItem {
@@ -58,6 +71,10 @@ export const agentApi = {
   },
   async getSkills(): Promise<SkillsResponse> {
     const response = await apiClient.get<SkillsResponse>('/api/v1/agent/skills');
+    return response.data;
+  },
+  async getCodexSkills(): Promise<CodexSkillsResponse> {
+    const response = await apiClient.get<CodexSkillsResponse>('/api/v1/agent/codex-skills');
     return response.data;
   },
   async getChatSessions(limit = 50): Promise<ChatSessionItem[]> {

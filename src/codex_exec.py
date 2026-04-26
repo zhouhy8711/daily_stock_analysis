@@ -25,7 +25,9 @@ DEFAULT_CODEX_EXEC_ARGS = (
     "--disable web_search_cached --disable web_search_request --disable general_analytics "
     "-c 'model_reasoning_effort=\"low\"' -c 'support_websocket=false'"
 )
+DEFAULT_CODEX_AGENT_ARGS = "--dangerously-bypass-approvals-and-sandbox"
 DEFAULT_CODEX_EXEC_TIMEOUT_SECONDS = 180
+DEFAULT_CODEX_AGENT_TIMEOUT_SECONDS = 600
 
 _COMPLETION_GUARD = """IMPORTANT:
 You are being used as a plain LLM completion backend for another application, not as a coding agent.
@@ -120,16 +122,48 @@ class CodexExecClient:
         model: str,
         timeout: Optional[float] = None,
     ) -> str:
+        """Run ``codex exec`` as an isolated completion backend."""
+        extra_args = str(
+            self._config_value("codex_exec_args", DEFAULT_CODEX_EXEC_ARGS)
+            if self._config_value("codex_exec_args", DEFAULT_CODEX_EXEC_ARGS) is not None
+            else DEFAULT_CODEX_EXEC_ARGS
+        )
+        return self._run_exec(prompt, model=model, extra_args=extra_args, timeout=timeout)
+
+    def complete_agent_prompt(
+        self,
+        prompt: str,
+        *,
+        model: str,
+        timeout: Optional[float] = None,
+    ) -> str:
+        """Run ``codex exec`` in agent mode and return its final assistant message.
+
+        This intentionally does not use the guarded completion prompt or the
+        default isolated argument set.  It is used when the user explicitly
+        selects a local Codex skill and expects Codex to run that skill with
+        its normal local capabilities.
+        """
+        extra_args = str(
+            self._config_value("codex_exec_agent_args", DEFAULT_CODEX_AGENT_ARGS)
+            if self._config_value("codex_exec_agent_args", DEFAULT_CODEX_AGENT_ARGS) is not None
+            else DEFAULT_CODEX_AGENT_ARGS
+        )
+        return self._run_exec(prompt, model=model, extra_args=extra_args, timeout=timeout)
+
+    def _run_exec(
+        self,
+        prompt: str,
+        *,
+        model: str,
+        extra_args: str,
+        timeout: Optional[float],
+    ) -> str:
         """Run ``codex exec`` and return its final assistant message."""
         cli_model = self._resolve_model(model)
         command = str(
             self._config_value("codex_exec_command", DEFAULT_CODEX_EXEC_COMMAND)
             or DEFAULT_CODEX_EXEC_COMMAND
-        )
-        extra_args = str(
-            self._config_value("codex_exec_args", DEFAULT_CODEX_EXEC_ARGS)
-            if self._config_value("codex_exec_args", DEFAULT_CODEX_EXEC_ARGS) is not None
-            else DEFAULT_CODEX_EXEC_ARGS
         )
         timeout_seconds = timeout
         if timeout_seconds is None or timeout_seconds <= 0:

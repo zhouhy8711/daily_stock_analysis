@@ -40,6 +40,20 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
+AGENT_STREAM_KEEPALIVE_SECONDS = 15.0
+AGENT_STREAM_GRACE_SECONDS = 30.0
+
+
+def _agent_stream_timeout_seconds(config) -> float:
+    """Return the outer SSE timeout budget for Agent chat streams."""
+    candidates = [
+        float(getattr(config, "agent_orchestrator_timeout_s", 0) or 0),
+        float(getattr(config, "codex_exec_agent_timeout_seconds", 0) or 0),
+        float(getattr(config, "codex_exec_timeout_seconds", 0) or 0),
+    ]
+    configured = max([value for value in candidates if value > 0] or [300.0])
+    return configured + AGENT_STREAM_GRACE_SECONDS
+
 class ChatRequest(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
@@ -50,6 +64,7 @@ class ChatRequest(BaseModel):
         validation_alias=AliasChoices("skills", "strategies"),
     )
     context: Optional[Dict[str, Any]] = None  # Previous analysis context for data reuse
+    codex_skill_id: Optional[str] = None
 
     @property
     def effective_skills(self) -> Optional[List[str]]:
@@ -70,6 +85,18 @@ class SkillInfo(BaseModel):
 class SkillsResponse(BaseModel):
     skills: List[SkillInfo]
     default_skill_id: str = ""
+
+
+class CodexSkillInfo(BaseModel):
+    id: str
+    name: str
+    description: str = ""
+    source: str
+    relative_path: str
+
+
+class CodexSkillsResponse(BaseModel):
+    skills: List[CodexSkillInfo]
 
 
 class StrategiesResponse(BaseModel):
@@ -136,6 +163,25 @@ async def get_skills():
     return _build_skills_response(get_config())
 
 
+@router.get("/codex-skills", response_model=CodexSkillsResponse)
+async def get_codex_skills():
+    """Get local Codex skills available for custom chat modes."""
+    from src.services.codex_skill_service import list_codex_skills
+
+    return CodexSkillsResponse(
+        skills=[
+            CodexSkillInfo(
+                id=skill.id,
+                name=skill.name,
+                description=skill.description,
+                source=skill.source,
+                relative_path=skill.relative_path,
+            )
+            for skill in list_codex_skills()
+        ]
+    )
+
+
 @router.get("/strategies", response_model=StrategiesResponse, include_in_schema=False)
 async def get_strategies():
     """Compatibility alias for legacy clients."""
@@ -167,6 +213,8 @@ async def agent_chat(request: ChatRequest):
         ctx = dict(request.context or {})
         if skills is not None:
             ctx["skills"] = skills
+        if request.codex_skill_id:
+            ctx["codex_skill_id"] = request.codex_skill_id
 
         # Offload the blocking call to a thread to avoid blocking the event loop.
         loop = asyncio.get_running_loop()
@@ -396,6 +444,8 @@ async def agent_chat_stream(request: ChatRequest):
     stream_ctx = dict(request.context or {})
     if skills is not None:
         stream_ctx["skills"] = skills
+    if request.codex_skill_id:
+        stream_ctx["codex_skill_id"] = request.codex_skill_id
 
     def progress_callback(event: dict):
         # Enrich tool events with display names
@@ -434,13 +484,30 @@ async def agent_chat_stream(request: ChatRequest):
     async def event_generator():
         # Start executor in a thread so we don't block the event loop
         fut = loop.run_in_executor(None, run_sync)
+        stream_timeout_seconds = _agent_stream_timeout_seconds(config)
+        started_at = loop.time()
         try:
             while True:
-                try:
-                    event = await asyncio.wait_for(queue.get(), timeout=300.0)
-                except asyncio.TimeoutError:
+                elapsed = loop.time() - started_at
+                remaining = stream_timeout_seconds - elapsed
+                if remaining <= 0:
                     yield "data: " + json.dumps({"type": "error", "message": "分析超时"}, ensure_ascii=False) + "\n\n"
                     break
+
+                try:
+                    event = await asyncio.wait_for(
+                        queue.get(),
+                        timeout=min(AGENT_STREAM_KEEPALIVE_SECONDS, remaining),
+                    )
+                except asyncio.TimeoutError:
+                    if fut.done() and queue.empty():
+                        yield "data: " + json.dumps(
+                            {"type": "error", "message": "分析任务已结束但没有返回结果"},
+                            ensure_ascii=False,
+                        ) + "\n\n"
+                        break
+                    yield ": keep-alive\n\n"
+                    continue
                 yield "data: " + json.dumps(event, ensure_ascii=False) + "\n\n"
                 if event.get("type") in ("done", "error"):
                     break

@@ -57,6 +57,13 @@ function formatPct(value?: number | null): string {
   return `${value >= 0 ? '+' : ''}${value.toFixed(2)}%`;
 }
 
+function formatSignedNumber(value?: number | null, digits = 2): string {
+  if (typeof value !== 'number' || Number.isNaN(value)) {
+    return '--';
+  }
+  return `${value >= 0 ? '+' : ''}${value.toFixed(digits)}`;
+}
+
 function formatDateTime(value?: string | null): string {
   if (!value) {
     return '--';
@@ -129,6 +136,38 @@ function getTrendLabel(latest?: ChartPoint): string {
   return '横盘震荡';
 }
 
+function getPointChange(point: ChartPoint, previous?: ChartPoint): number | undefined {
+  if (!previous?.close) {
+    return undefined;
+  }
+  return point.close - previous.close;
+}
+
+function getPointChangePct(point: ChartPoint, previous?: ChartPoint): number | undefined {
+  if (typeof point.changePercent === 'number' && !Number.isNaN(point.changePercent)) {
+    return point.changePercent;
+  }
+  if (!previous?.close) {
+    return undefined;
+  }
+  return ((point.close - previous.close) / previous.close) * 100;
+}
+
+function getPointAmplitude(point: ChartPoint, previous?: ChartPoint): number | undefined {
+  const base = previous?.close ?? point.open;
+  if (!base) {
+    return undefined;
+  }
+  return ((point.high - point.low) / base) * 100;
+}
+
+function getPointVolumeRatio(point: ChartPoint): number | undefined {
+  if (typeof point.volume !== 'number' || Number.isNaN(point.volume) || !point.volumeMa5) {
+    return undefined;
+  }
+  return point.volume / point.volumeMa5;
+}
+
 function buildPath(
   points: ChartPoint[],
   width: number,
@@ -164,11 +203,13 @@ const ChartLegend: React.FC = () => (
 );
 
 const CandlestickChart: React.FC<{ points: ChartPoint[] }> = ({ points }) => {
+  const [hoveredIndex, setHoveredIndex] = useState<number | null>(null);
   const width = 960;
   const priceTop = 24;
   const priceHeight = 310;
   const volumeTop = 362;
   const volumeHeight = 110;
+  const visibleStartIndex = Math.max(points.length - 80, 0);
   const visible = points.slice(-80);
   const priceValues = visible.flatMap((point) => [point.high, point.low, point.ma5, point.ma10, point.ma20])
     .filter((value): value is number => typeof value === 'number' && !Number.isNaN(value));
@@ -188,6 +229,13 @@ const CandlestickChart: React.FC<{ points: ChartPoint[] }> = ({ points }) => {
   const ma5Path = buildPath(visible, width, priceTop, priceHeight, chartMin, chartMax, (point) => point.ma5);
   const ma10Path = buildPath(visible, width, priceTop, priceHeight, chartMin, chartMax, (point) => point.ma10);
   const ma20Path = buildPath(visible, width, priceTop, priceHeight, chartMin, chartMax, (point) => point.ma20);
+  const hoveredPoint = hoveredIndex === null ? null : visible[hoveredIndex];
+  const hoveredPrevious = hoveredIndex === null ? undefined : points[visibleStartIndex + hoveredIndex - 1];
+  const hoveredX = hoveredIndex === null ? 0 : hoveredIndex * step;
+  const tooltipWidth = 250;
+  const tooltipHeight = 222;
+  const tooltipX = hoveredX > width - tooltipWidth - 18 ? hoveredX - tooltipWidth - 14 : hoveredX + 14;
+  const tooltipY = priceTop + 12;
 
   return (
     <div className="rounded-xl border border-subtle bg-surface/75 p-3">
@@ -259,6 +307,88 @@ const CandlestickChart: React.FC<{ points: ChartPoint[] }> = ({ points }) => {
           <path d={ma20Path} fill="none" stroke="#a855f7" strokeWidth="2" />
           <line x1="0" y1={volumeTop} x2={width} y2={volumeTop} stroke="currentColor" className="text-border/70" />
           <text x="6" y={volumeTop + 16} className="fill-muted-text text-[10px]">成交量</text>
+
+          {visible.map((point, index) => {
+            const x = index * step;
+            const hitWidth = Math.max(step, bodyWidth + 8);
+            return (
+              <rect
+                key={`hit-${point.date}-${index}`}
+                data-testid={`indicator-chart-bar-${point.date}`}
+                x={x - hitWidth / 2}
+                y={priceTop}
+                width={hitWidth}
+                height={volumeTop + volumeHeight - priceTop}
+                fill="transparent"
+                pointerEvents="all"
+                tabIndex={0}
+                role="graphics-symbol"
+                aria-label={`${point.date} 指标明细`}
+                onMouseEnter={() => setHoveredIndex(index)}
+                onMouseLeave={() => setHoveredIndex((current) => (current === index ? null : current))}
+                onFocus={() => setHoveredIndex(index)}
+                onBlur={() => setHoveredIndex((current) => (current === index ? null : current))}
+              />
+            );
+          })}
+
+          {hoveredPoint ? (
+            <g data-testid="indicator-chart-tooltip" pointerEvents="none">
+              <line
+                x1={hoveredX}
+                y1={priceTop}
+                x2={hoveredX}
+                y2={volumeTop + volumeHeight}
+                stroke="#e5e7eb"
+                strokeDasharray="4 5"
+                strokeWidth="1"
+                opacity="0.45"
+              />
+              <rect
+                x={hoveredX - Math.max(bodyWidth, 8) / 2}
+                y={priceTop}
+                width={Math.max(bodyWidth, 8)}
+                height={volumeTop + volumeHeight - priceTop}
+                fill="#38bdf8"
+                opacity="0.08"
+                rx="3"
+              />
+              <g transform={`translate(${tooltipX}, ${tooltipY})`}>
+                <rect
+                  width={tooltipWidth}
+                  height={tooltipHeight}
+                  rx="10"
+                  fill="#101522"
+                  stroke="#334155"
+                  strokeWidth="1"
+                  opacity="0.98"
+                />
+                <text x="14" y="22" className="fill-foreground text-[12px] font-semibold">
+                  {hoveredPoint.date}
+                </text>
+                <text x={tooltipWidth - 14} y="22" textAnchor="end" className={hoveredPoint.close >= hoveredPoint.open ? 'fill-success text-[11px]' : 'fill-danger text-[11px]'}>
+                  {hoveredPoint.close >= hoveredPoint.open ? '阳线' : '阴线'}
+                </text>
+
+                {[
+                  ['开盘', formatNumber(hoveredPoint.open), '最高', formatNumber(hoveredPoint.high)],
+                  ['收盘', formatNumber(hoveredPoint.close), '最低', formatNumber(hoveredPoint.low)],
+                  ['涨跌额', formatSignedNumber(getPointChange(hoveredPoint, hoveredPrevious)), '涨跌幅', formatPct(getPointChangePct(hoveredPoint, hoveredPrevious))],
+                  ['振幅', formatPct(getPointAmplitude(hoveredPoint, hoveredPrevious)), '量比', formatNumber(getPointVolumeRatio(hoveredPoint), 2)],
+                  ['成交量', formatCompactNumber(hoveredPoint.volume), '成交额', formatCompactNumber(hoveredPoint.amount)],
+                  ['MA5', formatNumber(hoveredPoint.ma5), 'MA10', formatNumber(hoveredPoint.ma10)],
+                  ['MA20', formatNumber(hoveredPoint.ma20), '量均5日', formatCompactNumber(hoveredPoint.volumeMa5)],
+                ].map(([leftLabel, leftValue, rightLabel, rightValue], rowIndex) => (
+                  <g key={`${leftLabel}-${rightLabel}`} transform={`translate(14, ${42 + rowIndex * 24})`}>
+                    <text x="0" y="0" className="fill-muted-text text-[10px]">{leftLabel}</text>
+                    <text x="58" y="0" className="fill-foreground text-[11px] font-medium tabular-nums">{leftValue}</text>
+                    <text x="132" y="0" className="fill-muted-text text-[10px]">{rightLabel}</text>
+                    <text x="236" y="0" textAnchor="end" className="fill-foreground text-[11px] font-medium tabular-nums">{rightValue}</text>
+                  </g>
+                ))}
+              </g>
+            </g>
+          ) : null}
         </svg>
       </div>
     </div>

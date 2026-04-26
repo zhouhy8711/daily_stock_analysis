@@ -21,6 +21,8 @@ from dotenv import load_dotenv, dotenv_values
 from dataclasses import dataclass, field
 
 from src.codex_exec import (
+    DEFAULT_CODEX_AGENT_ARGS,
+    DEFAULT_CODEX_AGENT_TIMEOUT_SECONDS,
     DEFAULT_CODEX_EXEC_ARGS,
     DEFAULT_CODEX_EXEC_COMMAND,
     DEFAULT_CODEX_EXEC_TIMEOUT_SECONDS,
@@ -465,7 +467,9 @@ class Config:
     codex_exec_model: str = ""
     codex_exec_command: str = DEFAULT_CODEX_EXEC_COMMAND
     codex_exec_args: str = DEFAULT_CODEX_EXEC_ARGS
+    codex_exec_agent_args: str = DEFAULT_CODEX_AGENT_ARGS
     codex_exec_timeout_seconds: int = DEFAULT_CODEX_EXEC_TIMEOUT_SECONDS
+    codex_exec_agent_timeout_seconds: int = DEFAULT_CODEX_AGENT_TIMEOUT_SECONDS
 
     # --- Multi-channel LLM config (new) ---
     # LITELLM_CONFIG: path to a standard litellm_config.yaml file (most powerful)
@@ -953,10 +957,17 @@ class Config:
         codex_exec_model = os.getenv('CODEX_EXEC_MODEL', '').strip()
         codex_exec_command = os.getenv('CODEX_EXEC_COMMAND', DEFAULT_CODEX_EXEC_COMMAND).strip() or DEFAULT_CODEX_EXEC_COMMAND
         codex_exec_args = os.getenv('CODEX_EXEC_ARGS', DEFAULT_CODEX_EXEC_ARGS)
+        codex_exec_agent_args = os.getenv('CODEX_EXEC_AGENT_ARGS', DEFAULT_CODEX_AGENT_ARGS)
         codex_exec_timeout_seconds = parse_env_int(
             os.getenv('CODEX_EXEC_TIMEOUT_SECONDS'),
             DEFAULT_CODEX_EXEC_TIMEOUT_SECONDS,
             field_name='CODEX_EXEC_TIMEOUT_SECONDS',
+            minimum=1,
+        )
+        codex_exec_agent_timeout_seconds = parse_env_int(
+            os.getenv('CODEX_EXEC_AGENT_TIMEOUT_SECONDS'),
+            DEFAULT_CODEX_AGENT_TIMEOUT_SECONDS,
+            field_name='CODEX_EXEC_AGENT_TIMEOUT_SECONDS',
             minimum=1,
         )
 
@@ -1158,7 +1169,9 @@ class Config:
             codex_exec_model=codex_exec_model,
             codex_exec_command=codex_exec_command,
             codex_exec_args=codex_exec_args,
+            codex_exec_agent_args=codex_exec_agent_args,
             codex_exec_timeout_seconds=codex_exec_timeout_seconds,
+            codex_exec_agent_timeout_seconds=codex_exec_agent_timeout_seconds,
             litellm_config_path=litellm_config_path,
             llm_models_source=llm_models_source,
             llm_channels=llm_channels,

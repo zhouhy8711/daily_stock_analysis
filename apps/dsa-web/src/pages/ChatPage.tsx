@@ -1,12 +1,13 @@
-import React, { useState, useRef, useEffect, useCallback } from 'react';
+import React, { useState, useRef, useEffect, useCallback, useMemo } from 'react';
 import { useSearchParams } from 'react-router-dom';
+import { Plus, Settings2, X } from 'lucide-react';
 import Markdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { cn } from '../utils/cn';
 import { agentApi } from '../api/agent';
 import { ApiErrorAlert, Badge, Button, ConfirmDialog, EmptyState, InlineAlert, ScrollArea, Tooltip } from '../components/common';
 import { getParsedApiError } from '../api/error';
-import type { SkillInfo } from '../api/agent';
+import type { CodexSkillInfo, SkillInfo } from '../api/agent';
 import { DashboardStateBlock } from '../components/dashboard';
 import {
   useAgentChatStore,
@@ -35,11 +36,63 @@ const QUICK_QUESTIONS = [
   { label: '用情绪周期分析东方财富', skill: 'emotion_cycle' },
 ];
 
+const CUSTOM_CODEX_MODES_STORAGE_KEY = 'dsa_chat_custom_codex_modes';
+
+interface CustomCodexMode {
+  skillId: string;
+  name: string;
+  description: string;
+  source: string;
+  relativePath: string;
+}
+
+const toCustomCodexMode = (skill: CodexSkillInfo): CustomCodexMode => ({
+  skillId: skill.id,
+  name: skill.name,
+  description: skill.description,
+  source: skill.source,
+  relativePath: skill.relative_path,
+});
+
+const loadCustomCodexModes = (): CustomCodexMode[] => {
+  if (typeof localStorage === 'undefined') return [];
+  try {
+    const raw = localStorage.getItem(CUSTOM_CODEX_MODES_STORAGE_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw) as Partial<CustomCodexMode>[];
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .filter((item) => item && typeof item.skillId === 'string' && typeof item.name === 'string')
+      .map((item) => ({
+        skillId: item.skillId || '',
+        name: item.name || item.relativePath || 'Codex skill',
+        description: item.description || '',
+        source: item.source || 'user',
+        relativePath: item.relativePath || item.name || '',
+      }))
+      .filter((item) => item.skillId);
+  } catch {
+    return [];
+  }
+};
+
+const persistCustomCodexModes = (modes: CustomCodexMode[]) => {
+  if (typeof localStorage === 'undefined') return;
+  localStorage.setItem(CUSTOM_CODEX_MODES_STORAGE_KEY, JSON.stringify(modes));
+};
+
 const ChatPage: React.FC = () => {
   const [searchParams, setSearchParams] = useSearchParams();
   const [input, setInput] = useState('');
   const [skills, setSkills] = useState<SkillInfo[]>([]);
   const [selectedSkill, setSelectedSkill] = useState<string>('');
+  const [codexSkills, setCodexSkills] = useState<CodexSkillInfo[]>([]);
+  const [codexSkillsLoading, setCodexSkillsLoading] = useState(false);
+  const [codexSkillError, setCodexSkillError] = useState<string | null>(null);
+  const [customCodexModes, setCustomCodexModes] = useState<CustomCodexMode[]>(loadCustomCodexModes);
+  const [selectedCodexSkillId, setSelectedCodexSkillId] = useState<string>('');
+  const [customPanelOpen, setCustomPanelOpen] = useState(false);
+  const [pendingCodexSkillId, setPendingCodexSkillId] = useState<string>('');
   const [showSkillDesc, setShowSkillDesc] = useState<string | null>(null);
   const [expandedThinking, setExpandedThinking] = useState<Set<string>>(new Set());
   const [deleteConfirmId, setDeleteConfirmId] = useState<string | null>(null);
@@ -181,8 +234,94 @@ const ChatPage: React.FC = () => {
       });
   }, []);
 
+  useEffect(() => {
+    let active = true;
+    setCodexSkillsLoading(true);
+    setCodexSkillError(null);
+    agentApi.getCodexSkills()
+      .then((res) => {
+        if (!active) return;
+        setCodexSkills(res.skills);
+        setPendingCodexSkillId((current) => current || res.skills[0]?.id || '');
+        setCustomCodexModes((current) => {
+          const refreshed = current.map((mode) => {
+            const latest = res.skills.find((skill) => skill.id === mode.skillId);
+            return latest ? toCustomCodexMode(latest) : mode;
+          });
+          persistCustomCodexModes(refreshed);
+          return refreshed;
+        });
+      })
+      .catch((error) => {
+        if (!active) return;
+        console.error('Failed to load Codex skills:', error);
+        setCodexSkillError('Codex skill 列表加载失败');
+      })
+      .finally(() => {
+        if (active) {
+          setCodexSkillsLoading(false);
+        }
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
+
   const availableSkillIds = new Set(skills.map((skill) => skill.id));
   const quickQuestions = QUICK_QUESTIONS.filter((question) => availableSkillIds.size === 0 || availableSkillIds.has(question.skill));
+
+  const customCodexModeIds = useMemo(
+    () => new Set(customCodexModes.map((mode) => mode.skillId)),
+    [customCodexModes],
+  );
+  const addableCodexSkills = useMemo(
+    () => codexSkills.filter((skill) => !customCodexModeIds.has(skill.id)),
+    [codexSkills, customCodexModeIds],
+  );
+  const selectedCodexMode =
+    customCodexModes.find((mode) => mode.skillId === selectedCodexSkillId) ||
+    codexSkills.find((skill) => skill.id === selectedCodexSkillId);
+
+  const handleSelectBuiltInSkill = useCallback((skillId: string) => {
+    setSelectedSkill(skillId);
+    setSelectedCodexSkillId('');
+  }, []);
+
+  const handleSelectCustomCodexMode = useCallback((skillId: string) => {
+    setSelectedCodexSkillId(skillId);
+    setSelectedSkill('');
+  }, []);
+
+  const handleAddCustomCodexMode = useCallback(() => {
+    const skill =
+      codexSkills.find((item) => item.id === pendingCodexSkillId && !customCodexModeIds.has(item.id)) ||
+      addableCodexSkills[0];
+    if (!skill) return;
+    const nextMode = toCustomCodexMode(skill);
+    setCustomCodexModes((current) => {
+      if (current.some((mode) => mode.skillId === nextMode.skillId)) {
+        return current;
+      }
+      const next = [...current, nextMode];
+      persistCustomCodexModes(next);
+      return next;
+    });
+    setSelectedCodexSkillId(nextMode.skillId);
+    setSelectedSkill('');
+    const nextPending = addableCodexSkills.find((item) => item.id !== skill.id)?.id || '';
+    setPendingCodexSkillId(nextPending);
+  }, [addableCodexSkills, codexSkills, customCodexModeIds, pendingCodexSkillId]);
+
+  const handleRemoveCustomCodexMode = useCallback((skillId: string) => {
+    setCustomCodexModes((current) => {
+      const next = current.filter((mode) => mode.skillId !== skillId);
+      persistCustomCodexModes(next);
+      return next;
+    });
+    if (selectedCodexSkillId === skillId) {
+      setSelectedCodexSkillId('');
+    }
+  }, [selectedCodexSkillId]);
 
   const handleStartNewChat = useCallback(() => {
     followUpContextRef.current = null;
@@ -250,11 +389,16 @@ const ChatPage: React.FC = () => {
   }, [searchParams, setSearchParams]);
 
   const handleSend = useCallback(
-    async (overrideMessage?: string, overrideSkill?: string) => {
+    async (overrideMessage?: string, overrideSkill?: string, overrideCodexSkillId?: string) => {
       const msgText = overrideMessage || input.trim();
       if (!msgText || loading) return;
-      const usedSkill = overrideSkill || selectedSkill;
+      const usedCodexSkillId = overrideCodexSkillId ?? selectedCodexSkillId;
+      const usedSkill = usedCodexSkillId ? '' : (overrideSkill ?? selectedSkill);
+      const usedCodexMode =
+        customCodexModes.find((mode) => mode.skillId === usedCodexSkillId) ||
+        codexSkills.find((skill) => skill.id === usedCodexSkillId);
       const usedSkillName =
+        usedCodexMode?.name ||
         skills.find((s) => s.id === usedSkill)?.name ||
         (usedSkill ? usedSkill : '通用');
 
@@ -262,6 +406,7 @@ const ChatPage: React.FC = () => {
         message: msgText,
         session_id: sessionId,
         skills: usedSkill ? [usedSkill] : undefined,
+        codex_skill_id: usedCodexSkillId || undefined,
         context: followUpContextRef.current ?? undefined,
       };
       followUpHydrationTokenRef.current += 1;
@@ -272,7 +417,18 @@ const ChatPage: React.FC = () => {
       requestScrollToBottom('smooth');
       await startStream(payload, { skillName: usedSkillName });
     },
-    [input, loading, requestScrollToBottom, selectedSkill, skills, sessionId, startStream],
+    [
+      codexSkills,
+      customCodexModes,
+      input,
+      loading,
+      requestScrollToBottom,
+      selectedCodexSkillId,
+      selectedSkill,
+      skills,
+      sessionId,
+      startStream,
+    ],
   );
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -284,7 +440,8 @@ const ChatPage: React.FC = () => {
 
   const handleQuickQuestion = (q: (typeof QUICK_QUESTIONS)[0]) => {
     setSelectedSkill(q.skill);
-    handleSend(q.label, q.skill);
+    setSelectedCodexSkillId('');
+    handleSend(q.label, q.skill, '');
   };
 
   const showSendFeedback = useCallback((nextToast: { type: 'success' | 'error'; message: string }, durationMs: number) => {
@@ -392,6 +549,12 @@ const ChatPage: React.FC = () => {
     );
   };
 
+  const formatStepDuration = (duration?: number) => (
+    typeof duration === 'number' && Number.isFinite(duration)
+      ? ` (${duration.toFixed(1)}s)`
+      : ''
+  );
+
   const renderThinkingDetails = (steps: ProgressStep[]) => (
     <div className="mb-3 pl-5 border-l border-border/40 space-y-1.5 animate-fade-in">
       {steps.map((step, idx) => {
@@ -407,7 +570,7 @@ const ChatPage: React.FC = () => {
           statusClass = 'chat-progress-item-tool';
           iconClass = 'chat-progress-dot-tool';
         } else if (step.type === 'tool_done') {
-          text = `${step.display_name || step.tool} (${step.duration}s)`;
+          text = `${step.display_name || step.tool}${formatStepDuration(step.duration)}`;
           statusClass = step.success ? 'chat-progress-item-success' : 'chat-progress-item-danger';
           iconClass = step.success ? 'chat-progress-dot-success' : 'chat-progress-dot-danger';
         } else if (step.type === 'generating') {
@@ -912,7 +1075,7 @@ const ChatPage: React.FC = () => {
                   className="rounded-xl px-3 py-2 text-xs shadow-none"
                 />
               ) : null}
-            {skills.length > 0 && (
+            {(skills.length > 0 || codexSkills.length > 0 || customCodexModes.length > 0 || codexSkillsLoading || codexSkillError) && (
               <div className="flex flex-wrap items-start gap-x-5 gap-y-2">
                 <span className="text-xs text-muted-text font-medium uppercase tracking-wider flex-shrink-0 mt-1">
                   策略
@@ -922,12 +1085,12 @@ const ChatPage: React.FC = () => {
                     type="radio"
                     name="skill"
                     value=""
-                    checked={selectedSkill === ''}
-                    onChange={() => setSelectedSkill('')}
+                    checked={selectedSkill === '' && selectedCodexSkillId === ''}
+                    onChange={() => handleSelectBuiltInSkill('')}
                     className="chat-skill-radio"
                   />
                   <span
-                    className={`transition-colors text-sm ${selectedSkill === '' ? 'text-foreground font-medium' : 'text-secondary-text group-hover:text-foreground'}`}
+                    className={`transition-colors text-sm ${selectedSkill === '' && selectedCodexSkillId === '' ? 'text-foreground font-medium' : 'text-secondary-text group-hover:text-foreground'}`}
                   >
                     通用分析
                   </span>
@@ -943,12 +1106,12 @@ const ChatPage: React.FC = () => {
                       type="radio"
                       name="skill"
                       value={s.id}
-                      checked={selectedSkill === s.id}
-                      onChange={() => setSelectedSkill(s.id)}
+                      checked={selectedSkill === s.id && selectedCodexSkillId === ''}
+                      onChange={() => handleSelectBuiltInSkill(s.id)}
                       className="chat-skill-radio"
                     />
                     <span
-                      className={`transition-colors text-sm ${selectedSkill === s.id ? 'text-foreground font-medium' : 'text-secondary-text group-hover:text-foreground'}`}
+                      className={`transition-colors text-sm ${selectedSkill === s.id && selectedCodexSkillId === '' ? 'text-foreground font-medium' : 'text-secondary-text group-hover:text-foreground'}`}
                     >
                       {s.name}
                     </span>
@@ -960,6 +1123,141 @@ const ChatPage: React.FC = () => {
                     )}
                   </label>
                 ))}
+                {customCodexModes.map((mode) => (
+                  <button
+                    key={mode.skillId}
+                    type="button"
+                    className={cn(
+                      'mt-0.5 inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-sm transition-colors',
+                      selectedCodexSkillId === mode.skillId
+                        ? 'border-cyan/70 bg-cyan/15 text-cyan font-medium'
+                        : 'border-white/10 bg-white/4 text-secondary-text hover:border-cyan/40 hover:text-foreground',
+                    )}
+                    onClick={() => handleSelectCustomCodexMode(mode.skillId)}
+                    aria-pressed={selectedCodexSkillId === mode.skillId}
+                    aria-label={`使用自定义问询 ${mode.name}`}
+                  >
+                    <span className="h-1.5 w-1.5 rounded-full bg-cyan" />
+                    {mode.name}
+                  </button>
+                ))}
+                <div className="relative mt-0.5">
+                  <button
+                    type="button"
+                    className={cn(
+                      'inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-sm transition-colors',
+                      customPanelOpen
+                        ? 'border-cyan/70 bg-cyan/15 text-cyan'
+                        : 'border-cyan/35 bg-cyan/8 text-cyan hover:bg-cyan/14',
+                    )}
+                    aria-label="管理自定义问询方式"
+                    aria-expanded={customPanelOpen}
+                    onClick={() => setCustomPanelOpen((open) => !open)}
+                  >
+                    <Settings2 className="h-3.5 w-3.5" aria-hidden="true" />
+                    自定义问询
+                  </button>
+
+                  {customPanelOpen && (
+                    <div className="absolute bottom-full left-0 z-50 mb-2 w-[min(38rem,calc(100vw-2rem))] rounded-2xl border border-cyan/25 bg-card/95 p-3 shadow-[0_24px_80px_rgba(0,0,0,0.35)] backdrop-blur">
+                      <div className="mb-2 flex items-center justify-between gap-3">
+                        <div>
+                          <p className="text-sm font-semibold text-foreground">自定义问询方式</p>
+                          {selectedCodexMode?.name ? (
+                            <p className="text-xs text-muted-text">当前：{selectedCodexMode.name}</p>
+                          ) : null}
+                        </div>
+                        <button
+                          type="button"
+                          className="inline-flex h-7 w-7 items-center justify-center rounded-full text-muted-text transition-colors hover:bg-white/8 hover:text-foreground"
+                          aria-label="关闭自定义问询面板"
+                          onClick={() => setCustomPanelOpen(false)}
+                        >
+                          <X className="h-4 w-4" aria-hidden="true" />
+                        </button>
+                      </div>
+
+                      <div className="max-h-52 space-y-2 overflow-y-auto pr-1">
+                        {customCodexModes.length > 0 ? (
+                          customCodexModes.map((mode) => (
+                            <div
+                              key={mode.skillId}
+                              className={cn(
+                                'flex items-center gap-2 rounded-xl border p-2',
+                                selectedCodexSkillId === mode.skillId
+                                  ? 'border-cyan/50 bg-cyan/10'
+                                  : 'border-white/10 bg-white/4',
+                              )}
+                            >
+                              <button
+                                type="button"
+                                className="min-w-0 flex-1 text-left"
+                                onClick={() => handleSelectCustomCodexMode(mode.skillId)}
+                                aria-label={`选择自定义问询 ${mode.name}`}
+                              >
+                                <span className="block truncate text-sm font-medium text-foreground">
+                                  {mode.name}
+                                </span>
+                                <span className="block truncate text-xs text-muted-text">
+                                  {mode.relativePath}
+                                </span>
+                              </button>
+                              <button
+                                type="button"
+                                className="inline-flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-full text-muted-text transition-colors hover:bg-white/8 hover:text-danger"
+                                aria-label={`删除自定义问询 ${mode.name}`}
+                                onClick={() => handleRemoveCustomCodexMode(mode.skillId)}
+                              >
+                                <X className="h-4 w-4" aria-hidden="true" />
+                              </button>
+                            </div>
+                          ))
+                        ) : (
+                          <div className="rounded-xl border border-dashed border-white/10 px-3 py-4 text-center text-sm text-muted-text">
+                            暂无自定义问询
+                          </div>
+                        )}
+                      </div>
+
+                      <div className="mt-3 flex items-center gap-2">
+                        <select
+                          className="input-surface min-w-0 flex-1 rounded-xl border bg-transparent px-3 py-2 text-sm text-foreground outline-none disabled:cursor-not-allowed disabled:opacity-60"
+                          aria-label="选择 Codex skill"
+                          value={pendingCodexSkillId}
+                          disabled={codexSkillsLoading || addableCodexSkills.length === 0}
+                          onChange={(event) => setPendingCodexSkillId(event.target.value)}
+                        >
+                          {codexSkillsLoading ? (
+                            <option value="">加载中...</option>
+                          ) : addableCodexSkills.length === 0 ? (
+                            <option value="">暂无可添加 skill</option>
+                          ) : (
+                            addableCodexSkills.map((skill) => (
+                              <option key={skill.id} value={skill.id}>
+                                {skill.name} · {skill.relative_path}
+                              </option>
+                            ))
+                          )}
+                        </select>
+                        <button
+                          type="button"
+                          className="inline-flex h-10 flex-shrink-0 items-center gap-1.5 rounded-xl border border-cyan/35 bg-cyan/12 px-3 text-sm font-medium text-cyan transition-colors hover:bg-cyan/18 disabled:cursor-not-allowed disabled:opacity-50"
+                          onClick={handleAddCustomCodexMode}
+                          disabled={codexSkillsLoading || addableCodexSkills.length === 0}
+                        >
+                          <Plus className="h-4 w-4" aria-hidden="true" />
+                          添加
+                        </button>
+                      </div>
+
+                      {codexSkillError ? (
+                        <p className="mt-2 text-xs text-danger" role="alert">
+                          {codexSkillError}
+                        </p>
+                      ) : null}
+                    </div>
+                  )}
+                </div>
               </div>
             )}
 

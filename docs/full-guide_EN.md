@@ -175,7 +175,9 @@ Default schedule: Every weekday at **18:00 (Beijing Time)** automatic execution.
 | `CODEX_EXEC_ENABLED` | Enable local Codex CLI runtime without model API keys | `false` | Optional |
 | `CODEX_EXEC_MODEL` | Model passed to `codex exec -m`; can auto-select `codex/<model>` as the primary model | - | Optional |
 | `CODEX_EXEC_ARGS` | Extra arguments passed to `codex exec`; defaults include approval/sandbox bypass plus isolation for user config, project rules, plugins, and tools | Built-in isolated args | Optional |
+| `CODEX_EXEC_AGENT_ARGS` | Agent-mode arguments used for selected custom Codex skills in Q&A; defaults preserve local skills and tools | `--dangerously-bypass-approvals-and-sandbox` | Optional |
 | `CODEX_EXEC_TIMEOUT_SECONDS` | Per-call Codex CLI timeout in seconds | `180` | Optional |
+| `CODEX_EXEC_AGENT_TIMEOUT_SECONDS` | Timeout in seconds for Agent Q&A requests that run through Codex CLI | `600` | Optional |
 | `GEMINI_API_KEY` | Google Gemini API Key | - | Optional |
 | `GEMINI_MODEL` | Primary model name (legacy, `LITELLM_MODEL` preferred) | `gemini-3-flash-preview` | No |
 | `GEMINI_MODEL_FALLBACK` | Fallback model (legacy) | `gemini-2.5-flash` | No |
@@ -732,7 +734,7 @@ System defaults to AkShare (free), also supports other data sources:
 ### YFinance
 - Free, no configuration needed
 - Supports US/HK stock data
-- US stock historical and real-time data both use YFinance exclusively to avoid technical indicator errors from akshare's US stock adjustment issues
+- US stock historical and real-time data prefer YFinance by default to avoid technical indicator errors from AkShare's US stock adjustment issues. If YFinance is rate-limited and Efinance/Longbridge are unavailable, historical daily bars fall back to AkShare/Sina as the last resort so Web indicator analysis can still render.
 
 ---
 
@@ -770,7 +772,9 @@ For local or self-hosted environments where Codex CLI is installed and authentic
 CODEX_EXEC_ENABLED=true
 CODEX_EXEC_MODEL=gpt-5.4
 CODEX_EXEC_ARGS=--dangerously-bypass-approvals-and-sandbox --ignore-user-config --ignore-rules --skip-git-repo-check --ephemeral --disable plugins --disable apps --disable browser_use --disable computer_use --disable in_app_browser --disable shell_tool --disable tool_search --disable web_search_cached --disable web_search_request --disable general_analytics -c 'model_reasoning_effort="low"' -c 'support_websocket=false'
+CODEX_EXEC_AGENT_ARGS=--dangerously-bypass-approvals-and-sandbox
 CODEX_EXEC_TIMEOUT_SECONDS=180
+CODEX_EXEC_AGENT_TIMEOUT_SECONDS=600
 ```
 
 You can also select it directly:
@@ -779,7 +783,7 @@ You can also select it directly:
 LITELLM_MODEL=codex/gpt-5.4
 ```
 
-The underlying command is shaped like `codex exec --dangerously-bypass-approvals-and-sandbox -m gpt-5.4 "..."`. By default the runtime also isolates user config, project rules, plugins, and tools so analysis prompts are not treated as full Codex agent tasks that browse the web or read/write the repository. This mode does not cover Vision/image extraction; image features still need a separate vision-capable API model.
+The underlying command is shaped like `codex exec --dangerously-bypass-approvals-and-sandbox -m gpt-5.4 "..."`. Regular model calls still isolate user config, project rules, plugins, and tools so analysis prompts are not treated as full Codex agent tasks that browse the web or read/write the repository; when Q&A runs a selected custom Codex skill, it uses `CODEX_EXEC_AGENT_ARGS` instead, preserving local skills, web search, and tools by default. This mode does not cover Vision/image extraction; image features still need a separate vision-capable API model.
 
 ### Advanced Model Routing (Powered by LiteLLM)
 

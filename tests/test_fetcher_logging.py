@@ -176,6 +176,34 @@ class TestFetcherLogging(unittest.TestCase):
         self.assertEqual(efinance.calls, 1)
         self.assertEqual(longbridge.calls, 0)
 
+    def test_us_stock_history_uses_akshare_after_yfinance_and_efinance_fail(self):
+        yfinance = _NamedDailyFetcher(
+            "YfinanceFetcher",
+            4,
+            error=DataFetchError("Yahoo Finance rate limited"),
+        )
+        efinance = _NamedDailyFetcher(
+            "EfinanceFetcher",
+            0,
+            error=DataFetchError("Eastmoney remote disconnected"),
+        )
+        akshare = _NamedDailyFetcher("AkshareFetcher", 1, result=_sample_df())
+        longbridge = _NamedDailyFetcher(
+            "LongbridgeFetcher",
+            5,
+            error=DataFetchError("Longbridge not configured"),
+        )
+        manager = DataFetcherManager(fetchers=[efinance, akshare, yfinance, longbridge])
+
+        df, source = manager.get_daily_data("BABA", start_date="2026-04-01", end_date="2026-04-25")
+
+        self.assertFalse(df.empty)
+        self.assertEqual(source, "AkshareFetcher")
+        self.assertEqual(yfinance.calls, 1)
+        self.assertEqual(efinance.calls, 1)
+        self.assertEqual(akshare.calls, 1)
+        self.assertEqual(longbridge.calls, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

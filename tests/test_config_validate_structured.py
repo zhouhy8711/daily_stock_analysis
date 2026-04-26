@@ -363,7 +363,10 @@ class TestValidateStructuredNotification:
         assert not any("FEISHU_APP_ID / FEISHU_APP_SECRET" in i.message for i in warn)
 
     def test_no_search_engine_is_info(self):
-        cfg = _make_config(searxng_public_instances_enabled=False)
+        cfg = _make_config(
+            public_finance_news_enabled=False,
+            searxng_public_instances_enabled=False,
+        )
         issues = cfg.validate_structured()
         info = [i for i in issues if i.severity == "info"]
         assert any("搜索引擎" in i.message for i in info)

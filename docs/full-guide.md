@@ -197,7 +197,9 @@ daily_stock_analysis/
 | `CODEX_EXEC_ENABLED` | 启用本机 Codex CLI 运行时（无需模型 API Key） | `false` | 可选 |
 | `CODEX_EXEC_MODEL` | 传给 `codex exec -m` 的模型名；启用后可自动作为 `codex/<model>` 主模型 | - | 可选 |
 | `CODEX_EXEC_ARGS` | 传给 `codex exec` 的附加参数，默认包含跳过审批/沙箱、隔离用户配置/项目规则/插件/工具能力 | 内置隔离参数集 | 可选 |
+| `CODEX_EXEC_AGENT_ARGS` | 问股页自定义 Codex skill 使用的 agent 模式参数，默认保留本机 skill 和工具能力 | `--dangerously-bypass-approvals-and-sandbox` | 可选 |
 | `CODEX_EXEC_TIMEOUT_SECONDS` | 单次 Codex CLI 调用超时秒数 | `180` | 可选 |
+| `CODEX_EXEC_AGENT_TIMEOUT_SECONDS` | 问股 / Agent 走 Codex CLI 链路的超时秒数 | `600` | 可选 |
 | `AIHUBMIX_KEY` | [AIHubmix](https://aihubmix.com/?aff=CfMq) API Key，一 Key 切换使用全系模型，无需额外配置 Base URL | - | 可选 |
 | `GEMINI_API_KEY` | Google Gemini API Key | - | 可选 |
 | `GEMINI_MODEL` | 主模型名称（legacy，`LITELLM_MODEL` 优先） | `gemini-3-flash-preview` | 否 |
@@ -856,7 +858,7 @@ PUSHOVER_API_TOKEN=your_api_token
 ### YFinance
 - 免费，无需配置
 - 支持美股/港股数据
-- 美股历史数据与实时行情均统一使用 YFinance，以避免 akshare 美股复权异常导致的技术指标错误
+- 美股历史数据与实时行情默认优先使用 YFinance，以避免 AkShare 美股复权异常导致的技术指标错误；当 YFinance 被限流且 Efinance/Longbridge 不可用时，历史 K 线会最后回退到 AkShare/Sina，保证 Web 指标分析仍可展示
 
 ### Longbridge（长桥）
 - 美股/港股数据兜底，补充 YFinance 缺失的量比、换手率、PE 等字段
@@ -914,7 +916,9 @@ OPENAI_MODEL=deepseek-chat
 CODEX_EXEC_ENABLED=true
 CODEX_EXEC_MODEL=gpt-5.4
 CODEX_EXEC_ARGS=--dangerously-bypass-approvals-and-sandbox --ignore-user-config --ignore-rules --skip-git-repo-check --ephemeral --disable plugins --disable apps --disable browser_use --disable computer_use --disable in_app_browser --disable shell_tool --disable tool_search --disable web_search_cached --disable web_search_request --disable general_analytics -c 'model_reasoning_effort="low"' -c 'support_websocket=false'
+CODEX_EXEC_AGENT_ARGS=--dangerously-bypass-approvals-and-sandbox
 CODEX_EXEC_TIMEOUT_SECONDS=180
+CODEX_EXEC_AGENT_TIMEOUT_SECONDS=600
 ```
 
 也可以直接指定：
@@ -923,7 +927,7 @@ CODEX_EXEC_TIMEOUT_SECONDS=180
 LITELLM_MODEL=codex/gpt-5.4
 ```
 
-底层执行形态类似 `codex exec --dangerously-bypass-approvals-and-sandbox -m gpt-5.4 "..."`，默认会额外隔离用户配置、项目规则、插件和工具能力，避免分析请求被当成 Codex 代理任务去联网或读写仓库。该模式不适用于图片识别（Vision），图片功能仍需单独配置支持 Vision 的 API 模型。
+底层执行形态类似 `codex exec --dangerously-bypass-approvals-and-sandbox -m gpt-5.4 "..."`。普通模型调用默认会额外隔离用户配置、项目规则、插件和工具能力，避免分析请求被当成 Codex 代理任务去联网或读写仓库；问股页选择自定义 Codex skill 时会改用 `CODEX_EXEC_AGENT_ARGS`，默认保留本机 skill、联网搜索与工具能力。该模式不适用于图片识别（Vision），图片功能仍需单独配置支持 Vision 的 API 模型。
 
 ### 高级模型路由（底层由 LiteLLM 驱动）
 

@@ -18,12 +18,14 @@ function createDeferred<T>() {
 
 const {
   mockGetSkills,
+  mockGetCodexSkills,
   mockDeleteChatSession,
   mockSendChat,
   mockDownloadSession,
   mockFormatSessionAsMarkdown,
 } = vi.hoisted(() => ({
   mockGetSkills: vi.fn(),
+  mockGetCodexSkills: vi.fn(),
   mockDeleteChatSession: vi.fn(),
   mockSendChat: vi.fn(),
   mockDownloadSession: vi.fn(),
@@ -63,6 +65,7 @@ const mockStoreState = {
 vi.mock('../../api/agent', () => ({
   agentApi: {
     getSkills: mockGetSkills,
+    getCodexSkills: mockGetCodexSkills,
     deleteChatSession: mockDeleteChatSession,
     sendChat: mockSendChat,
   },
@@ -124,6 +127,7 @@ beforeAll(() => {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  localStorage.clear();
   mockStoreState.messages = [];
   mockStoreState.loading = false;
   mockStoreState.progressSteps = [];
@@ -144,6 +148,17 @@ beforeEach(() => {
       { id: 'bull_trend', name: '趋势分析', description: '测试技能' },
     ],
     default_skill_id: 'bull_trend',
+  });
+  mockGetCodexSkills.mockResolvedValue({
+    skills: [
+      {
+        id: 'codex-skill-1',
+        name: '一阳夹三阴',
+        description: '按一阳夹三阴形态分析',
+        source: 'user',
+        relative_path: 'gstack/one-yang-three-yin',
+      },
+    ],
   });
   mockDeleteChatSession.mockResolvedValue(undefined);
   mockSendChat.mockResolvedValue({ success: true });
@@ -505,6 +520,41 @@ describe('ChatPage', () => {
       );
     });
     expect(historyApi.getDetail).not.toHaveBeenCalled();
+  });
+
+  it('adds a Codex skill custom inquiry mode and sends with codex_skill_id', async () => {
+    render(
+      <MemoryRouter initialEntries={['/chat']}>
+        <ChatPage />
+      </MemoryRouter>
+    );
+
+    fireEvent.click(await screen.findByRole('button', { name: '管理自定义问询方式' }));
+    expect(await screen.findByRole('combobox', { name: '选择 Codex skill' })).toHaveValue('codex-skill-1');
+
+    fireEvent.click(screen.getByRole('button', { name: '添加' }));
+    const customModeButton = await screen.findByRole('button', {
+      name: '使用自定义问询 一阳夹三阴',
+    });
+    expect(customModeButton).toHaveAttribute('aria-pressed', 'true');
+
+    fireEvent.change(screen.getByPlaceholderText(/分析 600519/), {
+      target: { value: '分析中际旭创' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: '发送' }));
+
+    await waitFor(() => {
+      expect(mockStartStream).toHaveBeenCalledWith(
+        expect.objectContaining({
+          message: '分析中际旭创',
+          skills: undefined,
+          codex_skill_id: 'codex-skill-1',
+        }),
+        expect.objectContaining({
+          skillName: '一阳夹三阴',
+        }),
+      );
+    });
   });
 
   it('ignores malformed follow-up query params', async () => {

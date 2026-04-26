@@ -1,6 +1,6 @@
 import type React from 'react';
 import { useMemo, useState } from 'react';
-import { CheckSquare, RefreshCw, Search, Square } from 'lucide-react';
+import { BarChart3, CheckSquare, RefreshCw, Search, Square } from 'lucide-react';
 import { Badge, Button, EmptyState } from '../common';
 import { DashboardStateBlock } from '../dashboard';
 import { formatDateTime } from '../../utils/format';
@@ -27,6 +27,7 @@ interface WatchlistBoardProps {
   onRefresh: () => void;
   onReanalyzeSelected: () => void;
   onOpenItem: (item: WatchlistItem) => void;
+  onOpenIndicatorAnalysis: (item: WatchlistItem) => void;
   onToggleSelection: (stockCode: string) => void;
   onSelectVisible: (stockCodes: string[]) => void;
   onClearSelection: () => void;
@@ -90,6 +91,7 @@ export const WatchlistBoard: React.FC<WatchlistBoardProps> = ({
   onRefresh,
   onReanalyzeSelected,
   onOpenItem,
+  onOpenIndicatorAnalysis,
   onToggleSelection,
   onSelectVisible,
   onClearSelection,
@@ -193,10 +195,11 @@ export const WatchlistBoard: React.FC<WatchlistBoardProps> = ({
           </div>
         </div>
 
-        <div className="grid grid-cols-[minmax(13rem,1.7fr)_minmax(6rem,0.8fr)_minmax(6rem,0.8fr)_minmax(8rem,1fr)] items-center gap-4 border-b border-subtle px-4 py-2 text-xs text-muted-text md:px-6">
+        <div className="grid grid-cols-[minmax(12rem,1.6fr)_minmax(5.5rem,0.7fr)_minmax(5.5rem,0.7fr)_minmax(6rem,0.7fr)_minmax(8rem,1fr)] items-center gap-4 border-b border-subtle px-4 py-2 text-xs text-muted-text md:px-6">
           <span>股票</span>
           <span className="text-right">最新价</span>
           <span className="text-right">涨跌幅</span>
+          <span className="text-right">指标分析</span>
           <span className="text-right">最近分析</span>
         </div>
 
@@ -225,20 +228,18 @@ export const WatchlistBoard: React.FC<WatchlistBoardProps> = ({
                 const changeClass = typeof item.changePct === 'number' && item.changePct < 0
                   ? 'text-danger'
                   : 'text-success';
+                const openRow = () => {
+                  if (selectionMode) {
+                    onToggleSelection(item.stockCode);
+                    return;
+                  }
+                  onOpenItem(item);
+                };
 
                 return (
-                  <button
+                  <div
                     key={item.stockCode}
-                    type="button"
-                    aria-label={`查看 ${stockName} 报告`}
-                    onClick={() => {
-                      if (selectionMode) {
-                        onToggleSelection(item.stockCode);
-                        return;
-                      }
-                      onOpenItem(item);
-                    }}
-                    className={`grid min-h-[5.5rem] w-full grid-cols-[minmax(13rem,1.7fr)_minmax(6rem,0.8fr)_minmax(6rem,0.8fr)_minmax(8rem,1fr)] items-center gap-4 px-4 py-3 text-left transition-colors hover:bg-hover md:px-6 ${
+                    className={`grid min-h-[5.5rem] w-full grid-cols-[minmax(12rem,1.6fr)_minmax(5.5rem,0.7fr)_minmax(5.5rem,0.7fr)_minmax(6rem,0.7fr)_minmax(8rem,1fr)] items-center gap-4 px-4 py-3 text-left transition-colors hover:bg-hover md:px-6 ${
                       selected ? 'bg-primary/5' : ''
                     }`}
                   >
@@ -253,7 +254,12 @@ export const WatchlistBoard: React.FC<WatchlistBoardProps> = ({
                           className="h-4 w-4 shrink-0 rounded border-subtle-hover bg-transparent accent-primary focus:ring-primary/30"
                         />
                       ) : null}
-                      <span className="min-w-0">
+                      <button
+                        type="button"
+                        aria-label={`查看 ${stockName} 报告`}
+                        onClick={openRow}
+                        className="min-w-0 rounded-lg text-left transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-primary/50"
+                      >
                         <span className="block truncate text-lg font-semibold text-foreground">
                           {stockName}
                         </span>
@@ -263,7 +269,7 @@ export const WatchlistBoard: React.FC<WatchlistBoardProps> = ({
                           </span>
                           <span className="font-mono">{item.stockCode}</span>
                         </span>
-                      </span>
+                      </button>
                     </span>
 
                     <span className={`text-right text-base font-semibold ${changeClass}`}>
@@ -271,6 +277,22 @@ export const WatchlistBoard: React.FC<WatchlistBoardProps> = ({
                     </span>
                     <span className={`text-right text-base font-semibold ${changeClass}`}>
                       {formatChangePct(item.changePct)}
+                    </span>
+                    <span className="flex justify-end">
+                      <Button
+                        variant="home-action-ai"
+                        size="sm"
+                        className="h-9 justify-center px-3"
+                        aria-label={`查看 ${stockName} 指标分析`}
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          onOpenIndicatorAnalysis(item);
+                        }}
+                        onKeyDown={(event) => event.stopPropagation()}
+                      >
+                        <BarChart3 className="h-4 w-4" />
+                        <span className="hidden xl:inline">指标</span>
+                      </Button>
                     </span>
                     <span className="flex min-w-0 flex-col items-end gap-1">
                       <Badge variant={getAdviceVariant(item.operationAdvice)} size="sm" className="shadow-none">
@@ -281,7 +303,7 @@ export const WatchlistBoard: React.FC<WatchlistBoardProps> = ({
                         {item.createdAt ? formatDateTime(item.createdAt) : '暂无报告'}
                       </span>
                     </span>
-                  </button>
+                  </div>
                 );
               })}
             </div>
@@ -289,7 +311,7 @@ export const WatchlistBoard: React.FC<WatchlistBoardProps> = ({
         </div>
 
         <div className="border-t border-subtle px-4 py-3 text-center text-xs text-muted-text md:px-6">
-          点击股票查看报告；进入多选后，自选区“重新分析”会批量分析已选股票。
+          点击股票查看报告；指标分析可直接查看日 K 与实时行情指标；进入多选后，自选区“重新分析”会批量分析已选股票。
         </div>
       </section>
   );

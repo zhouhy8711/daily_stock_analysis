@@ -288,10 +288,21 @@ def _handle_get_chip_distribution(stock_code: str) -> dict:
     chip = manager.get_chip_distribution(stock_code)
 
     if chip is None:
-        return {"error": f"No chip distribution data available for {stock_code}"}
+        return {
+            "code": stock_code,
+            "status": "unavailable",
+            "error": f"No chip distribution data available for {stock_code}",
+            "retriable": False,
+            "note": (
+                "Chip distribution is optional context and may be unavailable when "
+                "A-share chip data sources, network access, or Tushare credentials are unavailable. "
+                "Skip this tool and continue with quote, K-line, trend, and news data."
+            ),
+        }
 
     return {
         "code": chip.code,
+        "status": "ok",
         "date": chip.date,
         "source": chip.source,
         "profit_ratio": chip.profit_ratio,

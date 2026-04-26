@@ -27,7 +27,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [改进] Web 首页分析进度与自选监控区改为铺满右侧工作区，报告浮窗支持按 Esc 关闭
 - [改进] 历史列表摘要补充分析时股价与涨跌幅字段，供首页自选监控列表展示最新分析价格状态
 - [新功能] Web 分析报告浮窗新增指标分析入口，可查看实时行情、历史 K 线、成交量、均线、量比、关键价位与趋势摘要，并支持 Esc 或关闭按钮退出
+- [改进] Web 指标分析入口从报告浮窗移至自选监控列表行级操作，并覆盖全部、A股、港股、美股筛选视图
+- [改进] Web 指标分析 K 线/成交量图新增悬停指标卡，可查看单个交易日的 OHLC、涨跌、成交量/额、均线、量比与振幅
 - [修复] 美股历史 K 线在 YFinance 限流且未配置 Longbridge 时自动回退到 Efinance/东方财富，避免 BABA、AAPL 等海外股票指标分析无图
+- [修复] 美股历史 K 线在 YFinance 与 Efinance 同时不可用时继续回退到 AkShare/Sina 日线，避免 BABA 指标分析再次无图
+- [文档] 新增 Bloomberg、LSEG/Refinitiv、Reuters 与 Wind 竞品调研及项目借鉴路线
+- [修复] Agent 问股在 Codex CLI 主模型下改为后端预采集数据后单次调用 Codex，避免多轮工具调用导致对话长时间停留在“正在制定分析路径”
+- [新功能] Web 问股支持从本机 Codex skill 目录添加自定义问询方式，发送时通过 Codex CLI 按所选 skill 生成回答
+- [修复] Agent 问股自定义 Codex skill 不再叠加默认交易技能与固定问股模板，所选 SKILL.md 成为本轮回答最高优先级
+- [修复] Agent 问股自定义 Codex skill 改为 Codex CLI agent 模式直连执行，不再预跑平台内置行情、K 线、技术指标、筹码或资讯工具
+- [改进] 新增 `CODEX_EXEC_AGENT_TIMEOUT_SECONDS`，单独控制问股 / Agent 走 Codex CLI 链路的超时时间，默认 600 秒
+- [修复] Agent 问股流式接口等待 Codex CLI 长任务时改为发送 SSE keep-alive，避免 300 秒无新进度事件被误判为“分析超时”
+- [修复] Agent 问股在 Codex CLI 主模型下预采集筹码分布失败时改为可选数据降级，并修复思考过程工具耗时显示为 `undefineds`
 
 ## [3.13.0] - 2026-04-21
 

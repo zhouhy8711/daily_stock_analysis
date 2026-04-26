@@ -17,7 +17,12 @@ import litellm
 from json_repair import repair_json
 from litellm import Router
 
-from src.codex_exec import CodexExecClient, filter_codex_exec_model_list, is_codex_exec_model
+from src.codex_exec import (
+    CodexExecClient,
+    filter_codex_exec_model_list,
+    is_codex_exec_model,
+    normalize_codex_exec_model,
+)
 from src.config import (
     extra_litellm_params,
     get_api_keys_for_model,
@@ -246,6 +251,16 @@ class LLMToolAdapter:
             return model.split("/")[0]
         return model or "none"
 
+    @property
+    def uses_codex_exec_primary(self) -> bool:
+        """True when the Agent primary model is routed through Codex CLI."""
+        return is_codex_exec_model(get_effective_agent_primary_model(self._config))
+
+    @property
+    def has_codex_exec_runtime(self) -> bool:
+        """True when Codex CLI can be addressed as an Agent model runtime."""
+        return self.uses_codex_exec_primary or bool(getattr(self._config, "codex_exec_model", ""))
+
     # ============================================================
     # Unified call
     # ============================================================
@@ -288,6 +303,108 @@ class LLMToolAdapter:
             max_tokens=max_tokens,
             timeout=timeout,
         )
+
+    def call_codex_text(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        timeout: Optional[float] = None,
+    ) -> LLMResponse:
+        """Send a text-only completion directly through Codex CLI."""
+        primary_model = get_effective_agent_primary_model(self._config)
+        if is_codex_exec_model(primary_model):
+            model = primary_model
+        else:
+            codex_model = str(getattr(self._config, "codex_exec_model", "") or "").strip()
+            if not codex_model:
+                return LLMResponse(
+                    content="Codex CLI runtime is not configured. Set CODEX_EXEC_MODEL or use LITELLM_MODEL=codex/<model>.",
+                    tool_calls=[],
+                    usage={},
+                    provider="error",
+                    model="",
+                    raw=None,
+                )
+            model = f"codex/{codex_model}"
+
+        try:
+            raw_text = CodexExecClient(self._config).complete_messages(
+                self._convert_messages(messages),
+                model=model,
+                tools=None,
+                timeout=timeout,
+            )
+            return LLMResponse(
+                content=raw_text,
+                tool_calls=[],
+                usage={},
+                provider="codex",
+                model=normalize_codex_exec_model(model),
+                raw=raw_text,
+            )
+        except Exception as exc:
+            logger.warning("Agent Codex direct text call failed: %s", exc)
+            return LLMResponse(
+                content=str(exc),
+                tool_calls=[],
+                usage={},
+                provider="error",
+                model=normalize_codex_exec_model(model),
+                raw=exc,
+            )
+
+    def call_codex_agent_text(
+        self,
+        prompt: str,
+        *,
+        timeout: Optional[float] = None,
+    ) -> LLMResponse:
+        """Send one prompt directly through Codex CLI agent mode."""
+        model = self._resolve_codex_text_model()
+        if not model:
+            return LLMResponse(
+                content="Codex CLI runtime is not configured. Set CODEX_EXEC_MODEL or use LITELLM_MODEL=codex/<model>.",
+                tool_calls=[],
+                usage={},
+                provider="error",
+                model="",
+                raw=None,
+            )
+
+        try:
+            raw_text = CodexExecClient(self._config).complete_agent_prompt(
+                prompt,
+                model=model,
+                timeout=timeout,
+            )
+            return LLMResponse(
+                content=raw_text,
+                tool_calls=[],
+                usage={},
+                provider="codex",
+                model=normalize_codex_exec_model(model),
+                raw=raw_text,
+            )
+        except Exception as exc:
+            logger.warning("Agent Codex skill call failed: %s", exc)
+            return LLMResponse(
+                content=str(exc),
+                tool_calls=[],
+                usage={},
+                provider="error",
+                model=normalize_codex_exec_model(model),
+                raw=exc,
+            )
+
+    def _resolve_codex_text_model(self) -> str:
+        """Return a codex/<model> runtime name when Codex CLI is configured."""
+        primary_model = get_effective_agent_primary_model(self._config)
+        if is_codex_exec_model(primary_model):
+            return primary_model
+        codex_model = str(getattr(self._config, "codex_exec_model", "") or "").strip()
+        if not codex_model:
+            return ""
+        return f"codex/{codex_model}"
 
     def call_completion(
         self,

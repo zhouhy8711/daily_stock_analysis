@@ -10,8 +10,9 @@ Verifies that:
 import asyncio
 import sys
 import os
+import time
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
@@ -86,6 +87,50 @@ class TestAgentSSECleanup(unittest.IsolatedAsyncioTestCase):
             await self._run_cleanup(ValueError("bad value"))
 
         self.assertTrue(any("cleanup error" in msg for msg in cm.output))
+
+    async def test_stream_keepalive_prevents_idle_timeout(self):
+        """Long Codex agent calls should keep the SSE connection alive."""
+        import api.v1.endpoints.agent as agent_mod
+
+        class FakeConfig:
+            agent_orchestrator_timeout_s = 1
+            codex_exec_agent_timeout_seconds = 1
+            codex_exec_timeout_seconds = 1
+
+            @staticmethod
+            def is_agent_available():
+                return True
+
+        class FakeResult:
+            success = True
+            content = "ok"
+            error = None
+            total_steps = 1
+
+        class FakeExecutor:
+            def chat(self, *, progress_callback, **_kwargs):
+                progress_callback({"type": "generating", "message": "running"})
+                time.sleep(0.05)
+                return FakeResult()
+
+        request = agent_mod.ChatRequest(message="hello")
+        with (
+            patch.object(agent_mod, "get_config", return_value=FakeConfig()),
+            patch.object(agent_mod, "_build_executor", return_value=FakeExecutor()),
+            patch.object(agent_mod, "AGENT_STREAM_KEEPALIVE_SECONDS", 0.01),
+            patch.object(agent_mod, "AGENT_STREAM_GRACE_SECONDS", 1.0),
+        ):
+            response = await agent_mod.agent_chat_stream(request)
+            chunks = []
+            async for chunk in response.body_iterator:
+                chunks.append(chunk.decode() if isinstance(chunk, bytes) else chunk)
+                if '"type": "done"' in chunks[-1]:
+                    break
+
+        body = "".join(chunks)
+        self.assertIn(": keep-alive", body)
+        self.assertIn('"type": "done"', body)
+        self.assertNotIn('"message": "分析超时"', body)
 
 
 if __name__ == "__main__":

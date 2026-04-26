@@ -209,7 +209,7 @@ describe('HomePage', () => {
     });
   });
 
-  it('opens indicator analysis and closes it with Escape without closing the report overlay', async () => {
+  it('opens indicator analysis from the watchlist action and removes the report overlay entry', async () => {
     vi.mocked(historyApi.getList).mockResolvedValue({
       total: 1,
       page: 1,
@@ -256,22 +256,93 @@ describe('HomePage', () => {
       </MemoryRouter>,
     );
 
-    fireEvent.click(await screen.findByRole('button', { name: '查看 贵州茅台 报告' }));
-    const overlay = await screen.findByTestId('report-overlay');
-    fireEvent.click(within(overlay).getByRole('button', { name: '指标分析' }));
+    const indicatorButton = await screen.findByRole('button', { name: '查看 贵州茅台 指标分析' });
+    fireEvent.click(indicatorButton);
 
     expect(await screen.findByTestId('indicator-analysis-modal')).toBeInTheDocument();
     expect(stocksApi.getHistory).toHaveBeenCalledWith('600519', 120);
     expect(stocksApi.getQuote).toHaveBeenCalledWith('600519');
     expect(await screen.findByText('MA5 / MA10 / MA20')).toBeInTheDocument();
     expect(await screen.findByText('昨收 / 涨跌额')).toBeInTheDocument();
+    expect(screen.queryByTestId('report-overlay')).not.toBeInTheDocument();
+
+    fireEvent.mouseEnter(await screen.findByTestId('indicator-chart-bar-2026-03-24'));
+    const tooltip = await screen.findByTestId('indicator-chart-tooltip');
+    expect(within(tooltip).getByText('2026-03-24')).toBeInTheDocument();
+    expect(within(tooltip).getByText('收盘')).toBeInTheDocument();
+    expect(within(tooltip).getByText('123.00')).toBeInTheDocument();
+    expect(within(tooltip).getByText('量比')).toBeInTheDocument();
+
+    fireEvent.mouseLeave(screen.getByTestId('indicator-chart-bar-2026-03-24'));
+    await waitFor(() => {
+      expect(screen.queryByTestId('indicator-chart-tooltip')).not.toBeInTheDocument();
+    });
 
     fireEvent.keyDown(window, { key: 'Escape' });
 
     await waitFor(() => {
       expect(screen.queryByTestId('indicator-analysis-modal')).not.toBeInTheDocument();
     });
-    expect(screen.getByTestId('report-overlay')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: '查看 贵州茅台 报告' }));
+    const overlay = await screen.findByTestId('report-overlay');
+    expect(within(overlay).queryByRole('button', { name: '指标分析' })).not.toBeInTheDocument();
+  });
+
+  it('keeps the indicator action available across all market filters', async () => {
+    const marketItems = [
+      historyItem,
+      {
+        ...historyItem,
+        id: 2,
+        queryId: 'q-hk',
+        stockCode: '00700.HK',
+        stockName: '腾讯控股',
+      },
+      {
+        ...historyItem,
+        id: 3,
+        queryId: 'q-us',
+        stockCode: 'BABA',
+        stockName: '阿里巴巴',
+      },
+    ];
+
+    vi.mocked(historyApi.getList).mockResolvedValue({
+      total: 3,
+      page: 1,
+      limit: 20,
+      items: marketItems,
+    });
+    vi.mocked(historyApi.getDetail).mockResolvedValue(historyReport);
+
+    render(
+      <MemoryRouter>
+        <HomePage />
+      </MemoryRouter>,
+    );
+
+    expect(await screen.findByRole('button', { name: '查看 贵州茅台 指标分析' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '查看 腾讯控股 指标分析' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '查看 阿里巴巴 指标分析' })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: '港股' }));
+    expect(screen.getByRole('button', { name: '查看 腾讯控股 指标分析' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '查看 贵州茅台 指标分析' })).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: '查看 腾讯控股 指标分析' }));
+    expect(await screen.findByTestId('indicator-analysis-modal')).toBeInTheDocument();
+    expect(stocksApi.getHistory).toHaveBeenLastCalledWith('00700.HK', 120);
+
+    fireEvent.keyDown(window, { key: 'Escape' });
+    await waitFor(() => {
+      expect(screen.queryByTestId('indicator-analysis-modal')).not.toBeInTheDocument();
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: '美股' }));
+    fireEvent.click(screen.getByRole('button', { name: '查看 阿里巴巴 指标分析' }));
+    expect(await screen.findByTestId('indicator-analysis-modal')).toBeInTheDocument();
+    expect(stocksApi.getHistory).toHaveBeenLastCalledWith('BABA', 120);
   });
 
   it('shows the empty report workspace when history is empty', async () => {
