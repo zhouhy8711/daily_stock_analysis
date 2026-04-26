@@ -35,6 +35,9 @@ from api.v1.schemas.history import (
     ReportDetails,
 )
 from api.v1.schemas.stocks import (
+    ChipDistributionMetrics,
+    MajorHolder,
+    StockIndicatorMetricsResponse,
     StockQuote,
     StockHistoryResponse,
     KLineData,
@@ -119,6 +122,9 @@ __all__ = [
     # stocks
     "StockQuote",
     "StockHistoryResponse",
+    "StockIndicatorMetricsResponse",
+    "ChipDistributionMetrics",
+    "MajorHolder",
     "KLineData",
     # backtest
     "BacktestRunRequest",

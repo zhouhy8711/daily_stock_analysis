@@ -2332,6 +2332,71 @@ class DataFetcherManager:
             list(payload.get("errors", [])) + ([err] if err else []),
         )
 
+    def get_major_holders_context(
+        self,
+        stock_code: str,
+        budget_seconds: Optional[float] = None,
+        top_n: int = 20,
+    ) -> Dict[str, Any]:
+        """主力/机构持仓名称块（fail-open）。"""
+        from src.config import get_config
+
+        config = get_config()
+        stock_code = normalize_stock_code(stock_code)
+        timeout = float(budget_seconds if budget_seconds is not None else config.fundamental_fetch_timeout_seconds)
+        if _market_tag(stock_code) != "cn" or _is_etf_code(stock_code):
+            return self._build_fundamental_block(
+                "not_supported",
+                {"holders": []},
+                [{"provider": "major_holders", "result": "not_supported", "duration_ms": 0}],
+                ["not supported"],
+            )
+
+        if timeout <= 0:
+            return self._build_fundamental_block(
+                "failed",
+                {"holders": []},
+                [{"provider": "major_holders", "result": "failed", "duration_ms": 0}],
+                ["major holders timeout"],
+            )
+
+        payload, err, cost_ms = self._run_with_retry(
+            lambda: self._fundamental_adapter.get_major_holders(stock_code, top_n=top_n),
+            timeout,
+            "major_holders",
+        )
+        if not isinstance(payload, dict):
+            return self._build_fundamental_block(
+                "failed",
+                {"holders": []},
+                [{"provider": "major_holders", "result": "failed", "duration_ms": cost_ms}],
+                [err or "major_holders failed"],
+            )
+
+        holders = payload.get("holders") if isinstance(payload.get("holders"), list) else []
+        adapter_status = str(payload.get("status", "not_supported"))
+        if holders:
+            status = "ok"
+        elif adapter_status == "not_supported":
+            status = "not_supported"
+        else:
+            status = "partial"
+
+        return self._build_fundamental_block(
+            status,
+            {
+                "holders": holders,
+                "as_of": payload.get("as_of"),
+            },
+            self._normalize_source_chain(
+                payload.get("source_chain", []),
+                "major_holders",
+                status,
+                cost_ms,
+            ),
+            list(payload.get("errors", [])) + ([err] if err else []),
+        )
+
     def get_dragon_tiger_context(self, stock_code: str, budget_seconds: Optional[float] = None) -> Dict[str, Any]:
         """龙虎榜块（fail-open）。"""
         from src.config import get_config

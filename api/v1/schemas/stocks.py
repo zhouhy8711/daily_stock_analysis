@@ -9,7 +9,7 @@
 2. 定义历史 K 线数据模型
 """
 
-from typing import Optional, List
+from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
 
@@ -28,6 +28,10 @@ class StockQuote(BaseModel):
     prev_close: Optional[float] = Field(None, description="昨收价")
     volume: Optional[float] = Field(None, description="成交量（股）")
     amount: Optional[float] = Field(None, description="成交额（元）")
+    volume_ratio: Optional[float] = Field(None, description="量比")
+    turnover_rate: Optional[float] = Field(None, description="换手率 (%)")
+    amplitude: Optional[float] = Field(None, description="振幅 (%)")
+    source: Optional[str] = Field(None, description="行情数据源")
     update_time: Optional[str] = Field(None, description="更新时间")
     
     class Config:
@@ -44,6 +48,10 @@ class StockQuote(BaseModel):
                 "prev_close": 1785.00,
                 "volume": 10000000,
                 "amount": 18000000000,
+                "volume_ratio": 1.2,
+                "turnover_rate": 0.8,
+                "amplitude": 1.6,
+                "source": "efinance",
                 "update_time": "2024-01-01T15:00:00"
             }
         }
@@ -109,3 +117,49 @@ class StockHistoryResponse(BaseModel):
                 "data": []
             }
         }
+
+
+class ChipDistributionMetrics(BaseModel):
+    """筹码分布指标"""
+
+    code: str = Field(..., description="股票代码")
+    date: Optional[str] = Field(None, description="数据日期")
+    source: Optional[str] = Field(None, description="筹码数据源")
+    profit_ratio: Optional[float] = Field(None, description="获利比例，0-1")
+    avg_cost: Optional[float] = Field(None, description="平均持仓成本")
+    cost_90_low: Optional[float] = Field(None, description="90% 筹码成本下限")
+    cost_90_high: Optional[float] = Field(None, description="90% 筹码成本上限")
+    concentration_90: Optional[float] = Field(None, description="90% 筹码集中度，0-1")
+    cost_70_low: Optional[float] = Field(None, description="70% 筹码成本下限")
+    cost_70_high: Optional[float] = Field(None, description="70% 筹码成本上限")
+    concentration_70: Optional[float] = Field(None, description="70% 筹码集中度，0-1")
+    chip_status: Optional[str] = Field(None, description="基于现价推导的筹码状态")
+
+
+class MajorHolder(BaseModel):
+    """主力/机构持仓名称与持股摘要"""
+
+    name: str = Field(..., description="股东或机构名称")
+    holder_type: Optional[str] = Field(None, description="股东/机构类型")
+    share_type: Optional[str] = Field(None, description="股份类型")
+    shares: Optional[float] = Field(None, description="持股数量")
+    holding_ratio: Optional[float] = Field(None, description="持股比例 (%)")
+    change: Optional[str] = Field(None, description="持股变化")
+    change_ratio: Optional[float] = Field(None, description="持股变化比例 (%)")
+    report_date: Optional[str] = Field(None, description="报告期")
+    announce_date: Optional[str] = Field(None, description="公告日期")
+    rank: Optional[int] = Field(None, description="排名")
+    source: Optional[str] = Field(None, description="数据源")
+
+
+class StockIndicatorMetricsResponse(BaseModel):
+    """指标分析扩展数据响应"""
+
+    stock_code: str = Field(..., description="股票代码")
+    stock_name: Optional[str] = Field(None, description="股票名称")
+    chip_distribution: Optional[ChipDistributionMetrics] = Field(None, description="筹码分布指标")
+    major_holders: List[MajorHolder] = Field(default_factory=list, description="主力/机构持仓名称")
+    major_holder_status: str = Field("not_supported", description="主力/机构持仓数据状态")
+    source_chain: List[Dict[str, Any]] = Field(default_factory=list, description="数据源链路")
+    errors: List[str] = Field(default_factory=list, description="降级错误信息")
+    update_time: Optional[str] = Field(None, description="更新时间")

@@ -261,6 +261,156 @@ def _extract_latest_row(df: pd.DataFrame, stock_code: str) -> Optional[pd.Series
     return df.iloc[0]
 
 
+def _safe_int(value: Any) -> Optional[int]:
+    parsed = _safe_float(value)
+    if parsed is None:
+        return None
+    return int(parsed)
+
+
+def _clean_optional_str(value: Any) -> Optional[str]:
+    text = _safe_str(value)
+    if text.lower() in ("", "-", "--", "nan", "none", "nat"):
+        return None
+    return text
+
+
+def _pick_clean(row: pd.Series, keywords: List[str]) -> Optional[Any]:
+    value = _pick_by_keywords(row, keywords)
+    if value is None:
+        return None
+    if isinstance(value, float) and pd.isna(value):
+        return None
+    if str(value).strip().lower() in ("", "-", "--", "nan", "none", "nat"):
+        return None
+    return value
+
+
+def _to_iso_date(value: Any) -> Optional[str]:
+    parsed = _safe_datetime(value)
+    return parsed.date().isoformat() if parsed else None
+
+
+def _latest_holder_rows(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    date_col = next(
+        (
+            col for col in df.columns
+            if any(k in str(col) for k in ("截至日期", "截止日期", "报告期", "END_DATE"))
+        ),
+        None,
+    )
+    if date_col is None:
+        return df
+
+    work_df = df.copy()
+    parsed_dates = pd.to_datetime(work_df[date_col], errors="coerce")
+    if parsed_dates.dropna().empty:
+        return work_df
+
+    latest_date = parsed_dates.max()
+    return work_df[parsed_dates == latest_date].copy()
+
+
+def _normalize_holder_rows(df: pd.DataFrame, source: str, top_n: int) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+    rows = _latest_holder_rows(df)
+    if rows.empty:
+        return [], None
+
+    rank_col = next((col for col in rows.columns if any(k in str(col) for k in ("名次", "编号", "排名", "股东排名"))), None)
+    if rank_col is not None:
+        rows = rows.copy()
+        rows["_rank_sort"] = pd.to_numeric(rows[rank_col], errors="coerce")
+        rows = rows.sort_values("_rank_sort", na_position="last")
+    else:
+        ratio_col = next(
+            (
+                col for col in rows.columns
+                if any(k in str(col) for k in ("占总股本持股比例", "占流通股比例", "持股比例", "期末持股-持股占流通股比"))
+            ),
+            None,
+        )
+        if ratio_col is not None:
+            rows = rows.copy()
+            rows["_ratio_sort"] = pd.to_numeric(rows[ratio_col], errors="coerce")
+            rows = rows.sort_values("_ratio_sort", ascending=False, na_position="last")
+
+    holders: List[Dict[str, Any]] = []
+    seen_names = set()
+    report_date: Optional[str] = None
+
+    for _, row in rows.iterrows():
+        if not isinstance(row, pd.Series):
+            continue
+        name = _clean_optional_str(_pick_clean(row, ["股东名称", "持股机构简称", "持股机构全称", "基金名称", "HOLDER_NAME"]))
+        if not name or name in seen_names:
+            continue
+        seen_names.add(name)
+
+        current_report_date = _to_iso_date(_pick_clean(row, ["截至日期", "截止日期", "报告期", "END_DATE"]))
+        report_date = report_date or current_report_date
+
+        holders.append({
+            "name": name,
+            "holder_type": _clean_optional_str(_pick_clean(row, ["股东类型", "股东性质", "持股机构类型"])),
+            "share_type": _clean_optional_str(_pick_clean(row, ["股份类型", "股本性质"])),
+            "shares": _safe_float(_pick_clean(row, ["持股数量", "持股数", "期末持股-数量", "最新持股数", "持仓数量"])),
+            "holding_ratio": _safe_float(_pick_clean(row, ["占总股本持股比例", "占流通股比例", "持股比例", "最新持股比例", "期末持股-持股占流通股比"])),
+            "change": _clean_optional_str(_pick_clean(row, ["增减", "持股变动", "数量变化"])),
+            "change_ratio": _safe_float(_pick_clean(row, ["变动比率", "数量变化比例", "持股比例增幅", "占流通股比例增幅"])),
+            "report_date": current_report_date,
+            "announce_date": _to_iso_date(_pick_clean(row, ["公告日期", "公告日", "NOTICE_DATE"])),
+            "rank": _safe_int(_pick_clean(row, ["名次", "编号", "股东排名"])),
+            "source": source,
+        })
+
+        if len(holders) >= max(1, top_n):
+            break
+
+    return holders, report_date
+
+
+def _recent_quarter_codes(max_count: int = 8) -> List[str]:
+    now = datetime.now()
+    quarters = [(3, "1"), (6, "2"), (9, "3"), (12, "4")]
+    result: List[str] = []
+    for year in range(now.year, now.year - 4, -1):
+        for month, quarter in reversed(quarters):
+            if year == now.year and month > now.month:
+                continue
+            result.append(f"{year}{quarter}")
+            if len(result) >= max_count:
+                return result
+    return result
+
+
+def _eastmoney_symbol(stock_code: str) -> str:
+    code = _normalize_code(stock_code)
+    if code.startswith(("6", "9")):
+        return f"sh{code}"
+    if code.startswith(("0", "2", "3")):
+        return f"sz{code}"
+    if code.startswith(("4", "8")):
+        return f"bj{code}"
+    return code
+
+
+def _recent_report_dates(max_count: int = 8) -> List[str]:
+    now = datetime.now()
+    quarter_ends = [(12, 31), (9, 30), (6, 30), (3, 31)]
+    result: List[str] = []
+    for year in range(now.year, now.year - 4, -1):
+        for month, day in quarter_ends:
+            if year == now.year and (month, day) > (now.month, now.day):
+                continue
+            result.append(f"{year}{month:02d}{day:02d}")
+            if len(result) >= max_count:
+                return result
+    return result
+
+
 class AkshareFundamentalAdapter:
     """AkShare adapter for fundamentals, capital flow and dragon-tiger signals."""
 
@@ -411,6 +561,89 @@ class AkshareFundamentalAdapter:
 
         has_content = bool(result["growth"] or result["earnings"] or result["institution"])
         result["status"] = "partial" if has_content else "not_supported"
+        return result
+
+    def get_major_holders(self, stock_code: str, top_n: int = 20) -> Dict[str, Any]:
+        """
+        Return latest major holder / institution names for an A-share stock.
+        """
+        result: Dict[str, Any] = {
+            "status": "not_supported",
+            "holders": [],
+            "as_of": None,
+            "source_chain": [],
+            "errors": [],
+        }
+
+        try:
+            import akshare as ak
+        except Exception as exc:
+            result["errors"].append(f"import_akshare:{type(exc).__name__}")
+            return result
+
+        normalized_code = _normalize_code(stock_code)
+        direct_candidates: List[Tuple[str, Dict[str, Any]]] = [
+            ("stock_main_stock_holder", {"stock": normalized_code}),
+            ("stock_circulate_stock_holder", {"symbol": normalized_code}),
+        ]
+
+        for func_name, kwargs in direct_candidates:
+            fn = getattr(ak, func_name, None)
+            if fn is None:
+                continue
+            try:
+                df = fn(**kwargs)
+                if isinstance(df, pd.Series):
+                    df = df.to_frame().T
+                holders, report_date = _normalize_holder_rows(df, func_name, top_n)
+                if holders:
+                    result.update({
+                        "status": "ok",
+                        "holders": holders,
+                        "as_of": report_date,
+                        "source_chain": [f"major_holders:{func_name}"],
+                    })
+                    return result
+            except Exception as exc:
+                result["errors"].append(f"{func_name}:{type(exc).__name__}")
+
+        institute_fn = getattr(ak, "stock_institute_hold_detail", None)
+        if institute_fn is not None:
+            for quarter in _recent_quarter_codes():
+                try:
+                    df = institute_fn(stock=normalized_code, quarter=quarter)
+                    holders, report_date = _normalize_holder_rows(df, "stock_institute_hold_detail", top_n)
+                    if holders:
+                        result.update({
+                            "status": "ok",
+                            "holders": holders,
+                            "as_of": report_date or quarter,
+                            "source_chain": [f"major_holders:stock_institute_hold_detail:{quarter}"],
+                        })
+                        return result
+                except Exception as exc:
+                    result["errors"].append(f"stock_institute_hold_detail:{quarter}:{type(exc).__name__}")
+
+        em_symbol = _eastmoney_symbol(normalized_code)
+        for report_date in _recent_report_dates():
+            for func_name in ("stock_gdfx_top_10_em", "stock_gdfx_free_top_10_em"):
+                fn = getattr(ak, func_name, None)
+                if fn is None:
+                    continue
+                try:
+                    df = fn(symbol=em_symbol, date=report_date)
+                    holders, normalized_report_date = _normalize_holder_rows(df, func_name, top_n)
+                    if holders:
+                        result.update({
+                            "status": "ok",
+                            "holders": holders,
+                            "as_of": normalized_report_date or report_date,
+                            "source_chain": [f"major_holders:{func_name}:{report_date}"],
+                        })
+                        return result
+                except Exception as exc:
+                    result["errors"].append(f"{func_name}:{report_date}:{type(exc).__name__}")
+
         return result
 
     def get_capital_flow(self, stock_code: str, top_n: int = 5) -> Dict[str, Any]:

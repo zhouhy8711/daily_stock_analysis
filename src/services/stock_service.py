@@ -10,12 +10,34 @@
 """
 
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime
+import math
 from typing import Optional, Dict, Any, List
 
 from src.repositories.stock_repo import StockRepository
 
 logger = logging.getLogger(__name__)
+
+
+def _to_optional_float(value: Any) -> Optional[float]:
+    try:
+        if value is None:
+            return None
+        number = float(value)
+        if math.isnan(number):
+            return None
+        return number
+    except (TypeError, ValueError):
+        return None
+
+
+def _source_to_string(source: Any) -> Optional[str]:
+    if source is None:
+        return None
+    value = getattr(source, "value", None)
+    if value:
+        return str(value)
+    return str(source)
 
 
 class StockService:
@@ -75,6 +97,10 @@ class StockService:
                 "prev_close": getattr(quote, "pre_close", None),
                 "volume": getattr(quote, "volume", None),
                 "amount": getattr(quote, "amount", None),
+                "volume_ratio": getattr(quote, "volume_ratio", None),
+                "turnover_rate": getattr(quote, "turnover_rate", None),
+                "amplitude": getattr(quote, "amplitude", None),
+                "source": _source_to_string(getattr(quote, "source", None)),
                 "update_time": datetime.now().isoformat(),
             }
             
@@ -84,6 +110,75 @@ class StockService:
         except Exception as e:
             logger.error(f"获取实时行情失败: {e}", exc_info=True)
             return None
+
+    def get_indicator_metrics(self, stock_code: str) -> Dict[str, Any]:
+        """
+        获取指标分析扩展数据：筹码分布与主力/机构持仓名称。
+
+        这些数据源均为可选上下文，接口保持 fail-open，失败时返回空结构，
+        不影响 K 线与实时行情展示。
+        """
+        from data_provider.base import DataFetcherManager
+
+        manager = DataFetcherManager()
+        stock_name = None
+        chip_payload = None
+        major_holder_status = "not_supported"
+        major_holders: List[Dict[str, Any]] = []
+        source_chain: List[Dict[str, Any]] = []
+        errors: List[str] = []
+
+        try:
+            stock_name = manager.get_stock_name(stock_code, allow_realtime=False)
+        except Exception as e:
+            logger.debug(f"获取 {stock_code} 股票名称失败: {e}")
+
+        try:
+            chip = manager.get_chip_distribution(stock_code)
+            if chip is not None:
+                chip_payload = {
+                    "code": getattr(chip, "code", stock_code),
+                    "date": getattr(chip, "date", None),
+                    "source": getattr(chip, "source", None),
+                    "profit_ratio": _to_optional_float(getattr(chip, "profit_ratio", None)),
+                    "avg_cost": _to_optional_float(getattr(chip, "avg_cost", None)),
+                    "cost_90_low": _to_optional_float(getattr(chip, "cost_90_low", None)),
+                    "cost_90_high": _to_optional_float(getattr(chip, "cost_90_high", None)),
+                    "concentration_90": _to_optional_float(getattr(chip, "concentration_90", None)),
+                    "cost_70_low": _to_optional_float(getattr(chip, "cost_70_low", None)),
+                    "cost_70_high": _to_optional_float(getattr(chip, "cost_70_high", None)),
+                    "concentration_70": _to_optional_float(getattr(chip, "concentration_70", None)),
+                    "chip_status": None,
+                }
+        except Exception as e:
+            logger.debug(f"获取 {stock_code} 筹码分布失败: {e}")
+            errors.append(f"chip_distribution:{type(e).__name__}")
+
+        try:
+            holder_context = manager.get_major_holders_context(stock_code, top_n=20)
+            major_holder_status = str(holder_context.get("status", "not_supported"))
+            holder_data = holder_context.get("data", {})
+            if isinstance(holder_data, dict):
+                raw_holders = holder_data.get("holders", [])
+                if isinstance(raw_holders, list):
+                    major_holders = [item for item in raw_holders if isinstance(item, dict)]
+            source_chain.extend(holder_context.get("source_chain") or [])
+            errors.extend(str(err) for err in (holder_context.get("errors") or []) if err)
+        except Exception as e:
+            logger.debug(f"获取 {stock_code} 主力持仓失败: {e}")
+            major_holder_status = "failed"
+            errors.append(f"major_holders:{type(e).__name__}")
+
+        return {
+            "stock_code": stock_code,
+            "stock_name": stock_name,
+            "chip_distribution": chip_payload,
+            "major_holders": major_holders,
+            "major_holder_status": major_holder_status,
+            "source_chain": source_chain,
+            "errors": errors,
+            "update_time": datetime.now().isoformat(),
+        }
     
     def get_history_data(
         self,
@@ -182,5 +277,9 @@ class StockService:
             "prev_close": None,
             "volume": None,
             "amount": None,
+            "volume_ratio": None,
+            "turnover_rate": None,
+            "amplitude": None,
+            "source": "fallback",
             "update_time": datetime.now().isoformat(),
         }

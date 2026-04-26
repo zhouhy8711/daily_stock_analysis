@@ -52,6 +52,7 @@ vi.mock('../../api/stocks', () => ({
   stocksApi: {
     getQuote: vi.fn(),
     getHistory: vi.fn(),
+    getIndicatorMetrics: vi.fn(),
   },
 }));
 
@@ -138,6 +139,18 @@ describe('HomePage', () => {
       prevClose: 121.8,
       volume: 1000000,
       amount: 120000000,
+      volumeRatio: 1.1,
+      turnoverRate: 0.8,
+      updateTime: '2026-04-25T15:00:00',
+    });
+    vi.mocked(stocksApi.getIndicatorMetrics).mockResolvedValue({
+      stockCode: '600519',
+      stockName: '贵州茅台',
+      chipDistribution: null,
+      majorHolders: [],
+      majorHolderStatus: 'not_supported',
+      sourceChain: [],
+      errors: [],
       updateTime: '2026-04-25T15:00:00',
     });
   });
@@ -247,6 +260,33 @@ describe('HomePage', () => {
       prevClose: 123,
       volume: 1240000,
       amount: 152000000,
+      volumeRatio: 1.3,
+      turnoverRate: 0.72,
+      updateTime: '2026-04-25T15:00:00',
+    });
+    vi.mocked(stocksApi.getIndicatorMetrics).mockResolvedValue({
+      stockCode: '600519',
+      stockName: '贵州茅台',
+      chipDistribution: {
+        code: '600519',
+        date: '2026-04-24',
+        source: 'akshare',
+        profitRatio: 0.68,
+        avgCost: 118.5,
+        cost90Low: 110.2,
+        cost90High: 130.8,
+        concentration90: 0.12,
+        cost70Low: 114.1,
+        cost70High: 126.2,
+        concentration70: 0.09,
+      },
+      majorHolders: [
+        { name: '摩根士丹利', holdingRatio: 2.35, holderType: 'QFII', reportDate: '2026-03-31' },
+        { name: '香港中央结算有限公司', holdingRatio: 6.18, holderType: '机构', reportDate: '2026-03-31' },
+      ],
+      majorHolderStatus: 'ok',
+      sourceChain: [],
+      errors: [],
       updateTime: '2026-04-25T15:00:00',
     });
 
@@ -262,8 +302,44 @@ describe('HomePage', () => {
     expect(await screen.findByTestId('indicator-analysis-modal')).toBeInTheDocument();
     expect(stocksApi.getHistory).toHaveBeenCalledWith('600519', 120);
     expect(stocksApi.getQuote).toHaveBeenCalledWith('600519');
+    expect(stocksApi.getIndicatorMetrics).toHaveBeenCalledWith('600519');
     expect(await screen.findByText('MA5 / MA10 / MA20')).toBeInTheDocument();
     expect(await screen.findByText('昨收 / 涨跌额')).toBeInTheDocument();
+    expect(await screen.findByText('主力持仓与筹码分布')).toBeInTheDocument();
+    const marketStructureToggle = await screen.findByTestId('market-structure-toggle');
+    expect(marketStructureToggle).toHaveAttribute('aria-expanded', 'false');
+    expect(screen.queryByText('平均成本')).not.toBeInTheDocument();
+    expect(screen.queryByText('摩根士丹利')).not.toBeInTheDocument();
+
+    fireEvent.click(marketStructureToggle);
+    expect(marketStructureToggle).toHaveAttribute('aria-expanded', 'true');
+    expect(screen.getByRole('img', { name: '主力筹码趋势图' })).toBeInTheDocument();
+    const holderSelect = screen.getByRole('combobox', { name: '选择主力名称' });
+    expect(holderSelect).toHaveValue('all');
+    expect(within(holderSelect).getByRole('option', { name: '所有主力合计' })).toBeInTheDocument();
+    expect(within(holderSelect).getByRole('option', { name: '摩根士丹利 2.35%' })).toBeInTheDocument();
+    expect(screen.getByText('主力判断')).toBeInTheDocument();
+    expect(screen.getByText('主力指标')).toBeInTheDocument();
+    expect(screen.getByText('基础指标')).toBeInTheDocument();
+    expect(screen.getByText('当前主力')).toBeInTheDocument();
+    expect(screen.getByTestId('selected-holder-label')).toHaveTextContent('所有主力合计');
+    expect(screen.getByText('平均成本')).toBeInTheDocument();
+    expect(screen.getAllByText('118.50').length).toBeGreaterThan(0);
+    fireEvent.mouseEnter(await screen.findByTestId('market-structure-trend-point-2026-03-24'));
+    const structureTooltip = await screen.findByTestId('market-structure-trend-tooltip');
+    expect(within(structureTooltip).getByText('2026-03-24')).toBeInTheDocument();
+    expect(within(structureTooltip).getByText('收盘价')).toBeInTheDocument();
+    expect(within(structureTooltip).getByText('主力动能')).toBeInTheDocument();
+    fireEvent.mouseLeave(screen.getByTestId('market-structure-trend-point-2026-03-24'));
+    await waitFor(() => {
+      expect(screen.queryByTestId('market-structure-trend-tooltip')).not.toBeInTheDocument();
+    });
+    fireEvent.change(holderSelect, { target: { value: 'holder-0' } });
+    expect(holderSelect).toHaveValue('holder-0');
+    expect(screen.getByTestId('selected-holder-label')).toHaveTextContent('摩根士丹利 2.35%');
+    const klineToggle = screen.getByTestId('kline-chart-toggle');
+    expect(klineToggle).toHaveAttribute('aria-expanded', 'true');
+    expect(screen.getByRole('button', { name: '收起K线图' })).toBeInTheDocument();
     expect(screen.queryByTestId('report-overlay')).not.toBeInTheDocument();
 
     fireEvent.mouseEnter(await screen.findByTestId('indicator-chart-bar-2026-03-24'));

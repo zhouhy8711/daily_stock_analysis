@@ -20,6 +20,7 @@ from api.v1.schemas.stocks import (
     ExtractFromImageResponse,
     ExtractItem,
     KLineData,
+    StockIndicatorMetricsResponse,
     StockHistoryResponse,
     StockQuote,
 )
@@ -292,6 +293,10 @@ def get_stock_quote(stock_code: str) -> StockQuote:
             prev_close=result.get("prev_close"),
             volume=result.get("volume"),
             amount=result.get("amount"),
+            volume_ratio=result.get("volume_ratio"),
+            turnover_rate=result.get("turnover_rate"),
+            amplitude=result.get("amplitude"),
+            source=result.get("source"),
             update_time=result.get("update_time")
         )
         
@@ -304,6 +309,38 @@ def get_stock_quote(stock_code: str) -> StockQuote:
             detail={
                 "error": "internal_error",
                 "message": f"获取实时行情失败: {str(e)}"
+            }
+        )
+
+
+@router.get(
+    "/{stock_code}/indicator-metrics",
+    response_model=StockIndicatorMetricsResponse,
+    responses={
+        200: {"description": "指标分析扩展数据"},
+        500: {"description": "服务器错误", "model": ErrorResponse},
+    },
+    summary="获取指标分析扩展数据",
+    description="获取筹码分布、筹码成本与主力/机构持仓名称等指标分析补充数据"
+)
+def get_stock_indicator_metrics(stock_code: str) -> StockIndicatorMetricsResponse:
+    """
+    获取指标分析扩展数据。
+
+    该接口中的筹码和主力/机构持仓均为可选数据源，服务层会按 fail-open
+    语义返回空结构，避免单个三方接口失败拖垮指标弹窗。
+    """
+    try:
+        service = StockService()
+        result = service.get_indicator_metrics(stock_code)
+        return StockIndicatorMetricsResponse(**result)
+    except Exception as e:
+        logger.error(f"获取指标扩展数据失败: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": "internal_error",
+                "message": f"获取指标扩展数据失败: {str(e)}"
             }
         )
 
