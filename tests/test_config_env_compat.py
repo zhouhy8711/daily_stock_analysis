@@ -340,6 +340,7 @@ class ConfigEnvCompatibilityTestCase(unittest.TestCase):
         env = {
             "AGENT_ORCHESTRATOR_TIMEOUT_S": "oops",
             "CODEX_EXEC_AGENT_TIMEOUT_SECONDS": "not-a-number",
+            "CODEX_EXEC_AGENT_BACKGROUND_TIMEOUT_SECONDS": "still-not-a-number",
             "NEWS_MAX_AGE_DAYS": "bad",
             "MAX_WORKERS": "",
             "WEBUI_PORT": "invalid",
@@ -350,6 +351,7 @@ class ConfigEnvCompatibilityTestCase(unittest.TestCase):
 
         self.assertEqual(config.agent_orchestrator_timeout_s, 600)
         self.assertEqual(config.codex_exec_agent_timeout_seconds, 600)
+        self.assertEqual(config.codex_exec_agent_background_timeout_seconds, 7200)
         self.assertEqual(config.news_max_age_days, 3)
         self.assertEqual(config.max_workers, 3)
         self.assertEqual(config.webui_port, 8000)

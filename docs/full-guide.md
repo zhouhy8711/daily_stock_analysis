@@ -200,6 +200,7 @@ daily_stock_analysis/
 | `CODEX_EXEC_AGENT_ARGS` | 问股页自定义 Codex skill 使用的 agent 模式参数，默认保留本机 skill 和工具能力 | `--dangerously-bypass-approvals-and-sandbox` | 可选 |
 | `CODEX_EXEC_TIMEOUT_SECONDS` | 单次 Codex CLI 调用超时秒数 | `180` | 可选 |
 | `CODEX_EXEC_AGENT_TIMEOUT_SECONDS` | 问股 / Agent 走 Codex CLI 链路的超时秒数 | `600` | 可选 |
+| `CODEX_EXEC_AGENT_BACKGROUND_TIMEOUT_SECONDS` | 自定义 Codex skill 问股后台任务超时秒数，完成后结果写入 `skill_out/` 并追加到历史对话 | `7200` | 可选 |
 | `AIHUBMIX_KEY` | [AIHubmix](https://aihubmix.com/?aff=CfMq) API Key，一 Key 切换使用全系模型，无需额外配置 Base URL | - | 可选 |
 | `GEMINI_API_KEY` | Google Gemini API Key | - | 可选 |
 | `GEMINI_MODEL` | 主模型名称（legacy，`LITELLM_MODEL` 优先） | `gemini-3-flash-preview` | 否 |
@@ -919,6 +920,7 @@ CODEX_EXEC_ARGS=--dangerously-bypass-approvals-and-sandbox --ignore-user-config 
 CODEX_EXEC_AGENT_ARGS=--dangerously-bypass-approvals-and-sandbox
 CODEX_EXEC_TIMEOUT_SECONDS=180
 CODEX_EXEC_AGENT_TIMEOUT_SECONDS=600
+CODEX_EXEC_AGENT_BACKGROUND_TIMEOUT_SECONDS=7200
 ```
 
 也可以直接指定：
@@ -927,7 +929,7 @@ CODEX_EXEC_AGENT_TIMEOUT_SECONDS=600
 LITELLM_MODEL=codex/gpt-5.4
 ```
 
-底层执行形态类似 `codex exec --dangerously-bypass-approvals-and-sandbox -m gpt-5.4 "..."`。普通模型调用默认会额外隔离用户配置、项目规则、插件和工具能力，避免分析请求被当成 Codex 代理任务去联网或读写仓库；问股页选择自定义 Codex skill 时会改用 `CODEX_EXEC_AGENT_ARGS`，默认保留本机 skill、联网搜索与工具能力。该模式不适用于图片识别（Vision），图片功能仍需单独配置支持 Vision 的 API 模型。
+底层执行形态类似 `codex exec --dangerously-bypass-approvals-and-sandbox -m gpt-5.4 "..."`。普通模型调用默认会额外隔离用户配置、项目规则、插件和工具能力，避免分析请求被当成 Codex 代理任务去联网或读写仓库；问股页选择自定义 Codex skill 时会改用 `CODEX_EXEC_AGENT_ARGS`，默认保留本机 skill、联网搜索与工具能力。自定义 Codex skill 会转入后台执行，页面立即返回占位消息；完成后 Markdown 结果写入仓库根目录 `skill_out/`，并在同一历史对话追加结果链接。该模式不适用于图片识别（Vision），图片功能仍需单独配置支持 Vision 的 API 模型。
 
 ### 高级模型路由（底层由 LiteLLM 驱动）
 
@@ -1079,6 +1081,7 @@ FastAPI 提供 RESTful API 服务，支持配置管理和触发分析。
 | `/api/v1/backtest/results` | GET | 查询回测结果（分页） |
 | `/api/v1/backtest/performance` | GET | 获取整体回测表现 |
 | `/api/v1/backtest/performance/{code}` | GET | 获取单股回测表现 |
+| `/api/v1/agent/skill-output/{filename}` | GET | 查看自定义 Codex skill 后台任务生成的 Markdown 结果 |
 | `/api/v1/stocks/extract-from-image` | POST | 从图片提取股票代码（multipart，超时 60s） |
 | `/api/v1/stocks/parse-import` | POST | 解析 CSV/Excel/剪贴板（multipart file 或 JSON `{"text":"..."}`，文件≤2MB，文本≤100KB） |
 | `/api/health` | GET | 健康检查 |

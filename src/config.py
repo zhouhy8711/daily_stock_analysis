@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 
 from src.codex_exec import (
     DEFAULT_CODEX_AGENT_ARGS,
+    DEFAULT_CODEX_AGENT_BACKGROUND_TIMEOUT_SECONDS,
     DEFAULT_CODEX_AGENT_TIMEOUT_SECONDS,
     DEFAULT_CODEX_EXEC_ARGS,
     DEFAULT_CODEX_EXEC_COMMAND,
@@ -470,6 +471,7 @@ class Config:
     codex_exec_agent_args: str = DEFAULT_CODEX_AGENT_ARGS
     codex_exec_timeout_seconds: int = DEFAULT_CODEX_EXEC_TIMEOUT_SECONDS
     codex_exec_agent_timeout_seconds: int = DEFAULT_CODEX_AGENT_TIMEOUT_SECONDS
+    codex_exec_agent_background_timeout_seconds: int = DEFAULT_CODEX_AGENT_BACKGROUND_TIMEOUT_SECONDS
 
     # --- Multi-channel LLM config (new) ---
     # LITELLM_CONFIG: path to a standard litellm_config.yaml file (most powerful)
@@ -970,6 +972,12 @@ class Config:
             field_name='CODEX_EXEC_AGENT_TIMEOUT_SECONDS',
             minimum=1,
         )
+        codex_exec_agent_background_timeout_seconds = parse_env_int(
+            os.getenv('CODEX_EXEC_AGENT_BACKGROUND_TIMEOUT_SECONDS'),
+            DEFAULT_CODEX_AGENT_BACKGROUND_TIMEOUT_SECONDS,
+            field_name='CODEX_EXEC_AGENT_BACKGROUND_TIMEOUT_SECONDS',
+            minimum=1,
+        )
 
         # LITELLM_MODEL: explicit config takes precedence; else infer from available keys
         litellm_model = os.getenv('LITELLM_MODEL', '').strip()
@@ -1172,6 +1180,7 @@ class Config:
             codex_exec_agent_args=codex_exec_agent_args,
             codex_exec_timeout_seconds=codex_exec_timeout_seconds,
             codex_exec_agent_timeout_seconds=codex_exec_agent_timeout_seconds,
+            codex_exec_agent_background_timeout_seconds=codex_exec_agent_background_timeout_seconds,
             litellm_config_path=litellm_config_path,
             llm_models_source=llm_models_source,
             llm_channels=llm_channels,

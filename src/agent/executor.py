@@ -47,6 +47,7 @@ class AgentResult:
     provider: str = ""
     model: str = ""                            # comma-separated models used (supports fallback)
     error: Optional[str] = None
+    assistant_persisted: bool = False           # true when a path already wrote the assistant turn
 
 
 _CODE_LIKE_RE = re.compile(
@@ -710,15 +711,16 @@ class AgentExecutor:
         if self._should_use_codex_direct_chat(context or {}):
             conversation_manager.add_message(session_id, "user", message)
             result = self._run_codex_direct_chat(
+                session_id=session_id,
                 message=message,
                 history=history,
                 context=context or {},
                 report_language=report_language,
                 progress_callback=progress_callback,
             )
-            if result.success:
+            if result.success and not result.assistant_persisted:
                 conversation_manager.add_message(session_id, "assistant", result.content)
-            else:
+            elif not result.success and not result.assistant_persisted:
                 conversation_manager.add_message(
                     session_id,
                     "assistant",
@@ -764,9 +766,9 @@ class AgentExecutor:
         result = self._run_loop(messages, tool_decls, parse_dashboard=False, progress_callback=progress_callback)
 
         # Persist assistant reply (or error note) for context continuity
-        if result.success:
+        if result.success and not result.assistant_persisted:
             conversation_manager.add_message(session_id, "assistant", result.content)
-        else:
+        elif not result.success and not result.assistant_persisted:
             error_note = f"[分析失败] {result.error or '未知错误'}"
             conversation_manager.add_message(session_id, "assistant", error_note)
 
@@ -782,6 +784,7 @@ class AgentExecutor:
     def _run_codex_direct_chat(
         self,
         *,
+        session_id: str,
         message: str,
         history: List[Dict[str, Any]],
         context: Dict[str, Any],
@@ -808,6 +811,15 @@ class AgentExecutor:
                 error="所选 Codex skill 不存在或无法读取，请重新添加自定义问询方式。",
             )
         if codex_skill_context is not None:
+            if context.get("codex_skill_background"):
+                return self._start_codex_skill_background_chat(
+                    session_id=session_id,
+                    message=message,
+                    history=history,
+                    context=context,
+                    codex_skill_context=codex_skill_context,
+                    progress_callback=progress_callback,
+                )
             return self._run_codex_skill_agent_chat(
                 message=message,
                 history=history,
@@ -922,6 +934,91 @@ class AgentExecutor:
             error=None if success else (response.content or "Codex skill returned empty response"),
         )
 
+    def _start_codex_skill_background_chat(
+        self,
+        *,
+        session_id: str,
+        message: str,
+        history: List[Dict[str, Any]],
+        context: Dict[str, Any],
+        codex_skill_context: Dict[str, str],
+        progress_callback: Optional[Callable] = None,
+    ) -> AgentResult:
+        """Schedule a selected local Codex skill without keeping the HTTP stream open."""
+        from src.agent.conversation import conversation_manager
+        from src.services.codex_skill_job_service import (
+            CodexSkillJobResult,
+            start_codex_skill_background_job,
+        )
+
+        if progress_callback:
+            progress_callback({
+                "type": "thinking",
+                "step": 1,
+                "message": "正在将 Codex skill 转入后台执行...",
+            })
+
+        prompt = self._build_codex_skill_agent_prompt(
+            message=message,
+            history=history,
+            context=context,
+            codex_skill_context=codex_skill_context,
+        )
+        config = getattr(self.llm_adapter, "_config", None)
+        from src.codex_exec import DEFAULT_CODEX_AGENT_BACKGROUND_TIMEOUT_SECONDS
+
+        timeout_seconds = float(
+            getattr(
+                config,
+                "codex_exec_agent_background_timeout_seconds",
+                DEFAULT_CODEX_AGENT_BACKGROUND_TIMEOUT_SECONDS,
+            )
+            or DEFAULT_CODEX_AGENT_BACKGROUND_TIMEOUT_SECONDS
+        )
+        skill_name = (
+            codex_skill_context.get("name")
+            or codex_skill_context.get("relative_path")
+            or "Codex skill"
+        )
+        skill_path = codex_skill_context.get("relative_path", "")
+
+        def run_job() -> CodexSkillJobResult:
+            response = self.llm_adapter.call_codex_agent_text(
+                prompt,
+                timeout=timeout_seconds,
+            )
+            success = response.provider != "error" and bool(response.content)
+            return CodexSkillJobResult(
+                success=success,
+                content=response.content or "",
+                error=None if success else (response.content or "Codex skill returned empty response"),
+            )
+
+        job = start_codex_skill_background_job(
+            session_id=session_id,
+            user_message=message,
+            skill_name=skill_name,
+            skill_path=skill_path,
+            run=run_job,
+        )
+        if progress_callback:
+            progress_callback({
+                "type": "generating",
+                "step": 1,
+                "message": "后台任务已创建，结果会写入 skill_out。",
+            })
+        conversation_manager.add_message(session_id, "assistant", job.accepted_message)
+        return AgentResult(
+            success=True,
+            content=job.accepted_message,
+            dashboard=None,
+            tool_calls_log=[],
+            total_steps=1,
+            provider="codex",
+            model="codex",
+            assistant_persisted=True,
+        )
+
     def _build_codex_skill_agent_prompt(
         self,
         *,
@@ -935,7 +1032,7 @@ class AgentExecutor:
         safe_context = {
             key: value
             for key, value in (context or {}).items()
-            if key not in {"skills", "codex_skill_id"} and value not in (None, "")
+            if key not in {"skills", "codex_skill_id", "codex_skill_background"} and value not in (None, "")
         }
         history_lines: List[str] = []
         for item in (history or [])[-6:]:

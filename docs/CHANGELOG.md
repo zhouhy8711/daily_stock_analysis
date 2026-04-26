@@ -43,6 +43,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [改进] 新增 `CODEX_EXEC_AGENT_TIMEOUT_SECONDS`，单独控制问股 / Agent 走 Codex CLI 链路的超时时间，默认 600 秒
 - [修复] Agent 问股流式接口等待 Codex CLI 长任务时改为发送 SSE keep-alive，避免 300 秒无新进度事件被误判为“分析超时”
 - [修复] Agent 问股在 Codex CLI 主模型下预采集筹码分布失败时改为可选数据降级，并修复思考过程工具耗时显示为 `undefineds`
+- [修复] Agent 问股自定义 Codex skill 改为后台执行，完成后将 Markdown 结果写入 `skill_out/` 并把链接追加到历史对话，避免深度联网分析被前台请求超时打断
 
 ## [3.13.0] - 2026-04-21
 

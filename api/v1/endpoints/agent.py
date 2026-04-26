@@ -10,7 +10,7 @@ import uuid
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
 from src.config import get_config
@@ -215,6 +215,7 @@ async def agent_chat(request: ChatRequest):
             ctx["skills"] = skills
         if request.codex_skill_id:
             ctx["codex_skill_id"] = request.codex_skill_id
+            ctx["codex_skill_background"] = True
 
         # Offload the blocking call to a thread to avoid blocking the event loop.
         loop = asyncio.get_running_loop()
@@ -446,6 +447,7 @@ async def agent_chat_stream(request: ChatRequest):
         stream_ctx["skills"] = skills
     if request.codex_skill_id:
         stream_ctx["codex_skill_id"] = request.codex_skill_id
+        stream_ctx["codex_skill_background"] = True
 
     def progress_callback(event: dict):
         # Enrich tool events with display names
@@ -530,4 +532,22 @@ async def agent_chat_stream(request: ChatRequest):
             "X-Accel-Buffering": "no",
             "Connection": "keep-alive",
         },
+    )
+
+
+@router.get("/skill-output/{filename}")
+async def get_skill_output(filename: str):
+    """Serve generated Codex skill output files from the repo-local skill_out directory."""
+    from src.services.codex_skill_job_service import resolve_skill_output_file
+
+    try:
+        path = resolve_skill_output_file(filename)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Skill output not found") from None
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="Skill output not found")
+    return FileResponse(
+        path,
+        media_type="text/markdown; charset=utf-8",
+        filename=filename,
     )

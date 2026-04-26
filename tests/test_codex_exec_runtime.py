@@ -4,10 +4,11 @@
 import os
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import ModuleType
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from tests.litellm_stub import ensure_litellm_stub
 
@@ -22,6 +23,7 @@ from src.agent.executor import AgentExecutor
 from src.agent.tools.registry import ToolDefinition, ToolParameter, ToolRegistry
 from src.config import Config
 from src.codex_exec import CodexExecClient
+from src.services.codex_skill_job_service import CodexSkillJobResult, start_codex_skill_background_job
 from src.services.codex_skill_service import list_codex_skills, load_codex_skill_instructions
 
 
@@ -50,6 +52,7 @@ class CodexExecRuntimeTestCase(unittest.TestCase):
         self.assertEqual(config.litellm_model, "codex/gpt-5.4")
         self.assertEqual(config.codex_exec_model, "gpt-5.4")
         self.assertEqual(config.codex_exec_agent_timeout_seconds, 600)
+        self.assertEqual(config.codex_exec_agent_background_timeout_seconds, 7200)
         self.assertEqual(config.llm_model_list, [])
         self.assertFalse(any(issue.field == "LITELLM_CONFIG" for issue in config.validate_structured()))
 
@@ -391,6 +394,129 @@ class CodexExecRuntimeTestCase(unittest.TestCase):
         self.assertIn("回答必须先检查一阳夹三阴形态", prompt)
         self.assertNotIn("默认 bull_trend 交易技能", prompt)
         self.assertEqual(result.tool_calls_log, [])
+
+    def test_agent_chat_with_custom_codex_skill_can_run_in_background(self) -> None:
+        config = Config(
+            stock_list=["600519"],
+            litellm_model="openai/gpt-4o-mini",
+            codex_exec_model="gpt-5.4",
+            codex_exec_agent_timeout_seconds=45,
+            codex_exec_agent_background_timeout_seconds=7200,
+            llm_model_list=[],
+        )
+        adapter = LLMToolAdapter(config)
+        executor = AgentExecutor(
+            tool_registry=ToolRegistry(),
+            llm_adapter=adapter,
+            timeout_seconds=60,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            skill_dir = Path(tmpdir) / "skills" / "custom" / "deep-finance"
+            skill_dir.mkdir(parents=True)
+            (skill_dir / "SKILL.md").write_text(
+                "---\n"
+                "name: finance-core-analysis\n"
+                "description: 深度财经分析\n"
+                "---\n\n"
+                "联网采集并输出深度分析。\n",
+                encoding="utf-8",
+            )
+            output_dir = Path(tmpdir) / "skill_out"
+            session = MagicMock()
+            session.get_history.return_value = []
+
+            with patch.dict(os.environ, {"CODEX_HOME": tmpdir}):
+                skill_id = next(
+                    skill.id
+                    for skill in list_codex_skills()
+                    if skill.relative_path == "custom/deep-finance"
+                )
+                with (
+                    patch("src.services.codex_skill_job_service.skill_output_dir", return_value=output_dir),
+                    patch("src.agent.conversation.conversation_manager.get_or_create", return_value=session),
+                    patch("src.agent.conversation.conversation_manager.add_message") as mock_add_message,
+                    patch.object(CodexExecClient, "complete_agent_prompt", return_value="后台分析结果") as mock_complete,
+                ):
+                    result = executor.chat(
+                        "分析中际旭创",
+                        session_id="test-background-codex-skill",
+                        context={
+                            "codex_skill_id": skill_id,
+                            "codex_skill_background": True,
+                        },
+                    )
+
+                    deadline = time.time() + 3
+                    output_files = []
+                    while time.time() < deadline:
+                        output_files = list(output_dir.glob("*.md"))
+                        if output_files and "后台分析结果" in output_files[0].read_text(encoding="utf-8"):
+                            break
+                        time.sleep(0.05)
+                    else:
+                        self.fail("background Codex skill output file was not completed")
+
+        self.assertTrue(result.success)
+        self.assertTrue(result.assistant_persisted)
+        self.assertIn("转入后台执行", result.content)
+        self.assertIn("skill_out/", result.content)
+        self.assertEqual(mock_complete.call_count, 1)
+        self.assertAlmostEqual(mock_complete.call_args.kwargs.get("timeout"), 7200, places=2)
+        self.assertTrue(
+            any(
+                call.args[:2] == ("test-background-codex-skill", "assistant")
+                and "后台分析已完成" in call.args[2]
+                for call in mock_add_message.call_args_list
+            )
+        )
+
+    def test_codex_skill_background_job_writes_heartbeat_while_running(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir) / "skill_out"
+
+            def run_job() -> CodexSkillJobResult:
+                time.sleep(0.18)
+                return CodexSkillJobResult(success=True, content="完成内容")
+
+            with (
+                patch("src.services.codex_skill_job_service.skill_output_dir", return_value=output_dir),
+                patch("src.services.codex_skill_job_service._HEARTBEAT_SECONDS", 0.05),
+                patch("src.agent.conversation.conversation_manager.add_message"),
+            ):
+                job = start_codex_skill_background_job(
+                    session_id="session-heartbeat",
+                    user_message="分析中际旭创",
+                    skill_name="finance-core-analysis",
+                    skill_path="finance-core-analysis",
+                    run=run_job,
+                )
+
+                deadline = time.time() + 2
+                heartbeat_text = ""
+                while time.time() < deadline:
+                    heartbeat_text = job.output_path.read_text(encoding="utf-8")
+                    if "后台任务仍在执行中" in heartbeat_text:
+                        break
+                    time.sleep(0.02)
+                else:
+                    self.fail("background Codex skill job did not write a heartbeat")
+
+                self.assertIn("Status: running", heartbeat_text)
+                self.assertIn("Last heartbeat at:", heartbeat_text)
+
+                deadline = time.time() + 2
+                final_text = ""
+                while time.time() < deadline:
+                    final_text = job.output_path.read_text(encoding="utf-8")
+                    if "完成内容" in final_text:
+                        break
+                    time.sleep(0.02)
+                else:
+                    self.fail("background Codex skill job did not write final content")
+
+        self.assertIn("Status: completed", final_text)
+        self.assertIn("Finished at:", final_text)
 
 
 if __name__ == "__main__":

@@ -132,6 +132,53 @@ class TestAgentSSECleanup(unittest.IsolatedAsyncioTestCase):
         self.assertIn('"type": "done"', body)
         self.assertNotIn('"message": "分析超时"', body)
 
+    async def test_stream_marks_custom_codex_skill_for_background_execution(self):
+        """Custom Codex skill chat requests should not stay on the foreground SSE path."""
+        import api.v1.endpoints.agent as agent_mod
+
+        class FakeConfig:
+            agent_orchestrator_timeout_s = 600
+            codex_exec_agent_timeout_seconds = 600
+            codex_exec_timeout_seconds = 180
+
+            @staticmethod
+            def is_agent_available():
+                return True
+
+        class FakeResult:
+            success = True
+            content = "accepted"
+            error = None
+            total_steps = 1
+
+        captured = {}
+
+        class FakeExecutor:
+            def chat(self, *, context, **_kwargs):
+                captured["context"] = context
+                return FakeResult()
+
+        request = agent_mod.ChatRequest(
+            message="分析中际旭创",
+            session_id="session-bg",
+            codex_skill_id="skill-1",
+        )
+        with (
+            patch.object(agent_mod, "get_config", return_value=FakeConfig()),
+            patch.object(agent_mod, "_build_executor", return_value=FakeExecutor()),
+        ):
+            response = await agent_mod.agent_chat_stream(request)
+            chunks = []
+            async for chunk in response.body_iterator:
+                text = chunk.decode() if isinstance(chunk, bytes) else chunk
+                chunks.append(text)
+                if '"type": "done"' in text:
+                    break
+
+        self.assertEqual(captured["context"]["codex_skill_id"], "skill-1")
+        self.assertTrue(captured["context"]["codex_skill_background"])
+        self.assertIn('"content": "accepted"', "".join(chunks))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -36,6 +36,11 @@ export interface StreamMeta {
   skillName?: string;
 }
 
+interface ActiveStreamInfo {
+  progressSteps: ProgressStep[];
+  abortController: AbortController;
+}
+
 interface AgentChatState {
   messages: Message[];
   loading: boolean;
@@ -48,6 +53,7 @@ interface AgentChatState {
   completionBadge: boolean;
   hasInitialLoad: boolean;
   abortController: AbortController | null;
+  activeStreams: Record<string, ActiveStreamInfo>;
 }
 
 interface AgentChatActions {
@@ -77,6 +83,7 @@ export const useAgentChatStore = create<AgentChatState & AgentChatActions>((set,
   completionBadge: false,
   hasInitialLoad: false,
   abortController: null,
+  activeStreams: {},
 
   setCurrentRoute: (path) => set({ currentRoute: path }),
 
@@ -133,23 +140,34 @@ export const useAgentChatStore = create<AgentChatState & AgentChatActions>((set,
   },
 
   switchSession: async (targetSessionId) => {
-    const { sessionId, messages, abortController } = get();
+    const { sessionId, messages } = get();
     if (targetSessionId === sessionId && messages.length > 0) return;
 
-    abortController?.abort();
-    set({ abortController: null });
-
-    set({ messages: [], sessionId: targetSessionId });
+    const activeStream = get().activeStreams[targetSessionId];
+    set({
+      messages: [],
+      sessionId: targetSessionId,
+      loading: Boolean(activeStream),
+      progressSteps: activeStream?.progressSteps ?? [],
+      abortController: activeStream?.abortController ?? null,
+      chatError: null,
+    });
     localStorage.setItem(STORAGE_KEY_SESSION, targetSessionId);
 
     try {
       const msgs = await agentApi.getChatSessionMessages(targetSessionId);
+      const latest = get();
+      if (latest.sessionId !== targetSessionId) return;
+      const latestActiveStream = latest.activeStreams[targetSessionId];
       set({
         messages: msgs.map((m) => ({
           id: m.id,
           role: m.role,
           content: m.content,
         })),
+        loading: Boolean(latestActiveStream),
+        progressSteps: latestActiveStream?.progressSteps ?? [],
+        abortController: latestActiveStream?.abortController ?? null,
       });
     } catch {
       // Ignore
@@ -157,8 +175,6 @@ export const useAgentChatStore = create<AgentChatState & AgentChatActions>((set,
   },
 
   startNewChat: () => {
-    // Abort any in-flight stream so the old request does not keep running
-    get().abortController?.abort();
     const newId = generateUUID();
     set({
       sessionId: newId,
@@ -172,14 +188,11 @@ export const useAgentChatStore = create<AgentChatState & AgentChatActions>((set,
   },
 
   startStream: async (payload, meta) => {
-    if (get().loading) return;
-    const { abortController: prevAc, sessionId: storeSessionId } = get();
-    prevAc?.abort();
+    const { activeStreams, sessionId: storeSessionId } = get();
+    const streamSessionId = payload.session_id || storeSessionId;
+    if (activeStreams[streamSessionId]) return;
 
     const ac = new AbortController();
-    set({ abortController: ac });
-
-    const streamSessionId = payload.session_id || storeSessionId;
     const skillName = meta?.skillName ?? '通用';
 
     const userMessage: Message = {
@@ -191,10 +204,18 @@ export const useAgentChatStore = create<AgentChatState & AgentChatActions>((set,
     };
 
     set((s) => ({
-      messages: [...s.messages, userMessage],
-      loading: true,
-      progressSteps: [],
-      chatError: null,
+      activeStreams: {
+        ...s.activeStreams,
+        [streamSessionId]: {
+          progressSteps: [],
+          abortController: ac,
+        },
+      },
+      messages: s.sessionId === streamSessionId ? [...s.messages, userMessage] : s.messages,
+      loading: s.sessionId === streamSessionId ? true : s.loading,
+      progressSteps: s.sessionId === streamSessionId ? [] : s.progressSteps,
+      abortController: s.sessionId === streamSessionId ? ac : s.abortController,
+      chatError: s.sessionId === streamSessionId ? null : s.chatError,
       sessions: s.sessions.some((x) => x.session_id === streamSessionId)
         ? s.sessions
         : [
@@ -250,7 +271,25 @@ export const useAgentChatStore = create<AgentChatState & AgentChatActions>((set,
         }
 
         currentProgressSteps.push(event);
-        set((s) => ({ progressSteps: [...s.progressSteps, event] }));
+        set((s) => {
+          const activeStream = s.activeStreams[streamSessionId];
+          if (!activeStream) return {};
+          const nextSteps = [...activeStream.progressSteps, event];
+          const activeStreams = {
+            ...s.activeStreams,
+            [streamSessionId]: {
+              ...activeStream,
+              progressSteps: nextSteps,
+            },
+          };
+          if (s.sessionId !== streamSessionId) {
+            return { activeStreams };
+          }
+          return {
+            activeStreams,
+            progressSteps: nextSteps,
+          };
+        });
       };
 
       while (true) {
@@ -308,21 +347,33 @@ export const useAgentChatStore = create<AgentChatState & AgentChatActions>((set,
       if (error instanceof Error && error.name === 'AbortError') {
         // User-initiated abort: silent, no badge
       } else {
-        set({ chatError: getParsedApiError(error) });
-        const { currentRoute } = get();
-        if (currentRoute !== '/chat') {
+        const { currentRoute, sessionId: currentSessionId } = get();
+        if (currentSessionId === streamSessionId) {
+          set({ chatError: getParsedApiError(error) });
+        }
+        if (currentRoute !== '/chat' || currentSessionId !== streamSessionId) {
           set({ completionBadge: true });
         }
       }
     } finally {
-      const { abortController: currentAc } = get();
-      if (currentAc === ac) {
-        set({
+      set((s) => {
+        const activeStream = s.activeStreams[streamSessionId];
+        if (activeStream?.abortController !== ac) return {};
+        const activeStreams = { ...s.activeStreams };
+        delete activeStreams[streamSessionId];
+        if (s.sessionId !== streamSessionId) {
+          return {
+            activeStreams,
+            abortController: s.abortController === ac ? null : s.abortController,
+          };
+        }
+        return {
+          activeStreams,
           loading: false,
           progressSteps: [],
           abortController: null,
-        });
-      }
+        };
+      });
       await get().loadSessions();
     }
   },

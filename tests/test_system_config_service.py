@@ -375,6 +375,7 @@ class SystemConfigServiceTestCase(unittest.TestCase):
 
         self.assertEqual(items["AGENT_ORCHESTRATOR_TIMEOUT_S"]["schema"]["default_value"], "600")
         self.assertEqual(items["CODEX_EXEC_AGENT_TIMEOUT_SECONDS"]["schema"]["default_value"], "600")
+        self.assertEqual(items["CODEX_EXEC_AGENT_BACKGROUND_TIMEOUT_SECONDS"]["schema"]["default_value"], "7200")
         self.assertTrue(items["AGENT_DEEP_RESEARCH_BUDGET"]["schema"]["is_editable"])
         self.assertTrue(items["AGENT_EVENT_MONITOR_ENABLED"]["schema"]["is_editable"])
 

@@ -43,6 +43,7 @@ describe('agentChatStore.startStream', () => {
       completionBadge: false,
       hasInitialLoad: true,
       abortController: null,
+      activeStreams: {},
     });
     vi.clearAllMocks();
   });
@@ -76,5 +77,64 @@ describe('agentChatStore.startStream', () => {
     });
     expect(state.messages[1].thinkingSteps).toHaveLength(2);
     expect(state.progressSteps).toEqual([]);
+  });
+
+  it('keeps in-flight progress scoped to its own session', async () => {
+    const firstStream: { controller?: ReadableStreamDefaultController<Uint8Array> } = {};
+    vi.mocked(agentApi.chatStream)
+      .mockResolvedValueOnce(new Response(
+        new ReadableStream({
+          start(controller) {
+            firstStream.controller = controller;
+            controller.enqueue(encoder.encode('data: {"type":"thinking","step":1,"message":"获取实时行情..."}\n'));
+          },
+        }),
+        {
+          status: 200,
+          headers: { 'Content-Type': 'text/event-stream' },
+        },
+      ))
+      .mockResolvedValueOnce(createStreamResponse([
+        'data: {"type":"done","success":true,"content":"第二个会话结果"}',
+      ]));
+
+    const firstRun = useAgentChatStore
+      .getState()
+      .startStream({ message: '分析中际旭创', session_id: 'session-test' }, { skillName: '通用' });
+
+    await vi.waitFor(() => {
+      const state = useAgentChatStore.getState();
+      expect(state.loading).toBe(true);
+      expect(state.progressSteps[0]?.message).toBe('获取实时行情...');
+    });
+
+    useAgentChatStore.getState().startNewChat();
+    const newSessionId = useAgentChatStore.getState().sessionId;
+    expect(useAgentChatStore.getState().loading).toBe(false);
+    expect(useAgentChatStore.getState().progressSteps).toEqual([]);
+
+    await useAgentChatStore
+      .getState()
+      .startStream({ message: '看一下 600519', session_id: newSessionId }, { skillName: '通用' });
+
+    let state = useAgentChatStore.getState();
+    expect(state.sessionId).toBe(newSessionId);
+    expect(state.messages.map((msg) => msg.content)).toEqual([
+      '看一下 600519',
+      '第二个会话结果',
+    ]);
+    expect(state.progressSteps).toEqual([]);
+
+    firstStream.controller?.enqueue(encoder.encode('data: {"type":"done","success":true,"content":"第一个会话结果"}\n'));
+    firstStream.controller?.close();
+    await firstRun;
+
+    state = useAgentChatStore.getState();
+    expect(state.sessionId).toBe(newSessionId);
+    expect(state.messages.map((msg) => msg.content)).toEqual([
+      '看一下 600519',
+      '第二个会话结果',
+    ]);
+    expect(state.activeStreams).toEqual({});
   });
 });

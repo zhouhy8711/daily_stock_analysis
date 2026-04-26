@@ -68,6 +68,7 @@ CODEX_EXEC_ARGS=--dangerously-bypass-approvals-and-sandbox --ignore-user-config 
 CODEX_EXEC_AGENT_ARGS=--dangerously-bypass-approvals-and-sandbox
 CODEX_EXEC_TIMEOUT_SECONDS=180
 CODEX_EXEC_AGENT_TIMEOUT_SECONDS=600
+CODEX_EXEC_AGENT_BACKGROUND_TIMEOUT_SECONDS=7200
 ```
 
 You can also select it directly as the primary model:
@@ -88,10 +89,11 @@ Optional settings:
 - `CODEX_EXEC_AGENT_ARGS`: arguments used when Agent Q&A runs a selected custom Codex skill. The default only adds `--dangerously-bypass-approvals-and-sandbox`, preserving local Codex skills, web search, and tools so behavior stays close to invoking the skill directly in Codex.
 - `CODEX_EXEC_TIMEOUT_SECONDS`: timeout for regular isolated Codex CLI completion calls, default 180 seconds.
 - `CODEX_EXEC_AGENT_TIMEOUT_SECONDS`: timeout for Agent Q&A requests that run through Codex CLI, default 600 seconds, intended for custom skills that may search the web and prepare supporting material.
+- `CODEX_EXEC_AGENT_BACKGROUND_TIMEOUT_SECONDS`: timeout for background custom Codex skill Q&A jobs, default 7200 seconds. Completed Markdown results are written to repo-local `skill_out/`, and the same chat history receives a result link.
 
 When Agent Q&A uses `codex/<model>` as the primary model, the backend first gathers quote, K-line, technical, chip, and news context, then asks `codex exec` once for the final answer. This avoids treating Codex CLI as a multi-round function-calling model and prevents chats from sitting on the first thinking state for too long.
 
-The Q&A page's "Custom Inquiry" control can read `SKILL.md` files from local `$CODEX_HOME/skills` (default `~/.codex/skills`) plus project-local `.codex/skills` and `.agents/skills`. After a mode is added, the frontend sends the selected `codex_skill_id` to the backend, and the backend switches to Codex CLI agent mode for that skill. It no longer pre-runs DSA's built-in quote, K-line, technical, chip, or news tools, and it no longer stacks the default trading skill or fixed Q&A template on top.
+The Q&A page's "Custom Inquiry" control can read `SKILL.md` files from local `$CODEX_HOME/skills` (default `~/.codex/skills`) plus project-local `.codex/skills` and `.agents/skills`. After a mode is added, the frontend sends the selected `codex_skill_id` to the backend, and the backend runs that Codex CLI agent skill in the background. It no longer pre-runs DSA's built-in quote, K-line, technical, chip, or news tools, and it no longer stacks the default trading skill or fixed Q&A template on top. The page returns a background notice immediately; when the job finishes, a Markdown file is generated in `skill_out/` and linked from chat history.
 
 > Note: Codex CLI mode uses the local login session and local command execution environment. Enable it only in a trusted, isolated local or self-hosted environment. Vision/image extraction still requires a separate vision-capable API model.
 

@@ -28,6 +28,7 @@ DEFAULT_CODEX_EXEC_ARGS = (
 DEFAULT_CODEX_AGENT_ARGS = "--dangerously-bypass-approvals-and-sandbox"
 DEFAULT_CODEX_EXEC_TIMEOUT_SECONDS = 180
 DEFAULT_CODEX_AGENT_TIMEOUT_SECONDS = 600
+DEFAULT_CODEX_AGENT_BACKGROUND_TIMEOUT_SECONDS = 7200
 
 _COMPLETION_GUARD = """IMPORTANT:
 You are being used as a plain LLM completion backend for another application, not as a coding agent.
