@@ -222,7 +222,7 @@ describe('HomePage', () => {
     });
   });
 
-  it('opens indicator analysis from the watchlist action and removes the report overlay entry', async () => {
+  it('navigates to the standalone indicator analysis page from the watchlist action', async () => {
     vi.mocked(historyApi.getList).mockResolvedValue({
       total: 1,
       page: 1,
@@ -299,75 +299,8 @@ describe('HomePage', () => {
     const indicatorButton = await screen.findByRole('button', { name: '查看 贵州茅台 指标分析' });
     fireEvent.click(indicatorButton);
 
-    expect(await screen.findByTestId('indicator-analysis-modal')).toBeInTheDocument();
-    expect(stocksApi.getHistory).toHaveBeenCalledWith('600519', 120, 'daily');
-    expect(stocksApi.getQuote).toHaveBeenCalledWith('600519');
-    expect(stocksApi.getIndicatorMetrics).toHaveBeenCalledWith('600519');
-    expect(screen.getByRole('tab', { name: '日K' })).toHaveAttribute('aria-selected', 'true');
-    expect(screen.getByRole('tab', { name: '5分' })).toBeInTheDocument();
-    expect(await screen.findByText('MA5 / MA10 / MA20')).toBeInTheDocument();
-    expect(await screen.findByText('昨收 / 涨跌额')).toBeInTheDocument();
-    expect(screen.getByRole('slider', { name: 'K线时间窗口' })).toBeInTheDocument();
-    fireEvent.click(screen.getByRole('tab', { name: '1分' }));
-    await waitFor(() => {
-      expect(stocksApi.getHistory).toHaveBeenLastCalledWith('600519', 3, '1m');
-    });
-    expect(await screen.findByText('数据周期')).toBeInTheDocument();
-    expect(screen.getByText('1分 · 北京时间')).toBeInTheDocument();
-    expect(await screen.findByText('主力持仓与筹码分布')).toBeInTheDocument();
-    const marketStructureToggle = await screen.findByTestId('market-structure-toggle');
-    expect(marketStructureToggle).toHaveAttribute('aria-expanded', 'false');
-    expect(screen.queryByText('平均成本')).not.toBeInTheDocument();
-    expect(screen.queryByText('摩根士丹利')).not.toBeInTheDocument();
-
-    fireEvent.click(marketStructureToggle);
-    expect(marketStructureToggle).toHaveAttribute('aria-expanded', 'true');
-    expect(screen.getByRole('img', { name: '主力筹码趋势图' })).toBeInTheDocument();
-    const holderSelect = screen.getByRole('combobox', { name: '选择主力名称' });
-    expect(holderSelect).toHaveValue('all');
-    expect(within(holderSelect).getByRole('option', { name: '所有主力合计' })).toBeInTheDocument();
-    expect(within(holderSelect).getByRole('option', { name: '摩根士丹利 2.35%' })).toBeInTheDocument();
-    expect(screen.getByText('主力判断')).toBeInTheDocument();
-    expect(screen.getByText('主力指标')).toBeInTheDocument();
-    expect(screen.getByText('基础指标')).toBeInTheDocument();
-    expect(screen.getByText('当前主力')).toBeInTheDocument();
-    expect(screen.getByTestId('selected-holder-label')).toHaveTextContent('所有主力合计');
-    expect(screen.getByText('平均成本')).toBeInTheDocument();
-    expect(screen.getAllByText('118.50').length).toBeGreaterThan(0);
-    fireEvent.mouseEnter(await screen.findByTestId('market-structure-trend-point-2026-03-24'));
-    const structureTooltip = await screen.findByTestId('market-structure-trend-tooltip');
-    expect(within(structureTooltip).getByText('2026-03-24')).toBeInTheDocument();
-    expect(within(structureTooltip).getByText('收盘价')).toBeInTheDocument();
-    expect(within(structureTooltip).getByText('主力动能')).toBeInTheDocument();
-    fireEvent.mouseLeave(screen.getByTestId('market-structure-trend-point-2026-03-24'));
-    await waitFor(() => {
-      expect(screen.queryByTestId('market-structure-trend-tooltip')).not.toBeInTheDocument();
-    });
-    fireEvent.change(holderSelect, { target: { value: 'holder-0' } });
-    expect(holderSelect).toHaveValue('holder-0');
-    expect(screen.getByTestId('selected-holder-label')).toHaveTextContent('摩根士丹利 2.35%');
-    const klineToggle = screen.getByTestId('kline-chart-toggle');
-    expect(klineToggle).toHaveAttribute('aria-expanded', 'true');
-    expect(screen.getByRole('button', { name: '收起K线图' })).toBeInTheDocument();
+    expect(navigateMock).toHaveBeenCalledWith('/indicators/600519?name=%E8%B4%B5%E5%B7%9E%E8%8C%85%E5%8F%B0');
     expect(screen.queryByTestId('report-overlay')).not.toBeInTheDocument();
-
-    fireEvent.mouseEnter(await screen.findByTestId('indicator-chart-bar-2026-03-24'));
-    const tooltip = await screen.findByTestId('indicator-chart-tooltip');
-    expect(within(tooltip).getByText('2026-03-24')).toBeInTheDocument();
-    expect(within(tooltip).getByText('收盘')).toBeInTheDocument();
-    expect(within(tooltip).getByText('123.00')).toBeInTheDocument();
-    expect(within(tooltip).getByText('量比')).toBeInTheDocument();
-
-    fireEvent.mouseLeave(screen.getByTestId('indicator-chart-bar-2026-03-24'));
-    await waitFor(() => {
-      expect(screen.queryByTestId('indicator-chart-tooltip')).not.toBeInTheDocument();
-    });
-
-    fireEvent.keyDown(window, { key: 'Escape' });
-
-    await waitFor(() => {
-      expect(screen.queryByTestId('indicator-analysis-modal')).not.toBeInTheDocument();
-    });
 
     fireEvent.click(screen.getByRole('button', { name: '查看 贵州茅台 报告' }));
     const overlay = await screen.findByTestId('report-overlay');
@@ -416,18 +349,11 @@ describe('HomePage', () => {
     expect(screen.queryByRole('button', { name: '查看 贵州茅台 指标分析' })).not.toBeInTheDocument();
 
     fireEvent.click(screen.getByRole('button', { name: '查看 腾讯控股 指标分析' }));
-    expect(await screen.findByTestId('indicator-analysis-modal')).toBeInTheDocument();
-    expect(stocksApi.getHistory).toHaveBeenLastCalledWith('00700.HK', 120, 'daily');
-
-    fireEvent.keyDown(window, { key: 'Escape' });
-    await waitFor(() => {
-      expect(screen.queryByTestId('indicator-analysis-modal')).not.toBeInTheDocument();
-    });
+    expect(navigateMock).toHaveBeenLastCalledWith('/indicators/00700.HK?name=%E8%85%BE%E8%AE%AF%E6%8E%A7%E8%82%A1');
 
     fireEvent.click(screen.getByRole('button', { name: '美股' }));
     fireEvent.click(screen.getByRole('button', { name: '查看 阿里巴巴 指标分析' }));
-    expect(await screen.findByTestId('indicator-analysis-modal')).toBeInTheDocument();
-    expect(stocksApi.getHistory).toHaveBeenLastCalledWith('BABA', 120, 'daily');
+    expect(navigateMock).toHaveBeenLastCalledWith('/indicators/BABA?name=%E9%98%BF%E9%87%8C%E5%B7%B4%E5%B7%B4');
   });
 
   it('shows the empty report workspace when history is empty', async () => {

@@ -51,6 +51,15 @@ def get_market_for_stock(code: str) -> Optional[str]:
     if not code or not isinstance(code, str):
         return None
     code = (code or "").strip().upper()
+    normalized_code = code
+    if "." in normalized_code:
+        base, suffix = normalized_code.rsplit(".", 1)
+        if suffix in {"SH", "SZ", "BJ"} and base.isdigit():
+            normalized_code = base
+    for prefix in ("SH", "SZ", "BJ"):
+        if normalized_code.startswith(prefix) and normalized_code[len(prefix):].isdigit():
+            normalized_code = normalized_code[len(prefix):]
+            break
 
     from data_provider import is_us_stock_code, is_us_index_code, is_hk_stock_code
 
@@ -59,7 +68,7 @@ def get_market_for_stock(code: str) -> Optional[str]:
     if is_hk_stock_code(code):
         return "hk"
     # A-share: 6-digit numeric
-    if code.isdigit() and len(code) == 6:
+    if normalized_code.isdigit() and len(normalized_code) == 6:
         return "cn"
     return None
 

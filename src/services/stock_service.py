@@ -14,6 +14,7 @@ from datetime import datetime
 import math
 from typing import Optional, Dict, Any, List
 
+from src.core import trading_calendar
 from src.repositories.stock_repo import StockRepository
 
 logger = logging.getLogger(__name__)
@@ -234,11 +235,21 @@ class StockService:
             if normalized_period == "daily":
                 df, source = manager.get_daily_data(stock_code, days=days)
             else:
-                df, source = manager.get_intraday_data(
-                    stock_code,
-                    period=normalized_period,
-                    days=max(1, min(int(days or 1), 30)),
-                )
+                intraday_kwargs: Dict[str, Any] = {
+                    "period": normalized_period,
+                    "days": max(1, min(int(days or 1), 30)),
+                }
+                try:
+                    market = trading_calendar.get_market_for_stock(stock_code)
+                    if market in {"cn", "hk"}:
+                        market_today = trading_calendar.get_market_now(market).date()
+                        if not trading_calendar.is_market_open(market, market_today):
+                            effective_date = trading_calendar.get_effective_trading_date(market)
+                            intraday_kwargs["end_date"] = effective_date.isoformat()
+                except Exception as calendar_error:
+                    logger.debug("分钟K交易日锚定失败，按默认日期拉取: %s", calendar_error)
+
+                df, source = manager.get_intraday_data(stock_code, **intraday_kwargs)
             
             if df is None or df.empty:
                 logger.warning(f"获取 {stock_code} 历史数据失败")

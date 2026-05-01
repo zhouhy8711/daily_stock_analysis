@@ -50,6 +50,11 @@ class _FakeCalendar:
 
 
 class EffectiveTradingDateTestCase(unittest.TestCase):
+    def test_get_market_for_stock_accepts_a_share_suffix_and_prefix(self):
+        self.assertEqual(trading_calendar.get_market_for_stock("300274.SZ"), "cn")
+        self.assertEqual(trading_calendar.get_market_for_stock("688521.SH"), "cn")
+        self.assertEqual(trading_calendar.get_market_for_stock("SZ300274"), "cn")
+
     def test_weekend_returns_previous_session(self):
         fake_calendar = _FakeCalendar(
             sessions=[date(2026, 3, 26), date(2026, 3, 27)],

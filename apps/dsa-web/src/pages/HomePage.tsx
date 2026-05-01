@@ -8,19 +8,12 @@ import { useShellSidebarAction } from '../components/layout/ShellSidebarActionCo
 import { DashboardStateBlock } from '../components/dashboard';
 import { StockAutocomplete } from '../components/StockAutocomplete';
 import { HistoryList } from '../components/history';
-import { IndicatorAnalysisModal, ReportMarkdown, ReportSummary } from '../components/report';
+import { ReportMarkdown, ReportSummary } from '../components/report';
 import { WatchlistBoard, type WatchlistItem } from '../components/watchlist';
 import { useDashboardLifecycle, useHomeDashboardState } from '../hooks';
 import { getReportText, normalizeReportLanguage } from '../utils/reportLanguage';
 
 const normalizeWatchlistCode = (stockCode: string) => stockCode.trim().toUpperCase();
-
-type IndicatorAnalysisTarget = {
-  stockCode: string;
-  stockName: string;
-  currentPrice?: number;
-  changePct?: number;
-};
 
 const getWatchlistLookupKeys = (stockCode: string): string[] => {
   const code = normalizeWatchlistCode(stockCode);
@@ -59,7 +52,6 @@ const HomePage: React.FC = () => {
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
   const [reportOverlayOpen, setReportOverlayOpen] = useState(false);
-  const [indicatorAnalysisTarget, setIndicatorAnalysisTarget] = useState<IndicatorAnalysisTarget | null>(null);
   const [watchlistCodes, setWatchlistCodes] = useState<string[]>([]);
   const [selectedWatchlistCodes, setSelectedWatchlistCodes] = useState<string[]>([]);
   const [isLoadingWatchlist, setIsLoadingWatchlist] = useState(false);
@@ -219,7 +211,6 @@ const HomePage: React.FC = () => {
 
   const handleCloseReportOverlay = useCallback(() => {
     setReportOverlayOpen(false);
-    setIndicatorAnalysisTarget(null);
     setSidebarOpen(false);
     closeMarkdownDrawer();
   }, [closeMarkdownDrawer]);
@@ -233,16 +224,13 @@ const HomePage: React.FC = () => {
       if (event.key !== 'Escape') {
         return;
       }
-      if (indicatorAnalysisTarget) {
-        return;
-      }
       event.preventDefault();
       handleCloseReportOverlay();
     };
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [handleCloseReportOverlay, indicatorAnalysisTarget, reportOverlayOpen]);
+  }, [handleCloseReportOverlay, reportOverlayOpen]);
 
   const handleWatchlistItemOpen = useCallback((item: WatchlistItem) => {
     if (item.recordId === undefined) {
@@ -261,13 +249,16 @@ const HomePage: React.FC = () => {
   }, [selectHistoryItem, submitAnalysis]);
 
   const handleOpenIndicatorAnalysis = useCallback((item: WatchlistItem) => {
-    setIndicatorAnalysisTarget({
-      stockCode: item.stockCode,
-      stockName: item.stockName || item.stockCode,
-      currentPrice: item.currentPrice,
-      changePct: item.changePct,
-    });
-  }, []);
+    const params = new URLSearchParams();
+    params.set('name', item.stockName || item.stockCode);
+    if (typeof item.currentPrice === 'number' && Number.isFinite(item.currentPrice)) {
+      params.set('price', String(item.currentPrice));
+    }
+    if (typeof item.changePct === 'number' && Number.isFinite(item.changePct)) {
+      params.set('changePct', String(item.changePct));
+    }
+    navigate(`/indicators/${encodeURIComponent(item.stockCode)}?${params.toString()}`);
+  }, [navigate]);
 
   const toggleWatchlistSelection = useCallback((stockCode: string) => {
     setSelectedWatchlistCodes((current) => {
@@ -635,16 +626,6 @@ const HomePage: React.FC = () => {
             </div>
           </div>
         </div>
-      ) : null}
-
-      {indicatorAnalysisTarget ? (
-        <IndicatorAnalysisModal
-          stockCode={indicatorAnalysisTarget.stockCode}
-          stockName={indicatorAnalysisTarget.stockName}
-          reportCurrentPrice={indicatorAnalysisTarget.currentPrice}
-          reportChangePct={indicatorAnalysisTarget.changePct}
-          onClose={() => setIndicatorAnalysisTarget(null)}
-        />
       ) : null}
 
       {reportOverlayOpen && markdownDrawerOpen && selectedReport?.meta.id ? (

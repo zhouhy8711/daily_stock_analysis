@@ -1,3 +1,4 @@
+from datetime import date, datetime
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -74,7 +75,11 @@ class _FakeManager:
 
 
 class _FakeHistoryManager:
-    def get_intraday_data(self, stock_code, period="5m", days=1, **_kwargs):
+    def __init__(self):
+        self.last_intraday_kwargs = {}
+
+    def get_intraday_data(self, stock_code, period="5m", days=1, **kwargs):
+        self.last_intraday_kwargs = {"period": period, "days": days, **kwargs}
         assert stock_code == "600519"
         assert period == "5m"
         assert days == 1
@@ -134,3 +139,19 @@ def test_history_data_supports_intraday_period() -> None:
     assert result["data"][0]["date"] == "2026-04-30 09:35"
     assert result["data"][0]["open"] == 1408.0
     assert result["data"][1]["change_percent"] == -0.11
+
+
+def test_history_data_anchors_cn_intraday_to_previous_session_when_market_closed() -> None:
+    manager = _FakeHistoryManager()
+
+    with (
+        patch("data_provider.base.DataFetcherManager", return_value=manager),
+        patch("src.services.stock_service.trading_calendar.get_market_for_stock", return_value="cn"),
+        patch("src.services.stock_service.trading_calendar.get_market_now", return_value=datetime(2026, 5, 1, 10, 0)),
+        patch("src.services.stock_service.trading_calendar.is_market_open", return_value=False),
+        patch("src.services.stock_service.trading_calendar.get_effective_trading_date", return_value=date(2026, 4, 30)),
+    ):
+        result = StockService().get_history_data("600519", period="5m", days=1)
+
+    assert result["period"] == "5m"
+    assert manager.last_intraday_kwargs["end_date"] == "2026-04-30"

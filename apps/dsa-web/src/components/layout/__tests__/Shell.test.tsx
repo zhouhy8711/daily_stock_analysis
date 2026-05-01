@@ -87,4 +87,25 @@ describe('Shell', () => {
     fireEvent.click(screen.getByRole('button', { name: '确认退出' }));
     expect(mockLogout).toHaveBeenCalled();
   });
+
+  it('collapses the desktop sidebar into icon-only navigation', () => {
+    render(
+      <MemoryRouter initialEntries={['/']}>
+        <ThemeProvider>
+          <Shell>
+            <div>page content</div>
+          </Shell>
+        </ThemeProvider>
+      </MemoryRouter>
+    );
+
+    expect(screen.getByText('DSA')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: '收拢侧边栏' }));
+
+    expect(screen.getByRole('button', { name: '展开侧边栏' })).toBeInTheDocument();
+    expect(screen.queryByText('DSA')).not.toBeInTheDocument();
+    expect(screen.getByRole('link', { name: '首页' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '退出' })).toBeInTheDocument();
+  });
 });

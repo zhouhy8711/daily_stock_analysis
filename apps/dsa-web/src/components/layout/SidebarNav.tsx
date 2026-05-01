@@ -103,6 +103,7 @@ export const SidebarNav: React.FC<SidebarNavProps> = ({ collapsed = false, onNav
       {authEnabled ? (
         <button
           type="button"
+          aria-label="退出"
           onClick={() => setShowLogoutConfirm(true)}
           className={cn(
             'mt-5 flex h-11 w-full cursor-pointer select-none items-center gap-3 rounded-2xl border border-transparent px-3 text-sm text-secondary-text transition-all hover:border-border/70 hover:bg-hover hover:text-foreground',

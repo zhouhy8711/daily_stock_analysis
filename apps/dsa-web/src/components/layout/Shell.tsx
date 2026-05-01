@@ -1,6 +1,6 @@
 import type React from 'react';
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { Menu } from 'lucide-react';
+import { Menu, PanelLeftClose, PanelLeftOpen } from 'lucide-react';
 import { Outlet } from 'react-router-dom';
 import { Drawer } from '../common/Drawer';
 import { SidebarNav } from './SidebarNav';
@@ -15,7 +15,7 @@ type ShellProps = {
 export const Shell: React.FC<ShellProps> = ({ children }) => {
   const [mobileOpen, setMobileOpen] = useState(false);
   const [sidebarAction, setSidebarActionState] = useState<React.ReactNode | null>(null);
-  const collapsed = false;
+  const [collapsed, setCollapsed] = useState(false);
 
   const setSidebarAction = useCallback((action: React.ReactNode | null) => {
     setSidebarActionState(action);
@@ -69,9 +69,17 @@ export const Shell: React.FC<ShellProps> = ({ children }) => {
           )}
         >
           <aside
-            className="rounded-[1.5rem] border border-[var(--shell-sidebar-border)] bg-card/72 p-2 shadow-soft-card backdrop-blur-sm"
+            className="relative rounded-[1.5rem] border border-[var(--shell-sidebar-border)] bg-card/72 p-2 shadow-soft-card backdrop-blur-sm"
             aria-label="桌面侧边导航"
           >
+            <button
+              type="button"
+              aria-label={collapsed ? '展开侧边栏' : '收拢侧边栏'}
+              onClick={() => setCollapsed((value) => !value)}
+              className="absolute -right-2 top-5 z-10 inline-flex h-6 w-6 items-center justify-center rounded-full border border-border/70 bg-card text-muted-text shadow-soft-card transition-colors hover:border-primary/50 hover:text-primary"
+            >
+              {collapsed ? <PanelLeftOpen className="h-3.5 w-3.5" /> : <PanelLeftClose className="h-3.5 w-3.5" />}
+            </button>
             <SidebarNav collapsed={collapsed} onNavigate={() => setMobileOpen(false)} />
           </aside>
           {sidebarAction ? (

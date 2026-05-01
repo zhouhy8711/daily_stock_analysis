@@ -1,6 +1,18 @@
 import type React from 'react';
-import { useEffect, useMemo, useRef, useState } from 'react';
-import { Activity, BarChart3, ChevronDown, ChevronLeft, ChevronRight, LineChart, Users, X } from 'lucide-react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import {
+  Activity,
+  ArrowLeft,
+  BarChart3,
+  ChevronDown,
+  ChevronLeft,
+  ChevronRight,
+  Layers3,
+  LineChart,
+  Radio,
+  Users,
+  X,
+} from 'lucide-react';
 import {
   stocksApi,
   type ChipDistributionMetrics,
@@ -21,11 +33,32 @@ type IndicatorAnalysisModalProps = {
   onClose: () => void;
 };
 
+type IndicatorAnalysisViewProps = {
+  stockCode: string;
+  stockName: string;
+  reportCurrentPrice?: number;
+  reportChangePct?: number;
+  onClose?: () => void;
+  variant?: 'page' | 'modal';
+};
+
 type ChartPoint = KLineData & {
   ma5?: number;
   ma10?: number;
   ma20?: number;
+  ma30?: number;
+  ma60?: number;
   volumeMa5?: number;
+  volumeMa10?: number;
+  amountMa5?: number;
+  amountMa10?: number;
+  ema12?: number;
+  ema26?: number;
+  dif?: number;
+  dea?: number;
+  macd?: number;
+  rsi6?: number;
+  rsi12?: number;
 };
 
 type HistoryState = {
@@ -38,6 +71,8 @@ type HistoryState = {
   isLoading: boolean;
   error: string | null;
 };
+
+type HistoryCache = Partial<Record<KLinePeriod, HistoryState>>;
 
 type StructureTrendPoint = {
   date: string;
@@ -78,6 +113,21 @@ type HolderScopeProfile = {
   ratio?: number;
 };
 
+type OrderFlowMetric = {
+  label: string;
+  value?: number;
+  ratio: number;
+  tone: MainForceVariant | 'neutral';
+};
+
+type ChartMenuState = {
+  x: number;
+  y: number;
+};
+
+type VolumeIndicatorMode = 'volume' | 'amount' | 'volumeMa';
+type MomentumIndicatorMode = 'macd' | 'rsi';
+
 const EMPTY_HISTORY: KLineData[] = [];
 const EMPTY_HOLDERS: MajorHolder[] = [];
 const ALL_HOLDERS_KEY = 'all';
@@ -89,16 +139,51 @@ const KLINE_PERIOD_OPTIONS: Array<{ value: KLinePeriod; label: string; days: num
   { value: '30m', label: '30分', days: 3 },
   { value: '60m', label: '60分', days: 3 },
 ];
+const INTRADAY_PERIOD_OPTIONS = KLINE_PERIOD_OPTIONS.filter((option) => option.value !== 'daily');
 const MAX_VISIBLE_KLINE_POINTS = 80;
+const MIN_VISIBLE_KLINE_POINTS = 24;
+const MAX_EXPANDED_KLINE_POINTS = 160;
 const ONE_MINUTE_REFRESH_MS = 10_000;
 const LINE_COLORS = {
-  close: '#e5e7eb',
-  avgCost: '#f59e0b',
-  force: '#22d3ee',
-  profit: '#a855f7',
-  ma5: '#f59e0b',
-  ma10: '#22d3ee',
-  ma20: '#a855f7',
+  close: 'var(--indicator-line-close)',
+  avgCost: 'var(--indicator-line-avg-cost)',
+  force: 'var(--indicator-line-force)',
+  profit: 'var(--indicator-line-profit)',
+  ma5: 'var(--indicator-line-ma5)',
+  ma10: 'var(--indicator-line-ma10)',
+  ma20: 'var(--indicator-line-ma20)',
+  ma30: 'var(--indicator-line-ma30)',
+  ma60: 'var(--indicator-line-ma60)',
+};
+const TERMINAL_COLORS = {
+  bg: 'var(--indicator-chart-bg)',
+  panel: 'var(--indicator-chart-panel)',
+  panel2: 'var(--indicator-chart-panel-strong)',
+  redGrid: 'var(--indicator-chart-grid)',
+  redGridSoft: 'var(--indicator-chart-grid-soft)',
+  axis: 'var(--indicator-chart-axis)',
+  axisText: 'var(--indicator-chart-axis-text)',
+  text: 'var(--indicator-chart-text)',
+  muted: 'var(--indicator-chart-muted)',
+  cyan: 'var(--indicator-chart-cyan)',
+  orange: 'var(--indicator-chart-orange)',
+  green: 'var(--indicator-chart-green)',
+  blue: 'var(--indicator-chart-blue)',
+  yellow: 'var(--indicator-chart-yellow)',
+  purple: 'var(--indicator-chart-purple)',
+  white: 'var(--indicator-chart-contrast)',
+  selectedText: 'var(--indicator-chart-selected-text)',
+  activeTabBg: 'var(--indicator-chart-active-tab-bg)',
+  priceTagBg: 'var(--indicator-chart-price-tag-bg)',
+  priceTagText: 'var(--indicator-chart-price-tag-text)',
+  tooltipBg: 'var(--indicator-chart-tooltip-bg)',
+  tooltipBorder: 'var(--indicator-chart-tooltip-border)',
+  tooltipText: 'var(--indicator-chart-tooltip-text)',
+  tooltipMuted: 'var(--indicator-chart-tooltip-muted)',
+  chipBlue: 'var(--indicator-chart-chip-blue)',
+  positiveStroke: 'var(--indicator-chart-positive-stroke)',
+  negativeStroke: 'var(--indicator-chart-negative-stroke)',
+  shadow: 'var(--indicator-chart-shadow)',
 };
 const BASE_HOLDER_PROFILE: HolderScopeProfile = {
   isAll: true,
@@ -154,6 +239,69 @@ function getTimeMeta(stockCode: string) {
     klineLabel: '北京时间',
     quoteLabel: '北京时间',
   };
+}
+
+function createHistoryState(
+  stockCode: string,
+  period: KLinePeriod,
+  overrides: Partial<HistoryState> = {},
+): HistoryState {
+  return {
+    stockCode,
+    period,
+    history: [],
+    quote: null,
+    metrics: null,
+    metricsError: null,
+    isLoading: true,
+    error: null,
+    ...overrides,
+  };
+}
+
+function getKLineDateOnly(value?: string | null): string | null {
+  if (!value) {
+    return null;
+  }
+  const match = value.match(/^\d{4}-\d{2}-\d{2}/);
+  return match?.[0] ?? null;
+}
+
+function getLatestHistoryDate(history: KLineData[]): string | null {
+  for (let index = history.length - 1; index >= 0; index -= 1) {
+    const date = getKLineDateOnly(history[index]?.date);
+    if (date) {
+      return date;
+    }
+  }
+  return null;
+}
+
+function normalizeHistoryForPeriod(
+  history: KLineData[],
+  period: KLinePeriod,
+  market: 'cn' | 'hk' | 'us',
+  dailyCutoffDate?: string | null,
+): KLineData[] {
+  if (period === 'daily' || market === 'us' || !dailyCutoffDate) {
+    return history;
+  }
+
+  const uniqueDates = Array.from(new Set(
+    history.map((item) => getKLineDateOnly(item.date)).filter((date): date is string => Boolean(date)),
+  ));
+  if (uniqueDates.length === 1 && uniqueDates[0] && uniqueDates[0] > dailyCutoffDate) {
+    const staleDate = uniqueDates[0];
+    return history.map((item) => ({
+      ...item,
+      date: item.date.replace(staleDate, dailyCutoffDate),
+    }));
+  }
+
+  return history.filter((item) => {
+    const itemDate = getKLineDateOnly(item.date);
+    return !itemDate || itemDate <= dailyCutoffDate;
+  });
 }
 
 function formatAxisDate(value: string, period: KLinePeriod): string {
@@ -250,14 +398,69 @@ function movingAverage(data: KLineData[], index: number, period: number, pick: (
   return values.reduce((sum, value) => sum + value, 0) / period;
 }
 
+function relativeStrengthIndex(data: KLineData[], index: number, period: number): number | undefined {
+  if (index < period) {
+    return undefined;
+  }
+
+  let gains = 0;
+  let losses = 0;
+  for (let offset = index - period + 1; offset <= index; offset += 1) {
+    const previous = data[offset - 1];
+    const current = data[offset];
+    if (!previous || !current) {
+      return undefined;
+    }
+    const change = current.close - previous.close;
+    if (change >= 0) {
+      gains += change;
+    } else {
+      losses += Math.abs(change);
+    }
+  }
+
+  if (gains === 0 && losses === 0) {
+    return 50;
+  }
+  if (losses === 0) {
+    return 100;
+  }
+  const rs = gains / losses;
+  return 100 - (100 / (1 + rs));
+}
+
 function buildChartPoints(data: KLineData[]): ChartPoint[] {
-  return data.map((item, index) => ({
-    ...item,
-    ma5: movingAverage(data, index, 5, (point) => point.close),
-    ma10: movingAverage(data, index, 10, (point) => point.close),
-    ma20: movingAverage(data, index, 20, (point) => point.close),
-    volumeMa5: movingAverage(data, index, 5, (point) => point.volume ?? undefined),
-  }));
+  let ema12: number | undefined;
+  let ema26: number | undefined;
+  let dea = 0;
+
+  return data.map((item, index) => {
+    const close = item.close;
+    ema12 = typeof ema12 === 'number' ? (close * (2 / 13)) + (ema12 * (11 / 13)) : close;
+    ema26 = typeof ema26 === 'number' ? (close * (2 / 27)) + (ema26 * (25 / 27)) : close;
+    const dif = ema12 - ema26;
+    dea = index === 0 ? dif : (dif * (2 / 10)) + (dea * (8 / 10));
+
+    return {
+      ...item,
+      ma5: movingAverage(data, index, 5, (point) => point.close),
+      ma10: movingAverage(data, index, 10, (point) => point.close),
+      ma20: movingAverage(data, index, 20, (point) => point.close),
+      ma30: movingAverage(data, index, 30, (point) => point.close),
+      ma60: movingAverage(data, index, 60, (point) => point.close),
+      volumeMa5: movingAverage(data, index, 5, (point) => point.volume ?? undefined),
+      volumeMa10: movingAverage(data, index, 10, (point) => point.volume ?? undefined),
+      amountMa5: movingAverage(data, index, 5, (point) => point.amount ?? undefined),
+      amountMa10: movingAverage(data, index, 10, (point) => point.amount ?? undefined),
+      ema12,
+      ema26,
+      dif,
+      dea,
+      macd: (dif - dea) * 2,
+      rsi6: relativeStrengthIndex(data, index, 6),
+      rsi12: relativeStrengthIndex(data, index, 12),
+    };
+  });
 }
 
 function getRecentReturn(points: ChartPoint[], period: number): number | undefined {
@@ -270,25 +473,6 @@ function getRecentReturn(points: ChartPoint[], period: number): number | undefin
     return undefined;
   }
   return ((latest.close - previous.close) / previous.close) * 100;
-}
-
-function getTrendLabel(latest?: ChartPoint): string {
-  if (!latest?.ma5 || !latest.ma10 || !latest.ma20) {
-    return '数据不足';
-  }
-  if (latest.close > latest.ma5 && latest.ma5 > latest.ma10 && latest.ma10 > latest.ma20) {
-    return '多头排列';
-  }
-  if (latest.close < latest.ma5 && latest.ma5 < latest.ma10 && latest.ma10 < latest.ma20) {
-    return '空头排列';
-  }
-  if (latest.close > latest.ma20) {
-    return '震荡偏强';
-  }
-  if (latest.close < latest.ma20) {
-    return '震荡偏弱';
-  }
-  return '横盘震荡';
 }
 
 function getPointChange(point: ChartPoint, previous?: ChartPoint): number | undefined {
@@ -339,6 +523,12 @@ function formatHolderLabel(holder: MajorHolder): string {
 
 function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value));
+}
+
+function getVisiblePointCount(total: number, zoomLevel: number): number {
+  const base = Math.min(MAX_VISIBLE_KLINE_POINTS, total);
+  const zoomed = Math.round(base / (1.45 ** zoomLevel));
+  return clamp(zoomed, Math.min(MIN_VISIBLE_KLINE_POINTS, total), Math.min(MAX_EXPANDED_KLINE_POINTS, total));
 }
 
 function getValueToneClass(tone?: MainForceVariant | 'neutral'): string {
@@ -781,6 +971,130 @@ function buildMainForceSignal(
   };
 }
 
+function getMetricTone(value?: number | null, deadZone = 0): MainForceVariant | 'neutral' {
+  if (typeof value !== 'number' || Number.isNaN(value)) {
+    return 'neutral';
+  }
+  if (value > deadZone) {
+    return 'success';
+  }
+  if (value < -deadZone) {
+    return 'danger';
+  }
+  return 'warning';
+}
+
+function getLatestChangePct(points: ChartPoint[], quote: StockQuote | null): number | undefined {
+  const latest = points.at(-1);
+  const previous = points.at(-2);
+  return quote?.changePercent
+    ?? latest?.changePercent
+    ?? (latest && previous?.close ? ((latest.close - previous.close) / previous.close) * 100 : undefined);
+}
+
+function buildOrderFlowMetrics(
+  points: ChartPoint[],
+  quote: StockQuote | null,
+): { rows: OrderFlowMetric[]; sourceLabel: string; updatedAt?: string | null; netTotal?: number } {
+  const latest = points.at(-1);
+  const amount = quote?.amount
+    ?? latest?.amount
+    ?? (latest?.close && latest?.volume ? latest.close * latest.volume : undefined);
+  const changePct = getLatestChangePct(points, quote) ?? 0;
+  const return5 = getRecentReturn(points, 5) ?? 0;
+  const volumeRatio = quote?.volumeRatio ?? (
+    latest?.volume && latest.volumeMa5 ? latest.volume / latest.volumeMa5 : undefined
+  );
+  const flowRatio = clamp(
+    (changePct / 100) * 0.9
+      + (return5 / 100) * 0.32
+      + ((volumeRatio ?? 1) - 1) * 0.055,
+    -0.26,
+    0.26,
+  );
+  const netTotal = typeof amount === 'number' && Number.isFinite(amount) ? amount * flowRatio : undefined;
+
+  const bucketConfig = [
+    { label: '净特大单', weight: 0.44 },
+    { label: '净大单', weight: 0.30 },
+    { label: '净中单', weight: 0.18 },
+    { label: '净小单', weight: -0.08 },
+  ];
+  const maxAbs = typeof netTotal === 'number'
+    ? Math.max(...bucketConfig.map((bucket) => Math.abs(netTotal * bucket.weight)), 1)
+    : 1;
+
+  return {
+    rows: bucketConfig.map((bucket) => {
+      const value = typeof netTotal === 'number' ? netTotal * bucket.weight : undefined;
+      return {
+        label: bucket.label,
+        value,
+        ratio: typeof value === 'number' ? Math.min(Math.abs(value) / maxAbs, 1) : 0,
+        tone: getMetricTone(value, (amount ?? 0) * 0.002),
+      };
+    }),
+    sourceLabel: quote?.source ? `实时行情 · ${quote.source}` : '价量估算',
+    updatedAt: quote?.updateTime,
+    netTotal,
+  };
+}
+
+function buildChipPeakRows(points: ChartPoint[], chip?: ChipDistributionMetrics | null) {
+  const weightedPrices = points
+    .slice(-120)
+    .map((point) => ({ price: point.close, weight: point.volume ?? 0 }))
+    .filter((item) => item.price > 0 && item.weight > 0);
+  const latestClose = points.at(-1)?.close;
+  const anchors = [
+    chip?.cost90Low,
+    chip?.cost90High,
+    chip?.cost70Low,
+    chip?.cost70High,
+    chip?.avgCost,
+    latestClose,
+  ].filter((value): value is number => typeof value === 'number' && Number.isFinite(value) && value > 0);
+  const priceValues = [
+    ...weightedPrices.map((item) => item.price),
+    ...anchors,
+  ];
+
+  if (priceValues.length === 0) {
+    return [];
+  }
+
+  const minPrice = Math.min(...priceValues);
+  const maxPrice = Math.max(...priceValues);
+  const padding = Math.max((maxPrice - minPrice) * 0.08, maxPrice * 0.005, 0.01);
+  const floor = Math.max(0, minPrice - padding);
+  const ceiling = maxPrice + padding;
+  const bucketCount = 18;
+  const step = Math.max((ceiling - floor) / bucketCount, 0.01);
+  const buckets = Array.from({ length: bucketCount }, (_, index) => ({
+    low: floor + index * step,
+    high: floor + (index + 1) * step,
+    weight: 0,
+  }));
+
+  weightedPrices.forEach((item) => {
+    const index = clamp(Math.floor((item.price - floor) / step), 0, bucketCount - 1);
+    buckets[index].weight += item.weight;
+  });
+
+  const maxWeight = Math.max(...buckets.map((bucket) => bucket.weight), 1);
+  return buckets
+    .map((bucket) => {
+      const price = (bucket.low + bucket.high) / 2;
+      return {
+        price,
+        ratio: bucket.weight / maxWeight,
+        isAvgCost: typeof chip?.avgCost === 'number' && Math.abs(price - chip.avgCost) <= step / 2,
+        isCurrent: typeof latestClose === 'number' && Math.abs(price - latestClose) <= step / 2,
+      };
+    })
+    .sort((a, b) => b.price - a.price);
+}
+
 function buildPath(
   points: ChartPoint[],
   width: number,
@@ -829,132 +1143,264 @@ function buildTrendPath<T>(
   }).join(' ');
 }
 
-const ChartLegend: React.FC = () => (
-  <div className="flex flex-wrap items-center gap-3 text-[11px] text-muted-text">
-    <span className="inline-flex items-center gap-1"><i className="h-2 w-4 rounded bg-success" />阳线</span>
-    <span className="inline-flex items-center gap-1"><i className="h-2 w-4 rounded bg-danger" />阴线</span>
-    <span className="inline-flex items-center gap-1"><i className="h-0.5 w-5" style={{ backgroundColor: LINE_COLORS.ma5 }} />MA5</span>
-    <span className="inline-flex items-center gap-1"><i className="h-0.5 w-5" style={{ backgroundColor: LINE_COLORS.ma10 }} />MA10</span>
-    <span className="inline-flex items-center gap-1"><i className="h-0.5 w-5" style={{ backgroundColor: LINE_COLORS.ma20 }} />MA20</span>
+const ChartLegend: React.FC<{ latest?: ChartPoint; periodLabel: string }> = ({ latest, periodLabel }) => (
+  <div className="flex flex-wrap items-center gap-x-3 gap-y-1 font-mono text-[11px] leading-none">
+    <span style={{ color: TERMINAL_COLORS.text }}>{periodLabel}</span>
+    <span className="inline-flex items-center gap-1" style={{ color: TERMINAL_COLORS.cyan }}>
+      <i className="h-2 w-4 border" style={{ borderColor: TERMINAL_COLORS.cyan, backgroundColor: TERMINAL_COLORS.cyan }} />阳线
+    </span>
+    <span className="inline-flex items-center gap-1" style={{ color: TERMINAL_COLORS.orange }}>
+      <i className="h-2 w-4 border bg-transparent" style={{ borderColor: TERMINAL_COLORS.orange }} />阴线
+    </span>
+    <span style={{ color: LINE_COLORS.ma5 }}>MA5:{formatNumber(latest?.ma5)}</span>
+    <span style={{ color: LINE_COLORS.ma10 }}>MA10:{formatNumber(latest?.ma10)}</span>
+    <span style={{ color: LINE_COLORS.ma20 }}>MA20:{formatNumber(latest?.ma20)}</span>
+    <span style={{ color: LINE_COLORS.ma30 }}>MA30:{formatNumber(latest?.ma30)}</span>
+    <span style={{ color: LINE_COLORS.ma60 }}>MA60:{formatNumber(latest?.ma60)}</span>
+  </div>
+);
+
+const TerminalTabs: React.FC<{
+  labels: string[];
+  activeIndex?: number;
+  onSelect?: (index: number) => void;
+}> = ({ labels, activeIndex = 0, onSelect }) => (
+  <div className="flex min-w-max items-center border-t font-mono text-[10px] leading-none" style={{ borderColor: TERMINAL_COLORS.redGrid }}>
+    {labels.map((label, index) => (
+      <button
+        key={`${label}-${index}`}
+        type="button"
+        onClick={() => onSelect?.(index)}
+        className="border-r px-2 py-1"
+        style={{
+          borderColor: TERMINAL_COLORS.redGrid,
+          backgroundColor: index === activeIndex ? TERMINAL_COLORS.activeTabBg : TERMINAL_COLORS.panel,
+          color: index === activeIndex ? TERMINAL_COLORS.text : TERMINAL_COLORS.muted,
+        }}
+      >
+        {label}
+      </button>
+    ))}
   </div>
 );
 
 const CandlestickChart: React.FC<{
   points: ChartPoint[];
+  visible: ChartPoint[];
+  visibleStartIndex: number;
+  visibleCount: number;
+  safeWindowStart: number;
+  maxWindowStart: number;
+  hoveredIndex: number | null;
+  onHoverIndexChange: (index: number | null) => void;
+  onWindowStartChange: (value: number) => void;
+  onOpenChartMenu: (event: React.MouseEvent) => void;
   period: KLinePeriod;
   periodLabel: string;
   recentLabel: string;
   sampleUnit: string;
   timeZoneLabel: string;
-}> = ({ points, period, periodLabel, recentLabel, sampleUnit, timeZoneLabel }) => {
-  const [hoveredIndex, setHoveredIndex] = useState<number | null>(null);
-  const width = 960;
-  const priceTop = 24;
-  const priceHeight = 310;
-  const volumeTop = 362;
-  const volumeHeight = 110;
-  const visibleCount = Math.min(points.length, MAX_VISIBLE_KLINE_POINTS);
-  const maxWindowStart = Math.max(points.length - visibleCount, 0);
-  const [windowStart, setWindowStart] = useState(maxWindowStart);
-  const safeWindowStart = clamp(windowStart, 0, maxWindowStart);
-  const visibleStartIndex = safeWindowStart;
-  const visible = points.slice(safeWindowStart, safeWindowStart + visibleCount);
+  selectedPeriod: KLinePeriod;
+  onPeriodChange: (period: KLinePeriod) => void;
+}> = ({
+  points,
+  visible,
+  visibleStartIndex,
+  visibleCount,
+  safeWindowStart,
+  maxWindowStart,
+  hoveredIndex,
+  onHoverIndexChange,
+  onWindowStartChange,
+  onOpenChartMenu,
+  period,
+  periodLabel,
+  recentLabel,
+  sampleUnit,
+  timeZoneLabel,
+  selectedPeriod,
+  onPeriodChange,
+}) => {
+  const width = 1320;
+  const axisWidth = 64;
+  const plotRight = width - axisWidth;
+  const priceTop = 18;
+  const priceHeight = 264;
+  const chartBottom = 306;
   const canPan = maxWindowStart > 0;
   const visibleFirst = visible[0];
   const visibleLast = visible.at(-1);
-  const priceValues = visible.flatMap((point) => [point.high, point.low, point.ma5, point.ma10, point.ma20])
+  const priceValues = visible.flatMap((point) => [
+    point.high,
+    point.low,
+    point.ma5,
+    point.ma10,
+    point.ma20,
+    point.ma30,
+    point.ma60,
+  ])
     .filter((value): value is number => typeof value === 'number' && !Number.isNaN(value));
   const maxPrice = Math.max(...priceValues);
   const minPrice = Math.min(...priceValues);
   const pricePadding = Math.max((maxPrice - minPrice) * 0.08, 0.01);
   const chartMax = maxPrice + pricePadding;
   const chartMin = Math.max(0, minPrice - pricePadding);
-  const maxVolume = Math.max(...visible.map((point) => point.volume ?? 0), 1);
-  const step = width / Math.max(visible.length - 1, 1);
+  const step = plotRight / Math.max(visible.length - 1, 1);
   const bodyWidth = Math.max(3, Math.min(9, step * 0.55));
   const priceRange = Math.max(chartMax - chartMin, 0.01);
 
   const yForPrice = (value: number) => priceTop + ((chartMax - value) / priceRange) * priceHeight;
-  const yForVolume = (value?: number | null) => volumeTop + volumeHeight - ((value ?? 0) / maxVolume) * volumeHeight;
 
-  const ma5Path = buildPath(visible, width, priceTop, priceHeight, chartMin, chartMax, (point) => point.ma5);
-  const ma10Path = buildPath(visible, width, priceTop, priceHeight, chartMin, chartMax, (point) => point.ma10);
-  const ma20Path = buildPath(visible, width, priceTop, priceHeight, chartMin, chartMax, (point) => point.ma20);
-  const hoveredPoint = hoveredIndex === null ? null : visible[hoveredIndex];
-  const hoveredPrevious = hoveredIndex === null ? undefined : points[visibleStartIndex + hoveredIndex - 1];
-  const hoveredX = hoveredIndex === null ? 0 : hoveredIndex * step;
-  const tooltipWidth = 250;
-  const tooltipHeight = 222;
-  const tooltipX = hoveredX > width - tooltipWidth - 18 ? hoveredX - tooltipWidth - 14 : hoveredX + 14;
+  const ma5Path = buildPath(visible, plotRight, priceTop, priceHeight, chartMin, chartMax, (point) => point.ma5);
+  const ma10Path = buildPath(visible, plotRight, priceTop, priceHeight, chartMin, chartMax, (point) => point.ma10);
+  const ma20Path = buildPath(visible, plotRight, priceTop, priceHeight, chartMin, chartMax, (point) => point.ma20);
+  const ma30Path = buildPath(visible, plotRight, priceTop, priceHeight, chartMin, chartMax, (point) => point.ma30);
+  const ma60Path = buildPath(visible, plotRight, priceTop, priceHeight, chartMin, chartMax, (point) => point.ma60);
+  const hoveredVisibleIndex = hoveredIndex !== null && hoveredIndex >= visibleStartIndex && hoveredIndex < visibleStartIndex + visible.length
+    ? hoveredIndex - visibleStartIndex
+    : null;
+  const hoveredPoint = hoveredVisibleIndex === null ? null : visible[hoveredVisibleIndex];
+  const hoveredPrevious = hoveredIndex === null ? undefined : points[hoveredIndex - 1];
+  const hoveredX = hoveredVisibleIndex === null ? 0 : hoveredVisibleIndex * step;
+  const tooltipWidth = 238;
+  const tooltipHeight = 206;
+  const tooltipX = hoveredX > plotRight - tooltipWidth - 18 ? hoveredX - tooltipWidth - 14 : hoveredX + 14;
   const tooltipY = priceTop + 12;
+  const latestCloseY = typeof visibleLast?.close === 'number' ? yForPrice(visibleLast.close) : null;
 
   const shiftWindow = (direction: -1 | 1) => {
-    setWindowStart((current) => clamp(current + direction * visibleCount, 0, maxWindowStart));
-    setHoveredIndex(null);
+    onWindowStartChange(clamp(safeWindowStart + direction * visibleCount, 0, maxWindowStart));
+    onHoverIndexChange(null);
   };
 
   return (
-    <div className="rounded-xl border border-subtle bg-surface/75 p-3">
-      <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
-        <ChartLegend />
-        <span className="text-[11px] text-muted-text">
+    <div
+      className="overflow-hidden"
+      style={{ backgroundColor: TERMINAL_COLORS.bg }}
+      onContextMenu={onOpenChartMenu}
+    >
+      <div className="flex flex-wrap items-center justify-between gap-2 border-b px-2 py-1" style={{ borderColor: TERMINAL_COLORS.redGrid, backgroundColor: TERMINAL_COLORS.panel }}>
+        <div className="flex min-w-0 flex-wrap items-center gap-2">
+          <div
+            role="tablist"
+            aria-label="K线周期"
+            className="inline-flex items-center border font-mono text-[10px]"
+            style={{ borderColor: TERMINAL_COLORS.redGrid }}
+          >
+            {KLINE_PERIOD_OPTIONS.map((option) => {
+              const selected = selectedPeriod === option.value;
+              return (
+                <button
+                  key={option.value}
+                  type="button"
+                  role="tab"
+                  aria-selected={selected}
+                  onClick={() => onPeriodChange(option.value)}
+                  className="border-r px-2 py-1 last:border-r-0"
+                  style={{
+                    borderColor: TERMINAL_COLORS.redGrid,
+                    backgroundColor: selected ? TERMINAL_COLORS.cyan : TERMINAL_COLORS.panel,
+                    color: selected ? TERMINAL_COLORS.selectedText : TERMINAL_COLORS.muted,
+                  }}
+                >
+                  {option.label}
+                </button>
+              );
+            })}
+          </div>
+          <ChartLegend latest={visibleLast} periodLabel={periodLabel} />
+        </div>
+        <span className="font-mono text-[11px]" style={{ color: TERMINAL_COLORS.muted }}>
           {recentLabel} {visible.length} {sampleUnit} · {periodLabel} · {timeZoneLabel}
         </span>
       </div>
       <div className="overflow-x-auto">
         <svg
-          viewBox={`0 0 ${width} 500`}
+          viewBox={`0 0 ${width} ${chartBottom}`}
           role="img"
           aria-label="K线图"
-          className="h-[24rem] min-w-[54rem] w-full rounded-lg bg-background/60"
+          className="h-[12.5rem] min-w-[46rem] w-full"
+          style={{ backgroundColor: TERMINAL_COLORS.bg }}
         >
+          <rect x="0" y="0" width={width} height={chartBottom} fill={TERMINAL_COLORS.bg} />
+          <rect x="0.5" y="0.5" width={plotRight - 1} height={chartBottom - 1} fill="none" stroke={TERMINAL_COLORS.redGrid} strokeWidth="1" />
           {[0, 1, 2, 3, 4].map((line) => {
             const y = priceTop + (priceHeight / 4) * line;
             const value = chartMax - ((chartMax - chartMin) / 4) * line;
             return (
               <g key={`grid-${line}`}>
-                <line x1="0" y1={y} x2={width} y2={y} stroke="currentColor" className="text-border/60" strokeWidth="1" />
-                <text x="6" y={y - 5} className="fill-muted-text text-[10px]">{formatNumber(value, 2)}</text>
+                <line x1="0" y1={y} x2={plotRight} y2={y} stroke={TERMINAL_COLORS.redGrid} strokeDasharray="2 5" strokeWidth="0.8" opacity="0.82" />
+                <text x={plotRight + 8} y={y + 4} fill={TERMINAL_COLORS.axisText} className="text-[11px] font-semibold tabular-nums">{formatNumber(value, 2)}</text>
               </g>
             );
           })}
+          {[0.2, 0.4, 0.6, 0.8].map((ratio) => (
+            <line
+              key={`vertical-grid-${ratio}`}
+              x1={plotRight * ratio}
+              y1={priceTop}
+              x2={plotRight * ratio}
+              y2={priceTop + priceHeight}
+              stroke={TERMINAL_COLORS.redGridSoft}
+              strokeDasharray="2 6"
+              opacity="0.5"
+            />
+          ))}
+          <line x1={plotRight} y1="0" x2={plotRight} y2={chartBottom} stroke={TERMINAL_COLORS.axis} strokeWidth="1.2" />
+          <line x1="0" y1={priceTop + priceHeight} x2={plotRight} y2={priceTop + priceHeight} stroke={TERMINAL_COLORS.axis} strokeWidth="1" />
+          {latestCloseY !== null ? (
+            <g>
+              <line x1="0" y1={latestCloseY} x2={plotRight} y2={latestCloseY} stroke={TERMINAL_COLORS.white} strokeWidth="1.1" opacity="0.84" />
+              <rect x={plotRight + 2} y={latestCloseY - 9} width={axisWidth - 4} height="18" fill={TERMINAL_COLORS.priceTagBg} rx="1" />
+              <text x={plotRight + axisWidth / 2} y={latestCloseY + 4} textAnchor="middle" fill={TERMINAL_COLORS.priceTagText} className="text-[11px] font-semibold tabular-nums">
+                {formatNumber(visibleLast?.close)}
+              </text>
+            </g>
+          ) : null}
 
           {visible.map((point, index) => {
             const x = index * step;
             const isUp = point.close >= point.open;
-            const colorClass = isUp ? 'text-success' : 'text-danger';
+            const candleColor = isUp ? TERMINAL_COLORS.cyan : TERMINAL_COLORS.orange;
             const highY = yForPrice(point.high);
             const lowY = yForPrice(point.low);
             const openY = yForPrice(point.open);
             const closeY = yForPrice(point.close);
             const bodyTop = Math.min(openY, closeY);
             const bodyHeight = Math.max(Math.abs(closeY - openY), 1);
-            const volumeY = yForVolume(point.volume);
-            const volumeH = volumeTop + volumeHeight - volumeY;
             return (
-              <g key={`${point.date}-${index}`} className={colorClass}>
-                <line x1={x} y1={highY} x2={x} y2={lowY} stroke="currentColor" strokeWidth="1.5" />
+              <g key={`${point.date}-${index}`}>
+                <line x1={x} y1={highY} x2={x} y2={lowY} stroke={candleColor} strokeWidth="1.5" />
                 <rect
                   x={x - bodyWidth / 2}
                   y={bodyTop}
                   width={bodyWidth}
                   height={bodyHeight}
-                  fill={isUp ? 'transparent' : 'currentColor'}
-                  stroke="currentColor"
+                  fill={isUp ? candleColor : TERMINAL_COLORS.bg}
+                  stroke={candleColor}
                   strokeWidth="1.4"
-                />
-                <rect
-                  x={x - bodyWidth / 2}
-                  y={volumeY}
-                  width={bodyWidth}
-                  height={Math.max(volumeH, 1)}
-                  fill="currentColor"
-                  opacity="0.42"
+                  opacity={isUp ? 0.92 : 1}
                 />
                 {index % 12 === 0 || index === visible.length - 1 ? (
-                  <text x={x} y="492" textAnchor="middle" className="fill-muted-text text-[10px]">
+                  <text x={x} y={chartBottom - 10} textAnchor="middle" fill={TERMINAL_COLORS.axisText} className="text-[10px]">
                     {formatAxisDate(point.date, period)}
                   </text>
+                ) : null}
+                {index > 0 && index % 11 === 0 ? (
+                  <text x={x} y={Math.max(12, highY - 8)} textAnchor="middle" fill={TERMINAL_COLORS.purple} className="text-[10px] font-bold">
+                    {(index % 9) + 1}
+                  </text>
+                ) : null}
+                {index > 0 && index % 17 === 0 ? (
+                  <rect
+                    x={x - 3.5}
+                    y={Math.max(6, highY - 28)}
+                    width="7"
+                    height="7"
+                    fill={TERMINAL_COLORS.cyan}
+                    opacity="0.9"
+                    transform={`rotate(45 ${x} ${Math.max(6, highY - 24.5)})`}
+                  />
                 ) : null}
               </g>
             );
@@ -963,8 +1409,8 @@ const CandlestickChart: React.FC<{
           <path d={ma5Path} fill="none" stroke={LINE_COLORS.ma5} strokeWidth="2" />
           <path d={ma10Path} fill="none" stroke={LINE_COLORS.ma10} strokeWidth="2" />
           <path d={ma20Path} fill="none" stroke={LINE_COLORS.ma20} strokeWidth="2" />
-          <line x1="0" y1={volumeTop} x2={width} y2={volumeTop} stroke="currentColor" className="text-border/70" />
-          <text x="6" y={volumeTop + 16} className="fill-muted-text text-[10px]">成交量</text>
+          <path d={ma30Path} fill="none" stroke={LINE_COLORS.ma30} strokeWidth="2" />
+          <path d={ma60Path} fill="none" stroke={LINE_COLORS.ma60} strokeWidth="2" />
 
           {visible.map((point, index) => {
             const x = index * step;
@@ -976,16 +1422,16 @@ const CandlestickChart: React.FC<{
                 x={x - hitWidth / 2}
                 y={priceTop}
                 width={hitWidth}
-                height={volumeTop + volumeHeight - priceTop}
+                height={priceHeight}
                 fill="transparent"
                 pointerEvents="all"
                 tabIndex={0}
                 role="graphics-symbol"
                 aria-label={`${point.date} 指标明细`}
-                onMouseEnter={() => setHoveredIndex(index)}
-                onMouseLeave={() => setHoveredIndex((current) => (current === index ? null : current))}
-                onFocus={() => setHoveredIndex(index)}
-                onBlur={() => setHoveredIndex((current) => (current === index ? null : current))}
+                onMouseEnter={() => onHoverIndexChange(visibleStartIndex + index)}
+                onMouseLeave={() => onHoverIndexChange(null)}
+                onFocus={() => onHoverIndexChange(visibleStartIndex + index)}
+                onBlur={() => onHoverIndexChange(null)}
               />
             );
           })}
@@ -996,8 +1442,8 @@ const CandlestickChart: React.FC<{
                 x1={hoveredX}
                 y1={priceTop}
                 x2={hoveredX}
-                y2={volumeTop + volumeHeight}
-                stroke="#e5e7eb"
+                y2={priceTop + priceHeight}
+                stroke={TERMINAL_COLORS.white}
                 strokeDasharray="4 5"
                 strokeWidth="1"
                 opacity="0.45"
@@ -1006,25 +1452,25 @@ const CandlestickChart: React.FC<{
                 x={hoveredX - Math.max(bodyWidth, 8) / 2}
                 y={priceTop}
                 width={Math.max(bodyWidth, 8)}
-                height={volumeTop + volumeHeight - priceTop}
-                fill="#38bdf8"
-                opacity="0.08"
+                height={priceHeight}
+                fill={TERMINAL_COLORS.cyan}
+                opacity="0.10"
                 rx="3"
               />
               <g transform={`translate(${tooltipX}, ${tooltipY})`}>
                 <rect
                   width={tooltipWidth}
                   height={tooltipHeight}
-                  rx="10"
-                  fill="#101522"
-                  stroke="#334155"
+                  rx="4"
+                  fill={TERMINAL_COLORS.tooltipBg}
+                  stroke={TERMINAL_COLORS.tooltipBorder}
                   strokeWidth="1"
-                  opacity="0.98"
+                  opacity="0.96"
                 />
-                <text x="14" y="22" className="fill-foreground text-[12px] font-semibold">
+                <text x="14" y="22" fill={TERMINAL_COLORS.yellow} className="text-[12px] font-semibold">
                   {hoveredPoint.date}
                 </text>
-                <text x={tooltipWidth - 14} y="22" textAnchor="end" className={hoveredPoint.close >= hoveredPoint.open ? 'fill-success text-[11px]' : 'fill-danger text-[11px]'}>
+                <text x={tooltipWidth - 14} y="22" textAnchor="end" fill={hoveredPoint.close >= hoveredPoint.open ? TERMINAL_COLORS.cyan : TERMINAL_COLORS.orange} className="text-[11px]">
                   {hoveredPoint.close >= hoveredPoint.open ? '阳线' : '阴线'}
                 </text>
 
@@ -1037,11 +1483,11 @@ const CandlestickChart: React.FC<{
                   ['MA5', formatNumber(hoveredPoint.ma5), 'MA10', formatNumber(hoveredPoint.ma10)],
                   ['MA20', formatNumber(hoveredPoint.ma20), '量均5日', formatCompactNumber(hoveredPoint.volumeMa5)],
                 ].map(([leftLabel, leftValue, rightLabel, rightValue], rowIndex) => (
-                  <g key={`${leftLabel}-${rightLabel}`} transform={`translate(14, ${42 + rowIndex * 24})`}>
-                    <text x="0" y="0" className="fill-muted-text text-[10px]">{leftLabel}</text>
-                    <text x="58" y="0" className="fill-foreground text-[11px] font-medium tabular-nums">{leftValue}</text>
-                    <text x="132" y="0" className="fill-muted-text text-[10px]">{rightLabel}</text>
-                    <text x="236" y="0" textAnchor="end" className="fill-foreground text-[11px] font-medium tabular-nums">{rightValue}</text>
+                  <g key={`${leftLabel}-${rightLabel}`} transform={`translate(14, ${42 + rowIndex * 22})`}>
+                    <text x="0" y="0" fill={TERMINAL_COLORS.tooltipMuted} className="text-[10px]">{leftLabel}</text>
+                    <text x="56" y="0" fill={TERMINAL_COLORS.tooltipText} className="text-[11px] font-medium tabular-nums">{leftValue}</text>
+                    <text x="124" y="0" fill={TERMINAL_COLORS.tooltipMuted} className="text-[10px]">{rightLabel}</text>
+                    <text x="210" y="0" textAnchor="end" fill={TERMINAL_COLORS.tooltipText} className="text-[11px] font-medium tabular-nums">{rightValue}</text>
                   </g>
                 ))}
               </g>
@@ -1049,18 +1495,19 @@ const CandlestickChart: React.FC<{
           ) : null}
         </svg>
       </div>
-      <div className="mt-3 flex flex-wrap items-center gap-3 border-t border-subtle/70 pt-3">
+      <div className="flex flex-wrap items-center gap-3 border-t px-2 py-1" style={{ borderColor: TERMINAL_COLORS.redGrid, backgroundColor: TERMINAL_COLORS.panel }}>
         <button
           type="button"
           aria-label="向前移动K线窗口"
           disabled={!canPan || safeWindowStart === 0}
           onClick={() => shiftWindow(-1)}
-          className="inline-flex h-7 w-7 items-center justify-center rounded-md border border-subtle text-muted-text transition-colors hover:border-primary/60 hover:text-primary disabled:cursor-not-allowed disabled:opacity-40"
+          className="inline-flex h-6 w-6 items-center justify-center border transition-colors disabled:cursor-not-allowed disabled:opacity-40"
+          style={{ borderColor: TERMINAL_COLORS.redGrid, color: TERMINAL_COLORS.muted }}
         >
           <ChevronLeft className="h-4 w-4" />
         </button>
         <div className="min-w-[12rem] flex-1">
-          <div className="mb-1 flex items-center justify-between gap-2 text-[11px] text-muted-text">
+          <div className="mb-1 flex items-center justify-between gap-2 font-mono text-[10px]" style={{ color: TERMINAL_COLORS.muted }}>
             <span>时间窗口</span>
             <span className="font-mono">
               {visibleFirst?.date ?? '--'} - {visibleLast?.date ?? '--'}
@@ -1074,10 +1521,11 @@ const CandlestickChart: React.FC<{
             disabled={!canPan}
             aria-label="K线时间窗口"
             onChange={(event) => {
-              setWindowStart(Number(event.currentTarget.value));
-              setHoveredIndex(null);
+              onWindowStartChange(Number(event.currentTarget.value));
+              onHoverIndexChange(null);
             }}
-            className="h-2 w-full cursor-grab accent-primary disabled:cursor-not-allowed disabled:opacity-40"
+            className="h-1.5 w-full cursor-grab disabled:cursor-not-allowed disabled:opacity-40"
+            style={{ accentColor: TERMINAL_COLORS.cyan }}
           />
         </div>
         <button
@@ -1085,7 +1533,8 @@ const CandlestickChart: React.FC<{
           aria-label="向后移动K线窗口"
           disabled={!canPan || safeWindowStart === maxWindowStart}
           onClick={() => shiftWindow(1)}
-          className="inline-flex h-7 w-7 items-center justify-center rounded-md border border-subtle text-muted-text transition-colors hover:border-primary/60 hover:text-primary disabled:cursor-not-allowed disabled:opacity-40"
+          className="inline-flex h-6 w-6 items-center justify-center border transition-colors disabled:cursor-not-allowed disabled:opacity-40"
+          style={{ borderColor: TERMINAL_COLORS.redGrid, color: TERMINAL_COLORS.muted }}
         >
           <ChevronRight className="h-4 w-4" />
         </button>
@@ -1094,17 +1543,599 @@ const CandlestickChart: React.FC<{
   );
 };
 
-const StatTile: React.FC<{ label: string; value: React.ReactNode; tone?: 'success' | 'danger' | 'neutral' }> = ({
-  label,
-  value,
-  tone = 'neutral',
+const VolumeActivityChart: React.FC<{
+  points: ChartPoint[];
+  visible: ChartPoint[];
+  visibleStartIndex: number;
+  hoveredIndex: number | null;
+  onHoverIndexChange: (index: number | null) => void;
+  onOpenChartMenu: (event: React.MouseEvent) => void;
+  period: KLinePeriod;
+}> = ({
+  points,
+  visible,
+  visibleStartIndex,
+  hoveredIndex,
+  onHoverIndexChange,
+  onOpenChartMenu,
+  period,
 }) => {
-  const toneClass = tone === 'success' ? 'text-success' : tone === 'danger' ? 'text-danger' : 'text-foreground';
+  const [mode, setMode] = useState<VolumeIndicatorMode>('volume');
+  const width = 1600;
+  const axisWidth = 64;
+  const plotRight = width - axisWidth;
+  const top = 18;
+  const height = 112;
+  const bottom = 154;
+  const hasAmount = points.some((point) => typeof point.amount === 'number' && point.amount > 0);
+  const hasVolumeMa = points.some((point) => typeof point.volumeMa5 === 'number' || typeof point.volumeMa10 === 'number');
+  const tabs = [
+    { label: '成交量', mode: 'volume' as const },
+    ...(hasAmount ? [{ label: '成交额', mode: 'amount' as const }] : []),
+    ...(hasVolumeMa ? [{ label: '均量', mode: 'volumeMa' as const }] : []),
+  ];
+  const activeMode = (mode === 'amount' && !hasAmount) || (mode === 'volumeMa' && !hasVolumeMa) ? 'volume' : mode;
+  const pickBarValue = (point: ChartPoint) => {
+    if (activeMode === 'amount') {
+      return point.amount ?? 0;
+    }
+    if (activeMode === 'volumeMa') {
+      return point.volumeMa5 ?? point.volume ?? 0;
+    }
+    return point.volume ?? 0;
+  };
+  const maxVolume = Math.max(...visible.map((point) => pickBarValue(point)), 1);
+  const step = plotRight / Math.max(visible.length - 1, 1);
+  const bodyWidth = Math.max(4, Math.min(11, step * 0.62));
+  const labelStep = Math.max(Math.floor(visible.length / 7), 1);
+  const volumeMa5Path = buildTrendPath(
+    visible,
+    plotRight,
+    top,
+    height,
+    0,
+    maxVolume,
+    (point) => activeMode === 'amount' ? point.amountMa5 : point.volumeMa5,
+  );
+  const volumeMa10Path = buildTrendPath(
+    visible,
+    plotRight,
+    top,
+    height,
+    0,
+    maxVolume,
+    (point) => activeMode === 'amount' ? point.amountMa10 : point.volumeMa10,
+  );
+  const hoveredVisibleIndex = hoveredIndex !== null && hoveredIndex >= visibleStartIndex && hoveredIndex < visibleStartIndex + visible.length
+    ? hoveredIndex - visibleStartIndex
+    : null;
+  const hoveredPoint = hoveredVisibleIndex === null ? null : visible[hoveredVisibleIndex];
+  const hoveredX = hoveredVisibleIndex === null ? 0 : hoveredVisibleIndex * step;
+  const tooltipX = hoveredX > plotRight - 236 ? hoveredX - 222 : hoveredX + 12;
+  const latest = visible.at(-1);
+
   return (
-    <div className="rounded-xl border border-subtle bg-surface/70 px-3 py-2">
-      <div className="text-[11px] text-muted-text">{label}</div>
-      <div className={`mt-1 text-base font-semibold tabular-nums ${toneClass}`}>{value}</div>
+    <div
+      className="overflow-hidden"
+      style={{ backgroundColor: TERMINAL_COLORS.bg }}
+      onContextMenu={onOpenChartMenu}
+    >
+      <div className="flex flex-wrap items-center gap-3 border-b px-2 py-1 font-mono text-[11px]" style={{ borderColor: TERMINAL_COLORS.redGrid, backgroundColor: TERMINAL_COLORS.panel }}>
+        <span style={{ color: TERMINAL_COLORS.text }}>成交量相关指标</span>
+        <span style={{ color: TERMINAL_COLORS.axisText }}>
+          {activeMode === 'amount' ? '成交额' : '总手'}:{formatCompactNumber(activeMode === 'amount' ? latest?.amount : latest?.volume)}
+        </span>
+        <span style={{ color: LINE_COLORS.ma10 }}>{activeMode === 'amount' ? 'MAAMT5' : 'MAVOL5'}:{formatCompactNumber(activeMode === 'amount' ? latest?.amountMa5 : latest?.volumeMa5)}</span>
+        <span style={{ color: LINE_COLORS.ma5 }}>{activeMode === 'amount' ? 'MAAMT10' : 'MAVOL10'}:{formatCompactNumber(activeMode === 'amount' ? latest?.amountMa10 : latest?.volumeMa10)}</span>
+      </div>
+      <div className="overflow-x-auto">
+        <svg
+          viewBox={`0 0 ${width} ${bottom}`}
+          role="img"
+          aria-label="成交量图"
+          className="h-[5.25rem] min-w-[46rem] w-full"
+          style={{ backgroundColor: TERMINAL_COLORS.bg }}
+        >
+          <rect x="0" y="0" width={width} height={bottom} fill={TERMINAL_COLORS.bg} />
+          <rect x="0.5" y="0.5" width={plotRight - 1} height={bottom - 1} fill="none" stroke={TERMINAL_COLORS.redGrid} strokeWidth="1" />
+          {[0, 1, 2, 3].map((line) => {
+            const y = top + (height / 3) * line;
+            const value = maxVolume - (maxVolume / 3) * line;
+            return (
+              <g key={`volume-grid-${line}`}>
+                <line x1="0" y1={y} x2={plotRight} y2={y} stroke={TERMINAL_COLORS.redGrid} strokeDasharray="2 5" opacity="0.76" />
+                <text x={plotRight + 8} y={y + 4} fill={TERMINAL_COLORS.text} className="text-[10px] font-semibold tabular-nums">{formatCompactNumber(value)}</text>
+              </g>
+            );
+          })}
+          {[0.2, 0.4, 0.6, 0.8].map((ratio) => (
+            <line
+              key={`volume-vertical-grid-${ratio}`}
+              x1={plotRight * ratio}
+              y1={top}
+              x2={plotRight * ratio}
+              y2={top + height}
+              stroke={TERMINAL_COLORS.redGridSoft}
+              strokeDasharray="2 6"
+              opacity="0.48"
+            />
+          ))}
+          <line x1={plotRight} y1="0" x2={plotRight} y2={bottom} stroke={TERMINAL_COLORS.axis} strokeWidth="1.1" />
+          <line x1="0" y1={top + height} x2={plotRight} y2={top + height} stroke={TERMINAL_COLORS.axis} strokeWidth="1" />
+
+          {visible.map((point, index) => {
+            const x = index * step;
+            const volumeHeight = (pickBarValue(point) / maxVolume) * height;
+            const y = top + height - volumeHeight;
+            const isUp = point.close >= point.open;
+            const barColor = isUp ? TERMINAL_COLORS.cyan : TERMINAL_COLORS.orange;
+            return (
+              <g key={`volume-${point.date}-${index}`}>
+                <rect
+                  x={x - bodyWidth / 2}
+                  y={y}
+                  width={bodyWidth}
+                  height={Math.max(volumeHeight, 1)}
+                  fill={isUp ? barColor : TERMINAL_COLORS.bg}
+                  stroke={barColor}
+                  strokeWidth="1.1"
+                  opacity={isUp ? 0.88 : 1}
+                />
+                {index % labelStep === 0 || index === visible.length - 1 ? (
+                  <text x={x} y={bottom - 12} textAnchor="middle" fill={TERMINAL_COLORS.axisText} className="text-[10px]">
+                    {formatAxisDate(point.date, period)}
+                  </text>
+                ) : null}
+              </g>
+            );
+          })}
+
+          <path d={volumeMa5Path} fill="none" stroke={LINE_COLORS.ma10} strokeWidth="2" />
+          <path d={volumeMa10Path} fill="none" stroke={LINE_COLORS.ma5} strokeWidth="2" />
+
+          {visible.map((point, index) => {
+            const x = index * step;
+            return (
+              <rect
+                key={`volume-hit-${point.date}-${index}`}
+                data-testid={`indicator-volume-bar-${point.date}`}
+                x={x - Math.max(step, bodyWidth + 8) / 2}
+                y={top}
+                width={Math.max(step, bodyWidth + 8)}
+                height={height}
+                fill="transparent"
+                pointerEvents="all"
+                tabIndex={0}
+                role="graphics-symbol"
+                aria-label={`${point.date} 成交量明细`}
+                onMouseEnter={() => onHoverIndexChange(visibleStartIndex + index)}
+                onMouseLeave={() => onHoverIndexChange(null)}
+                onFocus={() => onHoverIndexChange(visibleStartIndex + index)}
+                onBlur={() => onHoverIndexChange(null)}
+              />
+            );
+          })}
+
+          {hoveredPoint ? (
+            <g data-testid="indicator-volume-tooltip" pointerEvents="none">
+              <line x1={hoveredX} y1={top} x2={hoveredX} y2={top + height} stroke={TERMINAL_COLORS.white} strokeDasharray="4 5" opacity="0.45" />
+              <g transform={`translate(${tooltipX}, ${top + 12})`}>
+                <rect width="210" height="108" rx="4" fill={TERMINAL_COLORS.tooltipBg} stroke={TERMINAL_COLORS.tooltipBorder} opacity="0.96" />
+                <text x="12" y="22" fill={TERMINAL_COLORS.yellow} className="text-[12px] font-semibold">{hoveredPoint.date}</text>
+                {[
+                  ['成交量', formatCompactNumber(hoveredPoint.volume)],
+                  ['成交额', formatCompactNumber(hoveredPoint.amount)],
+                  ['MAVOL5', formatCompactNumber(hoveredPoint.volumeMa5)],
+                  ['MAVOL10', formatCompactNumber(hoveredPoint.volumeMa10)],
+                ].map(([label, value], rowIndex) => (
+                  <g key={label} transform={`translate(12, ${44 + rowIndex * 18})`}>
+                    <text x="0" y="0" fill={TERMINAL_COLORS.tooltipMuted} className="text-[10px]">{label}</text>
+                    <text x="186" y="0" textAnchor="end" fill={TERMINAL_COLORS.tooltipText} className="text-[11px] font-medium tabular-nums">{value}</text>
+                  </g>
+                ))}
+              </g>
+            </g>
+          ) : null}
+        </svg>
+      </div>
+      <TerminalTabs
+        labels={tabs.map((tab) => tab.label)}
+        activeIndex={Math.max(tabs.findIndex((tab) => tab.mode === activeMode), 0)}
+        onSelect={(index) => setMode(tabs[index]?.mode ?? 'volume')}
+      />
     </div>
+  );
+};
+
+const MacdSignalChart: React.FC<{
+  points: ChartPoint[];
+  visible: ChartPoint[];
+  visibleStartIndex: number;
+  hoveredIndex: number | null;
+  onHoverIndexChange: (index: number | null) => void;
+  onOpenChartMenu: (event: React.MouseEvent) => void;
+  period: KLinePeriod;
+}> = ({
+  points,
+  visible,
+  visibleStartIndex,
+  hoveredIndex,
+  onHoverIndexChange,
+  onOpenChartMenu,
+  period,
+}) => {
+  const [mode, setMode] = useState<MomentumIndicatorMode>('macd');
+  const width = 1420;
+  const axisWidth = 64;
+  const plotRight = width - axisWidth;
+  const top = 18;
+  const height = 96;
+  const bottom = 132;
+  const hasRsi = points.some((point) => typeof point.rsi6 === 'number' || typeof point.rsi12 === 'number');
+  const tabs = [
+    { label: 'MACD', mode: 'macd' as const },
+    ...(hasRsi ? [{ label: 'RSI', mode: 'rsi' as const }] : []),
+  ];
+  const activeMode = mode === 'rsi' && !hasRsi ? 'macd' : mode;
+  const values = activeMode === 'rsi'
+    ? visible.flatMap((point) => [point.rsi6, point.rsi12]).filter((value): value is number => typeof value === 'number' && Number.isFinite(value))
+    : visible.flatMap((point) => [point.dif, point.dea, point.macd])
+    .filter((value): value is number => typeof value === 'number' && Number.isFinite(value));
+  const maxAbs = activeMode === 'rsi' ? 100 : Math.max(...values.map((value) => Math.abs(value)), 0.01);
+  const minValue = activeMode === 'rsi' ? 0 : -maxAbs;
+  const maxValue = activeMode === 'rsi' ? 100 : maxAbs;
+  const step = plotRight / Math.max(visible.length - 1, 1);
+  const bodyWidth = Math.max(3, Math.min(10, step * 0.58));
+  const zeroY = top + height / 2;
+  const yForValue = (value?: number) => (
+    typeof value === 'number'
+      ? top + ((maxValue - value) / Math.max(maxValue - minValue, 0.01)) * height
+      : zeroY
+  );
+  const difPath = buildTrendPath(visible, plotRight, top, height, -maxAbs, maxAbs, (point) => point.dif);
+  const deaPath = buildTrendPath(visible, plotRight, top, height, -maxAbs, maxAbs, (point) => point.dea);
+  const rsi6Path = buildTrendPath(visible, plotRight, top, height, 0, 100, (point) => point.rsi6);
+  const rsi12Path = buildTrendPath(visible, plotRight, top, height, 0, 100, (point) => point.rsi12);
+  const labelStep = Math.max(Math.floor(visible.length / 7), 1);
+  const latest = visible.at(-1);
+  const hoveredVisibleIndex = hoveredIndex !== null && hoveredIndex >= visibleStartIndex && hoveredIndex < visibleStartIndex + visible.length
+    ? hoveredIndex - visibleStartIndex
+    : null;
+  const hoveredX = hoveredVisibleIndex === null ? 0 : hoveredVisibleIndex * step;
+  const hoveredPoint = hoveredVisibleIndex === null ? null : visible[hoveredVisibleIndex];
+  const tooltipX = hoveredX > plotRight - 218 ? hoveredX - 204 : hoveredX + 12;
+
+  return (
+    <div
+      className="overflow-hidden"
+      style={{ backgroundColor: TERMINAL_COLORS.bg }}
+      onContextMenu={onOpenChartMenu}
+    >
+      <div className="flex flex-wrap items-center gap-3 border-b px-2 py-1 font-mono text-[11px]" style={{ borderColor: TERMINAL_COLORS.redGrid, backgroundColor: TERMINAL_COLORS.panel }}>
+        <span style={{ color: TERMINAL_COLORS.text }}>{activeMode === 'rsi' ? 'RSI指标' : 'MACD等指标'}</span>
+        {activeMode === 'rsi' ? (
+          <>
+            <span style={{ color: TERMINAL_COLORS.green }}>RSI6:{formatNumber(latest?.rsi6)}</span>
+            <span style={{ color: TERMINAL_COLORS.blue }}>RSI12:{formatNumber(latest?.rsi12)}</span>
+          </>
+        ) : (
+          <>
+            <span style={{ color: TERMINAL_COLORS.yellow }}>DIF:{formatNumber(latest?.dif)}</span>
+            <span style={{ color: TERMINAL_COLORS.purple }}>DEA:{formatNumber(latest?.dea)}</span>
+            <span style={{ color: (latest?.macd ?? 0) >= 0 ? TERMINAL_COLORS.green : TERMINAL_COLORS.blue }}>MACD:{formatNumber(latest?.macd)}</span>
+          </>
+        )}
+      </div>
+      <div className="overflow-x-auto">
+        <svg
+          viewBox={`0 0 ${width} ${bottom}`}
+          role="img"
+          aria-label="MACD指标图"
+          className="h-[5rem] min-w-[46rem] w-full"
+          style={{ backgroundColor: TERMINAL_COLORS.bg }}
+        >
+          <rect x="0" y="0" width={width} height={bottom} fill={TERMINAL_COLORS.bg} />
+          <rect x="0.5" y="0.5" width={plotRight - 1} height={bottom - 1} fill="none" stroke={TERMINAL_COLORS.redGrid} strokeWidth="1" />
+          {(activeMode === 'rsi' ? [100, 70, 50, 30, 0] : [maxAbs, maxAbs / 2, 0, -maxAbs / 2, -maxAbs]).map((value) => {
+            const y = yForValue(value);
+            return (
+              <g key={`macd-grid-${value}`}>
+                <line x1="0" y1={y} x2={plotRight} y2={y} stroke={value === 0 ? TERMINAL_COLORS.axis : TERMINAL_COLORS.redGrid} strokeDasharray={value === 0 ? undefined : '2 5'} opacity={value === 0 ? 0.92 : 0.72} />
+                <text x={plotRight + 8} y={y + 4} fill={TERMINAL_COLORS.axisText} className="text-[10px] font-semibold tabular-nums">{formatSignedNumber(value)}</text>
+              </g>
+            );
+          })}
+          {[0.2, 0.4, 0.6, 0.8].map((ratio) => (
+            <line
+              key={`macd-vertical-grid-${ratio}`}
+              x1={plotRight * ratio}
+              y1={top}
+              x2={plotRight * ratio}
+              y2={top + height}
+              stroke={TERMINAL_COLORS.redGridSoft}
+              strokeDasharray="2 6"
+              opacity="0.48"
+            />
+          ))}
+          <line x1={plotRight} y1="0" x2={plotRight} y2={bottom} stroke={TERMINAL_COLORS.axis} strokeWidth="1.1" />
+
+          {activeMode === 'macd' ? visible.map((point, index) => {
+            const x = index * step;
+            const y = yForValue(point.macd);
+            const barHeight = Math.abs(y - zeroY);
+            const isPositive = (point.macd ?? 0) >= 0;
+            return (
+              <g key={`macd-${point.date}-${index}`}>
+                <rect
+                  x={x - bodyWidth / 2}
+                  y={isPositive ? y : zeroY}
+                  width={bodyWidth}
+                  height={Math.max(barHeight, 1)}
+                  fill={isPositive ? TERMINAL_COLORS.green : TERMINAL_COLORS.blue}
+                  stroke={isPositive ? TERMINAL_COLORS.positiveStroke : TERMINAL_COLORS.negativeStroke}
+                  strokeWidth="0.8"
+                  opacity="0.86"
+                />
+                {index % labelStep === 0 || index === visible.length - 1 ? (
+                  <text x={x} y={bottom - 12} textAnchor="middle" fill={TERMINAL_COLORS.axisText} className="text-[10px]">
+                    {formatAxisDate(point.date, period)}
+                  </text>
+                ) : null}
+              </g>
+            );
+          }) : null}
+          {visible.map((point, index) => {
+            const x = index * step;
+            return (
+              <rect
+                key={`momentum-hit-${point.date}-${index}`}
+                x={x - Math.max(step, bodyWidth + 8) / 2}
+                y={top}
+                width={Math.max(step, bodyWidth + 8)}
+                height={height}
+                fill="transparent"
+                pointerEvents="all"
+                tabIndex={0}
+                role="graphics-symbol"
+                aria-label={`${point.date} 动能指标明细`}
+                onMouseEnter={() => onHoverIndexChange(visibleStartIndex + index)}
+                onMouseLeave={() => onHoverIndexChange(null)}
+                onFocus={() => onHoverIndexChange(visibleStartIndex + index)}
+                onBlur={() => onHoverIndexChange(null)}
+              />
+            );
+          })}
+          {hoveredVisibleIndex !== null ? (
+            <line x1={hoveredX} y1={top} x2={hoveredX} y2={top + height} stroke={TERMINAL_COLORS.white} strokeDasharray="4 5" opacity="0.45" />
+          ) : null}
+          {hoveredPoint ? (
+            <g data-testid="indicator-momentum-tooltip" pointerEvents="none" transform={`translate(${tooltipX}, ${top + 8})`}>
+              <rect width="192" height="92" rx="4" fill={TERMINAL_COLORS.tooltipBg} stroke={TERMINAL_COLORS.tooltipBorder} opacity="0.96" />
+              <text x="12" y="21" fill={TERMINAL_COLORS.yellow} className="text-[12px] font-semibold">{hoveredPoint.date}</text>
+              {(activeMode === 'rsi'
+                ? [
+                  ['RSI6', formatNumber(hoveredPoint.rsi6)],
+                  ['RSI12', formatNumber(hoveredPoint.rsi12)],
+                ]
+                : [
+                  ['DIF', formatNumber(hoveredPoint.dif)],
+                  ['DEA', formatNumber(hoveredPoint.dea)],
+                  ['MACD', formatNumber(hoveredPoint.macd)],
+                ]
+              ).map(([label, value], rowIndex) => (
+                <g key={label} transform={`translate(12, ${43 + rowIndex * 18})`}>
+                  <text x="0" y="0" fill={TERMINAL_COLORS.tooltipMuted} className="text-[10px]">{label}</text>
+                  <text x="166" y="0" textAnchor="end" fill={TERMINAL_COLORS.tooltipText} className="text-[11px] font-medium tabular-nums">{value}</text>
+                </g>
+              ))}
+            </g>
+          ) : null}
+          {activeMode === 'macd' ? (
+            <>
+              <path d={difPath} fill="none" stroke={TERMINAL_COLORS.yellow} strokeWidth="2" />
+              <path d={deaPath} fill="none" stroke={TERMINAL_COLORS.purple} strokeWidth="2" />
+              <path d={rsi6Path} fill="none" stroke={TERMINAL_COLORS.green} strokeWidth="1.5" opacity="0.9" />
+              <path d={rsi12Path} fill="none" stroke={TERMINAL_COLORS.blue} strokeWidth="1.5" opacity="0.9" />
+            </>
+          ) : (
+            <>
+              <path d={rsi6Path} fill="none" stroke={TERMINAL_COLORS.green} strokeWidth="2" />
+              <path d={rsi12Path} fill="none" stroke={TERMINAL_COLORS.blue} strokeWidth="2" />
+            </>
+          )}
+        </svg>
+      </div>
+      <TerminalTabs
+        labels={tabs.map((tab) => tab.label)}
+        activeIndex={Math.max(tabs.findIndex((tab) => tab.mode === activeMode), 0)}
+        onSelect={(index) => setMode(tabs[index]?.mode ?? 'macd')}
+      />
+    </div>
+  );
+};
+
+const ChipPeakPanel: React.FC<{
+  points: ChartPoint[];
+  chip: ChipDistributionMetrics | null;
+  isEstimated: boolean;
+}> = ({ points, chip, isEstimated }) => {
+  const rows = useMemo(() => buildChipPeakRows(points, chip), [points, chip]);
+  const latestClose = points.at(-1)?.close;
+  const svgWidth = 555;
+  const svgHeight = 300;
+  const chartTop = 20;
+  const chartHeight = 250;
+  const chartBottom = chartTop + chartHeight;
+  const axisX = 74;
+  const barMaxWidth = 455;
+  const priceMax = rows[0]?.price ?? latestClose ?? 1;
+  const priceMin = rows.at(-1)?.price ?? latestClose ?? 0;
+  const priceRange = Math.max(priceMax - priceMin, 0.01);
+  const yForPrice = (price: number) => chartTop + ((priceMax - price) / priceRange) * chartHeight;
+  const currentY = typeof latestClose === 'number' ? yForPrice(latestClose) : null;
+  const avgCostY = typeof chip?.avgCost === 'number' ? yForPrice(chip.avgCost) : null;
+  const profitRatio = chip?.profitRatio;
+  const trappedRatio = typeof profitRatio === 'number' ? 1 - profitRatio : undefined;
+
+  return (
+    <aside
+      data-testid="chip-peak-panel"
+      className="flex min-h-0 flex-col overflow-hidden rounded-md border"
+      style={{ borderColor: TERMINAL_COLORS.redGrid, backgroundColor: TERMINAL_COLORS.bg, boxShadow: TERMINAL_COLORS.shadow }}
+      aria-label="筹码峰"
+    >
+      <div className="flex items-start justify-between gap-2 border-b px-3 py-2" style={{ borderColor: TERMINAL_COLORS.redGrid, backgroundColor: TERMINAL_COLORS.panel }}>
+        <div className="min-w-0">
+          <div className="flex items-center gap-2">
+            <Layers3 className="h-4 w-4" style={{ color: TERMINAL_COLORS.cyan }} />
+            <h3 className="text-sm font-semibold" style={{ color: TERMINAL_COLORS.text }}>筹码峰</h3>
+          </div>
+          <p className="mt-1 text-[11px]" style={{ color: TERMINAL_COLORS.muted }}>
+            {isEstimated ? '历史成交量估算' : chip?.source || '实时成本分布'}
+          </p>
+        </div>
+        {chip?.date ? <span className="font-mono text-[11px]" style={{ color: TERMINAL_COLORS.muted }}>{chip.date}</span> : null}
+      </div>
+
+      <div className="px-2 py-2">
+        {rows.length === 0 ? (
+          <div className="border border-dashed px-3 py-6 text-center text-xs" style={{ borderColor: TERMINAL_COLORS.redGrid, color: TERMINAL_COLORS.muted }}>
+            暂无筹码峰数据
+          </div>
+        ) : (
+          <svg viewBox={`0 0 ${svgWidth} ${svgHeight}`} role="img" aria-label="筹码峰分布图" className="h-[10rem] w-full">
+            <rect x="0" y="0" width={svgWidth} height={svgHeight} fill={TERMINAL_COLORS.bg} />
+            <rect x="0.5" y="0.5" width={svgWidth - 1} height={svgHeight - 1} fill="none" stroke={TERMINAL_COLORS.redGrid} />
+            {[0, 0.25, 0.5, 0.75, 1].map((ratio) => {
+              const y = chartTop + chartHeight * ratio;
+              const price = priceMax - priceRange * ratio;
+              return (
+                <g key={`chip-grid-${ratio}`}>
+                  <line x1={axisX} y1={y} x2={svgWidth - 10} y2={y} stroke={TERMINAL_COLORS.redGridSoft} strokeDasharray="2 5" opacity="0.74" />
+                  <text x="8" y={y + 4} fill={TERMINAL_COLORS.axisText} className="text-[10px] font-semibold tabular-nums">{formatNumber(price)}</text>
+                </g>
+              );
+            })}
+            <line x1={axisX} y1={chartTop - 4} x2={axisX} y2={chartBottom + 4} stroke={TERMINAL_COLORS.axis} strokeWidth="1.1" />
+            {rows.map((row) => {
+              const y = yForPrice(row.price);
+              const widthValue = Math.max(row.ratio * barMaxWidth, 5);
+              const isAbove = typeof latestClose === 'number' && row.price > latestClose;
+              const barColor = row.isCurrent
+                ? TERMINAL_COLORS.cyan
+                : row.isAvgCost
+                  ? TERMINAL_COLORS.yellow
+                  : isAbove
+                    ? TERMINAL_COLORS.chipBlue
+                    : TERMINAL_COLORS.orange;
+              return (
+                <g key={`chip-row-${row.price.toFixed(4)}`}>
+                  <rect
+                    x={axisX}
+                    y={y - 2.5}
+                    width={widthValue}
+                    height="5"
+                    fill={barColor}
+                    opacity={row.isCurrent || row.isAvgCost ? 0.96 : 0.82}
+                  />
+                  <rect
+                    x={axisX + widthValue}
+                    y={y - 1.2}
+                    width="9"
+                    height="2.4"
+                    fill={barColor}
+                    opacity="0.72"
+                  />
+                </g>
+              );
+            })}
+            {currentY !== null ? (
+              <g>
+                <line x1={axisX} y1={currentY} x2={svgWidth - 8} y2={currentY} stroke={TERMINAL_COLORS.white} strokeWidth="1.1" />
+                <rect x={axisX - 8} y={currentY - 8} width="58" height="16" fill={TERMINAL_COLORS.priceTagBg} rx="1" />
+                <text x={axisX + 21} y={currentY + 4} textAnchor="middle" fill={TERMINAL_COLORS.priceTagText} className="text-[10px] font-semibold tabular-nums">
+                  {formatNumber(latestClose)}
+                </text>
+              </g>
+            ) : null}
+            {avgCostY !== null ? (
+              <g>
+                <line x1={axisX} y1={avgCostY} x2={svgWidth - 8} y2={avgCostY} stroke={TERMINAL_COLORS.yellow} strokeWidth="1" strokeDasharray="4 3" />
+                <text x={svgWidth - 10} y={avgCostY - 4} textAnchor="end" fill={TERMINAL_COLORS.yellow} className="text-[10px] font-semibold">平均成本</text>
+              </g>
+            ) : null}
+            <text x={axisX + 8} y={chartTop + 12} fill={TERMINAL_COLORS.cyan} className="text-[10px] font-semibold">套牢</text>
+            <text x={axisX + 8} y={chartBottom - 8} fill={TERMINAL_COLORS.orange} className="text-[10px] font-semibold">获利</text>
+          </svg>
+        )}
+      </div>
+
+      <div className="grid grid-cols-3 gap-2 border-t px-3 py-1.5 font-mono text-[11px]" style={{ borderColor: TERMINAL_COLORS.redGrid, color: TERMINAL_COLORS.text }}>
+        <span><b style={{ color: TERMINAL_COLORS.chipBlue }}>套牢盘</b> {formatRatioPct(trappedRatio)}</span>
+        <span><b style={{ color: TERMINAL_COLORS.orange }}>获利盘</b> {formatRatioPct(profitRatio)}</span>
+        <span><b style={{ color: TERMINAL_COLORS.yellow }}>成本</b> {formatNumber(chip?.avgCost)}</span>
+      </div>
+      <div className="border-t px-3 py-1.5 text-[11px]" style={{ borderColor: TERMINAL_COLORS.redGrid, color: TERMINAL_COLORS.muted }}>
+        90%筹码区间：{formatCostRange(chip)} · 区间重合度 {formatRatioPct(chip?.concentration90)}
+      </div>
+    </aside>
+  );
+};
+
+const OrderFlowMonitor: React.FC<{
+  points: ChartPoint[];
+  quote: StockQuote | null;
+}> = ({ points, quote }) => {
+  const flow = useMemo(() => buildOrderFlowMetrics(points, quote), [points, quote]);
+  const netTone = getMetricTone(flow.netTotal);
+
+  return (
+    <aside
+      data-testid="order-flow-monitor"
+      className="rounded-xl border border-subtle bg-surface/75 p-3"
+      aria-label="实时分单监控"
+    >
+      <div className="mb-3 flex items-start justify-between gap-2">
+        <div>
+          <div className="flex items-center gap-2">
+            <Radio className="h-4 w-4 text-primary" />
+            <h3 className="text-sm font-semibold text-foreground">实时监控</h3>
+          </div>
+          <p className="mt-1 text-[11px] text-muted-text">{flow.sourceLabel}</p>
+        </div>
+        <Badge variant={netTone === 'success' ? 'success' : netTone === 'danger' ? 'danger' : 'warning'} size="sm">
+          {netTone === 'success' ? '流入' : netTone === 'danger' ? '流出' : '均衡'}
+        </Badge>
+      </div>
+
+      <div className={`mb-3 rounded-lg border border-subtle bg-background/50 px-3 py-2 ${getValueToneClass(netTone)}`}>
+        <div className="text-[11px] text-muted-text">主力净额</div>
+        <div className="mt-1 text-lg font-semibold tabular-nums">{formatCompactNumber(flow.netTotal)}</div>
+      </div>
+
+      <div className="space-y-3">
+        {flow.rows.map((row) => (
+          <div key={row.label}>
+            <div className="mb-1 flex items-center justify-between gap-2 text-xs">
+              <span className="text-secondary-text">{row.label}</span>
+              <span className={`font-semibold tabular-nums ${getValueToneClass(row.tone)}`}>
+                {formatCompactNumber(row.value)}
+              </span>
+            </div>
+            <div className="h-2 overflow-hidden rounded-full bg-background/70">
+              <div
+                className={`h-full rounded-full ${row.tone === 'success' ? 'bg-success' : row.tone === 'danger' ? 'bg-danger' : 'bg-warning'}`}
+                style={{ width: `${Math.max(row.ratio * 100, 6)}%` }}
+              />
+            </div>
+          </div>
+        ))}
+      </div>
+
+      <div className="mt-3 border-t border-subtle pt-3 text-[11px] text-muted-text">
+        更新时间 {formatDateTime(flow.updatedAt)}。美股或分单源缺失时使用价量估算，保证页面连续展示。
+      </div>
+    </aside>
   );
 };
 
@@ -1470,28 +2501,60 @@ const MarketStructureStrip: React.FC<{
   );
 };
 
-export const IndicatorAnalysisModal: React.FC<IndicatorAnalysisModalProps> = ({
+export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
   stockCode,
   stockName,
-  reportCurrentPrice,
-  reportChangePct,
   onClose,
+  variant = 'page',
 }) => {
-  const [isKLineExpanded, setIsKLineExpanded] = useState(true);
   const [selectedPeriod, setSelectedPeriod] = useState<KLinePeriod>('daily');
-  const [historyState, setHistoryState] = useState<HistoryState>({
-    stockCode,
-    period: 'daily',
-    history: [],
-    quote: null,
-    metrics: null,
-    metricsError: null,
-    isLoading: true,
-    error: null,
-  });
+  const [hoveredIndex, setHoveredIndex] = useState<number | null>(null);
+  const [timelineZoom, setTimelineZoom] = useState(0);
+  const [windowStart, setWindowStart] = useState(0);
+  const [chartMenu, setChartMenu] = useState<ChartMenuState | null>(null);
+  const [historyCache, setHistoryCache] = useState<HistoryCache>(() => ({
+    daily: createHistoryState(stockCode, 'daily'),
+  }));
   const oneMinuteRefreshInFlightRef = useRef(false);
+  const dailyCutoffDateRef = useRef<string | null>(null);
+  const selectedRefreshTokenRef = useRef<string | null>(null);
+  const marketKind = useMemo(() => getMarketKind(stockCode), [stockCode]);
+
+  const handlePeriodChange = useCallback((period: KLinePeriod) => {
+    selectedRefreshTokenRef.current = null;
+    setSelectedPeriod(period);
+  }, []);
 
   useEffect(() => {
+    setSelectedPeriod('daily');
+    setHoveredIndex(null);
+    setTimelineZoom(0);
+    setWindowStart(0);
+    setChartMenu(null);
+  }, [stockCode]);
+
+  useEffect(() => {
+    setHoveredIndex(null);
+    setChartMenu(null);
+  }, [selectedPeriod]);
+
+  useEffect(() => {
+    if (!chartMenu) {
+      return undefined;
+    }
+    const closeMenu = () => setChartMenu(null);
+    window.addEventListener('click', closeMenu);
+    window.addEventListener('keydown', closeMenu);
+    return () => {
+      window.removeEventListener('click', closeMenu);
+      window.removeEventListener('keydown', closeMenu);
+    };
+  }, [chartMenu]);
+
+  useEffect(() => {
+    if (!onClose) {
+      return undefined;
+    }
     const handleKeyDown = (event: KeyboardEvent) => {
       if (event.key === 'Escape') {
         event.preventDefault();
@@ -1504,67 +2567,216 @@ export const IndicatorAnalysisModal: React.FC<IndicatorAnalysisModalProps> = ({
 
   useEffect(() => {
     let ignore = false;
-    const periodMeta = getPeriodMeta(selectedPeriod);
-    Promise.allSettled([
-      stocksApi.getHistory(stockCode, periodMeta.days, selectedPeriod),
-      stocksApi.getQuote(stockCode),
-      stocksApi.getIndicatorMetrics(stockCode),
-    ])
-      .then(([historyResult, quoteResult, metricsResult]) => {
-        if (!ignore) {
-          const historyResponse = historyResult.status === 'fulfilled' ? historyResult.value : null;
-          const quoteResponse = quoteResult.status === 'fulfilled' ? quoteResult.value : null;
-          const metricsResponse = metricsResult.status === 'fulfilled' ? metricsResult.value : null;
-          setHistoryState({
-            stockCode,
-            period: selectedPeriod,
-            history: historyResponse?.data ?? [],
-            quote: quoteResponse,
-            metrics: metricsResponse,
-            metricsError: metricsResult.status === 'rejected'
-              ? metricsResult.reason instanceof Error
-                ? metricsResult.reason.message
-                : '主力筹码数据加载失败'
-              : null,
-            isLoading: false,
-            error: historyResult.status === 'rejected'
-              ? historyResult.reason instanceof Error
-                ? historyResult.reason.message
-                : '指标数据加载失败'
-              : null,
+    dailyCutoffDateRef.current = null;
+    selectedRefreshTokenRef.current = null;
+    setHistoryCache({ daily: createHistoryState(stockCode, 'daily') });
+
+    const loadInitialData = async () => {
+      const dailyMeta = getPeriodMeta('daily');
+      const [historyResult, quoteResult, metricsResult] = await Promise.allSettled([
+        stocksApi.getHistory(stockCode, dailyMeta.days, 'daily'),
+        stocksApi.getQuote(stockCode),
+        stocksApi.getIndicatorMetrics(stockCode),
+      ]);
+
+      if (ignore) {
+        return;
+      }
+
+      const historyResponse = historyResult.status === 'fulfilled' ? historyResult.value : null;
+      const quoteResponse = quoteResult.status === 'fulfilled' ? quoteResult.value : null;
+      const metricsResponse = metricsResult.status === 'fulfilled' ? metricsResult.value : null;
+      const dailyHistory = historyResponse?.data ?? [];
+      const dailyCutoffDate = getLatestHistoryDate(dailyHistory);
+      dailyCutoffDateRef.current = dailyCutoffDate;
+      const metricsError = metricsResult.status === 'rejected'
+        ? metricsResult.reason instanceof Error
+          ? metricsResult.reason.message
+          : '主力筹码数据加载失败'
+        : null;
+
+      const dailyState = createHistoryState(stockCode, 'daily', {
+        history: dailyHistory,
+        quote: quoteResponse,
+        metrics: metricsResponse,
+        metricsError,
+        isLoading: false,
+        error: historyResult.status === 'rejected'
+          ? historyResult.reason instanceof Error
+            ? historyResult.reason.message
+            : '指标数据加载失败'
+          : null,
+      });
+
+      setHistoryCache({ daily: dailyState });
+
+      INTRADAY_PERIOD_OPTIONS.forEach((option) => {
+        setHistoryCache((current) => ({
+          ...current,
+          [option.value]: createHistoryState(stockCode, option.value, {
+            quote: current.daily?.quote ?? quoteResponse,
+            metrics: current.daily?.metrics ?? metricsResponse,
+            metricsError: current.daily?.metricsError ?? metricsError,
+          }),
+        }));
+
+        void stocksApi.getHistory(stockCode, option.days, option.value)
+          .then((periodResponse) => {
+            if (ignore) {
+              return;
+            }
+            setHistoryCache((current) => {
+              const currentDaily = current.daily;
+              if (currentDaily?.stockCode !== stockCode) {
+                return current;
+              }
+              const cutoffDate = getLatestHistoryDate(currentDaily.history) ?? dailyCutoffDate;
+              const normalizedHistory = normalizeHistoryForPeriod(
+                periodResponse.data,
+                option.value,
+                marketKind,
+                cutoffDate,
+              );
+              return {
+                ...current,
+                [option.value]: createHistoryState(stockCode, option.value, {
+                  history: normalizedHistory,
+                  quote: currentDaily.quote,
+                  metrics: currentDaily.metrics,
+                  metricsError: currentDaily.metricsError,
+                  isLoading: false,
+                  error: null,
+                }),
+              };
+            });
+          })
+          .catch((err: unknown) => {
+            if (ignore) {
+              return;
+            }
+            setHistoryCache((current) => {
+              const currentState = current[option.value];
+              if (currentState?.stockCode !== stockCode) {
+                return current;
+              }
+              return {
+                ...current,
+                [option.value]: {
+                  ...currentState,
+                  isLoading: false,
+                  error: err instanceof Error ? err.message : '指标数据加载失败',
+                },
+              };
+            });
           });
-        }
-      })
-      .catch((err: unknown) => {
-        if (!ignore) {
-          setHistoryState({
-            stockCode,
-            period: selectedPeriod,
-            history: [],
-            quote: null,
-            metrics: null,
+      });
+    };
+
+    void loadInitialData().catch((err: unknown) => {
+      if (!ignore) {
+        setHistoryCache({
+          daily: createHistoryState(stockCode, 'daily', {
             metricsError: err instanceof Error ? err.message : '主力筹码数据加载失败',
             isLoading: false,
             error: err instanceof Error ? err.message : '指标数据加载失败',
-          });
-        }
-      });
+          }),
+        });
+      }
+    });
+
     return () => {
       ignore = true;
     };
-  }, [stockCode, selectedPeriod]);
+  }, [marketKind, stockCode]);
 
-  const periodMeta = getPeriodMeta(selectedPeriod);
-  const isCurrentState = historyState.stockCode === stockCode && historyState.period === selectedPeriod;
-  const isLoading = !isCurrentState || historyState.isLoading;
-  const error = isCurrentState ? historyState.error : null;
-  const history = isCurrentState ? historyState.history : EMPTY_HISTORY;
-  const quote = isCurrentState ? historyState.quote : null;
-  const metrics = isCurrentState ? historyState.metrics : null;
-  const metricsError = isCurrentState ? historyState.metricsError : null;
+  const selectedCachedState = historyCache[selectedPeriod];
+  const dailyCachedState = historyCache.daily;
+  const displayState = selectedCachedState?.stockCode === stockCode && selectedCachedState.history.length > 0
+    ? selectedCachedState
+    : dailyCachedState?.stockCode === stockCode && dailyCachedState.history.length > 0
+      ? dailyCachedState
+      : selectedCachedState?.stockCode === stockCode
+        ? selectedCachedState
+        : dailyCachedState?.stockCode === stockCode
+          ? dailyCachedState
+          : Object.values(historyCache).find((state) => state?.stockCode === stockCode);
+  const effectivePeriod = displayState?.period ?? selectedPeriod;
+  const periodMeta = getPeriodMeta(effectivePeriod);
+  const isLoading = !displayState || (displayState.isLoading && displayState.history.length === 0);
+  const error = displayState?.period === selectedPeriod ? displayState.error : null;
+  const history = displayState?.history ?? EMPTY_HISTORY;
+  const quote = displayState?.quote ?? dailyCachedState?.quote ?? null;
+  const metrics = displayState?.metrics ?? dailyCachedState?.metrics ?? null;
+  const metricsError = displayState?.metricsError ?? dailyCachedState?.metricsError ?? null;
 
   useEffect(() => {
-    if (selectedPeriod !== '1m' || !isCurrentState || isLoading) {
+    if (selectedPeriod === 'daily' || !selectedCachedState || selectedCachedState.isLoading) {
+      return undefined;
+    }
+
+    const refreshToken = `${stockCode}:${selectedPeriod}`;
+    if (selectedRefreshTokenRef.current === refreshToken) {
+      return undefined;
+    }
+    selectedRefreshTokenRef.current = refreshToken;
+
+    let ignore = false;
+    const selectedMeta = getPeriodMeta(selectedPeriod);
+    stocksApi.getHistory(stockCode, selectedMeta.days, selectedPeriod)
+      .then((periodResponse) => {
+        if (ignore) {
+          return;
+        }
+        setHistoryCache((current) => {
+          const currentState = current[selectedPeriod];
+          if (currentState?.stockCode !== stockCode) {
+            return current;
+          }
+          const cutoffDate = getLatestHistoryDate(current.daily?.history ?? []) ?? dailyCutoffDateRef.current;
+          const normalizedHistory = normalizeHistoryForPeriod(
+            periodResponse.data,
+            selectedPeriod,
+            marketKind,
+            cutoffDate,
+          );
+          return {
+            ...current,
+            [selectedPeriod]: {
+              ...currentState,
+              history: normalizedHistory,
+              isLoading: false,
+              error: null,
+            },
+          };
+        });
+      })
+      .catch((err: unknown) => {
+        if (ignore) {
+          return;
+        }
+        setHistoryCache((current) => {
+          const currentState = current[selectedPeriod];
+          if (currentState?.stockCode !== stockCode) {
+            return current;
+          }
+          return {
+            ...current,
+            [selectedPeriod]: {
+              ...currentState,
+              isLoading: false,
+              error: err instanceof Error ? err.message : '指标数据刷新失败',
+            },
+          };
+        });
+      });
+
+    return () => {
+      ignore = true;
+    };
+  }, [marketKind, selectedCachedState, selectedPeriod, stockCode]);
+
+  useEffect(() => {
+    if (selectedPeriod !== '1m' || !selectedCachedState || selectedCachedState.isLoading) {
       return undefined;
     }
 
@@ -1587,17 +2799,19 @@ export const IndicatorAnalysisModal: React.FC<IndicatorAnalysisModalProps> = ({
           return;
         }
 
-        setHistoryState((current) => {
-          if (current.stockCode !== stockCode || current.period !== '1m') {
+        setHistoryCache((current) => {
+          const currentState = current['1m'];
+          if (currentState?.stockCode !== stockCode) {
             return current;
           }
 
+          const cutoffDate = getLatestHistoryDate(current.daily?.history ?? []) ?? dailyCutoffDateRef.current;
           const nextHistory = historyResult.status === 'fulfilled'
-            ? historyResult.value.data
-            : current.history;
+            ? normalizeHistoryForPeriod(historyResult.value.data, '1m', marketKind, cutoffDate)
+            : currentState.history;
           const nextQuote = quoteResult.status === 'fulfilled'
             ? quoteResult.value
-            : current.quote;
+            : currentState.quote;
           const historyError = historyResult.status === 'rejected'
             ? historyResult.reason instanceof Error
               ? historyResult.reason.message
@@ -1606,9 +2820,12 @@ export const IndicatorAnalysisModal: React.FC<IndicatorAnalysisModalProps> = ({
 
           return {
             ...current,
-            history: nextHistory,
-            quote: nextQuote,
-            error: nextHistory.length > 0 ? null : historyError,
+            '1m': {
+              ...currentState,
+              history: nextHistory,
+              quote: nextQuote,
+              error: nextHistory.length > 0 ? null : historyError,
+            },
           };
         });
       } finally {
@@ -1625,47 +2842,95 @@ export const IndicatorAnalysisModal: React.FC<IndicatorAnalysisModalProps> = ({
       oneMinuteRefreshInFlightRef.current = false;
       window.clearInterval(intervalId);
     };
-  }, [stockCode, selectedPeriod, isCurrentState, isLoading]);
+  }, [marketKind, selectedCachedState, selectedPeriod, stockCode]);
+
+  useEffect(() => {
+    if (isLoading || selectedPeriod === '1m') {
+      return undefined;
+    }
+
+    let ignore = false;
+    const refreshQuote = async () => {
+      try {
+        const nextQuote = await stocksApi.getQuote(stockCode);
+        if (ignore) {
+          return;
+        }
+        setHistoryCache((current) => {
+          const next: HistoryCache = { ...current };
+          KLINE_PERIOD_OPTIONS.forEach((option) => {
+            const state = next[option.value];
+            if (state?.stockCode === stockCode) {
+              next[option.value] = {
+                ...state,
+                quote: nextQuote,
+              };
+            }
+          });
+          return next;
+        });
+      } catch {
+        // Quote refresh is a soft realtime enhancement; keep the last usable quote.
+      }
+    };
+
+    const intervalId = window.setInterval(() => {
+      void refreshQuote();
+    }, ONE_MINUTE_REFRESH_MS);
+
+    return () => {
+      ignore = true;
+      window.clearInterval(intervalId);
+    };
+  }, [isLoading, selectedPeriod, stockCode]);
 
   const timeMeta = useMemo(() => getTimeMeta(stockCode), [stockCode]);
   const points = useMemo(() => buildChartPoints(history), [history]);
+  const visibleCount = useMemo(() => getVisiblePointCount(points.length, timelineZoom), [points.length, timelineZoom]);
+  const maxWindowStart = Math.max(points.length - visibleCount, 0);
+  const safeWindowStart = clamp(windowStart, 0, maxWindowStart);
+  const visiblePoints = points.slice(safeWindowStart, safeWindowStart + visibleCount);
+  const safeHoveredIndex = hoveredIndex !== null && hoveredIndex >= 0 && hoveredIndex < points.length ? hoveredIndex : null;
+  const selectedPoint = safeHoveredIndex === null ? points.at(-1) : points[safeHoveredIndex];
+  const selectedPointIndex = safeHoveredIndex ?? Math.max(points.length - 1, 0);
   const latest = points.at(-1);
-  const previous = points.at(-2);
-  const displayOpen = quote?.open ?? latest?.open;
-  const displayHigh = quote?.high ?? latest?.high;
-  const displayLow = quote?.low ?? latest?.low;
   const displayClose = quote?.currentPrice ?? latest?.close;
   const displayVolume = quote?.volume ?? latest?.volume;
-  const displayAmount = quote?.amount ?? latest?.amount;
-  const displayPrevClose = quote?.prevClose ?? previous?.close;
-  const latestChangePct = reportChangePct
-    ?? quote?.changePercent
-    ?? latest?.changePercent
-    ?? (latest && previous?.close ? ((latest.close - previous.close) / previous.close) * 100 : undefined);
-  const latestPrice = reportCurrentPrice ?? quote?.currentPrice ?? latest?.close;
-  const dayAmplitude = displayHigh && displayLow && displayPrevClose
-    ? ((displayHigh - displayLow) / displayPrevClose) * 100
-    : undefined;
   const volumeRatio = displayVolume && latest?.volumeMa5 ? displayVolume / latest.volumeMa5 : undefined;
-  const estimatedChip = buildEstimatedChipDistribution(points, displayClose);
-  const support = points.length > 0 ? Math.min(...points.slice(-20).map((point) => point.low)) : undefined;
-  const resistance = points.length > 0 ? Math.max(...points.slice(-20).map((point) => point.high)) : undefined;
-  const return5 = getRecentReturn(points, 5);
-  const return20 = getRecentReturn(points, 20);
-  const trendLabel = getTrendLabel(latest);
-  const maDistance = latest?.ma20 && latest.close
-    ? ((latest.close - latest.ma20) / latest.ma20) * 100
-    : undefined;
+  const chipPoints = points.slice(0, selectedPointIndex + 1);
+  const selectedChipEstimate = buildEstimatedChipDistribution(chipPoints, selectedPoint?.close ?? displayClose);
+  const shouldUseHistoricalChip = safeHoveredIndex !== null && safeHoveredIndex < points.length - 1;
+  const estimatedChip = shouldUseHistoricalChip ? selectedChipEstimate : buildEstimatedChipDistribution(points, displayClose);
+  const chip = shouldUseHistoricalChip ? selectedChipEstimate : (metrics?.chipDistribution ?? estimatedChip);
+  const isEstimatedChip = shouldUseHistoricalChip || (!metrics?.chipDistribution && chip?.source === 'history_estimate');
+  const modal = variant === 'modal';
+
+  useEffect(() => {
+    setWindowStart(maxWindowStart);
+  }, [effectivePeriod, stockCode, points.length, visibleCount, maxWindowStart]);
+
+  const openChartMenu = (event: React.MouseEvent) => {
+    event.preventDefault();
+    setChartMenu({ x: event.clientX, y: event.clientY });
+  };
+
+  const adjustTimelineZoom = (delta: number) => {
+    setTimelineZoom((current) => clamp(current + delta, -1, 4));
+    setHoveredIndex(null);
+    setChartMenu(null);
+  };
 
   return (
     <div
-      data-testid="indicator-analysis-modal"
-      className="fixed inset-0 z-[70] flex items-center justify-center bg-background/75 p-2 backdrop-blur-sm md:p-5"
-      role="dialog"
-      aria-modal="true"
+      data-testid={modal ? 'indicator-analysis-modal' : 'indicator-analysis-page'}
+      className={modal
+        ? 'fixed inset-0 z-[70] flex items-center justify-center bg-background/75 p-2 backdrop-blur-sm md:p-5'
+        : 'flex h-[calc(100vh-5rem)] min-h-0 w-full flex-col overflow-hidden px-3 pb-4 md:h-[calc(100vh-2rem)] md:px-4'}
+      role={modal ? 'dialog' : 'region'}
+      aria-modal={modal ? 'true' : undefined}
       aria-label="指标分析"
     >
-      <div className="glass-card flex max-h-full w-full max-w-7xl flex-col overflow-hidden shadow-2xl">
+      <div className={`glass-card flex min-h-0 w-full flex-col overflow-hidden shadow-2xl ${modal ? 'max-h-full max-w-7xl' : 'h-full'}`}>
         <div className="flex shrink-0 items-center justify-between gap-3 border-b border-subtle px-4 py-3">
           <div className="min-w-0">
             <div className="flex flex-wrap items-center gap-2">
@@ -1673,14 +2938,20 @@ export const IndicatorAnalysisModal: React.FC<IndicatorAnalysisModalProps> = ({
               <Badge variant="info" size="sm">{stockCode}</Badge>
               <span className="truncate text-sm text-secondary-text">{stockName}</span>
             </div>
-            <p className="mt-1 text-xs text-muted-text">日 K、分钟 K、成交量、均线、量能与关键价位</p>
           </div>
-          <Button variant="ghost" size="sm" onClick={onClose} aria-label="关闭指标分析浮窗">
-            <X className="h-4 w-4" />
-          </Button>
+          {onClose ? (
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={onClose}
+              aria-label={modal ? '关闭指标分析浮窗' : '返回自选'}
+            >
+              {modal ? <X className="h-4 w-4" /> : <ArrowLeft className="h-4 w-4" />}
+            </Button>
+          ) : null}
         </div>
 
-        <div className="min-h-0 flex-1 overflow-y-auto p-4 md:p-5">
+        <div className={modal ? 'min-h-0 flex-1 overflow-y-auto p-4 md:p-5' : 'min-h-0 flex-1 overflow-hidden p-3 md:p-4'}>
           {isLoading ? (
             <DashboardStateBlock loading title="加载指标数据中..." className="min-h-[24rem]" />
           ) : error ? (
@@ -1693,139 +2964,128 @@ export const IndicatorAnalysisModal: React.FC<IndicatorAnalysisModalProps> = ({
               icon={<BarChart3 className="h-5 w-5" />}
             />
           ) : (
-            <div className="space-y-4">
-              <div className="flex flex-wrap items-center gap-2 border-b border-subtle pb-3">
-                <span className="text-xs font-medium text-muted-text">周期</span>
-                <div className="inline-flex flex-wrap items-center gap-1 rounded-lg border border-subtle bg-surface/70 p-1" role="tablist" aria-label="K线周期">
-                  {KLINE_PERIOD_OPTIONS.map((option) => {
-                    const isSelected = selectedPeriod === option.value;
-                    return (
-                      <button
-                        key={option.value}
-                        type="button"
-                        role="tab"
-                        aria-selected={isSelected}
-                        onClick={() => setSelectedPeriod(option.value)}
-                        className={`h-8 rounded-md px-3 text-xs font-medium transition-colors ${
-                          isSelected
-                            ? 'bg-primary text-primary-foreground shadow-sm'
-                            : 'text-secondary-text hover:bg-surface-2 hover:text-foreground'
-                        }`}
-                      >
-                        {option.label}
-                      </button>
-                    );
-                  })}
-                </div>
-              </div>
-
-              <section className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
-                <StatTile label="最新价" value={formatNumber(latestPrice, 2)} tone={(latestChangePct ?? 0) >= 0 ? 'success' : 'danger'} />
-                <StatTile label="涨跌幅" value={formatPct(latestChangePct)} tone={(latestChangePct ?? 0) >= 0 ? 'success' : 'danger'} />
-                <StatTile label="开 / 高 / 低 / 现" value={`${formatNumber(displayOpen)} / ${formatNumber(displayHigh)} / ${formatNumber(displayLow)} / ${formatNumber(displayClose)}`} />
-                <StatTile label="成交量 / 成交额" value={`${formatCompactNumber(displayVolume)} / ${formatCompactNumber(displayAmount)}`} />
-              </section>
-
-              <section className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
-                <StatTile label="MA5 / MA10 / MA20" value={`${formatNumber(latest?.ma5)} / ${formatNumber(latest?.ma10)} / ${formatNumber(latest?.ma20)}`} />
-                <StatTile label="MA20 乖离率" value={formatPct(maDistance)} tone={(maDistance ?? 0) >= 0 ? 'success' : 'danger'} />
-                <StatTile label="振幅 / 量比" value={`${formatPct(dayAmplitude)} / ${formatNumber(volumeRatio, 2)}`} />
-                <StatTile label="昨收 / 涨跌额" value={`${formatNumber(displayPrevClose)} / ${formatNumber(quote?.change)}`} tone={(latestChangePct ?? 0) >= 0 ? 'success' : 'danger'} />
-              </section>
-
-              <section className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
-                <StatTile label={periodMeta.returnLabel} value={`${formatPct(return5)} / ${formatPct(return20)}`} tone={(return20 ?? 0) >= 0 ? 'success' : 'danger'} />
-                <StatTile label={`行情更新时间 (${timeMeta.quoteLabel})`} value={formatDateTime(quote?.updateTime)} />
-                <StatTile label="历史样本" value={`${points.length} ${periodMeta.sampleUnit}`} />
-                <StatTile label="数据周期" value={`${periodMeta.label} · ${timeMeta.klineLabel}`} />
-              </section>
-
-              <MarketStructureStrip
-                points={points}
-                quote={quote}
-                metrics={metrics}
-                metricsError={metricsError}
-                estimatedChip={estimatedChip}
-                derivedVolumeRatio={volumeRatio}
-              />
-
-              <section className="rounded-xl border border-primary/25 bg-primary/5 px-4 py-3 shadow-[0_0_26px_rgba(34,211,238,0.06)]" aria-label="K线图">
-                <button
-                  type="button"
-                  data-testid="kline-chart-toggle"
-                  aria-expanded={isKLineExpanded}
-                  aria-label={`${isKLineExpanded ? '收起' : '展开'}K线图`}
-                  onClick={() => setIsKLineExpanded((value) => !value)}
-                  className={`flex w-full items-center justify-between gap-2 text-left outline-none transition-colors focus-visible:ring-2 focus-visible:ring-primary/45 ${isKLineExpanded ? 'mb-3' : ''}`}
-                >
-                  <div className="flex min-w-0 flex-wrap items-center gap-2">
-                    <BarChart3 className="h-4 w-4 shrink-0 text-primary" />
-                    <h3 className="text-sm font-semibold text-foreground">K线图</h3>
-                    {latest?.date ? <span className="font-mono text-[11px] text-muted-text">{latest.date}</span> : null}
-                    <span className="text-[11px] text-muted-text">{timeMeta.klineLabel}</span>
-                    <Badge variant="info" size="sm">{points.length} {periodMeta.sampleUnit}</Badge>
-                  </div>
-                  <ChevronDown className={`h-4 w-4 shrink-0 text-muted-text transition-transform ${isKLineExpanded ? 'rotate-180' : ''}`} />
-                </button>
-
-                {isKLineExpanded ? (
-                  <section className="grid gap-4 xl:grid-cols-[minmax(0,1.8fr)_minmax(18rem,0.8fr)]">
+            <div className="flex h-full min-h-0 flex-col gap-3">
+              <section className="grid min-h-0 flex-1 gap-3 xl:grid-cols-[minmax(0,1fr)_20rem] xl:items-start">
+                <div className="grid min-w-0 content-start gap-2 xl:h-full xl:min-h-0">
+                  <section
+                    className="min-h-0 overflow-hidden"
+                    aria-label="K线图区域"
+                  >
                     <CandlestickChart
-                      key={`${selectedPeriod}-${points.length}-${points[0]?.date ?? ''}-${latest?.date ?? ''}`}
                       points={points}
-                      period={selectedPeriod}
+                      visible={visiblePoints}
+                      visibleStartIndex={safeWindowStart}
+                      visibleCount={visibleCount}
+                      safeWindowStart={safeWindowStart}
+                      maxWindowStart={maxWindowStart}
+                      hoveredIndex={safeHoveredIndex}
+                      onHoverIndexChange={setHoveredIndex}
+                      onWindowStartChange={setWindowStart}
+                      onOpenChartMenu={openChartMenu}
+                      period={effectivePeriod}
                       periodLabel={periodMeta.label}
                       recentLabel={periodMeta.recentLabel}
                       sampleUnit={periodMeta.sampleUnit}
                       timeZoneLabel={timeMeta.klineLabel}
+                      selectedPeriod={selectedPeriod}
+                      onPeriodChange={handlePeriodChange}
                     />
-                    <div className="space-y-3">
-                      <div className="rounded-xl border border-subtle bg-surface/70 p-4">
-                        <div className="mb-3 flex items-center gap-2">
-                          <Activity className="h-4 w-4 text-primary" />
-                          <h3 className="text-sm font-semibold text-foreground">趋势摘要</h3>
-                        </div>
-                        <div className="space-y-3 text-sm">
-                          <div className="flex items-center justify-between gap-3">
-                            <span className="text-muted-text">均线结构</span>
-                            <Badge variant={trendLabel.includes('强') || trendLabel.includes('多头') ? 'success' : trendLabel.includes('弱') || trendLabel.includes('空头') ? 'danger' : 'warning'}>
-                              {trendLabel}
-                            </Badge>
-                          </div>
-                          <div className="flex items-center justify-between gap-3">
-                            <span className="text-muted-text">{periodMeta.supportLabel}</span>
-                            <span className="font-semibold tabular-nums text-foreground">{formatNumber(support)}</span>
-                          </div>
-                          <div className="flex items-center justify-between gap-3">
-                            <span className="text-muted-text">{periodMeta.resistanceLabel}</span>
-                            <span className="font-semibold tabular-nums text-foreground">{formatNumber(resistance)}</span>
-                          </div>
-                          <div className="flex items-center justify-between gap-3">
-                            <span className="text-muted-text">样本区间</span>
-                            <span className="font-mono text-xs text-secondary-text">
-                              {points[0]?.date} - {latest?.date}
-                            </span>
-                          </div>
-                        </div>
-                      </div>
-
-                      <div className="rounded-xl border border-subtle bg-surface/70 p-4">
-                        <div className="mb-3 flex items-center gap-2">
-                          <LineChart className="h-4 w-4 text-primary" />
-                          <h3 className="text-sm font-semibold text-foreground">数据说明</h3>
-                        </div>
-                        <p className="text-sm leading-6 text-secondary-text">
-                          {periodMeta.description}
-                        </p>
-                      </div>
-                    </div>
                   </section>
-                ) : null}
+
+                  <section
+                    className="min-h-0 overflow-hidden"
+                    aria-label="成交量图区域"
+                  >
+                    <VolumeActivityChart
+                      points={points}
+                      visible={visiblePoints}
+                      visibleStartIndex={safeWindowStart}
+                      hoveredIndex={safeHoveredIndex}
+                      onHoverIndexChange={setHoveredIndex}
+                      onOpenChartMenu={openChartMenu}
+                      period={effectivePeriod}
+                    />
+                  </section>
+
+                  <section
+                    className="min-h-0 overflow-hidden"
+                    aria-label="MACD图区域"
+                  >
+                    <MacdSignalChart
+                      points={points}
+                      visible={visiblePoints}
+                      visibleStartIndex={safeWindowStart}
+                      hoveredIndex={safeHoveredIndex}
+                      onHoverIndexChange={setHoveredIndex}
+                      onOpenChartMenu={openChartMenu}
+                      period={effectivePeriod}
+                    />
+                  </section>
+                </div>
+
+                <div className="flex min-h-0 flex-col gap-3 xl:h-full">
+                  <ChipPeakPanel points={chipPoints} chip={chip} isEstimated={isEstimatedChip} />
+                  <OrderFlowMonitor points={points} quote={quote} />
+                  {modal ? (
+                    <MarketStructureStrip
+                      points={points}
+                      quote={quote}
+                      metrics={metrics}
+                      metricsError={metricsError}
+                      estimatedChip={estimatedChip}
+                      derivedVolumeRatio={volumeRatio}
+                    />
+                  ) : null}
+                </div>
               </section>
             </div>
           )}
         </div>
       </div>
+      {chartMenu ? (
+        <div
+          className="fixed z-[90] min-w-28 overflow-hidden rounded-md border py-1 text-sm shadow-2xl"
+          style={{
+            left: chartMenu.x,
+            top: chartMenu.y,
+            borderColor: TERMINAL_COLORS.redGrid,
+            backgroundColor: TERMINAL_COLORS.panel,
+            color: TERMINAL_COLORS.text,
+          }}
+          role="menu"
+          aria-label="图表缩放菜单"
+        >
+          <button
+            type="button"
+            className="block w-full px-3 py-1.5 text-left hover:bg-white/10"
+            onClick={() => adjustTimelineZoom(1)}
+          >
+            放大
+          </button>
+          <button
+            type="button"
+            className="block w-full px-3 py-1.5 text-left hover:bg-white/10"
+            onClick={() => adjustTimelineZoom(-1)}
+          >
+            缩小
+          </button>
+          <button
+            type="button"
+            className="block w-full px-3 py-1.5 text-left hover:bg-white/10"
+            onClick={() => {
+              setTimelineZoom(0);
+              setHoveredIndex(null);
+              setChartMenu(null);
+            }}
+          >
+            重置
+          </button>
+        </div>
+      ) : null}
     </div>
   );
 };
+
+export const IndicatorAnalysisModal: React.FC<IndicatorAnalysisModalProps> = (props) => (
+  <IndicatorAnalysisView {...props} variant="modal" />
+);
