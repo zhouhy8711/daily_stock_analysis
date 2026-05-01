@@ -23,10 +23,12 @@ export type KLineData = {
   changePercent?: number | null;
 };
 
+export type KLinePeriod = 'daily' | '1m' | '5m' | '15m' | '30m' | '60m';
+
 export type StockHistoryResponse = {
   stockCode: string;
   stockName?: string | null;
-  period: string;
+  period: KLinePeriod | string;
   data: KLineData[];
 };
 
@@ -213,7 +215,7 @@ export const stocksApi = {
     return normalizeQuote(response.data, stockCode);
   },
 
-  async getHistory(stockCode: string, days = 120, period = 'daily'): Promise<StockHistoryResponse> {
+  async getHistory(stockCode: string, days = 120, period: KLinePeriod = 'daily'): Promise<StockHistoryResponse> {
     const response = await apiClient.get<Record<string, unknown>>(
       `/api/v1/stocks/${encodeURIComponent(stockCode)}/history`,
       {

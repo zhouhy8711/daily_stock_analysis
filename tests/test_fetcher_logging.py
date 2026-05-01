@@ -11,7 +11,9 @@ import requests
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from data_provider.base import BaseFetcher, DataFetchError, DataFetcherManager
+from data_provider.akshare_fetcher import AkshareFetcher
 from data_provider.efinance_fetcher import EfinanceFetcher
+from data_provider.yfinance_fetcher import YfinanceFetcher
 
 
 def _sample_df() -> pd.DataFrame:
@@ -157,6 +159,355 @@ class TestFetcherLogging(unittest.TestCase):
         self.assertEqual(captured_kwargs["stock_codes"], "BABA")
         self.assertEqual(list(df["code"].unique()), ["BABA"])
         self.assertAlmostEqual(df.iloc[-1]["close"], 135.82)
+
+    def test_efinance_intraday_data_uses_minute_klt(self):
+        fetcher = EfinanceFetcher()
+        captured_kwargs = {}
+        fake_df = pd.DataFrame(
+            {
+                "股票名称": ["贵州茅台", "贵州茅台"],
+                "股票代码": ["600519", "600519"],
+                "日期": ["2026-04-30 09:35", "2026-04-30 09:40"],
+                "开盘": [1408.0, 1408.0],
+                "收盘": [1407.99, 1406.4],
+                "最高": [1410.0, 1409.88],
+                "最低": [1405.1, 1406.0],
+                "成交量": [3865, 1969],
+                "成交额": [544054149.0, 277169247.0],
+                "涨跌幅": [-0.11, -0.11],
+            }
+        )
+
+        def fake_get_quote_history(**kwargs):
+            captured_kwargs.update(kwargs)
+            return fake_df
+
+        fake_efinance = types.SimpleNamespace(
+            stock=types.SimpleNamespace(get_quote_history=fake_get_quote_history)
+        )
+
+        with patch.dict(sys.modules, {"efinance": fake_efinance}):
+            with patch.object(fetcher, "_set_random_user_agent", return_value=None), patch.object(
+                fetcher, "_enforce_rate_limit", return_value=None
+            ):
+                df = fetcher.get_intraday_data(
+                    "600519",
+                    period="5m",
+                    start_date="2026-04-30",
+                    end_date="2026-04-30",
+                )
+
+        self.assertFalse(df.empty)
+        self.assertEqual(captured_kwargs["stock_codes"], "600519")
+        self.assertEqual(captured_kwargs["klt"], 5)
+        self.assertEqual(captured_kwargs["fqt"], 1)
+        self.assertEqual(df.iloc[-1]["date"].strftime("%Y-%m-%d %H:%M"), "2026-04-30 09:40")
+        self.assertAlmostEqual(df.iloc[-1]["close"], 1406.4)
+
+    def test_akshare_intraday_data_maps_time_column(self):
+        fetcher = AkshareFetcher()
+        captured_kwargs = {}
+        fake_df = pd.DataFrame(
+            {
+                "时间": ["2026-04-30 09:30:00", "2026-04-30 09:31:00"],
+                "开盘": [138.47, 138.43],
+                "收盘": [138.47, 138.90],
+                "最高": [138.47, 139.00],
+                "最低": [138.47, 138.18],
+                "成交量": [9800, 20897],
+                "成交额": [135700600.0, 289512016.0],
+                "均价": [138.47, 138.519],
+            }
+        )
+
+        def fake_stock_zh_a_hist_min_em(**kwargs):
+            captured_kwargs.update(kwargs)
+            return fake_df
+
+        fake_akshare = types.SimpleNamespace(stock_zh_a_hist_min_em=fake_stock_zh_a_hist_min_em)
+
+        with patch.dict(sys.modules, {"akshare": fake_akshare}):
+            with patch.object(fetcher, "_set_random_user_agent", return_value=None), patch.object(
+                fetcher, "_enforce_rate_limit", return_value=None
+            ):
+                df = fetcher.get_intraday_data(
+                    "300274",
+                    period="1m",
+                    start_date="2026-04-30",
+                    end_date="2026-04-30",
+                )
+
+        self.assertFalse(df.empty)
+        self.assertEqual(captured_kwargs["symbol"], "300274")
+        self.assertEqual(captured_kwargs["period"], "1")
+        self.assertEqual(df.iloc[-1]["date"].strftime("%Y-%m-%d %H:%M"), "2026-04-30 09:31")
+        self.assertAlmostEqual(df.iloc[-1]["close"], 138.90)
+
+    def test_akshare_intraday_resamples_one_minute_when_kline_fails(self):
+        fetcher = AkshareFetcher()
+        calls = []
+        fake_1m_df = pd.DataFrame(
+            {
+                "时间": [
+                    "2026-04-30 09:30:00",
+                    "2026-04-30 09:31:00",
+                    "2026-04-30 09:32:00",
+                    "2026-04-30 09:33:00",
+                    "2026-04-30 09:34:00",
+                    "2026-04-30 09:35:00",
+                ],
+                "开盘": [138.0, 138.1, 138.2, 138.3, 138.4, 138.5],
+                "收盘": [138.1, 138.2, 138.3, 138.4, 138.5, 138.6],
+                "最高": [138.2, 138.3, 138.4, 138.5, 138.6, 138.7],
+                "最低": [137.9, 138.0, 138.1, 138.2, 138.3, 138.4],
+                "成交量": [100, 200, 300, 400, 500, 600],
+                "成交额": [13800, 27600, 41400, 55200, 69000, 82800],
+                "均价": [138.0, 138.1, 138.2, 138.3, 138.4, 138.5],
+            }
+        )
+
+        def fake_stock_zh_a_hist_min_em(**kwargs):
+            calls.append(kwargs["period"])
+            if kwargs["period"] == "5":
+                raise requests.exceptions.ProxyError("temporary eastmoney failure")
+            return fake_1m_df
+
+        fake_akshare = types.SimpleNamespace(stock_zh_a_hist_min_em=fake_stock_zh_a_hist_min_em)
+
+        with patch.dict(sys.modules, {"akshare": fake_akshare}):
+            with patch.object(fetcher, "_set_random_user_agent", return_value=None), patch.object(
+                fetcher, "_enforce_rate_limit", return_value=None
+            ):
+                df = fetcher.get_intraday_data(
+                    "300274",
+                    period="5m",
+                    start_date="2026-04-30",
+                    end_date="2026-04-30",
+                )
+
+        self.assertEqual(calls, ["5", "1"])
+        self.assertFalse(df.empty)
+        self.assertEqual(df.iloc[-1]["date"].strftime("%Y-%m-%d %H:%M"), "2026-04-30 09:35")
+        self.assertAlmostEqual(df.iloc[-1]["open"], 138.1)
+        self.assertAlmostEqual(df.iloc[-1]["close"], 138.6)
+        self.assertEqual(df.iloc[-1]["volume"], 2000)
+
+    def test_akshare_intraday_uses_tencent_when_eastmoney_minute_fails(self):
+        fetcher = AkshareFetcher()
+        calls = []
+
+        def fake_stock_zh_a_hist_min_em(**kwargs):
+            calls.append(kwargs["period"])
+            raise requests.exceptions.ProxyError("temporary eastmoney failure")
+
+        class FakeResponse:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {
+                    "data": {
+                        "sz300274": {
+                            "data": {
+                                "data": [
+                                    "0930 138.47 9800 135700600.00",
+                                    "0931 138.90 30697 425212615.86",
+                                    "0932 138.49 46452 643326398.86",
+                                    "0933 139.86 61965 859277613.53",
+                                    "0934 139.77 78706 1093675388.41",
+                                    "0935 138.84 88217 1226175323.49",
+                                ]
+                            }
+                        }
+                    }
+                }
+
+        fake_akshare = types.SimpleNamespace(stock_zh_a_hist_min_em=fake_stock_zh_a_hist_min_em)
+
+        with patch.dict(sys.modules, {"akshare": fake_akshare}):
+            with patch.object(fetcher, "_set_random_user_agent", return_value=None), patch.object(
+                fetcher, "_enforce_rate_limit", return_value=None
+            ), patch("data_provider.akshare_fetcher.requests.get", return_value=FakeResponse()):
+                df = fetcher.get_intraday_data(
+                    "300274",
+                    period="5m",
+                    start_date="2026-04-30",
+                    end_date="2026-04-30",
+                )
+
+        self.assertEqual(calls, ["5", "1"])
+        self.assertFalse(df.empty)
+        self.assertEqual(df.iloc[-1]["date"].strftime("%Y-%m-%d %H:%M"), "2026-04-30 09:35")
+        self.assertAlmostEqual(df.iloc[-1]["open"], 138.47)
+        self.assertAlmostEqual(df.iloc[-1]["close"], 138.84)
+        self.assertAlmostEqual(df.iloc[-1]["volume"], 78417)
+
+    def test_akshare_us_intraday_uses_nasdaq_chart_fallback(self):
+        fetcher = AkshareFetcher()
+
+        def nasdaq_style_x(value: str) -> int:
+            return int(pd.Timestamp(value).timestamp() * 1000)
+
+        class FakeResponse:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {
+                    "data": {
+                        "chart": [
+                            {
+                                "x": nasdaq_style_x("2026-04-30 09:30:00"),
+                                "y": 130.15,
+                                "z": {"dateTime": "9:30 AM ET"},
+                            },
+                            {
+                                "x": nasdaq_style_x("2026-04-30 09:31:00"),
+                                "y": 130.20,
+                                "z": {"dateTime": "9:31 AM ET"},
+                            },
+                            {
+                                "x": nasdaq_style_x("2026-04-30 09:32:00"),
+                                "y": 130.35,
+                                "z": {"dateTime": "9:32 AM ET"},
+                            },
+                            {
+                                "x": nasdaq_style_x("2026-04-30 09:33:00"),
+                                "y": 130.10,
+                                "z": {"dateTime": "9:33 AM ET"},
+                            },
+                            {
+                                "x": nasdaq_style_x("2026-04-30 09:34:00"),
+                                "y": 130.50,
+                                "z": {"dateTime": "9:34 AM ET"},
+                            },
+                            {
+                                "x": nasdaq_style_x("2026-04-30 09:35:00"),
+                                "y": 130.80,
+                                "z": {"dateTime": "9:35 AM ET"},
+                            },
+                        ]
+                    }
+                }
+
+        with patch.object(fetcher, "_set_random_user_agent", return_value=None), patch.object(
+            fetcher, "_enforce_rate_limit", return_value=None
+        ), patch("data_provider.akshare_fetcher.requests.get", return_value=FakeResponse()):
+            df = fetcher.get_intraday_data(
+                "BABA",
+                period="5m",
+                start_date="2026-04-30",
+                end_date="2026-04-30",
+            )
+
+        self.assertFalse(df.empty)
+        self.assertEqual(df.iloc[-1]["date"].strftime("%Y-%m-%d %H:%M"), "2026-04-30 09:35")
+        self.assertAlmostEqual(df.iloc[-1]["open"], 130.15)
+        self.assertAlmostEqual(df.iloc[-1]["high"], 130.80)
+        self.assertAlmostEqual(df.iloc[-1]["low"], 130.10)
+        self.assertAlmostEqual(df.iloc[-1]["close"], 130.80)
+        self.assertEqual(df.iloc[-1]["volume"], 0)
+
+    def test_akshare_us_intraday_prefers_cnbc_multiday_ohlcv(self):
+        fetcher = AkshareFetcher()
+
+        class FakeResponse:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {
+                    "barData": {
+                        "priceBars": [
+                            {
+                                "tradeTime": "20260429155900",
+                                "open": "130.10",
+                                "high": "130.30",
+                                "low": "130.00",
+                                "close": "130.20",
+                                "volume": 1000,
+                            },
+                            {
+                                "tradeTime": "20260429180000",
+                                "open": "130.30",
+                                "high": "130.40",
+                                "low": "130.20",
+                                "close": "130.35",
+                                "volume": 900,
+                            },
+                            {
+                                "tradeTime": "20260430070000",
+                                "open": "130.80",
+                                "high": "131.10",
+                                "low": "130.70",
+                                "close": "131.00",
+                                "volume": 800,
+                            },
+                            {
+                                "tradeTime": "20260430103000",
+                                "open": "131.10",
+                                "high": "131.40",
+                                "low": "131.00",
+                                "close": "131.30",
+                                "volume": 1200,
+                            },
+                        ]
+                    }
+                }
+
+        with patch.object(fetcher, "_set_random_user_agent", return_value=None), patch.object(
+            fetcher, "_enforce_rate_limit", return_value=None
+        ), patch("data_provider.akshare_fetcher.requests.get", return_value=FakeResponse()) as mocked_get:
+            df = fetcher.get_intraday_data(
+                "BABA",
+                period="1m",
+                start_date="2026-04-29",
+                end_date="2026-04-30",
+            )
+
+        self.assertFalse(df.empty)
+        self.assertEqual(mocked_get.call_args.args[0], "https://ts-api.cnbc.com/harmony/app/charts/1D.json")
+        self.assertEqual(len(df), 2)
+        self.assertEqual(df.iloc[0]["date"].strftime("%Y-%m-%d %H:%M"), "2026-04-29 15:59")
+        self.assertEqual(df.iloc[-1]["date"].strftime("%Y-%m-%d %H:%M"), "2026-04-30 10:30")
+        self.assertAlmostEqual(df.iloc[-1]["close"], 131.30)
+        self.assertAlmostEqual(df.iloc[-1]["volume"], 1200)
+
+    def test_yfinance_intraday_data_maps_datetime_column(self):
+        fetcher = YfinanceFetcher()
+        captured_kwargs = {}
+        fake_df = pd.DataFrame(
+            {
+                "Open": [132.0, 132.5],
+                "High": [133.0, 133.2],
+                "Low": [131.8, 132.1],
+                "Close": [132.6, 133.0],
+                "Volume": [120000, 180000],
+            },
+            index=pd.to_datetime(["2026-04-30 09:35", "2026-04-30 09:40"]),
+        )
+        fake_df.index.name = "Datetime"
+
+        def fake_download(**kwargs):
+            captured_kwargs.update(kwargs)
+            return fake_df
+
+        fake_yfinance = types.SimpleNamespace(download=fake_download)
+
+        with patch.dict(sys.modules, {"yfinance": fake_yfinance}):
+            df = fetcher.get_intraday_data(
+                "BABA",
+                period="5m",
+                start_date="2026-04-30",
+                end_date="2026-04-30",
+            )
+
+        self.assertFalse(df.empty)
+        self.assertEqual(captured_kwargs["tickers"], "BABA")
+        self.assertEqual(captured_kwargs["interval"], "5m")
+        self.assertEqual(captured_kwargs["period"], "1d")
+        self.assertEqual(df.iloc[-1]["date"].strftime("%Y-%m-%d %H:%M"), "2026-04-30 09:40")
+        self.assertAlmostEqual(df.iloc[-1]["close"], 133.0)
 
     def test_us_stock_history_uses_efinance_as_yfinance_fallback(self):
         yfinance = _NamedDailyFetcher(

@@ -34,6 +34,53 @@ logger = logging.getLogger(__name__)
 
 # === 标准化列名定义 ===
 STANDARD_COLUMNS = ['date', 'open', 'high', 'low', 'close', 'volume', 'amount', 'pct_chg']
+INTRADAY_PERIOD_TO_MINUTES = {
+    "1m": 1,
+    "5m": 5,
+    "15m": 15,
+    "30m": 30,
+    "60m": 60,
+}
+KLINE_PERIOD_ALIASES = {
+    "daily": "daily",
+    "day": "daily",
+    "d": "daily",
+    "1": "1m",
+    "1m": "1m",
+    "1min": "1m",
+    "1minute": "1m",
+    "5": "5m",
+    "5m": "5m",
+    "5min": "5m",
+    "5minute": "5m",
+    "15": "15m",
+    "15m": "15m",
+    "15min": "15m",
+    "15minute": "15m",
+    "30": "30m",
+    "30m": "30m",
+    "30min": "30m",
+    "30minute": "30m",
+    "60": "60m",
+    "60m": "60m",
+    "60min": "60m",
+    "60minute": "60m",
+    "hour": "60m",
+}
+
+
+def normalize_kline_period(period: str) -> str:
+    """Normalize public K-line period aliases to canonical API values."""
+    key = str(period or "daily").strip().lower()
+    normalized = KLINE_PERIOD_ALIASES.get(key)
+    if normalized is None:
+        supported = ", ".join(["daily", *INTRADAY_PERIOD_TO_MINUTES.keys()])
+        raise ValueError(f"不支持的 K 线周期 '{period}'，支持: {supported}")
+    return normalized
+
+
+def is_intraday_period(period: str) -> bool:
+    return normalize_kline_period(period) in INTRADAY_PERIOD_TO_MINUTES
 
 
 def unwrap_exception(exc: Exception) -> Exception:
@@ -253,6 +300,7 @@ class BaseFetcher(ABC):
     
     name: str = "BaseFetcher"
     priority: int = 99  # 优先级数字越小越优先
+    supports_intraday_data: bool = False
     
     @abstractmethod
     def _fetch_raw_data(self, stock_code: str, start_date: str, end_date: str) -> pd.DataFrame:
@@ -394,6 +442,81 @@ class BaseFetcher(ABC):
                 f"error_type={error_type}, elapsed={elapsed:.2f}s, reason={error_reason}"
             )
             raise DataFetchError(f"[{self.name}] {stock_code}: {error_reason}") from e
+
+    def get_intraday_data(
+        self,
+        stock_code: str,
+        period: str = "5m",
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        days: int = 1,
+    ) -> pd.DataFrame:
+        """
+        获取分钟 K 线数据（统一入口）。
+
+        分钟 K 不落库，也不复用日线 volume_ratio 口径；调用方可按返回的
+        OHLCV 序列自行计算 MA、成交量均线等展示指标。
+        """
+        if not self.supports_intraday_data:
+            raise DataFetchError(f"[{self.name}] 不支持分钟 K 线数据")
+
+        normalized_period = normalize_kline_period(period)
+        if normalized_period == "daily":
+            return self.get_daily_data(
+                stock_code,
+                start_date=start_date,
+                end_date=end_date,
+                days=days,
+            )
+
+        if end_date is None:
+            end_date = datetime.now().strftime('%Y-%m-%d')
+
+        if start_date is None:
+            from datetime import timedelta
+            safe_days = max(1, int(days or 1))
+            start_dt = datetime.strptime(end_date, '%Y-%m-%d') - timedelta(days=safe_days - 1)
+            start_date = start_dt.strftime('%Y-%m-%d')
+
+        request_start = time.time()
+        logger.info(
+            f"[{self.name}] 开始获取 {stock_code} 分钟K线数据: "
+            f"period={normalized_period}, 范围={start_date} ~ {end_date}"
+        )
+
+        try:
+            raw_df = self._fetch_intraday_raw_data(stock_code, start_date, end_date, normalized_period)
+            if raw_df is None or raw_df.empty:
+                raise DataFetchError(f"[{self.name}] 未获取到 {stock_code} 的分钟K线数据")
+
+            df = self._normalize_data(raw_df, stock_code)
+            df = self._clean_data(df)
+
+            elapsed = time.time() - request_start
+            logger.info(
+                f"[{self.name}] {stock_code} 分钟K线获取成功: period={normalized_period}, "
+                f"范围={start_date} ~ {end_date}, rows={len(df)}, elapsed={elapsed:.2f}s"
+            )
+            return df
+
+        except Exception as e:
+            elapsed = time.time() - request_start
+            error_type, error_reason = summarize_exception(e)
+            logger.error(
+                f"[{self.name}] {stock_code} 分钟K线获取失败: period={normalized_period}, "
+                f"范围={start_date} ~ {end_date}, error_type={error_type}, "
+                f"elapsed={elapsed:.2f}s, reason={error_reason}"
+            )
+            raise DataFetchError(f"[{self.name}] {stock_code}: {error_reason}") from e
+
+    def _fetch_intraday_raw_data(
+        self,
+        stock_code: str,
+        start_date: str,
+        end_date: str,
+        period: str,
+    ) -> pd.DataFrame:
+        raise DataFetchError(f"[{self.name}] 不支持分钟 K 线数据")
     
     def _clean_data(self, df: pd.DataFrame) -> pd.DataFrame:
         """
@@ -1037,6 +1160,76 @@ class DataFetcherManager:
         error_summary = f"所有数据源获取 {stock_code} 失败:\n" + "\n".join(errors)
         elapsed = time.time() - request_start
         logger.error(f"[数据源终止] {stock_code} 获取失败: elapsed={elapsed:.2f}s\n{error_summary}")
+        raise DataFetchError(error_summary)
+
+    def get_intraday_data(
+        self,
+        stock_code: str,
+        period: str = "5m",
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        days: int = 1,
+    ) -> Tuple[pd.DataFrame, str]:
+        """
+        获取分钟 K 线数据（自动切换数据源）。
+
+        当前主要由 Efinance/东方财富提供，后续支持更多数据源时只需要在
+        对应 Fetcher 上声明 supports_intraday_data=True 并实现同名方法。
+        """
+        normalized_period = normalize_kline_period(period)
+        if normalized_period == "daily":
+            return self.get_daily_data(
+                stock_code,
+                start_date=start_date,
+                end_date=end_date,
+                days=days,
+            )
+
+        stock_code = normalize_stock_code(stock_code)
+        fetchers = self._get_fetchers_snapshot()
+        errors = []
+        total_fetchers = len(fetchers)
+        request_start = time.time()
+
+        for attempt, fetcher in enumerate(fetchers, start=1):
+            if not getattr(fetcher, "supports_intraday_data", False):
+                continue
+            try:
+                logger.info(
+                    f"[数据源尝试 {attempt}/{total_fetchers}] [{fetcher.name}] "
+                    f"获取 {stock_code} 分钟K线 period={normalized_period}..."
+                )
+                df = self._call_fetcher_method(
+                    fetcher,
+                    "get_intraday_data",
+                    stock_code=stock_code,
+                    period=normalized_period,
+                    start_date=start_date,
+                    end_date=end_date,
+                    days=days,
+                )
+                if df is not None and not df.empty:
+                    elapsed = time.time() - request_start
+                    logger.info(
+                        f"[数据源完成] {stock_code} 使用 [{fetcher.name}] 获取分钟K线成功: "
+                        f"period={normalized_period}, rows={len(df)}, elapsed={elapsed:.2f}s"
+                    )
+                    return df, fetcher.name
+            except Exception as e:
+                error_type, error_reason = summarize_exception(e)
+                error_msg = f"[{fetcher.name}] ({error_type}) {error_reason}"
+                logger.warning(
+                    f"[数据源失败 {attempt}/{total_fetchers}] [{fetcher.name}] {stock_code} "
+                    f"分钟K线 period={normalized_period}: error_type={error_type}, reason={error_reason}"
+                )
+                errors.append(error_msg)
+                continue
+
+        if not errors:
+            errors.append("没有可用的分钟K线数据源")
+        error_summary = f"所有数据源获取 {stock_code} 分钟K线失败:\n" + "\n".join(errors)
+        elapsed = time.time() - request_start
+        logger.error(f"[数据源终止] {stock_code} 分钟K线获取失败: elapsed={elapsed:.2f}s\n{error_summary}")
         raise DataFetchError(error_summary)
     
     @property

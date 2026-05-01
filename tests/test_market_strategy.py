@@ -38,6 +38,8 @@ class TestMarketAnalyzerStrategyPrompt(unittest.TestCase):
 
         self.assertIn("策略计划", prompt)
         self.assertIn("A股市场三段式复盘策略", prompt)
+        self.assertIn("所有时间必须使用24小时制", prompt)
+        self.assertIn("不使用上午/下午或 AM/PM", prompt)
 
     def test_us_prompt_contains_strategy_plan_section(self):
         analyzer = MarketAnalyzer(region="us")
@@ -45,6 +47,8 @@ class TestMarketAnalyzerStrategyPrompt(unittest.TestCase):
 
         self.assertIn("Strategy Plan", prompt)
         self.assertIn("US Market Regime Strategy", prompt)
+        self.assertIn("Use 24-hour time", prompt)
+        self.assertIn("instead of 9:30 PM", prompt)
 
     def test_cn_prompt_uses_english_shell_when_report_language_is_en(self):
         with patch("src.market_analyzer.get_config", return_value=SimpleNamespace(report_language="en")):

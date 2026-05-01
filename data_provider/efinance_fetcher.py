@@ -53,7 +53,18 @@ except (ValueError, TypeError):
 
 from patch.eastmoney_patch import eastmoney_patch
 from src.config import get_config
-from .base import BaseFetcher, DataFetchError, RateLimitError, STANDARD_COLUMNS,is_bse_code, is_st_stock, is_kc_cy_stock, normalize_stock_code
+from .base import (
+    BaseFetcher,
+    DataFetchError,
+    RateLimitError,
+    STANDARD_COLUMNS,
+    INTRADAY_PERIOD_TO_MINUTES,
+    is_bse_code,
+    is_st_stock,
+    is_kc_cy_stock,
+    normalize_kline_period,
+    normalize_stock_code,
+)
 from .realtime_types import (
     UnifiedRealtimeQuote, RealtimeSource,
     get_realtime_circuit_breaker,
@@ -254,6 +265,7 @@ class EfinanceFetcher(BaseFetcher):
     
     name = "EfinanceFetcher"
     priority = int(os.getenv("EFINANCE_PRIORITY", "0"))  # 最高优先级，排在 AkshareFetcher 之前
+    supports_intraday_data = True
     
     def __init__(self, sleep_min: float = 1.5, sleep_max: float = 3.0):
         """
@@ -438,6 +450,86 @@ class EfinanceFetcher(BaseFetcher):
 
             logger.error(failure_message)
             raise DataFetchError(f"efinance 获取数据失败: {failure_message}") from e
+
+    def _fetch_intraday_raw_data(
+        self,
+        stock_code: str,
+        start_date: str,
+        end_date: str,
+        period: str,
+    ) -> pd.DataFrame:
+        """
+        获取分钟 K 线数据。
+
+        efinance 的 get_quote_history 同一接口通过 klt 参数区分分钟/日/周/月：
+        1/5/15/30/60 分钟，101 日线。这里仅用于 API/UI 展示，不写入
+        stock_daily，避免混淆日线缓存。
+        """
+        import efinance as ef
+
+        normalized_period = normalize_kline_period(period)
+        klt = INTRADAY_PERIOD_TO_MINUTES.get(normalized_period)
+        if klt is None:
+            raise DataFetchError(f"efinance 不支持分钟周期: {period}")
+
+        self._set_random_user_agent()
+        self._enforce_rate_limit()
+
+        beg_date = start_date.replace('-', '')
+        end_date_fmt = end_date.replace('-', '')
+
+        logger.info(
+            f"[API调用] ef.stock.get_quote_history(stock_codes={stock_code}, "
+            f"beg={beg_date}, end={end_date_fmt}, klt={klt}, fqt=1) [intraday]"
+        )
+
+        api_start = time.time()
+        try:
+            df = _ef_call_with_timeout(
+                ef.stock.get_quote_history,
+                stock_codes=stock_code,
+                beg=beg_date,
+                end=end_date_fmt,
+                klt=klt,
+                fqt=1,
+                timeout=60,
+            )
+
+            api_elapsed = time.time() - api_start
+            if df is not None and not df.empty:
+                logger.info(
+                    "[API返回] Eastmoney 分钟K线成功: "
+                    f"endpoint={EASTMONEY_HISTORY_ENDPOINT}, stock_code={stock_code}, "
+                    f"period={normalized_period}, range={beg_date}~{end_date_fmt}, "
+                    f"rows={len(df)}, elapsed={api_elapsed:.2f}s"
+                )
+                logger.info(f"[API返回] 列名: {list(df.columns)}")
+            else:
+                logger.warning(
+                    "[API返回] Eastmoney 分钟K线为空: "
+                    f"endpoint={EASTMONEY_HISTORY_ENDPOINT}, stock_code={stock_code}, "
+                    f"period={normalized_period}, range={beg_date}~{end_date_fmt}, "
+                    f"elapsed={api_elapsed:.2f}s"
+                )
+            return df
+
+        except Exception as e:
+            api_elapsed = time.time() - api_start
+            category, failure_message = self._build_history_failure_message(
+                stock_code=stock_code,
+                beg_date=beg_date,
+                end_date=end_date_fmt,
+                exc=e,
+                elapsed=api_elapsed,
+                is_etf=_is_etf_code(stock_code),
+            )
+
+            if category == "rate_limit_or_anti_bot":
+                logger.warning(failure_message)
+                raise RateLimitError(f"efinance 可能被限流: {failure_message}") from e
+
+            logger.error(failure_message)
+            raise DataFetchError(f"efinance 获取分钟K线失败: {failure_message}") from e
     
     def _fetch_etf_data(self, stock_code: str, start_date: str, end_date: str) -> pd.DataFrame:
         """

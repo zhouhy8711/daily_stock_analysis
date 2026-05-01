@@ -633,6 +633,7 @@ Lagging: {bottom_sectors_text if bottom_sectors_text else "N/A"}"""
 - No JSON
 - No code blocks
 - Use emoji sparingly in headings (at most one per heading)
+- Use 24-hour time for every time mention, for example 21:30 instead of 9:30 PM
 - The entire fixed shell, headings, guidance, and conclusion must be in English
 
 ---
@@ -696,6 +697,7 @@ Output the report content directly, no extra commentary.
 - 禁止输出 JSON 格式
 - 禁止输出代码块
 - emoji 仅在标题处少量使用（每个标题最多1个）
+- 所有时间必须使用24小时制，例如 21:30，不使用上午/下午或 AM/PM
 
 ---
 

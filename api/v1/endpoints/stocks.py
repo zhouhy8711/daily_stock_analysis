@@ -43,6 +43,7 @@ router = APIRouter()
 
 # 须在 /{stock_code} 路由之前定义
 ALLOWED_MIME_STR = ", ".join(ALLOWED_MIME)
+KLINE_PERIOD_PATTERN = "^(daily|1m|5m|15m|30m|60m)$"
 
 
 @router.post(
@@ -358,7 +359,7 @@ def get_stock_indicator_metrics(stock_code: str) -> StockIndicatorMetricsRespons
 )
 def get_stock_history(
     stock_code: str,
-    period: str = Query("daily", description="K 线周期", pattern="^(daily|weekly|monthly)$"),
+    period: str = Query("daily", description="K 线周期: daily/1m/5m/15m/30m/60m", pattern=KLINE_PERIOD_PATTERN),
     days: int = Query(30, ge=1, le=365, description="获取天数")
 ) -> StockHistoryResponse:
     """
@@ -368,7 +369,7 @@ def get_stock_history(
     
     Args:
         stock_code: 股票代码
-        period: K 线周期 (daily/weekly/monthly)
+        period: K 线周期 (daily/1m/5m/15m/30m/60m)
         days: 获取天数
         
     Returns:
@@ -402,7 +403,7 @@ def get_stock_history(
         return StockHistoryResponse(
             stock_code=stock_code,
             stock_name=result.get("stock_name"),
-            period=period,
+            period=result.get("period", period),
             data=data
         )
     

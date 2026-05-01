@@ -1,10 +1,11 @@
 import type React from 'react';
-import { useEffect, useMemo, useState } from 'react';
-import { Activity, BarChart3, ChevronDown, LineChart, Users, X } from 'lucide-react';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { Activity, BarChart3, ChevronDown, ChevronLeft, ChevronRight, LineChart, Users, X } from 'lucide-react';
 import {
   stocksApi,
   type ChipDistributionMetrics,
   type KLineData,
+  type KLinePeriod,
   type MajorHolder,
   type StockIndicatorMetrics,
   type StockQuote,
@@ -29,6 +30,7 @@ type ChartPoint = KLineData & {
 
 type HistoryState = {
   stockCode: string;
+  period: KLinePeriod;
   history: KLineData[];
   quote: StockQuote | null;
   metrics: StockIndicatorMetrics | null;
@@ -79,6 +81,16 @@ type HolderScopeProfile = {
 const EMPTY_HISTORY: KLineData[] = [];
 const EMPTY_HOLDERS: MajorHolder[] = [];
 const ALL_HOLDERS_KEY = 'all';
+const KLINE_PERIOD_OPTIONS: Array<{ value: KLinePeriod; label: string; days: number }> = [
+  { value: 'daily', label: '日K', days: 120 },
+  { value: '1m', label: '1分', days: 3 },
+  { value: '5m', label: '5分', days: 3 },
+  { value: '15m', label: '15分', days: 3 },
+  { value: '30m', label: '30分', days: 3 },
+  { value: '60m', label: '60分', days: 3 },
+];
+const MAX_VISIBLE_KLINE_POINTS = 80;
+const ONE_MINUTE_REFRESH_MS = 10_000;
 const LINE_COLORS = {
   close: '#e5e7eb',
   avgCost: '#f59e0b',
@@ -95,6 +107,61 @@ const BASE_HOLDER_PROFILE: HolderScopeProfile = {
   costBias: 0,
   momentumWeight: 0,
 };
+
+function getPeriodMeta(period: KLinePeriod) {
+  const option = KLINE_PERIOD_OPTIONS.find((item) => item.value === period) ?? KLINE_PERIOD_OPTIONS[0];
+  const isDaily = option.value === 'daily';
+  return {
+    ...option,
+    isDaily,
+    sampleUnit: isDaily ? '个交易日' : '根K线',
+    recentLabel: isDaily ? '最近' : '当前窗口',
+    supportLabel: isDaily ? '近20日支撑' : '近20根支撑',
+    resistanceLabel: isDaily ? '近20日压力' : '近20根压力',
+    returnLabel: isDaily ? '5日 / 20日收益' : '5根 / 20根收益',
+    description: isDaily
+      ? '当前展示基于历史日 K 计算的技术指标，可切换上方分钟周期查看分段 K 线。五档盘口和逐笔成交暂不在此图中展示。'
+      : '当前展示分钟 K 线数据，按所选周期分段展示 OHLC、成交量、成交额与均线；可拖动下方时间窗口回看返回区间内的更早分钟数据。五档盘口和逐笔成交暂不在此图中展示。',
+  };
+}
+
+function getMarketKind(stockCode: string): 'cn' | 'hk' | 'us' {
+  const code = stockCode.trim().toUpperCase();
+  if (code.endsWith('.HK') || code.startsWith('HK') || /^\d{5}$/.test(code)) {
+    return 'hk';
+  }
+  if (/^[A-Z][A-Z0-9.-]*$/.test(code)) {
+    return 'us';
+  }
+  return 'cn';
+}
+
+function getTimeMeta(stockCode: string) {
+  const market = getMarketKind(stockCode);
+  if (market === 'us') {
+    return {
+      klineLabel: '美东 ET',
+      quoteLabel: '北京时间',
+    };
+  }
+  if (market === 'hk') {
+    return {
+      klineLabel: '港股时间',
+      quoteLabel: '北京时间',
+    };
+  }
+  return {
+    klineLabel: '北京时间',
+    quoteLabel: '北京时间',
+  };
+}
+
+function formatAxisDate(value: string, period: KLinePeriod): string {
+  if (period === 'daily') {
+    return value.slice(5);
+  }
+  return value.includes(' ') ? value.slice(5) : value;
+}
 
 function formatNumber(value?: number | null, digits = 2): string {
   if (typeof value !== 'number' || Number.isNaN(value)) {
@@ -772,15 +839,29 @@ const ChartLegend: React.FC = () => (
   </div>
 );
 
-const CandlestickChart: React.FC<{ points: ChartPoint[] }> = ({ points }) => {
+const CandlestickChart: React.FC<{
+  points: ChartPoint[];
+  period: KLinePeriod;
+  periodLabel: string;
+  recentLabel: string;
+  sampleUnit: string;
+  timeZoneLabel: string;
+}> = ({ points, period, periodLabel, recentLabel, sampleUnit, timeZoneLabel }) => {
   const [hoveredIndex, setHoveredIndex] = useState<number | null>(null);
   const width = 960;
   const priceTop = 24;
   const priceHeight = 310;
   const volumeTop = 362;
   const volumeHeight = 110;
-  const visibleStartIndex = Math.max(points.length - 80, 0);
-  const visible = points.slice(-80);
+  const visibleCount = Math.min(points.length, MAX_VISIBLE_KLINE_POINTS);
+  const maxWindowStart = Math.max(points.length - visibleCount, 0);
+  const [windowStart, setWindowStart] = useState(maxWindowStart);
+  const safeWindowStart = clamp(windowStart, 0, maxWindowStart);
+  const visibleStartIndex = safeWindowStart;
+  const visible = points.slice(safeWindowStart, safeWindowStart + visibleCount);
+  const canPan = maxWindowStart > 0;
+  const visibleFirst = visible[0];
+  const visibleLast = visible.at(-1);
   const priceValues = visible.flatMap((point) => [point.high, point.low, point.ma5, point.ma10, point.ma20])
     .filter((value): value is number => typeof value === 'number' && !Number.isNaN(value));
   const maxPrice = Math.max(...priceValues);
@@ -807,11 +888,18 @@ const CandlestickChart: React.FC<{ points: ChartPoint[] }> = ({ points }) => {
   const tooltipX = hoveredX > width - tooltipWidth - 18 ? hoveredX - tooltipWidth - 14 : hoveredX + 14;
   const tooltipY = priceTop + 12;
 
+  const shiftWindow = (direction: -1 | 1) => {
+    setWindowStart((current) => clamp(current + direction * visibleCount, 0, maxWindowStart));
+    setHoveredIndex(null);
+  };
+
   return (
     <div className="rounded-xl border border-subtle bg-surface/75 p-3">
       <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
         <ChartLegend />
-        <span className="text-[11px] text-muted-text">最近 {visible.length} 个交易日</span>
+        <span className="text-[11px] text-muted-text">
+          {recentLabel} {visible.length} {sampleUnit} · {periodLabel} · {timeZoneLabel}
+        </span>
       </div>
       <div className="overflow-x-auto">
         <svg
@@ -865,7 +953,7 @@ const CandlestickChart: React.FC<{ points: ChartPoint[] }> = ({ points }) => {
                 />
                 {index % 12 === 0 || index === visible.length - 1 ? (
                   <text x={x} y="492" textAnchor="middle" className="fill-muted-text text-[10px]">
-                    {point.date.slice(5)}
+                    {formatAxisDate(point.date, period)}
                   </text>
                 ) : null}
               </g>
@@ -960,6 +1048,47 @@ const CandlestickChart: React.FC<{ points: ChartPoint[] }> = ({ points }) => {
             </g>
           ) : null}
         </svg>
+      </div>
+      <div className="mt-3 flex flex-wrap items-center gap-3 border-t border-subtle/70 pt-3">
+        <button
+          type="button"
+          aria-label="向前移动K线窗口"
+          disabled={!canPan || safeWindowStart === 0}
+          onClick={() => shiftWindow(-1)}
+          className="inline-flex h-7 w-7 items-center justify-center rounded-md border border-subtle text-muted-text transition-colors hover:border-primary/60 hover:text-primary disabled:cursor-not-allowed disabled:opacity-40"
+        >
+          <ChevronLeft className="h-4 w-4" />
+        </button>
+        <div className="min-w-[12rem] flex-1">
+          <div className="mb-1 flex items-center justify-between gap-2 text-[11px] text-muted-text">
+            <span>时间窗口</span>
+            <span className="font-mono">
+              {visibleFirst?.date ?? '--'} - {visibleLast?.date ?? '--'}
+            </span>
+          </div>
+          <input
+            type="range"
+            min={0}
+            max={maxWindowStart}
+            value={safeWindowStart}
+            disabled={!canPan}
+            aria-label="K线时间窗口"
+            onChange={(event) => {
+              setWindowStart(Number(event.currentTarget.value));
+              setHoveredIndex(null);
+            }}
+            className="h-2 w-full cursor-grab accent-primary disabled:cursor-not-allowed disabled:opacity-40"
+          />
+        </div>
+        <button
+          type="button"
+          aria-label="向后移动K线窗口"
+          disabled={!canPan || safeWindowStart === maxWindowStart}
+          onClick={() => shiftWindow(1)}
+          className="inline-flex h-7 w-7 items-center justify-center rounded-md border border-subtle text-muted-text transition-colors hover:border-primary/60 hover:text-primary disabled:cursor-not-allowed disabled:opacity-40"
+        >
+          <ChevronRight className="h-4 w-4" />
+        </button>
       </div>
     </div>
   );
@@ -1349,8 +1478,10 @@ export const IndicatorAnalysisModal: React.FC<IndicatorAnalysisModalProps> = ({
   onClose,
 }) => {
   const [isKLineExpanded, setIsKLineExpanded] = useState(true);
+  const [selectedPeriod, setSelectedPeriod] = useState<KLinePeriod>('daily');
   const [historyState, setHistoryState] = useState<HistoryState>({
     stockCode,
+    period: 'daily',
     history: [],
     quote: null,
     metrics: null,
@@ -1358,6 +1489,7 @@ export const IndicatorAnalysisModal: React.FC<IndicatorAnalysisModalProps> = ({
     isLoading: true,
     error: null,
   });
+  const oneMinuteRefreshInFlightRef = useRef(false);
 
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
@@ -1372,8 +1504,9 @@ export const IndicatorAnalysisModal: React.FC<IndicatorAnalysisModalProps> = ({
 
   useEffect(() => {
     let ignore = false;
+    const periodMeta = getPeriodMeta(selectedPeriod);
     Promise.allSettled([
-      stocksApi.getHistory(stockCode, 120),
+      stocksApi.getHistory(stockCode, periodMeta.days, selectedPeriod),
       stocksApi.getQuote(stockCode),
       stocksApi.getIndicatorMetrics(stockCode),
     ])
@@ -1384,6 +1517,7 @@ export const IndicatorAnalysisModal: React.FC<IndicatorAnalysisModalProps> = ({
           const metricsResponse = metricsResult.status === 'fulfilled' ? metricsResult.value : null;
           setHistoryState({
             stockCode,
+            period: selectedPeriod,
             history: historyResponse?.data ?? [],
             quote: quoteResponse,
             metrics: metricsResponse,
@@ -1405,6 +1539,7 @@ export const IndicatorAnalysisModal: React.FC<IndicatorAnalysisModalProps> = ({
         if (!ignore) {
           setHistoryState({
             stockCode,
+            period: selectedPeriod,
             history: [],
             quote: null,
             metrics: null,
@@ -1417,14 +1552,82 @@ export const IndicatorAnalysisModal: React.FC<IndicatorAnalysisModalProps> = ({
     return () => {
       ignore = true;
     };
-  }, [stockCode]);
+  }, [stockCode, selectedPeriod]);
 
-  const isLoading = historyState.stockCode !== stockCode || historyState.isLoading;
-  const error = historyState.stockCode === stockCode ? historyState.error : null;
-  const history = historyState.stockCode === stockCode ? historyState.history : EMPTY_HISTORY;
-  const quote = historyState.stockCode === stockCode ? historyState.quote : null;
-  const metrics = historyState.stockCode === stockCode ? historyState.metrics : null;
-  const metricsError = historyState.stockCode === stockCode ? historyState.metricsError : null;
+  const periodMeta = getPeriodMeta(selectedPeriod);
+  const isCurrentState = historyState.stockCode === stockCode && historyState.period === selectedPeriod;
+  const isLoading = !isCurrentState || historyState.isLoading;
+  const error = isCurrentState ? historyState.error : null;
+  const history = isCurrentState ? historyState.history : EMPTY_HISTORY;
+  const quote = isCurrentState ? historyState.quote : null;
+  const metrics = isCurrentState ? historyState.metrics : null;
+  const metricsError = isCurrentState ? historyState.metricsError : null;
+
+  useEffect(() => {
+    if (selectedPeriod !== '1m' || !isCurrentState || isLoading) {
+      return undefined;
+    }
+
+    let ignore = false;
+    const oneMinuteMeta = getPeriodMeta('1m');
+
+    const refreshOneMinuteData = async () => {
+      if (oneMinuteRefreshInFlightRef.current) {
+        return;
+      }
+
+      oneMinuteRefreshInFlightRef.current = true;
+      try {
+        const [historyResult, quoteResult] = await Promise.allSettled([
+          stocksApi.getHistory(stockCode, oneMinuteMeta.days, '1m'),
+          stocksApi.getQuote(stockCode),
+        ]);
+
+        if (ignore) {
+          return;
+        }
+
+        setHistoryState((current) => {
+          if (current.stockCode !== stockCode || current.period !== '1m') {
+            return current;
+          }
+
+          const nextHistory = historyResult.status === 'fulfilled'
+            ? historyResult.value.data
+            : current.history;
+          const nextQuote = quoteResult.status === 'fulfilled'
+            ? quoteResult.value
+            : current.quote;
+          const historyError = historyResult.status === 'rejected'
+            ? historyResult.reason instanceof Error
+              ? historyResult.reason.message
+              : '指标数据刷新失败'
+            : null;
+
+          return {
+            ...current,
+            history: nextHistory,
+            quote: nextQuote,
+            error: nextHistory.length > 0 ? null : historyError,
+          };
+        });
+      } finally {
+        oneMinuteRefreshInFlightRef.current = false;
+      }
+    };
+
+    const intervalId = window.setInterval(() => {
+      void refreshOneMinuteData();
+    }, ONE_MINUTE_REFRESH_MS);
+
+    return () => {
+      ignore = true;
+      oneMinuteRefreshInFlightRef.current = false;
+      window.clearInterval(intervalId);
+    };
+  }, [stockCode, selectedPeriod, isCurrentState, isLoading]);
+
+  const timeMeta = useMemo(() => getTimeMeta(stockCode), [stockCode]);
   const points = useMemo(() => buildChartPoints(history), [history]);
   const latest = points.at(-1);
   const previous = points.at(-2);
@@ -1470,7 +1673,7 @@ export const IndicatorAnalysisModal: React.FC<IndicatorAnalysisModalProps> = ({
               <Badge variant="info" size="sm">{stockCode}</Badge>
               <span className="truncate text-sm text-secondary-text">{stockName}</span>
             </div>
-            <p className="mt-1 text-xs text-muted-text">日 K、成交量、均线、量能与关键价位</p>
+            <p className="mt-1 text-xs text-muted-text">日 K、分钟 K、成交量、均线、量能与关键价位</p>
           </div>
           <Button variant="ghost" size="sm" onClick={onClose} aria-label="关闭指标分析浮窗">
             <X className="h-4 w-4" />
@@ -1491,6 +1694,31 @@ export const IndicatorAnalysisModal: React.FC<IndicatorAnalysisModalProps> = ({
             />
           ) : (
             <div className="space-y-4">
+              <div className="flex flex-wrap items-center gap-2 border-b border-subtle pb-3">
+                <span className="text-xs font-medium text-muted-text">周期</span>
+                <div className="inline-flex flex-wrap items-center gap-1 rounded-lg border border-subtle bg-surface/70 p-1" role="tablist" aria-label="K线周期">
+                  {KLINE_PERIOD_OPTIONS.map((option) => {
+                    const isSelected = selectedPeriod === option.value;
+                    return (
+                      <button
+                        key={option.value}
+                        type="button"
+                        role="tab"
+                        aria-selected={isSelected}
+                        onClick={() => setSelectedPeriod(option.value)}
+                        className={`h-8 rounded-md px-3 text-xs font-medium transition-colors ${
+                          isSelected
+                            ? 'bg-primary text-primary-foreground shadow-sm'
+                            : 'text-secondary-text hover:bg-surface-2 hover:text-foreground'
+                        }`}
+                      >
+                        {option.label}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+
               <section className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
                 <StatTile label="最新价" value={formatNumber(latestPrice, 2)} tone={(latestChangePct ?? 0) >= 0 ? 'success' : 'danger'} />
                 <StatTile label="涨跌幅" value={formatPct(latestChangePct)} tone={(latestChangePct ?? 0) >= 0 ? 'success' : 'danger'} />
@@ -1506,10 +1734,10 @@ export const IndicatorAnalysisModal: React.FC<IndicatorAnalysisModalProps> = ({
               </section>
 
               <section className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
-                <StatTile label="5日 / 20日收益" value={`${formatPct(return5)} / ${formatPct(return20)}`} tone={(return20 ?? 0) >= 0 ? 'success' : 'danger'} />
-                <StatTile label="行情更新时间" value={formatDateTime(quote?.updateTime)} />
-                <StatTile label="历史样本" value={`${points.length} 个交易日`} />
-                <StatTile label="数据周期" value="日 K" />
+                <StatTile label={periodMeta.returnLabel} value={`${formatPct(return5)} / ${formatPct(return20)}`} tone={(return20 ?? 0) >= 0 ? 'success' : 'danger'} />
+                <StatTile label={`行情更新时间 (${timeMeta.quoteLabel})`} value={formatDateTime(quote?.updateTime)} />
+                <StatTile label="历史样本" value={`${points.length} ${periodMeta.sampleUnit}`} />
+                <StatTile label="数据周期" value={`${periodMeta.label} · ${timeMeta.klineLabel}`} />
               </section>
 
               <MarketStructureStrip
@@ -1534,14 +1762,23 @@ export const IndicatorAnalysisModal: React.FC<IndicatorAnalysisModalProps> = ({
                     <BarChart3 className="h-4 w-4 shrink-0 text-primary" />
                     <h3 className="text-sm font-semibold text-foreground">K线图</h3>
                     {latest?.date ? <span className="font-mono text-[11px] text-muted-text">{latest.date}</span> : null}
-                    <Badge variant="info" size="sm">{points.length} 个交易日</Badge>
+                    <span className="text-[11px] text-muted-text">{timeMeta.klineLabel}</span>
+                    <Badge variant="info" size="sm">{points.length} {periodMeta.sampleUnit}</Badge>
                   </div>
                   <ChevronDown className={`h-4 w-4 shrink-0 text-muted-text transition-transform ${isKLineExpanded ? 'rotate-180' : ''}`} />
                 </button>
 
                 {isKLineExpanded ? (
                   <section className="grid gap-4 xl:grid-cols-[minmax(0,1.8fr)_minmax(18rem,0.8fr)]">
-                    <CandlestickChart points={points} />
+                    <CandlestickChart
+                      key={`${selectedPeriod}-${points.length}-${points[0]?.date ?? ''}-${latest?.date ?? ''}`}
+                      points={points}
+                      period={selectedPeriod}
+                      periodLabel={periodMeta.label}
+                      recentLabel={periodMeta.recentLabel}
+                      sampleUnit={periodMeta.sampleUnit}
+                      timeZoneLabel={timeMeta.klineLabel}
+                    />
                     <div className="space-y-3">
                       <div className="rounded-xl border border-subtle bg-surface/70 p-4">
                         <div className="mb-3 flex items-center gap-2">
@@ -1556,11 +1793,11 @@ export const IndicatorAnalysisModal: React.FC<IndicatorAnalysisModalProps> = ({
                             </Badge>
                           </div>
                           <div className="flex items-center justify-between gap-3">
-                            <span className="text-muted-text">近20日支撑</span>
+                            <span className="text-muted-text">{periodMeta.supportLabel}</span>
                             <span className="font-semibold tabular-nums text-foreground">{formatNumber(support)}</span>
                           </div>
                           <div className="flex items-center justify-between gap-3">
-                            <span className="text-muted-text">近20日压力</span>
+                            <span className="text-muted-text">{periodMeta.resistanceLabel}</span>
                             <span className="font-semibold tabular-nums text-foreground">{formatNumber(resistance)}</span>
                           </div>
                           <div className="flex items-center justify-between gap-3">
@@ -1578,7 +1815,7 @@ export const IndicatorAnalysisModal: React.FC<IndicatorAnalysisModalProps> = ({
                           <h3 className="text-sm font-semibold text-foreground">数据说明</h3>
                         </div>
                         <p className="text-sm leading-6 text-secondary-text">
-                          当前展示基于历史日 K 计算的技术指标。五档盘口、逐笔成交与实时分时明细尚未接入前端数据源，因此这里优先展示项目已有的 OHLC、成交量、成交额与均线指标。
+                          {periodMeta.description}
                         </p>
                       </div>
                     </div>

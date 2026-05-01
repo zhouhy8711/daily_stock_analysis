@@ -1,6 +1,8 @@
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pandas as pd
+
 from data_provider.realtime_types import RealtimeSource
 from src.services.stock_service import StockService
 
@@ -71,6 +73,29 @@ class _FakeManager:
         }
 
 
+class _FakeHistoryManager:
+    def get_intraday_data(self, stock_code, period="5m", days=1, **_kwargs):
+        assert stock_code == "600519"
+        assert period == "5m"
+        assert days == 1
+        return pd.DataFrame(
+            {
+                "date": pd.to_datetime(["2026-04-30 09:35", "2026-04-30 09:40"]),
+                "open": [1408.0, 1408.0],
+                "high": [1410.0, 1409.88],
+                "low": [1405.1, 1406.0],
+                "close": [1407.99, 1406.4],
+                "volume": [3865, 1969],
+                "amount": [544054149.0, 277169247.0],
+                "pct_chg": [-0.11, -0.11],
+            }
+        ), "EfinanceFetcher"
+
+    def get_stock_name(self, stock_code):
+        assert stock_code == "600519"
+        return "贵州茅台"
+
+
 def test_realtime_quote_exposes_volume_turnover_and_source_fields() -> None:
     manager = _FakeManager()
 
@@ -96,3 +121,16 @@ def test_indicator_metrics_maps_chip_distribution_and_major_holders() -> None:
     assert result["major_holder_status"] == "ok"
     assert result["major_holders"][0]["name"] == "摩根士丹利"
     assert result["major_holders"][0]["holding_ratio"] == 2.35
+
+
+def test_history_data_supports_intraday_period() -> None:
+    manager = _FakeHistoryManager()
+
+    with patch("data_provider.base.DataFetcherManager", return_value=manager):
+        result = StockService().get_history_data("600519", period="5m", days=1)
+
+    assert result["period"] == "5m"
+    assert result["stock_name"] == "贵州茅台"
+    assert result["data"][0]["date"] == "2026-04-30 09:35"
+    assert result["data"][0]["open"] == 1408.0
+    assert result["data"][1]["change_percent"] == -0.11

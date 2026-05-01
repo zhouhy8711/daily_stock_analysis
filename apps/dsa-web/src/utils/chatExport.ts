@@ -11,6 +11,7 @@ export function formatSessionAsMarkdown(messages: Message[]): string {
     day: '2-digit',
     hour: '2-digit',
     minute: '2-digit',
+    hour12: false,
   });
 
   const lines: string[] = [

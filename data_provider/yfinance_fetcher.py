@@ -31,7 +31,13 @@ from tenacity import (
     before_sleep_log,
 )
 
-from .base import BaseFetcher, DataFetchError, STANDARD_COLUMNS, is_bse_code
+from .base import (
+    BaseFetcher,
+    DataFetchError,
+    STANDARD_COLUMNS,
+    is_bse_code,
+    normalize_kline_period,
+)
 from .realtime_types import UnifiedRealtimeQuote, RealtimeSource
 from .us_index_mapping import get_us_index_yf_symbol, is_us_stock_code
 
@@ -73,6 +79,7 @@ class YfinanceFetcher(BaseFetcher):
 
     name = "YfinanceFetcher"
     priority = int(os.getenv("YFINANCE_PRIORITY", "4"))
+    supports_intraday_data = True
 
     def __init__(self):
         """初始化 YfinanceFetcher"""
@@ -202,6 +209,60 @@ class YfinanceFetcher(BaseFetcher):
                 raise
             raise DataFetchError(f"Yahoo Finance 获取数据失败: {e}") from e
 
+    def _fetch_intraday_raw_data(
+        self,
+        stock_code: str,
+        start_date: str,
+        end_date: str,
+        period: str,
+    ) -> pd.DataFrame:
+        """Fetch intraday K-line data from Yahoo Finance."""
+        import yfinance as yf
+
+        normalized_period = normalize_kline_period(period)
+        if normalized_period == "daily":
+            return self._fetch_raw_data(stock_code, start_date, end_date)
+
+        yf_code = self._convert_stock_code(stock_code)
+
+        try:
+            start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+            end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+            requested_days = max((end_dt - start_dt).days + 1, 1)
+        except Exception:
+            requested_days = 1
+
+        # Yahoo Finance limits 1m bars to a shorter lookback. The Web UI only
+        # requests same-day data, but this keeps direct API calls bounded too.
+        max_days = 7 if normalized_period == "1m" else 30
+        yf_period = f"{min(requested_days, max_days)}d"
+
+        logger.debug(
+            f"调用 yfinance.download({yf_code}, period={yf_period}, interval={normalized_period})"
+        )
+
+        try:
+            df = yf.download(
+                tickers=yf_code,
+                period=yf_period,
+                interval=normalized_period,
+                progress=False,
+                auto_adjust=True,
+                multi_level_index=True,
+                prepost=False,
+                timeout=15,
+            )
+
+            if df.empty:
+                raise DataFetchError(f"Yahoo Finance 未查询到 {stock_code} 的分钟K线数据")
+
+            return df
+
+        except Exception as e:
+            if isinstance(e, DataFetchError):
+                raise
+            raise DataFetchError(f"Yahoo Finance 获取分钟K线失败: {e}") from e
+
     def _normalize_data(self, df: pd.DataFrame, stock_code: str) -> pd.DataFrame:
         """
         标准化 Yahoo Finance 数据
@@ -230,6 +291,7 @@ class YfinanceFetcher(BaseFetcher):
         # 列名映射（yfinance 使用首字母大写）
         column_mapping = {
             'Date': 'date',
+            'Datetime': 'date',
             'Open': 'open',
             'High': 'high',
             'Low': 'low',

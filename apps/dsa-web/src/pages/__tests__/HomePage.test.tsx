@@ -300,11 +300,20 @@ describe('HomePage', () => {
     fireEvent.click(indicatorButton);
 
     expect(await screen.findByTestId('indicator-analysis-modal')).toBeInTheDocument();
-    expect(stocksApi.getHistory).toHaveBeenCalledWith('600519', 120);
+    expect(stocksApi.getHistory).toHaveBeenCalledWith('600519', 120, 'daily');
     expect(stocksApi.getQuote).toHaveBeenCalledWith('600519');
     expect(stocksApi.getIndicatorMetrics).toHaveBeenCalledWith('600519');
+    expect(screen.getByRole('tab', { name: '日K' })).toHaveAttribute('aria-selected', 'true');
+    expect(screen.getByRole('tab', { name: '5分' })).toBeInTheDocument();
     expect(await screen.findByText('MA5 / MA10 / MA20')).toBeInTheDocument();
     expect(await screen.findByText('昨收 / 涨跌额')).toBeInTheDocument();
+    expect(screen.getByRole('slider', { name: 'K线时间窗口' })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('tab', { name: '1分' }));
+    await waitFor(() => {
+      expect(stocksApi.getHistory).toHaveBeenLastCalledWith('600519', 3, '1m');
+    });
+    expect(await screen.findByText('数据周期')).toBeInTheDocument();
+    expect(screen.getByText('1分 · 北京时间')).toBeInTheDocument();
     expect(await screen.findByText('主力持仓与筹码分布')).toBeInTheDocument();
     const marketStructureToggle = await screen.findByTestId('market-structure-toggle');
     expect(marketStructureToggle).toHaveAttribute('aria-expanded', 'false');
@@ -408,7 +417,7 @@ describe('HomePage', () => {
 
     fireEvent.click(screen.getByRole('button', { name: '查看 腾讯控股 指标分析' }));
     expect(await screen.findByTestId('indicator-analysis-modal')).toBeInTheDocument();
-    expect(stocksApi.getHistory).toHaveBeenLastCalledWith('00700.HK', 120);
+    expect(stocksApi.getHistory).toHaveBeenLastCalledWith('00700.HK', 120, 'daily');
 
     fireEvent.keyDown(window, { key: 'Escape' });
     await waitFor(() => {
@@ -418,7 +427,7 @@ describe('HomePage', () => {
     fireEvent.click(screen.getByRole('button', { name: '美股' }));
     fireEvent.click(screen.getByRole('button', { name: '查看 阿里巴巴 指标分析' }));
     expect(await screen.findByTestId('indicator-analysis-modal')).toBeInTheDocument();
-    expect(stocksApi.getHistory).toHaveBeenLastCalledWith('BABA', 120);
+    expect(stocksApi.getHistory).toHaveBeenLastCalledWith('BABA', 120, 'daily');
   });
 
   it('shows the empty report workspace when history is empty', async () => {

@@ -60,7 +60,7 @@ class StockQuote(BaseModel):
 class KLineData(BaseModel):
     """K 线数据点"""
     
-    date: str = Field(..., description="日期")
+    date: str = Field(..., description="日期或分钟时间")
     open: float = Field(..., description="开盘价")
     high: float = Field(..., description="最高价")
     low: float = Field(..., description="最低价")
@@ -105,7 +105,7 @@ class StockHistoryResponse(BaseModel):
     
     stock_code: str = Field(..., description="股票代码")
     stock_name: Optional[str] = Field(None, description="股票名称")
-    period: str = Field(..., description="K 线周期")
+    period: str = Field(..., description="K 线周期: daily/1m/5m/15m/30m/60m")
     data: List[KLineData] = Field(default_factory=list, description="K 线数据列表")
     
     class Config:

@@ -43,7 +43,18 @@ from tenacity import (
 
 from patch.eastmoney_patch import eastmoney_patch
 from src.config import get_config
-from .base import BaseFetcher, DataFetchError, RateLimitError, STANDARD_COLUMNS, is_bse_code, is_st_stock, is_kc_cy_stock, normalize_stock_code
+from .base import (
+    BaseFetcher,
+    DataFetchError,
+    INTRADAY_PERIOD_TO_MINUTES,
+    RateLimitError,
+    STANDARD_COLUMNS,
+    is_bse_code,
+    is_st_stock,
+    is_kc_cy_stock,
+    normalize_kline_period,
+    normalize_stock_code,
+)
 from .realtime_types import (
     UnifiedRealtimeQuote, ChipDistribution, RealtimeSource,
     get_realtime_circuit_breaker, get_chip_circuit_breaker,
@@ -60,6 +71,7 @@ logger = logging.getLogger(__name__)
 
 SINA_REALTIME_ENDPOINT = "hq.sinajs.cn/list"
 TENCENT_REALTIME_ENDPOINT = "qt.gtimg.cn/q"
+CNBC_CHART_ENDPOINT = "https://ts-api.cnbc.com/harmony/app/charts/1D.json"
 
 
 # User-Agent 池，用于随机轮换
@@ -266,6 +278,7 @@ class AkshareFetcher(BaseFetcher):
     
     name = "AkshareFetcher"
     priority = int(os.getenv("AKSHARE_PRIORITY", "1"))
+    supports_intraday_data = True
     
     def __init__(self, sleep_min: float = 2.0, sleep_max: float = 5.0):
         """
@@ -518,6 +531,512 @@ class AkshareFetcher(BaseFetcher):
 
         except Exception as e:
             raise e
+
+    @staticmethod
+    def _resample_intraday_from_1m(df: pd.DataFrame, period: str) -> pd.DataFrame:
+        """
+        Aggregate AkShare 1-minute bars into coarser minute K-lines.
+
+        Eastmoney's direct 5/15/30/60 minute endpoint can occasionally fail while
+        the trends endpoint still returns current-session 1-minute bars.  Keeping
+        this fallback local preserves the same OHLCV contract for the Web chart.
+        """
+        minutes = INTRADAY_PERIOD_TO_MINUTES[period]
+        if minutes == 1 or df is None or df.empty:
+            return df
+
+        required = {"时间", "开盘", "收盘", "最高", "最低", "成交量", "成交额"}
+        if not required.issubset(set(df.columns)):
+            missing = ", ".join(sorted(required - set(df.columns)))
+            raise DataFetchError(f"Akshare 1分钟数据缺少字段: {missing}")
+
+        work_df = df.copy()
+        work_df["时间"] = pd.to_datetime(work_df["时间"])
+        for column in ["开盘", "收盘", "最高", "最低", "成交量", "成交额"]:
+            work_df[column] = pd.to_numeric(work_df[column], errors="coerce")
+
+        work_df = work_df.dropna(subset=["时间", "开盘", "收盘", "最高", "最低"])
+        if work_df.empty:
+            return pd.DataFrame()
+
+        work_df["__timestamp"] = work_df["时间"]
+        grouped = (
+            work_df.set_index("时间")
+            .resample(f"{minutes}min", label="right", closed="right", origin="start_day", offset="9h30min")
+            .agg({
+                "__timestamp": "last",
+                "开盘": "first",
+                "收盘": "last",
+                "最高": "max",
+                "最低": "min",
+                "成交量": "sum",
+                "成交额": "sum",
+            })
+            .dropna(subset=["开盘", "收盘"])
+            .reset_index()
+        )
+        grouped["涨跌幅"] = grouped["收盘"].pct_change().fillna(0) * 100
+        grouped["时间"] = grouped["__timestamp"].dt.strftime("%Y-%m-%d %H:%M:%S")
+        grouped = grouped.drop(columns=["__timestamp"])
+        return grouped
+
+    def _fetch_a_stock_intraday_data(
+        self,
+        stock_code: str,
+        start_at: str,
+        end_at: str,
+        period: str,
+    ) -> pd.DataFrame:
+        """Fetch A-share minute bars, with local 1m and Tencent fallbacks."""
+        import akshare as ak
+
+        minutes = str(INTRADAY_PERIOD_TO_MINUTES[period])
+        try:
+            df = ak.stock_zh_a_hist_min_em(
+                symbol=stock_code,
+                period=minutes,
+                start_date=start_at,
+                end_date=end_at,
+                adjust="qfq",
+            )
+            if df is not None and not df.empty:
+                return df
+        except Exception as exc:
+            logger.warning(
+                "Akshare %s 分钟K线接口失败，尝试用 1 分钟数据聚合: %s",
+                minutes,
+                exc,
+            )
+
+        try:
+            one_minute_df = ak.stock_zh_a_hist_min_em(
+                symbol=stock_code,
+                period="1",
+                start_date=start_at,
+                end_date=end_at,
+                adjust="qfq",
+            )
+        except Exception as exc:
+            logger.warning(
+                "Akshare 1 分钟趋势接口失败，尝试腾讯当日分时接口: %s",
+                exc,
+            )
+            one_minute_df = self._fetch_tencent_intraday_data(stock_code, start_at, end_at)
+
+        return self._resample_intraday_from_1m(one_minute_df, period)
+
+    def _fetch_tencent_intraday_data(
+        self,
+        stock_code: str,
+        start_at: str,
+        end_at: str,
+    ) -> pd.DataFrame:
+        """
+        Fetch current-day A-share minute data from Tencent.
+
+        Tencent's minute endpoint returns cumulative volume/amount and the
+        minute price.  We convert cumulative values to per-minute bars and use
+        previous price as the next bar's open so downstream charting still gets
+        a normal OHLCV sequence when Eastmoney is unavailable.
+        """
+        symbol = _to_sina_tx_symbol(stock_code)
+        start_dt = pd.to_datetime(start_at)
+        end_dt = pd.to_datetime(end_at)
+        endpoint = "https://web.ifzq.gtimg.cn/appstock/app/minute/query"
+
+        response = requests.get(
+            endpoint,
+            params={"code": symbol},
+            timeout=10,
+            headers={"User-Agent": random.choice(USER_AGENTS)},
+        )
+        response.raise_for_status()
+        payload = response.json()
+        raw_points = (
+            payload.get("data", {})
+            .get(symbol, {})
+            .get("data", {})
+            .get("data", [])
+        )
+        if not raw_points:
+            raise DataFetchError(f"腾讯分时接口未返回 {stock_code} 数据")
+
+        trade_date = end_dt.strftime("%Y-%m-%d")
+        rows = []
+        previous_price: Optional[float] = None
+        previous_volume = 0.0
+        previous_amount = 0.0
+
+        for item in raw_points:
+            parts = str(item).split()
+            if len(parts) < 4:
+                continue
+
+            time_part, price_raw, volume_raw, amount_raw = parts[:4]
+            if len(time_part) != 4:
+                continue
+
+            timestamp = pd.to_datetime(
+                f"{trade_date} {time_part[:2]}:{time_part[2:]}:00",
+                errors="coerce",
+            )
+            if pd.isna(timestamp) or timestamp < start_dt or timestamp > end_dt:
+                continue
+
+            try:
+                close = float(price_raw)
+                cumulative_volume = float(volume_raw)
+                cumulative_amount = float(amount_raw)
+            except (TypeError, ValueError):
+                continue
+
+            open_price = previous_price if previous_price is not None else close
+            volume = max(cumulative_volume - previous_volume, 0.0)
+            amount = max(cumulative_amount - previous_amount, 0.0)
+            high = max(open_price, close)
+            low = min(open_price, close)
+
+            rows.append({
+                "时间": timestamp.strftime("%Y-%m-%d %H:%M:%S"),
+                "开盘": open_price,
+                "收盘": close,
+                "最高": high,
+                "最低": low,
+                "成交量": volume,
+                "成交额": amount,
+            })
+
+            previous_price = close
+            previous_volume = cumulative_volume
+            previous_amount = cumulative_amount
+
+        if not rows:
+            raise DataFetchError(f"腾讯分时接口无 {stock_code} 可用分钟记录")
+
+        return pd.DataFrame(rows)
+
+    def _fetch_hk_intraday_data(
+        self,
+        stock_code: str,
+        start_at: str,
+        end_at: str,
+        period: str,
+    ) -> pd.DataFrame:
+        """Fetch HK minute bars through AkShare Eastmoney APIs."""
+        import akshare as ak
+
+        code = stock_code.lower().replace("hk", "").replace(".hk", "").zfill(5)
+        minutes = str(INTRADAY_PERIOD_TO_MINUTES[period])
+        try:
+            df = ak.stock_hk_hist_min_em(
+                symbol=code,
+                period=minutes,
+                adjust="qfq",
+                start_date=start_at,
+                end_date=end_at,
+            )
+            if df is not None and not df.empty:
+                return df
+        except Exception as exc:
+            if period == "1m":
+                raise
+            logger.warning(
+                "Akshare 港股 %s 分钟K线接口失败，尝试用 1 分钟数据聚合: %s",
+                minutes,
+                exc,
+            )
+
+        one_minute_df = ak.stock_hk_hist_min_em(
+            symbol=code,
+            period="1",
+            adjust="qfq",
+            start_date=start_at,
+            end_date=end_at,
+        )
+        return self._resample_intraday_from_1m(one_minute_df, period)
+
+    def _fetch_us_intraday_data(
+        self,
+        stock_code: str,
+        start_at: str,
+        end_at: str,
+        period: str,
+    ) -> pd.DataFrame:
+        """
+        Fetch US minute K-lines from public chart endpoints.
+
+        CNBC provides recent multi-day minute OHLCV, which allows the Web chart
+        to pan back to previous sessions.  Nasdaq is kept as a same-day price
+        fallback for environments where CNBC is temporarily unavailable.
+        """
+        try:
+            return self._fetch_cnbc_us_intraday_data(stock_code, start_at, end_at, period)
+        except Exception as exc:
+            logger.warning(
+                "CNBC 美股分钟K线接口失败，尝试 Nasdaq 当日 chart 兜底: %s",
+                exc,
+            )
+            return self._fetch_nasdaq_us_intraday_data(stock_code, start_at, end_at, period)
+
+    def _fetch_cnbc_us_intraday_data(
+        self,
+        stock_code: str,
+        start_at: str,
+        end_at: str,
+        period: str,
+    ) -> pd.DataFrame:
+        """Fetch recent US minute OHLCV from CNBC's public chart endpoint."""
+        from zoneinfo import ZoneInfo
+
+        symbol = stock_code.strip().upper()
+        eastern = ZoneInfo("America/New_York")
+        start_dt = pd.to_datetime(start_at).tz_localize(eastern)
+        end_dt = pd.to_datetime(end_at).tz_localize(eastern)
+
+        response = requests.get(
+            CNBC_CHART_ENDPOINT,
+            params={"symbol": symbol},
+            timeout=20,
+            headers={
+                "Accept": "application/json, text/plain, */*",
+                "Referer": f"https://www.cnbc.com/quotes/{symbol}",
+                "User-Agent": random.choice(USER_AGENTS),
+            },
+        )
+        response.raise_for_status()
+        payload = response.json()
+        bars = (payload.get("barData") or {}).get("priceBars") or []
+        if not bars:
+            raise DataFetchError(f"CNBC 分钟接口未返回 {stock_code} 数据")
+
+        rows = []
+        for item in bars:
+            timestamp = self._parse_cnbc_chart_timestamp(item, eastern)
+            if timestamp is None or timestamp < start_dt or timestamp > end_dt:
+                continue
+
+            market_time = timestamp.strftime("%H:%M")
+            if market_time < "09:30" or market_time > "16:00":
+                continue
+
+            try:
+                open_price = float(item.get("open"))
+                high = float(item.get("high"))
+                low = float(item.get("low"))
+                close = float(item.get("close"))
+                volume = float(item.get("volume") or 0)
+            except (TypeError, ValueError):
+                continue
+
+            rows.append({
+                "时间": timestamp.strftime("%Y-%m-%d %H:%M:%S"),
+                "开盘": open_price,
+                "收盘": close,
+                "最高": high,
+                "最低": low,
+                "成交量": volume,
+                "成交额": close * volume,
+            })
+
+        if not rows:
+            raise DataFetchError(f"CNBC 分钟接口无 {stock_code} 可用分钟记录")
+
+        one_minute_df = pd.DataFrame(rows).drop_duplicates(subset=["时间"]).sort_values("时间")
+        return self._resample_intraday_from_1m(one_minute_df, period)
+
+    @staticmethod
+    def _parse_cnbc_chart_timestamp(item: Dict[str, Any], eastern) -> Optional[pd.Timestamp]:
+        trade_time = str(item.get("tradeTime") or "").strip()
+        if trade_time:
+            try:
+                parsed = datetime.strptime(trade_time, "%Y%m%d%H%M%S")
+                return pd.Timestamp(parsed).tz_localize(eastern)
+            except ValueError:
+                pass
+
+        try:
+            return pd.Timestamp(int(item["tradeTimeinMills"]), unit="ms", tz="UTC").tz_convert(eastern)
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    def _fetch_nasdaq_us_intraday_data(
+        self,
+        stock_code: str,
+        start_at: str,
+        end_at: str,
+        period: str,
+    ) -> pd.DataFrame:
+        """
+        Fetch US same-day minute prices from Nasdaq's public chart endpoint.
+
+        This endpoint provides timestamped prices but not minute volume.  We keep
+        volume/amount at zero instead of inventing liquidity, then aggregate the
+        price series to the selected K-line period.
+        """
+        from zoneinfo import ZoneInfo
+
+        symbol = stock_code.strip().upper()
+        endpoint = f"https://api.nasdaq.com/api/quote/{symbol}/chart"
+        headers = {
+            "Accept": "application/json, text/plain, */*",
+            "Origin": "https://www.nasdaq.com",
+            "Referer": f"https://www.nasdaq.com/market-activity/stocks/{symbol.lower()}",
+            "User-Agent": random.choice(USER_AGENTS),
+        }
+        response = requests.get(
+            endpoint,
+            params={"assetclass": "stocks"},
+            timeout=15,
+            headers=headers,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        chart = (payload.get("data") or {}).get("chart") or []
+        if not chart:
+            raise DataFetchError(f"Nasdaq 分时接口未返回 {stock_code} 数据")
+
+        eastern = ZoneInfo("America/New_York")
+        start_dt = pd.to_datetime(start_at).tz_localize(eastern)
+        end_dt = pd.to_datetime(end_at).tz_localize(eastern)
+
+        points = []
+        trade_date = end_dt.date()
+        for item in chart:
+            try:
+                close = float(item.get("y"))
+            except (TypeError, ValueError):
+                continue
+
+            timestamp = self._parse_nasdaq_chart_timestamp(item, trade_date, eastern)
+            if timestamp is None or timestamp.date() != trade_date:
+                continue
+
+            points.append((timestamp, close))
+
+        regular_points = [
+            (timestamp, close)
+            for timestamp, close in points
+            if start_dt <= timestamp <= end_dt
+        ]
+        selected_points = regular_points or points
+        if not selected_points:
+            raise DataFetchError(f"Nasdaq 分时接口无 {stock_code} 可用分钟记录")
+
+        selected_points = sorted(selected_points, key=lambda point: point[0])
+        rows = []
+        previous_price: Optional[float] = None
+        for timestamp, close in selected_points:
+            open_price = previous_price if previous_price is not None else close
+            high = max(open_price, close)
+            low = min(open_price, close)
+            rows.append({
+                "时间": timestamp.strftime("%Y-%m-%d %H:%M:%S"),
+                "开盘": open_price,
+                "收盘": close,
+                "最高": high,
+                "最低": low,
+                "成交量": 0,
+                "成交额": 0,
+            })
+            previous_price = close
+
+        one_minute_df = pd.DataFrame(rows)
+        return self._resample_intraday_from_1m(one_minute_df, period)
+
+    @staticmethod
+    def _parse_nasdaq_chart_timestamp(
+        item: Dict[str, Any],
+        trade_date,
+        eastern,
+    ) -> Optional[pd.Timestamp]:
+        """
+        Parse Nasdaq chart timestamps as US Eastern wall-clock time.
+
+        The chart payload's numeric ``x`` value is encoded like a local market
+        timestamp rather than a normal UTC epoch.  Prefer the explicit
+        ``z.dateTime`` field (for example, ``11:00 AM ET``), and only use ``x``
+        as a local-time fallback.
+        """
+        marker = item.get("z")
+        if isinstance(marker, dict):
+            timestamp_text = str(marker.get("dateTime") or "").strip()
+        else:
+            timestamp_text = str(marker or "").strip()
+
+        if timestamp_text:
+            cleaned = timestamp_text.replace(" ET", "").strip()
+            for fmt in ("%I:%M %p", "%b %d, %Y %I:%M %p"):
+                try:
+                    parsed = datetime.strptime(cleaned, fmt)
+                except ValueError:
+                    continue
+
+                if fmt == "%I:%M %p":
+                    parsed = datetime.combine(trade_date, parsed.time())
+                return pd.Timestamp(parsed).tz_localize(eastern)
+
+        try:
+            return pd.Timestamp(float(item["x"]), unit="ms").tz_localize(eastern)
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    def _fetch_intraday_raw_data(
+        self,
+        stock_code: str,
+        start_date: str,
+        end_date: str,
+        period: str,
+    ) -> pd.DataFrame:
+        """Fetch minute K-line data via AkShare as a secondary source."""
+        normalized_period = normalize_kline_period(period)
+        if normalized_period == "daily":
+            return self._fetch_raw_data(stock_code, start_date, end_date)
+
+        self._set_random_user_agent()
+        self._enforce_rate_limit()
+
+        start_at = f"{start_date} 09:30:00"
+        if _is_us_code(stock_code) or _is_hk_code(stock_code):
+            end_at = f"{end_date} 16:00:00"
+        else:
+            end_at = f"{end_date} 15:00:00"
+
+        logger.info(
+            "[API调用] Akshare 分钟K线: stock_code=%s, period=%s, range=%s~%s",
+            stock_code,
+            normalized_period,
+            start_at,
+            end_at,
+        )
+
+        try:
+            if _is_us_code(stock_code):
+                df = self._fetch_us_intraday_data(stock_code, start_at, end_at, normalized_period)
+            elif _is_hk_code(stock_code):
+                df = self._fetch_hk_intraday_data(stock_code, start_at, end_at, normalized_period)
+            else:
+                df = self._fetch_a_stock_intraday_data(stock_code, start_at, end_at, normalized_period)
+
+            if df is not None and not df.empty:
+                logger.info(
+                    "[API返回] Akshare 分钟K线成功: stock_code=%s, period=%s, rows=%s",
+                    stock_code,
+                    normalized_period,
+                    len(df),
+                )
+                return df
+
+            logger.warning(
+                "[API返回] Akshare 分钟K线为空: stock_code=%s, period=%s",
+                stock_code,
+                normalized_period,
+            )
+            return pd.DataFrame()
+        except Exception as e:
+            error_msg = str(e).lower()
+            if any(keyword in error_msg for keyword in ['banned', 'blocked', '频率', 'rate', '限制']):
+                raise RateLimitError(f"Akshare 可能被限流: {e}") from e
+            raise DataFetchError(f"Akshare 获取分钟K线失败: {e}") from e
     
     def _fetch_etf_data(self, stock_code: str, start_date: str, end_date: str) -> pd.DataFrame:
         """
@@ -754,6 +1273,7 @@ class AkshareFetcher(BaseFetcher):
         # 列名映射（Akshare 中文列名 -> 标准英文列名）
         column_mapping = {
             '日期': 'date',
+            '时间': 'date',
             '开盘': 'open',
             '收盘': 'close',
             '最高': 'high',

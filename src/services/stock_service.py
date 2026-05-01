@@ -179,6 +179,30 @@ class StockService:
             "errors": errors,
             "update_time": datetime.now().isoformat(),
         }
+
+    @staticmethod
+    def _format_kline_date(value: Any, period: str) -> str:
+        if hasattr(value, "strftime"):
+            if period == "daily":
+                return value.strftime("%Y-%m-%d")
+            return value.strftime("%Y-%m-%d %H:%M")
+        return str(value)
+
+    @staticmethod
+    def _build_kline_payload(df, period: str) -> List[Dict[str, Any]]:
+        data: List[Dict[str, Any]] = []
+        for _, row in df.iterrows():
+            data.append({
+                "date": StockService._format_kline_date(row.get("date"), period),
+                "open": _to_optional_float(row.get("open")) or 0.0,
+                "high": _to_optional_float(row.get("high")) or 0.0,
+                "low": _to_optional_float(row.get("low")) or 0.0,
+                "close": _to_optional_float(row.get("close")) or 0.0,
+                "volume": _to_optional_float(row.get("volume")),
+                "amount": _to_optional_float(row.get("amount")),
+                "change_percent": _to_optional_float(row.get("pct_chg")),
+            })
+        return data
     
     def get_history_data(
         self,
@@ -191,60 +215,45 @@ class StockService:
         
         Args:
             stock_code: 股票代码
-            period: K 线周期 (daily/weekly/monthly)
+            period: K 线周期 (daily/1m/5m/15m/30m/60m)
             days: 获取天数
             
         Returns:
             历史行情数据字典
             
         Raises:
-            ValueError: 当 period 不是 daily 时抛出（weekly/monthly 暂未实现）
+            ValueError: 当 period 不受支持时抛出
         """
-        # 验证 period 参数，只支持 daily
-        if period != "daily":
-            raise ValueError(
-                f"暂不支持 '{period}' 周期，目前仅支持 'daily'。"
-                "weekly/monthly 聚合功能将在后续版本实现。"
-            )
-        
         try:
             # 调用数据获取器获取历史数据
-            from data_provider.base import DataFetcherManager
+            from data_provider.base import DataFetcherManager, normalize_kline_period
+
+            normalized_period = normalize_kline_period(period)
             
             manager = DataFetcherManager()
-            df, source = manager.get_daily_data(stock_code, days=days)
+            if normalized_period == "daily":
+                df, source = manager.get_daily_data(stock_code, days=days)
+            else:
+                df, source = manager.get_intraday_data(
+                    stock_code,
+                    period=normalized_period,
+                    days=max(1, min(int(days or 1), 30)),
+                )
             
             if df is None or df.empty:
                 logger.warning(f"获取 {stock_code} 历史数据失败")
-                return {"stock_code": stock_code, "period": period, "data": []}
+                return {"stock_code": stock_code, "period": normalized_period, "data": []}
             
             # 获取股票名称
             stock_name = manager.get_stock_name(stock_code)
             
             # 转换为响应格式
-            data = []
-            for _, row in df.iterrows():
-                date_val = row.get("date")
-                if hasattr(date_val, "strftime"):
-                    date_str = date_val.strftime("%Y-%m-%d")
-                else:
-                    date_str = str(date_val)
-                
-                data.append({
-                    "date": date_str,
-                    "open": float(row.get("open", 0)),
-                    "high": float(row.get("high", 0)),
-                    "low": float(row.get("low", 0)),
-                    "close": float(row.get("close", 0)),
-                    "volume": float(row.get("volume", 0)) if row.get("volume") else None,
-                    "amount": float(row.get("amount", 0)) if row.get("amount") else None,
-                    "change_percent": float(row.get("pct_chg", 0)) if row.get("pct_chg") else None,
-                })
+            data = self._build_kline_payload(df, normalized_period)
             
             return {
                 "stock_code": stock_code,
                 "stock_name": stock_name,
-                "period": period,
+                "period": normalized_period,
                 "data": data,
             }
             
