@@ -9,10 +9,20 @@ import { stocksApi } from '../../api/stocks';
 import { systemConfigApi } from '../../api/systemConfig';
 import { ShellSidebarActionProvider } from '../../components/layout/ShellSidebarActionContext';
 import { useStockPoolStore } from '../../stores';
+import type { StockIndexItem } from '../../types/stockIndex';
 import { getReportText, normalizeReportLanguage } from '../../utils/reportLanguage';
 import HomePage from '../HomePage';
 
 const navigateMock = vi.fn();
+const stockIndexHookState = vi.hoisted(() => ({
+  current: {
+    index: [] as StockIndexItem[],
+    loading: false,
+    error: null as Error | null,
+    fallback: false,
+    loaded: true,
+  },
+}));
 
 vi.mock('react-router-dom', async () => {
   const actual = await vi.importActual<typeof import('react-router-dom')>('react-router-dom');
@@ -45,12 +55,15 @@ vi.mock('../../api/analysis', async () => {
 vi.mock('../../api/systemConfig', () => ({
   systemConfigApi: {
     getConfig: vi.fn(),
+    update: vi.fn(),
   },
+  SystemConfigConflictError: class SystemConfigConflictError extends Error {},
 }));
 
 vi.mock('../../api/stocks', () => ({
   stocksApi: {
     getQuote: vi.fn(),
+    getQuotes: vi.fn(),
     getHistory: vi.fn(),
     getIndicatorMetrics: vi.fn(),
   },
@@ -58,6 +71,10 @@ vi.mock('../../api/stocks', () => ({
 
 vi.mock('../../hooks/useTaskStream', () => ({
   useTaskStream: vi.fn(),
+}));
+
+vi.mock('../../hooks/useStockIndex', () => ({
+  useStockIndex: () => stockIndexHookState.current,
 }));
 
 const historyItem = {
@@ -115,11 +132,27 @@ describe('HomePage', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     navigateMock.mockReset();
+    stockIndexHookState.current = {
+      index: [],
+      loading: false,
+      error: null,
+      fallback: false,
+      loaded: true,
+    };
     useStockPoolStore.getState().resetDashboardState();
     vi.mocked(systemConfigApi.getConfig).mockResolvedValue({
       configVersion: 'v1',
       maskToken: '******',
       items: [{ key: 'STOCK_LIST', value: '', rawValueExists: false, isMasked: false }],
+    });
+    vi.mocked(systemConfigApi.update).mockResolvedValue({
+      success: true,
+      configVersion: 'v2',
+      appliedCount: 1,
+      skippedMaskedCount: 0,
+      reloadTriggered: true,
+      updatedKeys: ['STOCK_LIST'],
+      warnings: [],
     });
     vi.mocked(stocksApi.getHistory).mockResolvedValue({
       stockCode: '600519',
@@ -141,6 +174,11 @@ describe('HomePage', () => {
       amount: 120000000,
       volumeRatio: 1.1,
       turnoverRate: 0.8,
+      updateTime: '2026-04-25T15:00:00',
+    });
+    vi.mocked(stocksApi.getQuotes).mockResolvedValue({
+      items: [],
+      failedCodes: [],
       updateTime: '2026-04-25T15:00:00',
     });
     vi.mocked(stocksApi.getIndicatorMetrics).mockResolvedValue({
@@ -195,6 +233,72 @@ describe('HomePage', () => {
         name: getReportText(normalizeReportLanguage(historyReport.meta.reportLanguage)).fullReport,
       }),
     ).toBeInTheDocument();
+  });
+
+  it('sorts the watchlist by latest price and change percentage', async () => {
+    vi.mocked(systemConfigApi.getConfig).mockResolvedValue({
+      configVersion: 'v1',
+      maskToken: '******',
+      items: [{ key: 'STOCK_LIST', value: '600519,000001', rawValueExists: true, isMasked: false }],
+    });
+    vi.mocked(historyApi.getList).mockResolvedValue({
+      total: 2,
+      page: 1,
+      limit: 20,
+      items: [
+        {
+          ...historyItem,
+          id: 1,
+          stockCode: '600519',
+          stockName: '贵州茅台',
+          currentPrice: 1688.5,
+          changePct: -1.25,
+        },
+        {
+          ...historyItem,
+          id: 2,
+          stockCode: '000001',
+          stockName: '平安银行',
+          currentPrice: 11.23,
+          changePct: 0.42,
+        },
+      ],
+    });
+
+    render(
+      <MemoryRouter>
+        <HomePage />
+      </MemoryRouter>,
+    );
+
+    const watchlistTab = await screen.findByRole('button', { name: '自选' });
+    const board = watchlistTab.closest('section') as HTMLElement;
+    const getStockLabels = () => within(board)
+      .getAllByRole('button', { name: /查看 .* 报告/ })
+      .map((button) => button.getAttribute('aria-label'));
+
+    expect(getStockLabels()).toEqual([
+      '查看 贵州茅台 报告',
+      '查看 平安银行 报告',
+    ]);
+
+    fireEvent.click(within(board).getByRole('button', { name: '最新价排序' }));
+    expect(getStockLabels()).toEqual([
+      '查看 贵州茅台 报告',
+      '查看 平安银行 报告',
+    ]);
+
+    fireEvent.click(within(board).getByRole('button', { name: '最新价降序排序' }));
+    expect(getStockLabels()).toEqual([
+      '查看 平安银行 报告',
+      '查看 贵州茅台 报告',
+    ]);
+
+    fireEvent.click(within(board).getByRole('button', { name: '涨跌幅排序' }));
+    expect(getStockLabels()).toEqual([
+      '查看 平安银行 报告',
+      '查看 贵州茅台 报告',
+    ]);
   });
 
   it('closes the report overlay when pressing Escape', async () => {
@@ -372,6 +476,140 @@ describe('HomePage', () => {
 
     expect(await screen.findByText('暂无监控股票')).toBeInTheDocument();
     expect(screen.getByText('在设置里维护 STOCK_LIST，或先完成一次分析后这里会展示最近关注的股票。')).toBeInTheDocument();
+  });
+
+  it('shows all A-share stocks sorted by id, filters with the home search, and adds to watchlist', async () => {
+    stockIndexHookState.current = {
+      index: [
+        {
+          canonicalCode: '600519.SH',
+          displayCode: '600519',
+          nameZh: '贵州茅台',
+          pinyinFull: 'guizhoumaotai',
+          pinyinAbbr: 'gzmt',
+          aliases: ['茅台'],
+          market: 'CN',
+          assetType: 'stock',
+          active: true,
+          popularity: 100,
+        },
+        {
+          canonicalCode: '000001.SZ',
+          displayCode: '000001',
+          nameZh: '平安银行',
+          pinyinFull: 'pinganyinhang',
+          pinyinAbbr: 'payh',
+          aliases: [],
+          market: 'CN',
+          assetType: 'stock',
+          active: true,
+          popularity: 90,
+        },
+        {
+          canonicalCode: 'BABA',
+          displayCode: 'BABA',
+          nameZh: '阿里巴巴',
+          market: 'US',
+          assetType: 'stock',
+          active: true,
+          popularity: 95,
+        },
+      ],
+      loading: false,
+      error: null,
+      fallback: false,
+      loaded: true,
+    };
+    vi.mocked(historyApi.getList).mockResolvedValue({
+      total: 0,
+      page: 1,
+      limit: 20,
+      items: [],
+    });
+    vi.mocked(analysisApi.analyzeAsync).mockResolvedValue({
+      taskId: 'task-all-share',
+      status: 'pending',
+    });
+    vi.mocked(stocksApi.getQuotes).mockImplementation(async (stockCodes: string[]) => ({
+      items: stockCodes
+        .filter((code) => code === '000001' || code === '600519')
+        .map((code) => ({
+          stockCode: code,
+          stockName: code === '000001' ? '平安银行' : '贵州茅台',
+          currentPrice: code === '000001' ? 11.23 : 1688.5,
+          changePercent: code === '000001' ? 0.42 : -1.25,
+          updateTime: '2026-04-25T15:00:00',
+        })),
+      failedCodes: [],
+      updateTime: '2026-04-25T15:00:00',
+    }));
+
+    render(
+      <MemoryRouter>
+        <HomePage />
+      </MemoryRouter>,
+    );
+
+    const allShareTab = await screen.findByRole('button', { name: 'A股所有' });
+    fireEvent.click(allShareTab);
+
+    const board = allShareTab.closest('section') as HTMLElement;
+    const stockButtons = within(board).getAllByRole('button', { name: /查看 .* 报告/ });
+    expect(stockButtons.map((button) => button.getAttribute('aria-label'))).toEqual([
+      '查看 平安银行 报告',
+      '查看 贵州茅台 报告',
+    ]);
+    expect(screen.queryByRole('button', { name: '查看 阿里巴巴 报告' })).not.toBeInTheDocument();
+    await waitFor(() => {
+      expect(stocksApi.getQuotes).toHaveBeenCalledWith(['000001', '600519']);
+    });
+    expect(await screen.findByText('11.230')).toBeInTheDocument();
+    expect(screen.getByText('+0.42%')).toBeInTheDocument();
+    expect(screen.getByText('1688.50')).toBeInTheDocument();
+    expect(screen.getByText('-1.25%')).toBeInTheDocument();
+
+    fireEvent.click(within(board).getByRole('button', { name: '最新价排序' }));
+    expect(within(board).getAllByRole('button', { name: /查看 .* 报告/ })
+      .map((button) => button.getAttribute('aria-label'))).toEqual([
+      '查看 贵州茅台 报告',
+      '查看 平安银行 报告',
+    ]);
+
+    fireEvent.click(within(board).getByRole('button', { name: '涨跌幅排序' }));
+    expect(within(board).getAllByRole('button', { name: /查看 .* 报告/ })
+      .map((button) => button.getAttribute('aria-label'))).toEqual([
+      '查看 平安银行 报告',
+      '查看 贵州茅台 报告',
+    ]);
+
+    const input = screen.getByPlaceholderText('输入股票代码或名称，如 600519、贵州茅台、AAPL');
+    fireEvent.change(input, { target: { value: '茅台' } });
+
+    expect(screen.getByRole('button', { name: '查看 贵州茅台 报告' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '查看 平安银行 报告' })).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: '添加 贵州茅台 到自选' }));
+
+    await waitFor(() => {
+      expect(systemConfigApi.update).toHaveBeenCalledWith(expect.objectContaining({
+        configVersion: 'v1',
+        maskToken: '******',
+        reloadNow: true,
+        items: [{ key: 'STOCK_LIST', value: '600519' }],
+      }));
+    });
+    expect(analysisApi.analyzeAsync).not.toHaveBeenCalled();
+    expect(await screen.findByRole('button', { name: '贵州茅台 已在自选' })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: '查看 贵州茅台 报告' }));
+
+    await waitFor(() => {
+      expect(analysisApi.analyzeAsync).toHaveBeenCalledWith(expect.objectContaining({
+        stockCode: '600519.SH',
+        stockName: '贵州茅台',
+        originalQuery: '600519.SH',
+      }));
+    });
   });
 
   it('surfaces duplicate task warnings from dashboard submission', async () => {
@@ -715,7 +953,7 @@ describe('HomePage', () => {
     );
 
     expect(await screen.findByRole('button', { name: '查看 阳光电源 报告' })).toBeInTheDocument();
-    const watchlistPanel = screen.getByRole('heading', { name: '自选' }).closest('section');
+    const watchlistPanel = screen.getByRole('button', { name: '自选' }).closest('section');
     expect(watchlistPanel).not.toBeNull();
     expect(within(watchlistPanel as HTMLElement).getByRole('button', { name: '重新分析' })).toBeDisabled();
     fireEvent.click(screen.getByRole('button', { name: '多选' }));

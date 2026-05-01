@@ -11,6 +11,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 <!-- 新条目格式：- [类型] 描述（类型取值：新功能/改进/修复/文档/测试/chore）-->
 - [新功能] Web 首页自选监控区新增重新分析入口，支持多选自选股票后批量重做，并将分析进度移入左侧边栏空白区
+- [新功能] Web 首页新增“A股所有”Tab，按股票 ID 展示全量 A 股并联动顶部搜索，保留最新价/涨跌幅列并通过批量实时行情填充，支持从列表一键添加到 `STOCK_LIST` 自选
+- [改进] Web 首页自选与“A股所有”列表支持按最新价或涨跌幅升降序排序，并在批量行情主源失败时回退腾讯批量接口填充 A 股价格
+- [改进] Web 指标分析图表支持点击固定联动光标，并用左右方向键同步移动 K线、成交量、MACD 与筹码峰选中日期
 <!-- 每条独立一行追加到本段末尾，无需分类标题，合并时冲突最小 -->
 - [修复] Pipeline Agent 5 个 K 线工具（get_daily_history / analyze_trend / calculate_ma / get_volume_analysis / analyze_pattern）改为 DB-first 加载，消除同一只股票 9x5=45 次重复 HTTP 请求 (Fixes #1066)
 - [修复] Pipeline Agent 执行前按需预热 240 天 K 线历史到 DB，正常情况下 K 线工具调用无需重复网络请求

@@ -39,6 +39,8 @@ from api.v1.schemas.stocks import (
     MajorHolder,
     StockIndicatorMetricsResponse,
     StockQuote,
+    StockQuotesRequest,
+    StockQuotesResponse,
     StockHistoryResponse,
     KLineData,
 )
@@ -121,6 +123,8 @@ __all__ = [
     "ReportDetails",
     # stocks
     "StockQuote",
+    "StockQuotesRequest",
+    "StockQuotesResponse",
     "StockHistoryResponse",
     "StockIndicatorMetricsResponse",
     "ChipDistributionMetrics",

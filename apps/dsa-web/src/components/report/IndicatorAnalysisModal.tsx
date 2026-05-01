@@ -125,6 +125,8 @@ type ChartMenuState = {
   y: number;
 };
 
+type HoverStepDirection = -1 | 1;
+
 type VolumeIndicatorMode = 'volume' | 'amount' | 'volumeMa';
 type MomentumIndicatorMode = 'macd' | 'rsi';
 
@@ -1192,7 +1194,10 @@ const CandlestickChart: React.FC<{
   safeWindowStart: number;
   maxWindowStart: number;
   hoveredIndex: number | null;
+  isHoverPinned: boolean;
   onHoverIndexChange: (index: number | null) => void;
+  onHoverPinnedChange: (value: boolean) => void;
+  onStepHoverIndex: (direction: HoverStepDirection) => void;
   onWindowStartChange: (value: number) => void;
   onOpenChartMenu: (event: React.MouseEvent) => void;
   period: KLinePeriod;
@@ -1210,7 +1215,10 @@ const CandlestickChart: React.FC<{
   safeWindowStart,
   maxWindowStart,
   hoveredIndex,
+  isHoverPinned,
   onHoverIndexChange,
+  onHoverPinnedChange,
+  onStepHoverIndex,
   onWindowStartChange,
   onOpenChartMenu,
   period,
@@ -1270,7 +1278,20 @@ const CandlestickChart: React.FC<{
 
   const shiftWindow = (direction: -1 | 1) => {
     onWindowStartChange(clamp(safeWindowStart + direction * visibleCount, 0, maxWindowStart));
+    onHoverPinnedChange(false);
     onHoverIndexChange(null);
+  };
+
+  const setVisibleHoverIndex = (index: number) => {
+    onHoverIndexChange(visibleStartIndex + index);
+  };
+
+  const handleHitMouseDown = (event: React.MouseEvent<SVGRectElement>) => {
+    if (!isHoverPinned || (event.button !== 3 && event.button !== 4)) {
+      return;
+    }
+    event.preventDefault();
+    onStepHoverIndex(event.button === 3 ? -1 : 1);
   };
 
   return (
@@ -1428,10 +1449,31 @@ const CandlestickChart: React.FC<{
                 tabIndex={0}
                 role="graphics-symbol"
                 aria-label={`${point.date} 指标明细`}
-                onMouseEnter={() => onHoverIndexChange(visibleStartIndex + index)}
-                onMouseLeave={() => onHoverIndexChange(null)}
-                onFocus={() => onHoverIndexChange(visibleStartIndex + index)}
-                onBlur={() => onHoverIndexChange(null)}
+                onMouseEnter={() => {
+                  if (!isHoverPinned) {
+                    setVisibleHoverIndex(index);
+                  }
+                }}
+                onMouseLeave={() => {
+                  if (!isHoverPinned) {
+                    onHoverIndexChange(null);
+                  }
+                }}
+                onMouseDown={handleHitMouseDown}
+                onClick={() => {
+                  setVisibleHoverIndex(index);
+                  onHoverPinnedChange(true);
+                }}
+                onFocus={() => {
+                  if (!isHoverPinned) {
+                    setVisibleHoverIndex(index);
+                  }
+                }}
+                onBlur={() => {
+                  if (!isHoverPinned) {
+                    onHoverIndexChange(null);
+                  }
+                }}
               />
             );
           })}
@@ -1522,6 +1564,7 @@ const CandlestickChart: React.FC<{
             aria-label="K线时间窗口"
             onChange={(event) => {
               onWindowStartChange(Number(event.currentTarget.value));
+              onHoverPinnedChange(false);
               onHoverIndexChange(null);
             }}
             className="h-1.5 w-full cursor-grab disabled:cursor-not-allowed disabled:opacity-40"
@@ -1548,7 +1591,10 @@ const VolumeActivityChart: React.FC<{
   visible: ChartPoint[];
   visibleStartIndex: number;
   hoveredIndex: number | null;
+  isHoverPinned: boolean;
   onHoverIndexChange: (index: number | null) => void;
+  onHoverPinnedChange: (value: boolean) => void;
+  onStepHoverIndex: (direction: HoverStepDirection) => void;
   onOpenChartMenu: (event: React.MouseEvent) => void;
   period: KLinePeriod;
 }> = ({
@@ -1556,7 +1602,10 @@ const VolumeActivityChart: React.FC<{
   visible,
   visibleStartIndex,
   hoveredIndex,
+  isHoverPinned,
   onHoverIndexChange,
+  onHoverPinnedChange,
+  onStepHoverIndex,
   onOpenChartMenu,
   period,
 }) => {
@@ -1613,6 +1662,16 @@ const VolumeActivityChart: React.FC<{
   const hoveredX = hoveredVisibleIndex === null ? 0 : hoveredVisibleIndex * step;
   const tooltipX = hoveredX > plotRight - 236 ? hoveredX - 222 : hoveredX + 12;
   const latest = visible.at(-1);
+  const setVisibleHoverIndex = (index: number) => {
+    onHoverIndexChange(visibleStartIndex + index);
+  };
+  const handleHitMouseDown = (event: React.MouseEvent<SVGRectElement>) => {
+    if (!isHoverPinned || (event.button !== 3 && event.button !== 4)) {
+      return;
+    }
+    event.preventDefault();
+    onStepHoverIndex(event.button === 3 ? -1 : 1);
+  };
 
   return (
     <div
@@ -1708,10 +1767,31 @@ const VolumeActivityChart: React.FC<{
                 tabIndex={0}
                 role="graphics-symbol"
                 aria-label={`${point.date} 成交量明细`}
-                onMouseEnter={() => onHoverIndexChange(visibleStartIndex + index)}
-                onMouseLeave={() => onHoverIndexChange(null)}
-                onFocus={() => onHoverIndexChange(visibleStartIndex + index)}
-                onBlur={() => onHoverIndexChange(null)}
+                onMouseEnter={() => {
+                  if (!isHoverPinned) {
+                    setVisibleHoverIndex(index);
+                  }
+                }}
+                onMouseLeave={() => {
+                  if (!isHoverPinned) {
+                    onHoverIndexChange(null);
+                  }
+                }}
+                onMouseDown={handleHitMouseDown}
+                onClick={() => {
+                  setVisibleHoverIndex(index);
+                  onHoverPinnedChange(true);
+                }}
+                onFocus={() => {
+                  if (!isHoverPinned) {
+                    setVisibleHoverIndex(index);
+                  }
+                }}
+                onBlur={() => {
+                  if (!isHoverPinned) {
+                    onHoverIndexChange(null);
+                  }
+                }}
               />
             );
           })}
@@ -1752,7 +1832,10 @@ const MacdSignalChart: React.FC<{
   visible: ChartPoint[];
   visibleStartIndex: number;
   hoveredIndex: number | null;
+  isHoverPinned: boolean;
   onHoverIndexChange: (index: number | null) => void;
+  onHoverPinnedChange: (value: boolean) => void;
+  onStepHoverIndex: (direction: HoverStepDirection) => void;
   onOpenChartMenu: (event: React.MouseEvent) => void;
   period: KLinePeriod;
 }> = ({
@@ -1760,7 +1843,10 @@ const MacdSignalChart: React.FC<{
   visible,
   visibleStartIndex,
   hoveredIndex,
+  isHoverPinned,
   onHoverIndexChange,
+  onHoverPinnedChange,
+  onStepHoverIndex,
   onOpenChartMenu,
   period,
 }) => {
@@ -1804,6 +1890,16 @@ const MacdSignalChart: React.FC<{
   const hoveredX = hoveredVisibleIndex === null ? 0 : hoveredVisibleIndex * step;
   const hoveredPoint = hoveredVisibleIndex === null ? null : visible[hoveredVisibleIndex];
   const tooltipX = hoveredX > plotRight - 218 ? hoveredX - 204 : hoveredX + 12;
+  const setVisibleHoverIndex = (index: number) => {
+    onHoverIndexChange(visibleStartIndex + index);
+  };
+  const handleHitMouseDown = (event: React.MouseEvent<SVGRectElement>) => {
+    if (!isHoverPinned || (event.button !== 3 && event.button !== 4)) {
+      return;
+    }
+    event.preventDefault();
+    onStepHoverIndex(event.button === 3 ? -1 : 1);
+  };
 
   return (
     <div
@@ -1898,10 +1994,31 @@ const MacdSignalChart: React.FC<{
                 tabIndex={0}
                 role="graphics-symbol"
                 aria-label={`${point.date} 动能指标明细`}
-                onMouseEnter={() => onHoverIndexChange(visibleStartIndex + index)}
-                onMouseLeave={() => onHoverIndexChange(null)}
-                onFocus={() => onHoverIndexChange(visibleStartIndex + index)}
-                onBlur={() => onHoverIndexChange(null)}
+                onMouseEnter={() => {
+                  if (!isHoverPinned) {
+                    setVisibleHoverIndex(index);
+                  }
+                }}
+                onMouseLeave={() => {
+                  if (!isHoverPinned) {
+                    onHoverIndexChange(null);
+                  }
+                }}
+                onMouseDown={handleHitMouseDown}
+                onClick={() => {
+                  setVisibleHoverIndex(index);
+                  onHoverPinnedChange(true);
+                }}
+                onFocus={() => {
+                  if (!isHoverPinned) {
+                    setVisibleHoverIndex(index);
+                  }
+                }}
+                onBlur={() => {
+                  if (!isHoverPinned) {
+                    onHoverIndexChange(null);
+                  }
+                }}
               />
             );
           })}
@@ -2509,6 +2626,7 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
 }) => {
   const [selectedPeriod, setSelectedPeriod] = useState<KLinePeriod>('daily');
   const [hoveredIndex, setHoveredIndex] = useState<number | null>(null);
+  const [isHoverPinned, setIsHoverPinned] = useState(false);
   const [timelineZoom, setTimelineZoom] = useState(0);
   const [windowStart, setWindowStart] = useState(0);
   const [chartMenu, setChartMenu] = useState<ChartMenuState | null>(null);
@@ -2528,6 +2646,7 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
   useEffect(() => {
     setSelectedPeriod('daily');
     setHoveredIndex(null);
+    setIsHoverPinned(false);
     setTimelineZoom(0);
     setWindowStart(0);
     setChartMenu(null);
@@ -2535,6 +2654,7 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
 
   useEffect(() => {
     setHoveredIndex(null);
+    setIsHoverPinned(false);
     setChartMenu(null);
   }, [selectedPeriod]);
 
@@ -2552,18 +2672,24 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
   }, [chartMenu]);
 
   useEffect(() => {
-    if (!onClose) {
-      return undefined;
-    }
     const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') {
+      if (event.key !== 'Escape') {
+        return;
+      }
+      if (isHoverPinned) {
+        event.preventDefault();
+        setIsHoverPinned(false);
+        setHoveredIndex(null);
+        return;
+      }
+      if (onClose) {
         event.preventDefault();
         onClose();
       }
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [onClose]);
+  }, [isHoverPinned, onClose]);
 
   useEffect(() => {
     let ignore = false;
@@ -2890,6 +3016,21 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
   const maxWindowStart = Math.max(points.length - visibleCount, 0);
   const safeWindowStart = clamp(windowStart, 0, maxWindowStart);
   const visiblePoints = points.slice(safeWindowStart, safeWindowStart + visibleCount);
+  const stepHoverIndex = useCallback((direction: HoverStepDirection) => {
+    if (points.length === 0) {
+      setHoveredIndex(null);
+      setIsHoverPinned(false);
+      return;
+    }
+    setHoveredIndex((current) => {
+      const baseIndex = current !== null && current >= 0 && current < points.length
+        ? current
+        : points.length - 1;
+      return clamp(baseIndex + direction, 0, points.length - 1);
+    });
+    setIsHoverPinned(true);
+    setChartMenu(null);
+  }, [points.length]);
   const safeHoveredIndex = hoveredIndex !== null && hoveredIndex >= 0 && hoveredIndex < points.length ? hoveredIndex : null;
   const selectedPoint = safeHoveredIndex === null ? points.at(-1) : points[safeHoveredIndex];
   const selectedPointIndex = safeHoveredIndex ?? Math.max(points.length - 1, 0);
@@ -2909,6 +3050,27 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
     setWindowStart(maxWindowStart);
   }, [effectivePeriod, stockCode, points.length, visibleCount, maxWindowStart]);
 
+  useEffect(() => {
+    if (hoveredIndex === null) {
+      setIsHoverPinned(false);
+    }
+  }, [hoveredIndex]);
+
+  useEffect(() => {
+    if (!isHoverPinned || points.length === 0) {
+      return undefined;
+    }
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') {
+        return;
+      }
+      event.preventDefault();
+      stepHoverIndex(event.key === 'ArrowLeft' ? -1 : 1);
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [isHoverPinned, points.length, stepHoverIndex]);
+
   const openChartMenu = (event: React.MouseEvent) => {
     event.preventDefault();
     setChartMenu({ x: event.clientX, y: event.clientY });
@@ -2916,6 +3078,7 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
 
   const adjustTimelineZoom = (delta: number) => {
     setTimelineZoom((current) => clamp(current + delta, -1, 4));
+    setIsHoverPinned(false);
     setHoveredIndex(null);
     setChartMenu(null);
   };
@@ -2979,7 +3142,10 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
                       safeWindowStart={safeWindowStart}
                       maxWindowStart={maxWindowStart}
                       hoveredIndex={safeHoveredIndex}
+                      isHoverPinned={isHoverPinned}
                       onHoverIndexChange={setHoveredIndex}
+                      onHoverPinnedChange={setIsHoverPinned}
+                      onStepHoverIndex={stepHoverIndex}
                       onWindowStartChange={setWindowStart}
                       onOpenChartMenu={openChartMenu}
                       period={effectivePeriod}
@@ -3001,7 +3167,10 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
                       visible={visiblePoints}
                       visibleStartIndex={safeWindowStart}
                       hoveredIndex={safeHoveredIndex}
+                      isHoverPinned={isHoverPinned}
                       onHoverIndexChange={setHoveredIndex}
+                      onHoverPinnedChange={setIsHoverPinned}
+                      onStepHoverIndex={stepHoverIndex}
                       onOpenChartMenu={openChartMenu}
                       period={effectivePeriod}
                     />
@@ -3016,7 +3185,10 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
                       visible={visiblePoints}
                       visibleStartIndex={safeWindowStart}
                       hoveredIndex={safeHoveredIndex}
+                      isHoverPinned={isHoverPinned}
                       onHoverIndexChange={setHoveredIndex}
+                      onHoverPinnedChange={setIsHoverPinned}
+                      onStepHoverIndex={stepHoverIndex}
                       onOpenChartMenu={openChartMenu}
                       period={effectivePeriod}
                     />
@@ -3074,6 +3246,7 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
             className="block w-full px-3 py-1.5 text-left hover:bg-white/10"
             onClick={() => {
               setTimelineZoom(0);
+              setIsHoverPinned(false);
               setHoveredIndex(null);
               setChartMenu(null);
             }}

@@ -1339,6 +1339,119 @@ class AkshareFetcher(BaseFetcher):
                 return self._get_stock_realtime_quote_tencent(stock_code)
             else:
                 return self._get_stock_realtime_quote_em(stock_code)
+
+    def get_realtime_quotes(self, stock_codes: List[str]) -> Dict[str, UnifiedRealtimeQuote]:
+        """
+        批量获取普通 A 股实时行情。
+
+        使用腾讯批量直连接口作为 efinance/东财全量行情失败时的兜底，
+        避免 A股所有页面对数千只股票逐只请求导致前端超时。
+        """
+        requested_codes = [
+            normalize_stock_code(code)
+            for code in stock_codes
+            if code and not _is_us_code(code) and not _is_hk_code(code) and not _is_etf_code(code)
+        ]
+        requested_codes = list(dict.fromkeys(code for code in requested_codes if code))
+        if not requested_codes:
+            return {}
+        requested_code_set = set(requested_codes)
+
+        circuit_breaker = get_realtime_circuit_breaker()
+        source_key = "akshare_tencent"
+        if not circuit_breaker.is_available(source_key):
+            logger.info(f"[熔断] 数据源 {source_key} 处于熔断状态，跳过批量行情")
+            return {}
+
+        quotes: Dict[str, UnifiedRealtimeQuote] = {}
+        headers = {
+            'Referer': 'http://finance.qq.com',
+            'User-Agent': random.choice(USER_AGENTS),
+        }
+        chunk_size = 500
+
+        try:
+            for start in range(0, len(requested_codes), chunk_size):
+                chunk_codes = requested_codes[start:start + chunk_size]
+                symbols = [_to_sina_tx_symbol(code) for code in chunk_codes]
+                url = f"http://{TENCENT_REALTIME_ENDPOINT}={','.join(symbols)}"
+                api_start = time.time()
+                logger.info(
+                    "[API调用] 腾讯财经批量接口获取实时行情: codes=%d-%d/%d",
+                    start + 1,
+                    min(start + len(chunk_codes), len(requested_codes)),
+                    len(requested_codes),
+                )
+                response = requests.get(url, headers=headers, timeout=12)
+                response.encoding = 'gbk'
+                response.raise_for_status()
+                api_elapsed = time.time() - api_start
+
+                for statement in response.text.split(';'):
+                    content = statement.strip()
+                    if not content or '=""' in content:
+                        continue
+
+                    data_start = content.find('"')
+                    data_end = content.rfind('"')
+                    if data_start == -1 or data_end == -1 or data_end <= data_start:
+                        continue
+
+                    fields = content[data_start + 1:data_end].split('~')
+                    if len(fields) < 45:
+                        continue
+
+                    code = str(fields[2] if len(fields) > 2 else '').strip()
+                    if not code:
+                        continue
+                    code = normalize_stock_code(code)
+                    if code not in requested_code_set:
+                        continue
+
+                    volume_lot = safe_int(fields[6]) if len(fields) > 6 else None
+                    amount = safe_float(fields[37]) if len(fields) > 37 else None
+                    circ_mv = safe_float(fields[44]) if len(fields) > 44 else None
+                    total_mv = safe_float(fields[45]) if len(fields) > 45 else None
+                    quotes[code] = UnifiedRealtimeQuote(
+                        code=code,
+                        name=fields[1] if len(fields) > 1 else "",
+                        source=RealtimeSource.TENCENT,
+                        price=safe_float(fields[3]),
+                        change_pct=safe_float(fields[32]) if len(fields) > 32 else None,
+                        change_amount=safe_float(fields[31]) if len(fields) > 31 else None,
+                        volume=volume_lot * 100 if volume_lot is not None else None,
+                        amount=amount * 10000 if amount is not None else None,
+                        open_price=safe_float(fields[5]) if len(fields) > 5 else None,
+                        high=safe_float(fields[33]) if len(fields) > 33 else None,
+                        low=safe_float(fields[34]) if len(fields) > 34 else None,
+                        pre_close=safe_float(fields[4]) if len(fields) > 4 else None,
+                        turnover_rate=safe_float(fields[38]) if len(fields) > 38 else None,
+                        amplitude=safe_float(fields[43]) if len(fields) > 43 else None,
+                        volume_ratio=safe_float(fields[49]) if len(fields) > 49 else None,
+                        pe_ratio=safe_float(fields[39]) if len(fields) > 39 else None,
+                        pb_ratio=safe_float(fields[46]) if len(fields) > 46 else None,
+                        circ_mv=circ_mv * 100000000 if circ_mv is not None else None,
+                        total_mv=total_mv * 100000000 if total_mv is not None else None,
+                    )
+
+                logger.info(
+                    "[API返回] 腾讯财经批量行情成功: 本批 %d 只, 已匹配 %d/%d, 耗时 %.2fs",
+                    len(chunk_codes),
+                    len(quotes),
+                    len(requested_codes),
+                    api_elapsed,
+                )
+
+            if quotes:
+                circuit_breaker.record_success(source_key)
+            else:
+                circuit_breaker.record_failure(source_key, "empty batch quote payload")
+            logger.info(f"[实时行情-腾讯] 批量匹配 {len(quotes)}/{len(requested_codes)} 只股票")
+            return quotes
+        except Exception as e:
+            logger.info(f"[API错误] 腾讯财经批量获取实时行情失败: {e}")
+            circuit_breaker.record_failure(source_key, str(e))
+            return quotes
     
     def _get_stock_realtime_quote_em(self, stock_code: str) -> Optional[UnifiedRealtimeQuote]:
         """

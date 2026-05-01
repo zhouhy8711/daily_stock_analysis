@@ -57,6 +57,20 @@ class StockQuote(BaseModel):
         }
 
 
+class StockQuotesRequest(BaseModel):
+    """批量实时行情请求"""
+
+    stock_codes: List[str] = Field(..., description="股票代码列表")
+
+
+class StockQuotesResponse(BaseModel):
+    """批量实时行情响应"""
+
+    items: List[StockQuote] = Field(default_factory=list, description="成功获取的行情列表")
+    failed_codes: List[str] = Field(default_factory=list, description="未获取到行情的股票代码")
+    update_time: Optional[str] = Field(None, description="接口响应时间")
+
+
 class KLineData(BaseModel):
     """K 线数据点"""
     

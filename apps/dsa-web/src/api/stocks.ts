@@ -51,6 +51,12 @@ export type StockQuote = {
   updateTime?: string | null;
 };
 
+export type StockQuotesResponse = {
+  items: StockQuote[];
+  failedCodes: string[];
+  updateTime?: string | null;
+};
+
 export type ChipDistributionMetrics = {
   code: string;
   date?: string | null;
@@ -213,6 +219,24 @@ export const stocksApi = {
       `/api/v1/stocks/${encodeURIComponent(stockCode)}/quote`,
     );
     return normalizeQuote(response.data, stockCode);
+  },
+
+  async getQuotes(stockCodes: string[]): Promise<StockQuotesResponse> {
+    const response = await apiClient.post<Record<string, unknown>>(
+      '/api/v1/stocks/quotes',
+      { stock_codes: stockCodes },
+    );
+    const rawItems = Array.isArray(response.data.items) ? response.data.items : [];
+    const rawFailedCodes = response.data.failed_codes ?? response.data.failedCodes;
+    return {
+      items: (rawItems as Array<Record<string, unknown>>).map((item) => (
+        normalizeQuote(item, String(item.stock_code ?? item.stockCode ?? ''))
+      )),
+      failedCodes: Array.isArray(rawFailedCodes)
+        ? rawFailedCodes.map(String)
+        : [],
+      updateTime: toNullableString(response.data.update_time ?? response.data.updateTime),
+    };
   },
 
   async getHistory(stockCode: string, days = 120, period: KLinePeriod = 'daily'): Promise<StockHistoryResponse> {

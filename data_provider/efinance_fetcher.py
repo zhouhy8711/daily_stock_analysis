@@ -791,6 +791,111 @@ class EfinanceFetcher(BaseFetcher):
             circuit_breaker.record_failure(source_key, str(e))
             return None
 
+    def get_realtime_quotes(self, stock_codes: List[str]) -> Dict[str, UnifiedRealtimeQuote]:
+        """
+        批量获取 A 股实时行情。
+
+        efinance 的股票实时接口一次返回全市场数据；这里复用同一个缓存并在
+        DataFrame 内做批量匹配，避免上层循环单股查询造成重复过滤和 fallback。
+        """
+        requested_codes = [normalize_stock_code(code) for code in stock_codes if code]
+        requested_codes = list(dict.fromkeys(code for code in requested_codes if code and not _is_etf_code(code)))
+        if not requested_codes:
+            return {}
+
+        import efinance as ef
+        circuit_breaker = get_realtime_circuit_breaker()
+        source_key = "efinance"
+
+        if not circuit_breaker.is_available(source_key):
+            logger.info(f"[熔断] 数据源 {source_key} 处于熔断状态，跳过批量行情")
+            return {}
+
+        try:
+            current_time = time.time()
+            if (
+                _realtime_cache['data'] is not None and
+                current_time - _realtime_cache['timestamp'] < _realtime_cache['ttl']
+            ):
+                df = _realtime_cache['data']
+                cache_age = int(current_time - _realtime_cache['timestamp'])
+                logger.debug(f"[缓存命中] 批量实时行情(efinance) - 缓存年龄 {cache_age}s/{_realtime_cache['ttl']}s")
+            else:
+                self._set_random_user_agent()
+                self._enforce_rate_limit()
+
+                logger.info("[API调用] ef.stock.get_realtime_quotes() 批量获取实时行情...")
+                import time as _time
+                api_start = _time.time()
+                df = _ef_call_with_timeout(ef.stock.get_realtime_quotes)
+                api_elapsed = _time.time() - api_start
+                logger.info(f"[API返回] 批量实时行情成功: 返回 {len(df)} 只股票, 耗时 {api_elapsed:.2f}s")
+                circuit_breaker.record_success(source_key)
+
+                _realtime_cache['data'] = df
+                _realtime_cache['timestamp'] = current_time
+
+            if df is None or df.empty:
+                return {}
+
+            code_col = '股票代码' if '股票代码' in df.columns else 'code'
+            name_col = '股票名称' if '股票名称' in df.columns else 'name'
+            price_col = '最新价' if '最新价' in df.columns else 'price'
+            pct_col = '涨跌幅' if '涨跌幅' in df.columns else 'pct_chg'
+            chg_col = '涨跌额' if '涨跌额' in df.columns else 'change'
+            vol_col = '成交量' if '成交量' in df.columns else 'volume'
+            amt_col = '成交额' if '成交额' in df.columns else 'amount'
+            turn_col = '换手率' if '换手率' in df.columns else 'turnover_rate'
+            amp_col = '振幅' if '振幅' in df.columns else 'amplitude'
+            high_col = '最高' if '最高' in df.columns else 'high'
+            low_col = '最低' if '最低' in df.columns else 'low'
+            open_col = '开盘' if '开盘' in df.columns else 'open'
+            vol_ratio_col = '量比' if '量比' in df.columns else 'volume_ratio'
+            pe_col = '市盈率' if '市盈率' in df.columns else 'pe_ratio'
+            total_mv_col = '总市值' if '总市值' in df.columns else 'total_mv'
+            circ_mv_col = '流通市值' if '流通市值' in df.columns else 'circ_mv'
+
+            code_series = df[code_col].astype(str).str.zfill(6)
+            requested_set = set(requested_codes)
+            matched = df[code_series.isin(requested_set)].copy()
+            matched['_normalized_code'] = code_series[code_series.isin(requested_set)].values
+
+            quotes: Dict[str, UnifiedRealtimeQuote] = {}
+            for _, row in matched.iterrows():
+                code = str(row.get('_normalized_code') or row.get(code_col) or '').zfill(6)
+                if not code:
+                    continue
+                quotes[code] = UnifiedRealtimeQuote(
+                    code=code,
+                    name=str(row.get(name_col, '')),
+                    source=RealtimeSource.EFINANCE,
+                    price=safe_float(row.get(price_col)),
+                    change_pct=safe_float(row.get(pct_col)),
+                    change_amount=safe_float(row.get(chg_col)),
+                    volume=safe_int(row.get(vol_col)),
+                    amount=safe_float(row.get(amt_col)),
+                    turnover_rate=safe_float(row.get(turn_col)),
+                    amplitude=safe_float(row.get(amp_col)),
+                    high=safe_float(row.get(high_col)),
+                    low=safe_float(row.get(low_col)),
+                    open_price=safe_float(row.get(open_col)),
+                    volume_ratio=safe_float(row.get(vol_ratio_col)),
+                    pe_ratio=safe_float(row.get(pe_col)),
+                    total_mv=safe_float(row.get(total_mv_col)),
+                    circ_mv=safe_float(row.get(circ_mv_col)),
+                )
+
+            logger.info(f"[实时行情-efinance] 批量匹配 {len(quotes)}/{len(requested_codes)} 只股票")
+            return quotes
+        except FuturesTimeoutError:
+            logger.info(f"[超时] ef.stock.get_realtime_quotes() 批量请求超过 {_EF_CALL_TIMEOUT}s")
+            circuit_breaker.record_failure(source_key, "timeout")
+            return {}
+        except Exception as e:
+            logger.info(f"[API错误] 批量获取实时行情(efinance)失败: {e}")
+            circuit_breaker.record_failure(source_key, str(e))
+            return {}
+
     def _get_etf_realtime_quote(self, stock_code: str) -> Optional[UnifiedRealtimeQuote]:
         """
         获取 ETF 实时行情

@@ -184,4 +184,37 @@ describe('IndicatorAnalysisModal', () => {
 
     unmount();
   });
+
+  it('pins the shared indicator cursor and moves it with left and right keys', async () => {
+    const onClose = vi.fn();
+    const { unmount } = render(
+      <IndicatorAnalysisModal stockCode="BABA" stockName="阿里巴巴" onClose={onClose} />,
+    );
+    await flushPromises();
+
+    const pinnedBar = screen.getByTestId('indicator-chart-bar-2026-04-24');
+    fireEvent.click(pinnedBar);
+    fireEvent.mouseLeave(pinnedBar);
+
+    expect(within(screen.getByTestId('indicator-chart-tooltip')).getByText('2026-04-24')).toBeInTheDocument();
+    expect(within(screen.getByTestId('indicator-volume-tooltip')).getByText('2026-04-24')).toBeInTheDocument();
+    expect(within(screen.getByTestId('indicator-momentum-tooltip')).getByText('2026-04-24')).toBeInTheDocument();
+    expect(within(screen.getByTestId('chip-peak-panel')).getByText('2026-04-24')).toBeInTheDocument();
+
+    fireEvent.keyDown(window, { key: 'ArrowLeft' });
+    expect(within(screen.getByTestId('indicator-chart-tooltip')).getByText('2026-04-23')).toBeInTheDocument();
+    expect(within(screen.getByTestId('indicator-volume-tooltip')).getByText('2026-04-23')).toBeInTheDocument();
+    expect(within(screen.getByTestId('indicator-momentum-tooltip')).getByText('2026-04-23')).toBeInTheDocument();
+    expect(within(screen.getByTestId('chip-peak-panel')).getByText('2026-04-23')).toBeInTheDocument();
+
+    fireEvent.keyDown(window, { key: 'ArrowRight' });
+    expect(within(screen.getByTestId('indicator-chart-tooltip')).getByText('2026-04-24')).toBeInTheDocument();
+    expect(within(screen.getByTestId('chip-peak-panel')).getByText('2026-04-24')).toBeInTheDocument();
+
+    fireEvent.keyDown(window, { key: 'Escape' });
+    expect(onClose).not.toHaveBeenCalled();
+    expect(screen.queryByTestId('indicator-chart-tooltip')).not.toBeInTheDocument();
+
+    unmount();
+  });
 });

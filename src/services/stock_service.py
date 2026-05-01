@@ -112,6 +112,116 @@ class StockService:
             logger.error(f"获取实时行情失败: {e}", exc_info=True)
             return None
 
+    def get_realtime_quotes(self, stock_codes: List[str]) -> Dict[str, Any]:
+        """
+        批量获取股票实时行情。
+
+        DataFetcherManager 会在 efinance/东财等全量行情源上复用模块级缓存，
+        因此批量读取不会为每只股票重复拉取全市场行情。
+        """
+        seen = set()
+        normalized_codes: List[str] = []
+        for code in stock_codes:
+            normalized = str(code or "").strip()
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            normalized_codes.append(normalized)
+
+        if not normalized_codes:
+            return {"items": [], "failed_codes": [], "update_time": datetime.now().isoformat()}
+
+        try:
+            from data_provider.base import DataFetcherManager, normalize_stock_code
+
+            manager = DataFetcherManager()
+            items: List[Dict[str, Any]] = []
+            quote_by_code: Dict[str, Any] = {}
+            normalized_to_original = {
+                normalize_stock_code(code): code for code in normalized_codes
+            }
+
+            for fetcher in manager._get_fetchers_snapshot():
+                if fetcher.name == "EfinanceFetcher" and hasattr(fetcher, "get_realtime_quotes"):
+                    quote_by_code = fetcher.get_realtime_quotes(list(normalized_to_original.keys()))
+                    break
+
+            missing_normalized_codes = [
+                normalized
+                for normalized in normalized_to_original.keys()
+                if normalized not in quote_by_code
+            ]
+            if missing_normalized_codes:
+                for fetcher in manager._get_fetchers_snapshot():
+                    if fetcher.name == "AkshareFetcher" and hasattr(fetcher, "get_realtime_quotes"):
+                        fallback_quotes = fetcher.get_realtime_quotes(missing_normalized_codes)
+                        quote_by_code.update(fallback_quotes)
+                        break
+
+            missing_codes = [
+                original
+                for normalized, original in normalized_to_original.items()
+                if normalized not in quote_by_code
+            ]
+            if len(normalized_codes) <= 20 and missing_codes:
+                for code in missing_codes:
+                    quote = manager.get_realtime_quote(code, log_final_failure=False)
+                    if quote is not None:
+                        quote_by_code[normalize_stock_code(code)] = quote
+
+            for normalized, original in normalized_to_original.items():
+                quote = quote_by_code.get(normalized)
+                if quote is None:
+                    continue
+
+                items.append({
+                    "stock_code": getattr(quote, "code", original),
+                    "stock_name": getattr(quote, "name", None),
+                    "current_price": getattr(quote, "price", 0.0) or 0.0,
+                    "change": getattr(quote, "change_amount", None),
+                    "change_percent": getattr(quote, "change_pct", None),
+                    "open": getattr(quote, "open_price", None),
+                    "high": getattr(quote, "high", None),
+                    "low": getattr(quote, "low", None),
+                    "prev_close": getattr(quote, "pre_close", None),
+                    "volume": getattr(quote, "volume", None),
+                    "amount": getattr(quote, "amount", None),
+                    "volume_ratio": getattr(quote, "volume_ratio", None),
+                    "turnover_rate": getattr(quote, "turnover_rate", None),
+                    "amplitude": getattr(quote, "amplitude", None),
+                    "source": _source_to_string(getattr(quote, "source", None)),
+                    "update_time": datetime.now().isoformat(),
+                })
+
+            found_codes = {
+                normalize_stock_code(str(item.get("stock_code") or ""))
+                for item in items
+            }
+            failed_codes = [
+                original
+                for normalized, original in normalized_to_original.items()
+                if normalized not in found_codes
+            ]
+            return {
+                "items": items,
+                "failed_codes": failed_codes,
+                "update_time": datetime.now().isoformat(),
+            }
+        except ImportError:
+            logger.warning("DataFetcherManager 未找到，批量行情返回空数据")
+            return {
+                "items": [],
+                "failed_codes": normalized_codes,
+                "update_time": datetime.now().isoformat(),
+            }
+        except Exception as e:
+            logger.error(f"批量获取实时行情失败: {e}", exc_info=True)
+            return {
+                "items": [],
+                "failed_codes": normalized_codes,
+                "update_time": datetime.now().isoformat(),
+            }
+
     def get_indicator_metrics(self, stock_code: str) -> Dict[str, Any]:
         """
         获取指标分析扩展数据：筹码分布与主力/机构持仓名称。

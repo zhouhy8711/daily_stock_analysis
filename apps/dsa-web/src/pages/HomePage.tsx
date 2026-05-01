@@ -1,8 +1,9 @@
 import type React from 'react';
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { RefreshCw, X } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
-import { systemConfigApi } from '../api/systemConfig';
+import { stocksApi, type StockQuote } from '../api/stocks';
+import { SystemConfigConflictError, systemConfigApi } from '../api/systemConfig';
 import { ApiErrorAlert, ConfirmDialog, Button, EmptyState, InlineAlert } from '../components/common';
 import { useShellSidebarAction } from '../components/layout/ShellSidebarActionContext';
 import { DashboardStateBlock } from '../components/dashboard';
@@ -11,9 +12,13 @@ import { HistoryList } from '../components/history';
 import { ReportMarkdown, ReportSummary } from '../components/report';
 import { WatchlistBoard, type WatchlistItem } from '../components/watchlist';
 import { useDashboardLifecycle, useHomeDashboardState } from '../hooks';
+import { useStockIndex } from '../hooks/useStockIndex';
+import type { StockIndexItem } from '../types/stockIndex';
+import { normalizeQuery } from '../utils/normalizeQuery';
 import { getReportText, normalizeReportLanguage } from '../utils/reportLanguage';
 
 const normalizeWatchlistCode = (stockCode: string) => stockCode.trim().toUpperCase();
+const ALL_SHARE_QUOTE_BATCH_SIZE = 6000;
 
 const getWatchlistLookupKeys = (stockCode: string): string[] => {
   const code = normalizeWatchlistCode(stockCode);
@@ -46,6 +51,46 @@ const parseWatchlistValue = (value: string): string[] => {
     });
 };
 
+const getStockIndexSortCode = (item: StockIndexItem): string => item.displayCode || item.canonicalCode;
+
+const compareStockIndexById = (left: StockIndexItem, right: StockIndexItem): number => (
+  getStockIndexSortCode(left).localeCompare(getStockIndexSortCode(right), 'en', { numeric: true })
+);
+
+const isAllShareStock = (item: StockIndexItem): boolean => (
+  item.active && item.assetType === 'stock' && (item.market === 'CN' || item.market === 'BSE')
+);
+
+const matchesStockIndexQuery = (item: StockIndexItem, query: string): boolean => {
+  if (!query) {
+    return true;
+  }
+
+  const fields = [
+    item.canonicalCode,
+    item.displayCode,
+    item.nameZh,
+    item.nameEn ?? '',
+    item.pinyinFull ?? '',
+    item.pinyinAbbr ?? '',
+    ...(item.aliases ?? []),
+  ];
+  return fields.some((field) => normalizeQuery(field).includes(query));
+};
+
+const hasEquivalentWatchlistCode = (codes: string[], candidateCode: string): boolean => {
+  const candidateKeys = new Set(getWatchlistLookupKeys(candidateCode));
+  return codes.some((code) => getWatchlistLookupKeys(code).some((key) => candidateKeys.has(key)));
+};
+
+const appendWatchlistCode = (codes: string[], candidateCode: string): string[] => {
+  const normalized = normalizeWatchlistCode(candidateCode);
+  if (!normalized || hasEquivalentWatchlistCode(codes, normalized)) {
+    return codes;
+  }
+  return [...codes, normalized];
+};
+
 const HomePage: React.FC = () => {
   const navigate = useNavigate();
   const { setSidebarAction } = useShellSidebarAction();
@@ -53,10 +98,22 @@ const HomePage: React.FC = () => {
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
   const [reportOverlayOpen, setReportOverlayOpen] = useState(false);
   const [watchlistCodes, setWatchlistCodes] = useState<string[]>([]);
+  const [watchlistConfigVersion, setWatchlistConfigVersion] = useState('');
+  const [watchlistMaskToken, setWatchlistMaskToken] = useState('******');
   const [selectedWatchlistCodes, setSelectedWatchlistCodes] = useState<string[]>([]);
   const [isLoadingWatchlist, setIsLoadingWatchlist] = useState(false);
   const [watchlistError, setWatchlistError] = useState<string | null>(null);
+  const [addingWatchlistCode, setAddingWatchlistCode] = useState<string | null>(null);
   const [reportHistoryStockCode, setReportHistoryStockCode] = useState<string | null>(null);
+  const [shouldLoadAllShareQuotes, setShouldLoadAllShareQuotes] = useState(false);
+  const [isLoadingAllShareQuotes, setIsLoadingAllShareQuotes] = useState(false);
+  const [allShareQuotesByCode, setAllShareQuotesByCode] = useState<Record<string, StockQuote>>({});
+  const allShareQuoteRequestIdRef = useRef(0);
+  const {
+    index: stockIndex,
+    loading: isLoadingStockIndex,
+    error: stockIndexError,
+  } = useStockIndex();
 
   const {
     query,
@@ -100,19 +157,30 @@ const HomePage: React.FC = () => {
   const reportLanguage = normalizeReportLanguage(selectedReport?.meta.reportLanguage);
   const reportText = getReportText(reportLanguage);
 
+  const readWatchlistConfig = useCallback(async () => {
+    const config = await systemConfigApi.getConfig(false);
+    const stockList = config.items.find((item) => item.key === 'STOCK_LIST')?.value ?? '';
+    return {
+      configVersion: config.configVersion,
+      maskToken: config.maskToken,
+      codes: parseWatchlistValue(stockList),
+    };
+  }, []);
+
   const loadWatchlist = useCallback(async () => {
     setIsLoadingWatchlist(true);
     setWatchlistError(null);
     try {
-      const config = await systemConfigApi.getConfig(false);
-      const stockList = config.items.find((item) => item.key === 'STOCK_LIST')?.value ?? '';
-      setWatchlistCodes(parseWatchlistValue(stockList));
+      const config = await readWatchlistConfig();
+      setWatchlistConfigVersion(config.configVersion);
+      setWatchlistMaskToken(config.maskToken);
+      setWatchlistCodes(config.codes);
     } catch (error) {
       setWatchlistError(error instanceof Error ? error.message : '自选股配置加载失败');
     } finally {
       setIsLoadingWatchlist(false);
     }
-  }, []);
+  }, [readWatchlistConfig]);
 
   useEffect(() => {
     void loadWatchlist();
@@ -131,6 +199,16 @@ const HomePage: React.FC = () => {
     return map;
   }, [historyItems]);
 
+  const watchlistLookupSet = useMemo(() => {
+    const keys = new Set<string>();
+    for (const code of watchlistCodes) {
+      for (const key of getWatchlistLookupKeys(code)) {
+        keys.add(key);
+      }
+    }
+    return keys;
+  }, [watchlistCodes]);
+
   const watchlistItems = useMemo<WatchlistItem[]>(() => {
     const sourceCodes = watchlistCodes.length > 0
       ? watchlistCodes
@@ -148,6 +226,7 @@ const HomePage: React.FC = () => {
         .find((item) => item !== undefined);
       return {
         stockCode: history?.stockCode || code,
+        watchlistCode: code,
         stockName: history?.stockName,
         recordId: history?.id,
         currentPrice: history?.currentPrice,
@@ -156,9 +235,108 @@ const HomePage: React.FC = () => {
         operationAdvice: history?.operationAdvice,
         createdAt: history?.createdAt,
         source: watchlistCodes.length > 0 ? 'config' : 'history',
+        isInWatchlist: true,
       };
     });
   }, [historyItems, latestHistoryByCode, watchlistCodes]);
+
+  const allShareIndexItems = useMemo(
+    () => stockIndex
+      .filter(isAllShareStock)
+      .sort(compareStockIndexById),
+    [stockIndex],
+  );
+
+  const allShareQuoteByKey = useMemo(() => {
+    const map = new Map<string, StockQuote>();
+    for (const quote of Object.values(allShareQuotesByCode)) {
+      for (const key of getWatchlistLookupKeys(quote.stockCode)) {
+        map.set(key, quote);
+      }
+    }
+    return map;
+  }, [allShareQuotesByCode]);
+
+  const allShareItems = useMemo<WatchlistItem[]>(() => {
+    const normalizedSearch = normalizeQuery(query);
+    return allShareIndexItems
+      .filter((item) => matchesStockIndexQuery(item, normalizedSearch))
+      .map((item) => {
+        const lookupKeys = getWatchlistLookupKeys(item.canonicalCode)
+          .concat(getWatchlistLookupKeys(item.displayCode));
+        const history = lookupKeys
+          .map((key) => latestHistoryByCode.get(key))
+          .find((historyItem) => historyItem !== undefined);
+        const quote = lookupKeys
+          .map((key) => allShareQuoteByKey.get(key))
+          .find((quoteItem) => quoteItem !== undefined);
+        const isInWatchlist = lookupKeys.some((key) => watchlistLookupSet.has(key));
+
+        return {
+          stockCode: history?.stockCode || item.canonicalCode,
+          watchlistCode: item.displayCode,
+          stockName: history?.stockName || quote?.stockName || item.nameZh,
+          recordId: history?.id,
+          currentPrice: quote?.currentPrice ?? history?.currentPrice,
+          changePct: quote?.changePercent ?? history?.changePct ?? undefined,
+          sentimentScore: history?.sentimentScore,
+          operationAdvice: history?.operationAdvice,
+          createdAt: history?.createdAt,
+          source: 'index',
+          isInWatchlist,
+        };
+      });
+  }, [allShareIndexItems, allShareQuoteByKey, latestHistoryByCode, query, watchlistLookupSet]);
+
+  const loadAllShareQuotes = useCallback(async () => {
+    if (allShareIndexItems.length === 0) {
+      return;
+    }
+
+    const requestId = allShareQuoteRequestIdRef.current + 1;
+    allShareQuoteRequestIdRef.current = requestId;
+    setIsLoadingAllShareQuotes(true);
+    setAllShareQuotesByCode({});
+
+    try {
+      const codes = allShareIndexItems.map((item) => item.displayCode || item.canonicalCode);
+      for (let index = 0; index < codes.length; index += ALL_SHARE_QUOTE_BATCH_SIZE) {
+        if (allShareQuoteRequestIdRef.current !== requestId) {
+          return;
+        }
+
+        const batchCodes = codes.slice(index, index + ALL_SHARE_QUOTE_BATCH_SIZE);
+        const response = await stocksApi.getQuotes(batchCodes);
+        if (allShareQuoteRequestIdRef.current !== requestId) {
+          return;
+        }
+
+        setAllShareQuotesByCode((current) => {
+          const next = { ...current };
+          response.items.forEach((quote) => {
+            if (quote.stockCode) {
+              next[normalizeWatchlistCode(quote.stockCode)] = quote;
+            }
+          });
+          return next;
+        });
+      }
+    } catch (error) {
+      setWatchlistError(error instanceof Error ? error.message : 'A股行情加载失败');
+    } finally {
+      if (allShareQuoteRequestIdRef.current === requestId) {
+        setIsLoadingAllShareQuotes(false);
+      }
+    }
+  }, [allShareIndexItems]);
+
+  useEffect(() => {
+    if (!shouldLoadAllShareQuotes || allShareIndexItems.length === 0) {
+      return;
+    }
+
+    void loadAllShareQuotes();
+  }, [allShareIndexItems.length, loadAllShareQuotes, shouldLoadAllShareQuotes]);
 
   const selectedWatchlistSet = useMemo(
     () => new Set(selectedWatchlistCodes),
@@ -319,6 +497,65 @@ const HomePage: React.FC = () => {
       });
     });
   }, [selectedWatchlistTargets, submitAnalysis]);
+
+  const saveWatchlistCodes = useCallback(async (codes: string[], configVersion: string, maskToken: string) => {
+    const updateResult = await systemConfigApi.update({
+      configVersion,
+      maskToken,
+      reloadNow: true,
+      items: [{ key: 'STOCK_LIST', value: codes.join(',') }],
+    });
+    setWatchlistConfigVersion(updateResult.configVersion || configVersion);
+    setWatchlistMaskToken(maskToken);
+    setWatchlistCodes(codes);
+  }, []);
+
+  const handleAddToWatchlist = useCallback(async (item: WatchlistItem) => {
+    const codeToAdd = normalizeWatchlistCode(item.watchlistCode || item.stockCode);
+    if (!codeToAdd || hasEquivalentWatchlistCode(watchlistCodes, codeToAdd)) {
+      return;
+    }
+
+    setAddingWatchlistCode(codeToAdd);
+    setWatchlistError(null);
+    try {
+      const config = watchlistConfigVersion
+        ? {
+          configVersion: watchlistConfigVersion,
+          maskToken: watchlistMaskToken,
+          codes: watchlistCodes,
+        }
+        : await readWatchlistConfig();
+      const nextCodes = appendWatchlistCode(config.codes, codeToAdd);
+
+      if (nextCodes === config.codes) {
+        setWatchlistCodes(config.codes);
+        return;
+      }
+
+      try {
+        await saveWatchlistCodes(nextCodes, config.configVersion, config.maskToken);
+      } catch (error) {
+        if (!(error instanceof SystemConfigConflictError)) {
+          throw error;
+        }
+
+        const refreshedConfig = await readWatchlistConfig();
+        const refreshedCodes = appendWatchlistCode(refreshedConfig.codes, codeToAdd);
+        await saveWatchlistCodes(refreshedCodes, refreshedConfig.configVersion, refreshedConfig.maskToken);
+      }
+    } catch (error) {
+      setWatchlistError(error instanceof Error ? error.message : '添加自选失败');
+    } finally {
+      setAddingWatchlistCode(null);
+    }
+  }, [
+    readWatchlistConfig,
+    saveWatchlistCodes,
+    watchlistCodes,
+    watchlistConfigVersion,
+    watchlistMaskToken,
+  ]);
 
   const sidebarProgressTasks = useMemo(
     () => activeTasks.filter((task) => task.status === 'pending' || task.status === 'processing'),
@@ -519,18 +756,30 @@ const HomePage: React.FC = () => {
           <div className="flex h-full min-h-0 flex-col gap-4">
             <WatchlistBoard
               items={watchlistItems}
+              allShareItems={allShareItems}
+              allShareTotal={allShareIndexItems.length}
+              allShareQuery={query}
               selectedCodes={selectedWatchlistSet}
               isLoading={isLoadingWatchlist || isLoadingHistory}
+              isLoadingAllShares={isLoadingStockIndex || isLoadingHistory}
+              isLoadingAllShareQuotes={isLoadingAllShareQuotes}
               loadError={watchlistError}
+              allShareError={stockIndexError?.message ?? null}
+              addingWatchlistCode={addingWatchlistCode}
               reanalyzeLabel={reanalyzeButtonText}
               reanalyzeDisabled={selectedWatchlistTargets.length === 0}
               onRefresh={() => {
                 void loadWatchlist();
                 void refreshHistory(true);
+                if (shouldLoadAllShareQuotes) {
+                  void loadAllShareQuotes();
+                }
               }}
               onReanalyzeSelected={handleReanalyzeWatchlist}
               onOpenItem={handleWatchlistItemOpen}
               onOpenIndicatorAnalysis={handleOpenIndicatorAnalysis}
+              onAddToWatchlist={handleAddToWatchlist}
+              onShowAllShares={() => setShouldLoadAllShareQuotes(true)}
               onToggleSelection={toggleWatchlistSelection}
               onSelectVisible={selectVisibleWatchlist}
               onClearSelection={clearWatchlistSelection}

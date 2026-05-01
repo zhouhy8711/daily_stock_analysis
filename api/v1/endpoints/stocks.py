@@ -23,6 +23,8 @@ from api.v1.schemas.stocks import (
     StockIndicatorMetricsResponse,
     StockHistoryResponse,
     StockQuote,
+    StockQuotesRequest,
+    StockQuotesResponse,
 )
 from api.v1.schemas.common import ErrorResponse
 from src.services.image_stock_extractor import (
@@ -44,6 +46,7 @@ router = APIRouter()
 # 须在 /{stock_code} 路由之前定义
 ALLOWED_MIME_STR = ", ".join(ALLOWED_MIME)
 KLINE_PERIOD_PATTERN = "^(daily|1m|5m|15m|30m|60m)$"
+MAX_BATCH_QUOTE_CODES = 6000
 
 
 @router.post(
@@ -239,6 +242,74 @@ async def parse_import(request: Request) -> ExtractFromImageResponse:
     ]
     codes = list(dict.fromkeys(i.code for i in extract_items if i.code))
     return ExtractFromImageResponse(codes=codes, items=extract_items, raw_text=None)
+
+
+@router.post(
+    "/quotes",
+    response_model=StockQuotesResponse,
+    responses={
+        200: {"description": "批量行情数据"},
+        400: {"description": "请求无效", "model": ErrorResponse},
+        500: {"description": "服务器错误", "model": ErrorResponse},
+    },
+    summary="批量获取股票实时行情",
+    description="批量获取指定股票的最新价和涨跌幅等实时行情数据。单次最多 6000 只。",
+)
+def get_stock_quotes(payload: StockQuotesRequest) -> StockQuotesResponse:
+    stock_codes = list(dict.fromkeys(code.strip() for code in payload.stock_codes if code and code.strip()))
+    if not stock_codes:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "bad_request", "message": "stock_codes 不能为空"},
+        )
+    if len(stock_codes) > MAX_BATCH_QUOTE_CODES:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "too_many_codes",
+                "message": f"单次最多查询 {MAX_BATCH_QUOTE_CODES} 只股票",
+            },
+        )
+
+    try:
+        service = StockService()
+        result = service.get_realtime_quotes(stock_codes)
+        return StockQuotesResponse(
+            items=[
+                StockQuote(
+                    stock_code=item.get("stock_code", ""),
+                    stock_name=item.get("stock_name"),
+                    current_price=item.get("current_price", 0.0),
+                    change=item.get("change"),
+                    change_percent=item.get("change_percent"),
+                    open=item.get("open"),
+                    high=item.get("high"),
+                    low=item.get("low"),
+                    prev_close=item.get("prev_close"),
+                    volume=item.get("volume"),
+                    amount=item.get("amount"),
+                    volume_ratio=item.get("volume_ratio"),
+                    turnover_rate=item.get("turnover_rate"),
+                    amplitude=item.get("amplitude"),
+                    source=item.get("source"),
+                    update_time=item.get("update_time"),
+                )
+                for item in result.get("items", [])
+            ],
+            failed_codes=result.get("failed_codes", []),
+            update_time=result.get("update_time"),
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"批量获取实时行情失败: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": "internal_error",
+                "message": f"批量获取实时行情失败: {str(e)}",
+            },
+        )
 
 
 @router.get(
