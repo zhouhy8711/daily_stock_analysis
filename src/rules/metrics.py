@@ -98,6 +98,61 @@ def _normalize_ratio_percent(value: Any) -> Optional[float]:
     return number
 
 
+def _normalize_date_key(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    try:
+        parsed = pd.to_datetime(value, errors="coerce")
+    except (TypeError, ValueError):
+        return None
+    if pd.isna(parsed):
+        return None
+    return parsed.strftime("%Y-%m-%d")
+
+
+def _chip_metric_values(chip: Dict[str, Any]) -> Dict[str, Optional[float]]:
+    return {
+        "profit_ratio": _normalize_ratio_percent(chip.get("profit_ratio")),
+        "chip_concentration_90": _normalize_ratio_percent(chip.get("concentration_90")),
+        "avg_cost": _to_float(chip.get("avg_cost")),
+    }
+
+
+def _apply_chip_metrics(df: pd.DataFrame, index: int, chip: Dict[str, Any]) -> None:
+    for metric_key, value in _chip_metric_values(chip).items():
+        if value is None:
+            continue
+        if metric_key not in df.columns:
+            df[metric_key] = pd.NA
+        df.at[index, metric_key] = value
+
+
+def _apply_chip_distribution(df: pd.DataFrame, chip: Dict[str, Any]) -> None:
+    if len(df) == 0:
+        return
+
+    date_to_index: Dict[str, int] = {}
+    if "date" in df.columns:
+        for index, value in df["date"].items():
+            date_key = _normalize_date_key(value)
+            if date_key:
+                date_to_index[date_key] = int(index)
+
+    snapshots = chip.get("snapshots") if isinstance(chip.get("snapshots"), list) else []
+    for snapshot in snapshots:
+        if not isinstance(snapshot, dict):
+            continue
+        date_key = _normalize_date_key(snapshot.get("date"))
+        if not date_key or date_key not in date_to_index:
+            continue
+        _apply_chip_metrics(df, date_to_index[date_key], snapshot)
+
+    top_level_index = date_to_index.get(_normalize_date_key(chip.get("date"))) if date_to_index else None
+    if top_level_index is None:
+        top_level_index = int(df.index[-1])
+    _apply_chip_metrics(df, top_level_index, chip)
+
+
 def build_metric_frame(
     history: Iterable[Dict[str, Any]],
     quote: Optional[Dict[str, Any]] = None,
@@ -155,17 +210,7 @@ def build_metric_frame(
                 df.at[latest_index, metric_key] = value
 
     if extra_metrics and len(df) > 0:
-        latest_index = df.index[-1]
         chip = extra_metrics.get("chip_distribution") if isinstance(extra_metrics.get("chip_distribution"), dict) else {}
-        chip_mapping = {
-            "profit_ratio": _normalize_ratio_percent(chip.get("profit_ratio")),
-            "chip_concentration_90": _normalize_ratio_percent(chip.get("concentration_90")),
-            "avg_cost": _to_float(chip.get("avg_cost")),
-        }
-        for metric_key, value in chip_mapping.items():
-            if value is not None:
-                if metric_key not in df.columns:
-                    df[metric_key] = pd.NA
-                df.at[latest_index, metric_key] = value
+        _apply_chip_distribution(df, chip)
 
     return df

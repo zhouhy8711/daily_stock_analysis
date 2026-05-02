@@ -148,6 +148,106 @@ def test_metric_frame_maps_chip_ratios_to_percent_values():
     assert latest["avg_cost"] == 12.3
 
 
+def test_metric_frame_maps_chip_snapshots_by_date():
+    frame = build_metric_frame(
+        _history(),
+        extra_metrics={
+            "chip_distribution": {
+                "date": "2026-04-05",
+                "profit_ratio": 0.99,
+                "concentration_90": 0.05,
+                "avg_cost": 14.2,
+                "snapshots": [
+                    {
+                        "date": "2026-04-03",
+                        "profit_ratio": 0.4097,
+                        "concentration_90": 0.1167,
+                        "avg_cost": 9.54,
+                    },
+                    {
+                        "date": "2026-04-04",
+                        "profit_ratio": 86,
+                        "concentration_90": 14,
+                        "avg_cost": 13.4,
+                    },
+                ],
+            }
+        },
+    )
+
+    snapshot_row = frame[frame["date"] == "2026-04-03"].iloc[0]
+    latest_row = frame.iloc[-1]
+
+    assert round(snapshot_row["profit_ratio"], 6) == 40.97
+    assert round(snapshot_row["chip_concentration_90"], 6) == 11.67
+    assert snapshot_row["avg_cost"] == 9.54
+    assert latest_row["profit_ratio"] == 99
+    assert latest_row["chip_concentration_90"] == 5
+    assert latest_row["avg_cost"] == 14.2
+
+
+def test_rule_engine_uses_dated_chip_snapshots_for_history_matches():
+    frame = build_metric_frame(
+        _history(),
+        extra_metrics={
+            "chip_distribution": {
+                "date": "2026-04-05",
+                "profit_ratio": 0.99,
+                "concentration_90": 0.05,
+                "avg_cost": 14.2,
+                "snapshots": [
+                    {
+                        "date": "2026-04-03",
+                        "profit_ratio": 0.4097,
+                        "concentration_90": 0.1167,
+                        "avg_cost": 9.54,
+                    },
+                    {
+                        "date": "2026-04-04",
+                        "profit_ratio": 0.20,
+                        "concentration_90": 0.10,
+                        "avg_cost": 11.0,
+                    },
+                ],
+            }
+        },
+    )
+    definition = {
+        "period": "daily",
+        "lookback_days": 120,
+        "target": {"scope": "custom", "stock_codes": ["600519"]},
+        "groups": [
+            {
+                "id": "g1",
+                "conditions": [
+                    {
+                        "id": "c1",
+                        "left": {"metric": "profit_ratio"},
+                        "operator": ">",
+                        "right": {"type": "literal", "value": 40},
+                    },
+                    {
+                        "id": "c2",
+                        "left": {"metric": "profit_ratio"},
+                        "operator": "<",
+                        "right": {"type": "literal", "value": 50},
+                    },
+                    {
+                        "id": "c3",
+                        "left": {"metric": "chip_concentration_90"},
+                        "operator": "<",
+                        "right": {"type": "literal", "value": 12},
+                    },
+                ],
+            }
+        ],
+    }
+
+    events = evaluate_rule_history(definition, frame)
+
+    assert [event["date"] for event in events] == ["2026-04-03"]
+
+
 def test_rule_service_rejects_cross_operators():
     definition = {
         "period": "daily",
