@@ -247,6 +247,18 @@ class StockService:
         try:
             chip = manager.get_chip_distribution(stock_code)
             if chip is not None:
+                raw_distribution = getattr(chip, "distribution", []) or []
+                distribution = []
+                for point in raw_distribution:
+                    if isinstance(point, dict):
+                        price = _to_optional_float(point.get("price"))
+                        percent = _to_optional_float(point.get("percent"))
+                    else:
+                        price = _to_optional_float(getattr(point, "price", None))
+                        percent = _to_optional_float(getattr(point, "percent", None))
+                    if price is not None and price > 0 and percent is not None and percent > 0:
+                        distribution.append({"price": price, "percent": percent})
+
                 chip_payload = {
                     "code": getattr(chip, "code", stock_code),
                     "date": getattr(chip, "date", None),
@@ -259,6 +271,7 @@ class StockService:
                     "cost_70_low": _to_optional_float(getattr(chip, "cost_70_low", None)),
                     "cost_70_high": _to_optional_float(getattr(chip, "cost_70_high", None)),
                     "concentration_70": _to_optional_float(getattr(chip, "concentration_70", None)),
+                    "distribution": distribution,
                     "chip_status": None,
                 }
         except Exception as e:
@@ -312,6 +325,7 @@ class StockService:
                 "volume": _to_optional_float(row.get("volume")),
                 "amount": _to_optional_float(row.get("amount")),
                 "change_percent": _to_optional_float(row.get("pct_chg")),
+                "turnover_rate": _to_optional_float(row.get("turnover_rate")),
             })
         return data
     

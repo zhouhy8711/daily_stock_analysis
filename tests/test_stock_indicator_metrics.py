@@ -39,6 +39,11 @@ class _FakeManager:
             cost_70_low=114.1,
             cost_70_high=126.2,
             concentration_70=0.09,
+            distribution=[
+                {"price": 110.2, "percent": 0.2},
+                SimpleNamespace(price=118.5, percent=0.5),
+                {"price": 130.8, "percent": 0.3},
+            ],
         )
 
     def get_realtime_quote(self, stock_code, **_kwargs):
@@ -123,6 +128,11 @@ def test_indicator_metrics_maps_chip_distribution_and_major_holders() -> None:
     assert result["stock_name"] == "贵州茅台"
     assert result["chip_distribution"]["avg_cost"] == 118.5
     assert result["chip_distribution"]["concentration_90"] == 0.12
+    assert result["chip_distribution"]["distribution"] == [
+        {"price": 110.2, "percent": 0.2},
+        {"price": 118.5, "percent": 0.5},
+        {"price": 130.8, "percent": 0.3},
+    ]
     assert result["major_holder_status"] == "ok"
     assert result["major_holders"][0]["name"] == "摩根士丹利"
     assert result["major_holders"][0]["holding_ratio"] == 2.35

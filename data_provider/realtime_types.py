@@ -18,7 +18,7 @@ import logging
 import time
 from threading import RLock
 from dataclasses import dataclass, field
-from typing import Optional, Dict, Any, Union
+from typing import Optional, Dict, Any, Union, List
 from enum import Enum
 
 logger = logging.getLogger(__name__)
@@ -179,6 +179,20 @@ class UnifiedRealtimeQuote:
 
 
 @dataclass
+class ChipDistributionPoint:
+    """逐价位筹码分布点。percent 使用 0-1 小数表示该价位筹码占比。"""
+
+    price: float
+    percent: float
+
+    def to_dict(self) -> Dict[str, float]:
+        return {
+            'price': self.price,
+            'percent': self.percent,
+        }
+
+
+@dataclass
 class ChipDistribution:
     """
     筹码分布数据
@@ -201,6 +215,7 @@ class ChipDistribution:
     cost_70_low: float = 0.0      # 70%筹码成本下限
     cost_70_high: float = 0.0     # 70%筹码成本上限
     concentration_70: float = 0.0  # 70%筹码集中度
+    distribution: List[ChipDistributionPoint] = field(default_factory=list)  # 逐价位筹码分布
     
     def to_dict(self) -> Dict[str, Any]:
         """转换为字典"""
@@ -213,7 +228,10 @@ class ChipDistribution:
             'cost_90_low': self.cost_90_low,
             'cost_90_high': self.cost_90_high,
             'concentration_90': self.concentration_90,
+            'cost_70_low': self.cost_70_low,
+            'cost_70_high': self.cost_70_high,
             'concentration_70': self.concentration_70,
+            'distribution': [point.to_dict() for point in self.distribution],
         }
     
     def get_chip_status(self, current_price: float) -> str:

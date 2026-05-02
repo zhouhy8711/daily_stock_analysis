@@ -451,6 +451,13 @@ class Config:
     # === 数据源 API Token ===
     tushare_token: Optional[str] = None
     tickflow_api_key: Optional[str] = None
+    ifind_username: Optional[str] = None
+    ifind_password: Optional[str] = None
+    ifind_chip_summary_function: str = "THS_BD"
+    ifind_chip_distribution_function: str = "THS_BD"
+    ifind_chip_summary_indicators: str = ""
+    ifind_chip_distribution_indicators: str = ""
+    ifind_chip_params: str = ""
     longbridge_app_key: Optional[str] = None
     longbridge_app_secret: Optional[str] = None
     longbridge_access_token: Optional[str] = None
@@ -1167,6 +1174,13 @@ class Config:
             feishu_folder_token=os.getenv('FEISHU_FOLDER_TOKEN'),
             tushare_token=os.getenv('TUSHARE_TOKEN'),
             tickflow_api_key=os.getenv('TICKFLOW_API_KEY'),
+            ifind_username=os.getenv('IFIND_USERNAME') or None,
+            ifind_password=os.getenv('IFIND_PASSWORD') or None,
+            ifind_chip_summary_function=os.getenv('IFIND_CHIP_SUMMARY_FUNCTION', 'THS_BD'),
+            ifind_chip_distribution_function=os.getenv('IFIND_CHIP_DISTRIBUTION_FUNCTION', 'THS_BD'),
+            ifind_chip_summary_indicators=os.getenv('IFIND_CHIP_SUMMARY_INDICATORS', ''),
+            ifind_chip_distribution_indicators=os.getenv('IFIND_CHIP_DISTRIBUTION_INDICATORS', ''),
+            ifind_chip_params=os.getenv('IFIND_CHIP_PARAMS', ''),
             longbridge_app_key=os.getenv('LONGBRIDGE_APP_KEY') or None,
             longbridge_app_secret=os.getenv('LONGBRIDGE_APP_SECRET') or None,
             longbridge_access_token=os.getenv('LONGBRIDGE_ACCESS_TOKEN') or None,

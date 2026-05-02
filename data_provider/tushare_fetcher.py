@@ -32,7 +32,7 @@ from tenacity import (
 )
 
 from .base import BaseFetcher, DataFetchError, RateLimitError, STANDARD_COLUMNS,is_bse_code, is_st_stock, is_kc_cy_stock, normalize_stock_code, _is_hk_market
-from .realtime_types import UnifiedRealtimeQuote, ChipDistribution
+from .realtime_types import UnifiedRealtimeQuote, ChipDistribution, ChipDistributionPoint
 from src.config import get_config
 import os
 from zoneinfo import ZoneInfo
@@ -129,6 +129,7 @@ class TushareFetcher(BaseFetcher):
     
     name = "TushareFetcher"
     priority = int(os.getenv("TUSHARE_PRIORITY", "2"))  # 默认优先级，会在 __init__ 中根据配置动态调整
+    chip_priority = 1
 
     def __init__(self, rate_limit_per_minute: int = 80):
         """
@@ -1165,9 +1166,11 @@ class TushareFetcher(BaseFetcher):
                     return None
                 current_price = daily_df.iloc[0]['close']
                 metrics = self.compute_cyq_metrics(df, current_price)
+                distribution = self.build_cyq_distribution(df)
 
                 chip = ChipDistribution(
                     code=stock_code,
+                    source="tushare_cyq_chips",
                     date=datetime.strptime(start_date, '%Y%m%d').strftime('%Y-%m-%d'),
                     profit_ratio=metrics['获利比例'],
                     avg_cost=metrics['平均成本'],
@@ -1177,6 +1180,7 @@ class TushareFetcher(BaseFetcher):
                     cost_70_low=metrics['70成本-低'],
                     cost_70_high=metrics['70成本-高'],
                     concentration_70=metrics['70集中度'],
+                    distribution=distribution,
                 )
                 
                 logger.info(f"[筹码分布] {stock_code} 日期={chip.date}: 获利比例={chip.profit_ratio:.1%}, "
@@ -1187,6 +1191,37 @@ class TushareFetcher(BaseFetcher):
         except Exception as e:
             logger.warning(f"[Tushare] 获取筹码分布失败 {stock_code}: {e}")
             return None
+
+    def build_cyq_distribution(self, df: pd.DataFrame) -> List[ChipDistributionPoint]:
+        """
+        将 Tushare cyq_chips 的逐价位明细转换成统一结构。
+
+        Tushare 返回的 percent 可能是百分数或小数；这里按当日总和归一化
+        到 0-1，前端直接使用该真实明细绘制筹码峰，不再从 K 线估算。
+        """
+        if df is None or df.empty or "price" not in df.columns or "percent" not in df.columns:
+            return []
+
+        values = df[["price", "percent"]].copy()
+        values["price"] = pd.to_numeric(values["price"], errors="coerce")
+        values["percent"] = pd.to_numeric(values["percent"], errors="coerce")
+        values = values.dropna(subset=["price", "percent"])
+        values = values[(values["price"] > 0) & (values["percent"] > 0)]
+        if values.empty:
+            return []
+
+        values = values.groupby("price", as_index=False)["percent"].sum().sort_values("price")
+        total_percent = float(values["percent"].sum())
+        if total_percent <= 0:
+            return []
+
+        return [
+            ChipDistributionPoint(
+                price=round(float(row["price"]), 4),
+                percent=round(float(row["percent"]) / total_percent, 8),
+            )
+            for _, row in values.iterrows()
+        ]
 
     def compute_cyq_metrics(self, df: pd.DataFrame, current_price: float) -> dict:
         """

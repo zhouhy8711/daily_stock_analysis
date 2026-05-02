@@ -383,6 +383,11 @@ describe('HomePage', () => {
         cost70Low: 114.1,
         cost70High: 126.2,
         concentration70: 0.09,
+        distribution: [
+          { price: 110.2, percent: 0.2 },
+          { price: 118.5, percent: 0.5 },
+          { price: 130.8, percent: 0.3 },
+        ],
       },
       majorHolders: [
         { name: '摩根士丹利', holdingRatio: 2.35, holderType: 'QFII', reportDate: '2026-03-31' },

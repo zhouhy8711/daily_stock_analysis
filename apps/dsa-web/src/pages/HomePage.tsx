@@ -13,83 +13,21 @@ import { ReportMarkdown, ReportSummary } from '../components/report';
 import { WatchlistBoard, type WatchlistItem } from '../components/watchlist';
 import { useDashboardLifecycle, useHomeDashboardState } from '../hooks';
 import { useStockIndex } from '../hooks/useStockIndex';
-import type { StockIndexItem } from '../types/stockIndex';
 import { normalizeQuery } from '../utils/normalizeQuery';
 import { getReportText, normalizeReportLanguage } from '../utils/reportLanguage';
+import {
+  appendWatchlistCode,
+  buildLatestHistoryByCode,
+  compareStockIndexById,
+  getWatchlistLookupKeys,
+  hasEquivalentWatchlistCode,
+  isAllShareStock,
+  matchesStockIndexQuery,
+  normalizeWatchlistCode,
+  parseWatchlistValue,
+} from '../utils/watchlist';
 
-const normalizeWatchlistCode = (stockCode: string) => stockCode.trim().toUpperCase();
 const ALL_SHARE_QUOTE_BATCH_SIZE = 6000;
-
-const getWatchlistLookupKeys = (stockCode: string): string[] => {
-  const code = normalizeWatchlistCode(stockCode);
-  const keys = new Set<string>([code]);
-  const [base] = code.split('.');
-  if (base) {
-    keys.add(base);
-  }
-  if (code.startsWith('HK') && code.length > 2) {
-    keys.add(code.slice(2));
-  }
-  if (/^\d{5}$/.test(code)) {
-    keys.add(`HK${code}`);
-    keys.add(`${code}.HK`);
-  }
-  return Array.from(keys).filter(Boolean);
-};
-
-const parseWatchlistValue = (value: string): string[] => {
-  const seen = new Set<string>();
-  return value
-    .split(/[,\n\r\t ]+/)
-    .map(normalizeWatchlistCode)
-    .filter((code) => {
-      if (!code || seen.has(code)) {
-        return false;
-      }
-      seen.add(code);
-      return true;
-    });
-};
-
-const getStockIndexSortCode = (item: StockIndexItem): string => item.displayCode || item.canonicalCode;
-
-const compareStockIndexById = (left: StockIndexItem, right: StockIndexItem): number => (
-  getStockIndexSortCode(left).localeCompare(getStockIndexSortCode(right), 'en', { numeric: true })
-);
-
-const isAllShareStock = (item: StockIndexItem): boolean => (
-  item.active && item.assetType === 'stock' && (item.market === 'CN' || item.market === 'BSE')
-);
-
-const matchesStockIndexQuery = (item: StockIndexItem, query: string): boolean => {
-  if (!query) {
-    return true;
-  }
-
-  const fields = [
-    item.canonicalCode,
-    item.displayCode,
-    item.nameZh,
-    item.nameEn ?? '',
-    item.pinyinFull ?? '',
-    item.pinyinAbbr ?? '',
-    ...(item.aliases ?? []),
-  ];
-  return fields.some((field) => normalizeQuery(field).includes(query));
-};
-
-const hasEquivalentWatchlistCode = (codes: string[], candidateCode: string): boolean => {
-  const candidateKeys = new Set(getWatchlistLookupKeys(candidateCode));
-  return codes.some((code) => getWatchlistLookupKeys(code).some((key) => candidateKeys.has(key)));
-};
-
-const appendWatchlistCode = (codes: string[], candidateCode: string): string[] => {
-  const normalized = normalizeWatchlistCode(candidateCode);
-  if (!normalized || hasEquivalentWatchlistCode(codes, normalized)) {
-    return codes;
-  }
-  return [...codes, normalized];
-};
 
 const HomePage: React.FC = () => {
   const navigate = useNavigate();
@@ -187,16 +125,7 @@ const HomePage: React.FC = () => {
   }, [loadWatchlist]);
 
   const latestHistoryByCode = useMemo(() => {
-    const map = new Map<string, typeof historyItems[number]>();
-    for (const item of historyItems) {
-      for (const key of getWatchlistLookupKeys(item.stockCode)) {
-        if (!key || map.has(key)) {
-          continue;
-        }
-        map.set(key, item);
-      }
-    }
-    return map;
+    return buildLatestHistoryByCode(historyItems);
   }, [historyItems]);
 
   const watchlistLookupSet = useMemo(() => {

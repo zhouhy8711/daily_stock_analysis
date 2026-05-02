@@ -21,6 +21,7 @@ export type KLineData = {
   volume?: number | null;
   amount?: number | null;
   changePercent?: number | null;
+  turnoverRate?: number | null;
 };
 
 export type KLinePeriod = 'daily' | '1m' | '5m' | '15m' | '30m' | '60m';
@@ -57,6 +58,11 @@ export type StockQuotesResponse = {
   updateTime?: string | null;
 };
 
+export type ChipDistributionPoint = {
+  price: number;
+  percent: number;
+};
+
 export type ChipDistributionMetrics = {
   code: string;
   date?: string | null;
@@ -69,6 +75,7 @@ export type ChipDistributionMetrics = {
   cost70Low?: number | null;
   cost70High?: number | null;
   concentration70?: number | null;
+  distribution: ChipDistributionPoint[];
   chipStatus?: string | null;
 };
 
@@ -124,6 +131,7 @@ function normalizeKLine(item: Record<string, unknown>): KLineData {
     volume: toNullableNumber(item.volume),
     amount: toNullableNumber(item.amount),
     changePercent: toNullableNumber(item.change_percent ?? item.changePercent),
+    turnoverRate: toNullableNumber(item.turnover_rate ?? item.turnoverRate),
   };
 }
 
@@ -157,6 +165,20 @@ function normalizeChipDistribution(item: unknown): ChipDistributionMetrics | nul
     return null;
   }
   const data = item as Record<string, unknown>;
+  const rawDistribution = Array.isArray(data.distribution) ? data.distribution : [];
+  const distribution = rawDistribution
+    .map((rawPoint) => {
+      if (!rawPoint || typeof rawPoint !== 'object') {
+        return null;
+      }
+      const point = rawPoint as Record<string, unknown>;
+      const price = toNullableNumber(point.price);
+      const percent = toNullableNumber(point.percent ?? point.ratio);
+      return price !== null && price > 0 && percent !== null && percent > 0
+        ? { price, percent }
+        : null;
+    })
+    .filter((point): point is ChipDistributionPoint => point !== null);
   return {
     code: String(data.code ?? ''),
     date: toNullableString(data.date),
@@ -169,6 +191,7 @@ function normalizeChipDistribution(item: unknown): ChipDistributionMetrics | nul
     cost70Low: toNullableNumber(data.cost_70_low ?? data.cost70Low),
     cost70High: toNullableNumber(data.cost_70_high ?? data.cost70High),
     concentration70: toNullableNumber(data.concentration_70 ?? data.concentration70),
+    distribution,
     chipStatus: toNullableString(data.chip_status ?? data.chipStatus),
   };
 }

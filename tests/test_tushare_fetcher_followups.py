@@ -152,6 +152,12 @@ class TestTushareFetcherFollowUps(unittest.TestCase):
         self.assertAlmostEqual(chip.avg_cost, 10.1)
         self.assertAlmostEqual(chip.concentration_90, 0.1)
         self.assertAlmostEqual(chip.concentration_70, 0.1)
+        self.assertEqual(chip.source, "tushare_cyq_chips")
+        self.assertEqual(len(chip.distribution), 3)
+        self.assertAlmostEqual(chip.distribution[0].price, 9.0)
+        self.assertAlmostEqual(chip.distribution[0].percent, 0.2)
+        self.assertAlmostEqual(chip.distribution[1].percent, 0.5)
+        self.assertAlmostEqual(chip.distribution[2].percent, 0.3)
         self.assertEqual(rate_limit_mock.call_count, 3)
 
     def test_convert_stock_code_accepts_exchange_prefixed_a_share(self) -> None:

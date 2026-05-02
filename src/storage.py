@@ -396,6 +396,65 @@ class BacktestSummary(Base):
     )
 
 
+class StockRule(Base):
+    """User-defined stock screening rule."""
+
+    __tablename__ = 'stock_rules'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    name = Column(String(100), nullable=False)
+    description = Column(Text)
+    is_active = Column(Boolean, nullable=False, default=True, index=True)
+    period = Column(String(16), nullable=False, default='daily')
+    lookback_days = Column(Integer, nullable=False, default=120)
+    target_scope = Column(String(16), nullable=False, default='watchlist', index=True)
+    target_codes_json = Column(Text)
+    definition_json = Column(Text, nullable=False)
+    created_at = Column(DateTime, default=datetime.now, index=True)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now, index=True)
+
+
+class StockRuleRun(Base):
+    """Execution record for a stock rule."""
+
+    __tablename__ = 'stock_rule_runs'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    rule_id = Column(Integer, ForeignKey('stock_rules.id'), nullable=False, index=True)
+    status = Column(String(16), nullable=False, default='running', index=True)
+    target_count = Column(Integer, nullable=False, default=0)
+    match_count = Column(Integer, nullable=False, default=0)
+    error = Column(Text)
+    started_at = Column(DateTime, default=datetime.now, index=True)
+    finished_at = Column(DateTime)
+    duration_ms = Column(Integer)
+
+    __table_args__ = (
+        Index('ix_stock_rule_run_rule_started', 'rule_id', 'started_at'),
+    )
+
+
+class StockRuleMatch(Base):
+    """Matched stock snapshot for a rule run."""
+
+    __tablename__ = 'stock_rule_matches'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    run_id = Column(Integer, ForeignKey('stock_rule_runs.id'), nullable=False, index=True)
+    rule_id = Column(Integer, ForeignKey('stock_rules.id'), nullable=False, index=True)
+    stock_code = Column(String(16), nullable=False, index=True)
+    stock_name = Column(String(80))
+    matched_groups_json = Column(Text)
+    snapshot_json = Column(Text)
+    explanation = Column(Text)
+    created_at = Column(DateTime, default=datetime.now, index=True)
+
+    __table_args__ = (
+        Index('ix_stock_rule_match_rule_created', 'rule_id', 'created_at'),
+        Index('ix_stock_rule_match_code_created', 'stock_code', 'created_at'),
+    )
+
+
 class PortfolioAccount(Base):
     """Portfolio account metadata."""
 

@@ -129,6 +129,9 @@ type HoverStepDirection = -1 | 1;
 
 type VolumeIndicatorMode = 'volume' | 'amount' | 'volumeMa';
 type MomentumIndicatorMode = 'macd' | 'rsi';
+type ChipPanelScope = 'all' | 'main';
+type ChipRangeLevel = '90' | '70';
+type SidePanelTab = 'chip' | 'flow';
 
 const EMPTY_HISTORY: KLineData[] = [];
 const EMPTY_HOLDERS: MajorHolder[] = [];
@@ -518,6 +521,19 @@ function formatCostRange(chip?: ChipDistributionMetrics | null): string {
   return low === '--' && high === '--' ? '--' : `${low} - ${high}`;
 }
 
+function formatChipRange(chip: ChipDistributionMetrics | null, rangeLevel: ChipRangeLevel): string {
+  if (!chip) {
+    return '--';
+  }
+  const low = formatNumber(rangeLevel === '90' ? chip.cost90Low : chip.cost70Low);
+  const high = formatNumber(rangeLevel === '90' ? chip.cost90High : chip.cost70High);
+  return low === '--' && high === '--' ? '--' : `${low} - ${high}`;
+}
+
+function getChipConcentration(chip: ChipDistributionMetrics | null, rangeLevel: ChipRangeLevel): number | null | undefined {
+  return rangeLevel === '90' ? chip?.concentration90 : chip?.concentration70;
+}
+
 function formatHolderLabel(holder: MajorHolder): string {
   const ratio = formatPlainPct(holder.holdingRatio);
   return ratio === '--' ? holder.name : `${holder.name} ${ratio}`;
@@ -557,80 +573,6 @@ function getSignedTone(value?: number | null): MainForceVariant | 'neutral' {
     return 'danger';
   }
   return 'warning';
-}
-
-function weightedQuantile(
-  items: Array<{ price: number; weight: number }>,
-  percentile: number,
-): number | undefined {
-  if (items.length === 0) {
-    return undefined;
-  }
-  const totalWeight = items.reduce((sum, item) => sum + item.weight, 0);
-  if (totalWeight <= 0) {
-    return undefined;
-  }
-  const target = totalWeight * percentile;
-  let cumulative = 0;
-  for (const item of items) {
-    cumulative += item.weight;
-    if (cumulative >= target) {
-      return item.price;
-    }
-  }
-  return items.at(-1)?.price;
-}
-
-function buildEstimatedChipDistribution(
-  points: ChartPoint[],
-  currentPrice?: number | null,
-): ChipDistributionMetrics | null {
-  if (typeof currentPrice !== 'number' || Number.isNaN(currentPrice) || currentPrice <= 0) {
-    return null;
-  }
-
-  const weightedPrices = points
-    .slice(-120)
-    .map((point) => ({
-      price: point.close,
-      weight: point.volume ?? 0,
-    }))
-    .filter((item) => item.price > 0 && item.weight > 0)
-    .sort((a, b) => a.price - b.price);
-
-  const totalWeight = weightedPrices.reduce((sum, item) => sum + item.weight, 0);
-  if (weightedPrices.length === 0 || totalWeight <= 0) {
-    return null;
-  }
-
-  const avgCost = weightedPrices.reduce((sum, item) => sum + item.price * item.weight, 0) / totalWeight;
-  const profitWeight = weightedPrices
-    .filter((item) => item.price <= currentPrice)
-    .reduce((sum, item) => sum + item.weight, 0);
-  const cost90Low = weightedQuantile(weightedPrices, 0.05);
-  const cost90High = weightedQuantile(weightedPrices, 0.95);
-  const cost70Low = weightedQuantile(weightedPrices, 0.15);
-  const cost70High = weightedQuantile(weightedPrices, 0.85);
-  const concentration = (low?: number, high?: number) => (
-    typeof low === 'number' && typeof high === 'number' && low + high > 0
-      ? (high - low) / (high + low)
-      : null
-  );
-
-  return {
-    code: '',
-    date: points.at(-1)?.date,
-    source: 'history_estimate',
-    profitRatio: profitWeight / totalWeight,
-    avgCost,
-    cost90Low,
-    cost90High,
-    concentration90: concentration(cost90Low, cost90High),
-    cost70Low,
-    cost70High,
-    concentration70: concentration(cost70Low, cost70High),
-    chipStatus: '历史成交量估算',
-  };
 }
 
 function buildSignedVolumeFlow(points: ChartPoint[]): number[] {
@@ -811,9 +753,8 @@ function buildStructureTrend(
 
   return points.slice(visibleStartIndex).map((point, visibleIndex) => {
     const originalIndex = visibleStartIndex + visibleIndex;
-    const estimatedChip = buildEstimatedChipDistribution(points.slice(0, originalIndex + 1), point.close);
     const chip = adjustChipForHolderScope(
-      originalIndex === points.length - 1 && currentChip ? currentChip : estimatedChip,
+      originalIndex === points.length - 1 && currentChip ? currentChip : null,
       profile,
     );
     return {
@@ -1042,58 +983,42 @@ function buildOrderFlowMetrics(
   };
 }
 
-function buildChipPeakRows(points: ChartPoint[], chip?: ChipDistributionMetrics | null) {
-  const weightedPrices = points
-    .slice(-120)
-    .map((point) => ({ price: point.close, weight: point.volume ?? 0 }))
-    .filter((item) => item.price > 0 && item.weight > 0);
-  const latestClose = points.at(-1)?.close;
-  const anchors = [
-    chip?.cost90Low,
-    chip?.cost90High,
-    chip?.cost70Low,
-    chip?.cost70High,
-    chip?.avgCost,
-    latestClose,
-  ].filter((value): value is number => typeof value === 'number' && Number.isFinite(value) && value > 0);
-  const priceValues = [
-    ...weightedPrices.map((item) => item.price),
-    ...anchors,
-  ];
+function buildChipPeakRows(chip?: ChipDistributionMetrics | null, latestClose?: number | null) {
+  const grouped = new Map<number, number>();
+  (chip?.distribution ?? []).forEach((point) => {
+    if (
+      Number.isFinite(point.price)
+      && point.price > 0
+      && Number.isFinite(point.percent)
+      && point.percent > 0
+    ) {
+      grouped.set(point.price, (grouped.get(point.price) ?? 0) + point.percent);
+    }
+  });
 
-  if (priceValues.length === 0) {
+  if (grouped.size === 0) {
     return [];
   }
 
-  const minPrice = Math.min(...priceValues);
-  const maxPrice = Math.max(...priceValues);
-  const padding = Math.max((maxPrice - minPrice) * 0.08, maxPrice * 0.005, 0.01);
-  const floor = Math.max(0, minPrice - padding);
-  const ceiling = maxPrice + padding;
-  const bucketCount = 18;
-  const step = Math.max((ceiling - floor) / bucketCount, 0.01);
-  const buckets = Array.from({ length: bucketCount }, (_, index) => ({
-    low: floor + index * step,
-    high: floor + (index + 1) * step,
-    weight: 0,
-  }));
+  const rowsAsc = Array.from(grouped.entries())
+    .map(([price, percent]) => ({ price, percent }))
+    .sort((a, b) => a.price - b.price);
+  const gaps = rowsAsc
+    .slice(1)
+    .map((row, index) => row.price - rowsAsc[index].price)
+    .filter((gap) => gap > 0);
+  const priceRange = (rowsAsc.at(-1)?.price ?? rowsAsc[0].price) - rowsAsc[0].price;
+  const minGap = gaps.length > 0 ? Math.min(...gaps) : 0.02;
+  const tolerance = Math.max(minGap / 2, priceRange * 0.002, 0.01);
+  const maxPercent = Math.max(...rowsAsc.map((row) => row.percent), 0.000001);
 
-  weightedPrices.forEach((item) => {
-    const index = clamp(Math.floor((item.price - floor) / step), 0, bucketCount - 1);
-    buckets[index].weight += item.weight;
-  });
-
-  const maxWeight = Math.max(...buckets.map((bucket) => bucket.weight), 1);
-  return buckets
-    .map((bucket) => {
-      const price = (bucket.low + bucket.high) / 2;
-      return {
-        price,
-        ratio: bucket.weight / maxWeight,
-        isAvgCost: typeof chip?.avgCost === 'number' && Math.abs(price - chip.avgCost) <= step / 2,
-        isCurrent: typeof latestClose === 'number' && Math.abs(price - latestClose) <= step / 2,
-      };
-    })
+  return rowsAsc
+    .map((row) => ({
+      price: row.price,
+      ratio: row.percent / maxPercent,
+      isAvgCost: typeof chip?.avgCost === 'number' && Math.abs(row.price - chip.avgCost) <= tolerance,
+      isCurrent: typeof latestClose === 'number' && Math.abs(row.price - latestClose) <= tolerance,
+    }))
     .sort((a, b) => b.price - a.price);
 }
 
@@ -2074,10 +1999,19 @@ const MacdSignalChart: React.FC<{
 const ChipPeakPanel: React.FC<{
   points: ChartPoint[];
   chip: ChipDistributionMetrics | null;
+  mainChip: ChipDistributionMetrics | null;
+  mainHolderCount: number;
   isEstimated: boolean;
-}> = ({ points, chip, isEstimated }) => {
-  const rows = useMemo(() => buildChipPeakRows(points, chip), [points, chip]);
+  requiresRealChipData: boolean;
+}> = ({ points, chip, mainChip, mainHolderCount, isEstimated, requiresRealChipData }) => {
+  const [activeScope, setActiveScope] = useState<ChipPanelScope>('all');
+  const [activeRange, setActiveRange] = useState<ChipRangeLevel>('90');
+  const activeChip = activeScope === 'main' ? mainChip : chip;
   const latestClose = points.at(-1)?.close;
+  const rows = useMemo(
+    () => (activeChip ? buildChipPeakRows(activeChip, latestClose) : []),
+    [activeChip, latestClose],
+  );
   const svgWidth = 555;
   const svgHeight = 300;
   const chartTop = 20;
@@ -2085,14 +2019,35 @@ const ChipPeakPanel: React.FC<{
   const chartBottom = chartTop + chartHeight;
   const axisX = 74;
   const barMaxWidth = 455;
-  const priceMax = rows[0]?.price ?? latestClose ?? 1;
-  const priceMin = rows.at(-1)?.price ?? latestClose ?? 0;
+  const axisPrices = [
+    ...rows.map((row) => row.price),
+    activeChip?.cost90Low,
+    activeChip?.cost90High,
+    activeChip?.cost70Low,
+    activeChip?.cost70High,
+    activeChip?.avgCost,
+    latestClose,
+  ].filter((value): value is number => typeof value === 'number' && Number.isFinite(value) && value > 0);
+  const priceMax = axisPrices.length > 0 ? Math.max(...axisPrices) : 1;
+  const priceMin = axisPrices.length > 0 ? Math.min(...axisPrices) : 0;
   const priceRange = Math.max(priceMax - priceMin, 0.01);
   const yForPrice = (price: number) => chartTop + ((priceMax - price) / priceRange) * chartHeight;
   const currentY = typeof latestClose === 'number' ? yForPrice(latestClose) : null;
-  const avgCostY = typeof chip?.avgCost === 'number' ? yForPrice(chip.avgCost) : null;
-  const profitRatio = chip?.profitRatio;
+  const avgCostY = typeof activeChip?.avgCost === 'number' ? yForPrice(activeChip.avgCost) : null;
+  const profitRatio = activeChip?.profitRatio;
   const trappedRatio = typeof profitRatio === 'number' ? 1 - profitRatio : undefined;
+  const concentration = getChipConcentration(activeChip, activeRange);
+  const chipNote = activeChip
+    ? activeScope === 'main'
+      ? activeChip.chipStatus || activeChip.source || '同源主力筹码明细'
+      : activeChip.chipStatus || (isEstimated ? '历史成交量估算，真实筹码源恢复后自动切换' : activeChip.source || '实时成本分布')
+    : activeScope === 'main'
+      ? mainHolderCount > 0
+        ? '暂无同源主力筹码明细，未使用股东持仓估算'
+        : '暂无主力筹码明细'
+    : requiresRealChipData
+      ? '真实筹码源与本地筹码模型均不可用，已停止展示历史成交量估算值，避免与同花顺口径混用'
+      : '暂无筹码分布说明';
 
   return (
     <aside
@@ -2108,16 +2063,26 @@ const ChipPeakPanel: React.FC<{
             <h3 className="text-sm font-semibold" style={{ color: TERMINAL_COLORS.text }}>筹码峰</h3>
           </div>
           <p className="mt-1 text-[11px]" style={{ color: TERMINAL_COLORS.muted }}>
-            {isEstimated ? '历史成交量估算' : chip?.source || '实时成本分布'}
+            {!activeChip && activeScope === 'main'
+              ? '同源主力明细不可用'
+              : !activeChip && requiresRealChipData
+                ? '真实筹码与模型均不可用'
+                : isEstimated
+                  ? '历史成交量估算'
+                  : activeChip?.source || '实时成本分布'}
           </p>
         </div>
-        {chip?.date ? <span className="font-mono text-[11px]" style={{ color: TERMINAL_COLORS.muted }}>{chip.date}</span> : null}
+        {activeChip?.date ? <span className="font-mono text-[11px]" style={{ color: TERMINAL_COLORS.muted }}>{activeChip.date}</span> : null}
       </div>
 
       <div className="px-2 py-2">
         {rows.length === 0 ? (
           <div className="border border-dashed px-3 py-6 text-center text-xs" style={{ borderColor: TERMINAL_COLORS.redGrid, color: TERMINAL_COLORS.muted }}>
-            暂无筹码峰数据
+            {activeScope === 'main'
+              ? '暂无同源主力筹码峰明细'
+              : requiresRealChipData
+                ? '真实筹码明细与本地模型均不可用，无法与同花顺对齐'
+                : '暂无真实筹码峰明细'}
           </div>
         ) : (
           <svg viewBox={`0 0 ${svgWidth} ${svgHeight}`} role="img" aria-label="筹码峰分布图" className="h-[10rem] w-full">
@@ -2187,13 +2152,104 @@ const ChipPeakPanel: React.FC<{
         )}
       </div>
 
-      <div className="grid grid-cols-3 gap-2 border-t px-3 py-1.5 font-mono text-[11px]" style={{ borderColor: TERMINAL_COLORS.redGrid, color: TERMINAL_COLORS.text }}>
-        <span><b style={{ color: TERMINAL_COLORS.chipBlue }}>套牢盘</b> {formatRatioPct(trappedRatio)}</span>
-        <span><b style={{ color: TERMINAL_COLORS.orange }}>获利盘</b> {formatRatioPct(profitRatio)}</span>
-        <span><b style={{ color: TERMINAL_COLORS.yellow }}>成本</b> {formatNumber(chip?.avgCost)}</span>
-      </div>
-      <div className="border-t px-3 py-1.5 text-[11px]" style={{ borderColor: TERMINAL_COLORS.redGrid, color: TERMINAL_COLORS.muted }}>
-        90%筹码区间：{formatCostRange(chip)} · 区间重合度 {formatRatioPct(chip?.concentration90)}
+      <div className="border-t px-3 py-2" style={{ borderColor: TERMINAL_COLORS.redGrid }}>
+        <div
+          role="tablist"
+          aria-label="筹码明细范围"
+          className="inline-flex overflow-hidden rounded border font-mono text-[11px]"
+          style={{ borderColor: TERMINAL_COLORS.redGrid }}
+        >
+          {([
+            { value: 'all', label: '全部筹码' },
+            { value: 'main', label: '主力筹码' },
+          ] as Array<{ value: ChipPanelScope; label: string }>).map((option) => {
+            const selected = activeScope === option.value;
+            return (
+              <button
+                key={option.value}
+                type="button"
+                role="tab"
+                aria-selected={selected}
+                onClick={() => setActiveScope(option.value)}
+                className="border-r px-2.5 py-1 last:border-r-0"
+                style={{
+                  borderColor: TERMINAL_COLORS.redGrid,
+                  backgroundColor: selected ? TERMINAL_COLORS.activeTabBg : TERMINAL_COLORS.panel,
+                  color: selected ? TERMINAL_COLORS.text : TERMINAL_COLORS.muted,
+                }}
+              >
+                {option.label}
+              </button>
+            );
+          })}
+        </div>
+
+        <dl className="mt-2 grid grid-cols-2 gap-x-4 gap-y-2 font-mono text-[12px]">
+          <div className="flex items-center justify-between gap-2">
+            <dt style={{ color: TERMINAL_COLORS.orange }}>收盘获利</dt>
+            <dd className="font-semibold tabular-nums" style={{ color: TERMINAL_COLORS.orange }}>{formatRatioPct(profitRatio)}</dd>
+          </div>
+          <div className="flex items-center justify-between gap-2">
+            <dt style={{ color: TERMINAL_COLORS.chipBlue }}>套牢盘</dt>
+            <dd className="font-semibold tabular-nums" style={{ color: TERMINAL_COLORS.chipBlue }}>{formatRatioPct(trappedRatio)}</dd>
+          </div>
+          <div className="flex items-center justify-between gap-2">
+            <dt style={{ color: TERMINAL_COLORS.yellow }}>平均成本</dt>
+            <dd className="font-semibold tabular-nums" style={{ color: TERMINAL_COLORS.yellow }}>{formatNumber(activeChip?.avgCost)}</dd>
+          </div>
+          <div className="flex items-center justify-between gap-2">
+            <dt style={{ color: TERMINAL_COLORS.muted }}>筹码来源</dt>
+            <dd className="truncate text-right tabular-nums" style={{ color: TERMINAL_COLORS.text }}>{activeScope === 'main' ? (activeChip?.source || '--') : (isEstimated ? '历史估算' : activeChip?.source || '--')}</dd>
+          </div>
+        </dl>
+
+        <div className="mt-3 flex flex-wrap items-center gap-2">
+          <div
+            role="tablist"
+            aria-label="筹码区间"
+            className="inline-flex overflow-hidden rounded border font-mono text-[11px]"
+            style={{ borderColor: TERMINAL_COLORS.redGrid }}
+          >
+            {([
+              { value: '90', label: '90%筹码' },
+              { value: '70', label: '70%筹码' },
+            ] as Array<{ value: ChipRangeLevel; label: string }>).map((option) => {
+              const selected = activeRange === option.value;
+              return (
+                <button
+                  key={option.value}
+                  type="button"
+                  role="tab"
+                  aria-selected={selected}
+                  onClick={() => setActiveRange(option.value)}
+                  className="border-r px-2.5 py-1 last:border-r-0"
+                  style={{
+                    borderColor: TERMINAL_COLORS.redGrid,
+                    backgroundColor: selected ? TERMINAL_COLORS.text : TERMINAL_COLORS.panel,
+                    color: selected ? TERMINAL_COLORS.selectedText : TERMINAL_COLORS.muted,
+                  }}
+                >
+                  {option.label}
+                </button>
+              );
+            })}
+          </div>
+        </div>
+
+        <dl className="mt-2 space-y-1.5 font-mono text-[12px]">
+          <div className="flex items-center justify-between gap-3">
+            <dt style={{ color: TERMINAL_COLORS.muted }}>价格区间</dt>
+            <dd className="font-semibold tabular-nums" style={{ color: TERMINAL_COLORS.text }}>{formatChipRange(activeChip, activeRange)}</dd>
+          </div>
+          <div className="flex items-center justify-between gap-3">
+            <dt style={{ color: TERMINAL_COLORS.muted }}>集中度</dt>
+            <dd className="font-semibold tabular-nums" style={{ color: TERMINAL_COLORS.text }}>{formatRatioPct(concentration)}</dd>
+          </div>
+          <div className="flex items-start justify-between gap-3">
+            <dt className="shrink-0" style={{ color: TERMINAL_COLORS.muted }}>筹码分布说明</dt>
+            <dd className="min-w-0 text-right leading-5" style={{ color: TERMINAL_COLORS.text }}>{chipNote}</dd>
+          </div>
+        </dl>
       </div>
     </aside>
   );
@@ -2253,6 +2309,80 @@ const OrderFlowMonitor: React.FC<{
         更新时间 {formatDateTime(flow.updatedAt)}。美股或分单源缺失时使用价量估算，保证页面连续展示。
       </div>
     </aside>
+  );
+};
+
+const IndicatorSidePanel: React.FC<{
+  points: ChartPoint[];
+  chipPoints: ChartPoint[];
+  chip: ChipDistributionMetrics | null;
+  mainChip: ChipDistributionMetrics | null;
+  mainHolderCount: number;
+  isEstimatedChip: boolean;
+  requiresRealChipData: boolean;
+  quote: StockQuote | null;
+}> = ({
+  points,
+  chipPoints,
+  chip,
+  mainChip,
+  mainHolderCount,
+  isEstimatedChip,
+  requiresRealChipData,
+  quote,
+}) => {
+  const [activeTab, setActiveTab] = useState<SidePanelTab>('chip');
+
+  return (
+    <div className="flex min-h-0 flex-col gap-2 xl:flex-1" data-testid="indicator-side-panel">
+      <div
+        role="tablist"
+        aria-label="筹码与监控切换"
+        className="grid grid-cols-2 overflow-hidden rounded-md border font-mono text-xs"
+        style={{ borderColor: TERMINAL_COLORS.redGrid, backgroundColor: TERMINAL_COLORS.panel }}
+      >
+        {([
+          { value: 'chip', label: '筹码峰', icon: Layers3 },
+          { value: 'flow', label: '实时监控', icon: Radio },
+        ] as Array<{ value: SidePanelTab; label: string; icon: React.ElementType<{ className?: string }> }>).map((option) => {
+          const selected = activeTab === option.value;
+          const Icon = option.icon;
+          return (
+            <button
+              key={option.value}
+              type="button"
+              role="tab"
+              aria-selected={selected}
+              onClick={() => setActiveTab(option.value)}
+              className="flex items-center justify-center gap-2 border-r px-3 py-2 last:border-r-0"
+              style={{
+                borderColor: TERMINAL_COLORS.redGrid,
+                backgroundColor: selected ? TERMINAL_COLORS.activeTabBg : TERMINAL_COLORS.panel,
+                color: selected ? TERMINAL_COLORS.text : TERMINAL_COLORS.muted,
+              }}
+            >
+              <Icon className="h-4 w-4" />
+              <span>{option.label}</span>
+            </button>
+          );
+        })}
+      </div>
+
+      <div className="min-h-0 flex-1 overflow-y-auto">
+        {activeTab === 'chip' ? (
+          <ChipPeakPanel
+            points={chipPoints}
+            chip={chip}
+            mainChip={mainChip}
+            mainHolderCount={mainHolderCount}
+            isEstimated={isEstimatedChip}
+            requiresRealChipData={requiresRealChipData}
+          />
+        ) : (
+          <OrderFlowMonitor points={points} quote={quote} />
+        )}
+      </div>
+    </div>
   );
 };
 
@@ -3032,18 +3162,16 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
     setChartMenu(null);
   }, [points.length]);
   const safeHoveredIndex = hoveredIndex !== null && hoveredIndex >= 0 && hoveredIndex < points.length ? hoveredIndex : null;
-  const selectedPoint = safeHoveredIndex === null ? points.at(-1) : points[safeHoveredIndex];
-  const selectedPointIndex = safeHoveredIndex ?? Math.max(points.length - 1, 0);
   const latest = points.at(-1);
-  const displayClose = quote?.currentPrice ?? latest?.close;
   const displayVolume = quote?.volume ?? latest?.volume;
   const volumeRatio = displayVolume && latest?.volumeMa5 ? displayVolume / latest.volumeMa5 : undefined;
-  const chipPoints = points.slice(0, selectedPointIndex + 1);
-  const selectedChipEstimate = buildEstimatedChipDistribution(chipPoints, selectedPoint?.close ?? displayClose);
-  const shouldUseHistoricalChip = safeHoveredIndex !== null && safeHoveredIndex < points.length - 1;
-  const estimatedChip = shouldUseHistoricalChip ? selectedChipEstimate : buildEstimatedChipDistribution(points, displayClose);
-  const chip = shouldUseHistoricalChip ? selectedChipEstimate : (metrics?.chipDistribution ?? estimatedChip);
-  const isEstimatedChip = shouldUseHistoricalChip || (!metrics?.chipDistribution && chip?.source === 'history_estimate');
+  const chipPoints = points;
+  const requiresRealChipData = marketKind === 'cn';
+  const estimatedChip: ChipDistributionMetrics | null = null;
+  const chip = metrics?.chipDistribution ?? null;
+  const isEstimatedChip = false;
+  const majorHolders = metrics?.majorHolders ?? EMPTY_HOLDERS;
+  const mainChip: ChipDistributionMetrics | null = null;
   const modal = variant === 'modal';
 
   useEffect(() => {
@@ -3196,8 +3324,16 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
                 </div>
 
                 <div className="flex min-h-0 flex-col gap-3 xl:h-full">
-                  <ChipPeakPanel points={chipPoints} chip={chip} isEstimated={isEstimatedChip} />
-                  <OrderFlowMonitor points={points} quote={quote} />
+                  <IndicatorSidePanel
+                    points={points}
+                    chipPoints={chipPoints}
+                    chip={chip}
+                    mainChip={mainChip}
+                    mainHolderCount={majorHolders.length}
+                    isEstimatedChip={isEstimatedChip}
+                    requiresRealChipData={requiresRealChipData}
+                    quote={quote}
+                  />
                   {modal ? (
                     <MarketStructureStrip
                       points={points}

@@ -64,16 +64,37 @@ describe('IndicatorAnalysisModal', () => {
       source: stockCode === 'BABA' ? 'yfinance' : 'efinance',
       updateTime: '2026-04-30T23:50:00',
     }));
-    vi.mocked(stocksApi.getIndicatorMetrics).mockResolvedValue({
-      stockCode: 'BABA',
-      stockName: '阿里巴巴',
-      chipDistribution: null,
+    vi.mocked(stocksApi.getIndicatorMetrics).mockImplementation(async (stockCode) => ({
+      stockCode,
+      stockName: stockCode === 'BABA' ? '阿里巴巴' : '贵州茅台',
+      chipDistribution: stockCode === 'BABA'
+        ? {
+          code: 'BABA',
+          date: '2026-04-30',
+          source: 'tushare_cyq_chips',
+          profitRatio: 0.62,
+          avgCost: 131.2,
+          cost90Low: 125.1,
+          cost90High: 138.6,
+          concentration90: 0.051,
+          cost70Low: 128.4,
+          cost70High: 135.2,
+          concentration70: 0.026,
+          distribution: [
+            { price: 125.1, percent: 0.12 },
+            { price: 128.4, percent: 0.2 },
+            { price: 131.2, percent: 0.36 },
+            { price: 135.2, percent: 0.22 },
+            { price: 138.6, percent: 0.1 },
+          ],
+        }
+        : null,
       majorHolders: [],
       majorHolderStatus: 'not_supported',
       sourceChain: [],
       errors: [],
       updateTime: '2026-04-30T23:50:00',
-    });
+    }));
   });
 
   afterEach(() => {
@@ -154,14 +175,27 @@ describe('IndicatorAnalysisModal', () => {
     expect(screen.getByRole('img', { name: 'K线图' })).toBeInTheDocument();
     expect(screen.getByRole('img', { name: '成交量图' })).toBeInTheDocument();
     expect(screen.getByRole('img', { name: 'MACD指标图' })).toBeInTheDocument();
+    const sidePanel = screen.getByTestId('indicator-side-panel');
+    expect(within(sidePanel).getByRole('tab', { name: '筹码峰' })).toHaveAttribute('aria-selected', 'true');
     expect(screen.getByTestId('chip-peak-panel')).toBeInTheDocument();
+    expect(screen.queryByTestId('order-flow-monitor')).not.toBeInTheDocument();
+    expect(within(screen.getByTestId('chip-peak-panel')).getByRole('tab', { name: '全部筹码' })).toHaveAttribute('aria-selected', 'true');
+    expect(within(screen.getByTestId('chip-peak-panel')).getByText('收盘获利')).toBeInTheDocument();
+    expect(within(screen.getByTestId('chip-peak-panel')).getAllByText('平均成本').length).toBeGreaterThan(0);
+    expect(within(screen.getByTestId('chip-peak-panel')).getByText('价格区间')).toBeInTheDocument();
+    expect(within(screen.getByTestId('chip-peak-panel')).getByText('集中度')).toBeInTheDocument();
+    fireEvent.click(within(screen.getByTestId('chip-peak-panel')).getByRole('tab', { name: '主力筹码' }));
+    expect(within(screen.getByTestId('chip-peak-panel')).getByRole('tab', { name: '主力筹码' })).toHaveAttribute('aria-selected', 'true');
+    expect(within(screen.getByTestId('chip-peak-panel')).getByText('暂无同源主力筹码峰明细')).toBeInTheDocument();
+    fireEvent.click(within(screen.getByTestId('chip-peak-panel')).getByRole('tab', { name: '全部筹码' }));
+
+    fireEvent.click(within(sidePanel).getByRole('tab', { name: '实时监控' }));
     expect(screen.getByTestId('order-flow-monitor')).toBeInTheDocument();
-    expect(screen.getByText('筹码峰')).toBeInTheDocument();
-    expect(screen.getByText('实时监控')).toBeInTheDocument();
     expect(screen.getByText('净特大单')).toBeInTheDocument();
     expect(screen.getByText('净大单')).toBeInTheDocument();
     expect(screen.getByText('净中单')).toBeInTheDocument();
     expect(screen.getByText('净小单')).toBeInTheDocument();
+    fireEvent.click(within(sidePanel).getByRole('tab', { name: '筹码峰' }));
 
     fireEvent.mouseEnter(screen.getByTestId('indicator-chart-bar-2026-04-24'));
     const priceTooltip = screen.getByTestId('indicator-chart-tooltip');
@@ -169,7 +203,12 @@ describe('IndicatorAnalysisModal', () => {
     expect(within(priceTooltip).getByText('收盘')).toBeInTheDocument();
     expect(within(screen.getByTestId('indicator-volume-tooltip')).getByText('2026-04-24')).toBeInTheDocument();
     expect(within(screen.getByTestId('indicator-momentum-tooltip')).getByText('2026-04-24')).toBeInTheDocument();
-    expect(within(screen.getByTestId('chip-peak-panel')).getByText('2026-04-24')).toBeInTheDocument();
+    if (stockCode === '600519') {
+      expect(within(screen.getByTestId('chip-peak-panel')).getByText('真实筹码明细与本地模型均不可用，无法与同花顺对齐')).toBeInTheDocument();
+    } else {
+      expect(within(screen.getByTestId('chip-peak-panel')).getByText('2026-04-30')).toBeInTheDocument();
+      expect(screen.getByRole('img', { name: '筹码峰分布图' })).toBeInTheDocument();
+    }
     fireEvent.mouseLeave(screen.getByTestId('indicator-chart-bar-2026-04-24'));
 
     fireEvent.mouseEnter(screen.getByTestId('indicator-volume-bar-2026-04-24'));
@@ -199,17 +238,17 @@ describe('IndicatorAnalysisModal', () => {
     expect(within(screen.getByTestId('indicator-chart-tooltip')).getByText('2026-04-24')).toBeInTheDocument();
     expect(within(screen.getByTestId('indicator-volume-tooltip')).getByText('2026-04-24')).toBeInTheDocument();
     expect(within(screen.getByTestId('indicator-momentum-tooltip')).getByText('2026-04-24')).toBeInTheDocument();
-    expect(within(screen.getByTestId('chip-peak-panel')).getByText('2026-04-24')).toBeInTheDocument();
+    expect(within(screen.getByTestId('chip-peak-panel')).getByText('2026-04-30')).toBeInTheDocument();
 
     fireEvent.keyDown(window, { key: 'ArrowLeft' });
     expect(within(screen.getByTestId('indicator-chart-tooltip')).getByText('2026-04-23')).toBeInTheDocument();
     expect(within(screen.getByTestId('indicator-volume-tooltip')).getByText('2026-04-23')).toBeInTheDocument();
     expect(within(screen.getByTestId('indicator-momentum-tooltip')).getByText('2026-04-23')).toBeInTheDocument();
-    expect(within(screen.getByTestId('chip-peak-panel')).getByText('2026-04-23')).toBeInTheDocument();
+    expect(within(screen.getByTestId('chip-peak-panel')).getByText('2026-04-30')).toBeInTheDocument();
 
     fireEvent.keyDown(window, { key: 'ArrowRight' });
     expect(within(screen.getByTestId('indicator-chart-tooltip')).getByText('2026-04-24')).toBeInTheDocument();
-    expect(within(screen.getByTestId('chip-peak-panel')).getByText('2026-04-24')).toBeInTheDocument();
+    expect(within(screen.getByTestId('chip-peak-panel')).getByText('2026-04-30')).toBeInTheDocument();
 
     fireEvent.keyDown(window, { key: 'Escape' });
     expect(onClose).not.toHaveBeenCalled();

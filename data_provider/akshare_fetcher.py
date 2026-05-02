@@ -278,6 +278,7 @@ class AkshareFetcher(BaseFetcher):
     
     name = "AkshareFetcher"
     priority = int(os.getenv("AKSHARE_PRIORITY", "1"))
+    chip_priority = 3
     supports_intraday_data = True
     
     def __init__(self, sleep_min: float = 2.0, sleep_max: float = 5.0):
@@ -1281,6 +1282,7 @@ class AkshareFetcher(BaseFetcher):
             '成交量': 'volume',
             '成交额': 'amount',
             '涨跌幅': 'pct_chg',
+            '换手率': 'turnover_rate',
         }
         
         # 重命名列
@@ -2132,6 +2134,7 @@ class AkshareFetcher(BaseFetcher):
             # 使用 realtime_types.py 中的统一转换函数
             chip = ChipDistribution(
                 code=stock_code,
+                source="akshare_em",
                 date=str(latest.get('日期', '')),
                 profit_ratio=safe_float(latest.get('获利比例')),
                 avg_cost=safe_float(latest.get('平均成本')),

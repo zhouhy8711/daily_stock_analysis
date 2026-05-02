@@ -82,6 +82,7 @@ class KLineData(BaseModel):
     volume: Optional[float] = Field(None, description="成交量")
     amount: Optional[float] = Field(None, description="成交额")
     change_percent: Optional[float] = Field(None, description="涨跌幅 (%)")
+    turnover_rate: Optional[float] = Field(None, description="换手率 (%)")
     
     class Config:
         json_schema_extra = {
@@ -93,7 +94,8 @@ class KLineData(BaseModel):
                 "close": 1800.00,
                 "volume": 10000000,
                 "amount": 18000000000,
-                "change_percent": 0.84
+                "change_percent": 0.84,
+                "turnover_rate": 0.8
             }
         }
 
@@ -133,6 +135,13 @@ class StockHistoryResponse(BaseModel):
         }
 
 
+class ChipDistributionPoint(BaseModel):
+    """逐价位筹码分布点"""
+
+    price: float = Field(..., description="筹码所在价格")
+    percent: float = Field(..., description="该价位筹码占比，0-1")
+
+
 class ChipDistributionMetrics(BaseModel):
     """筹码分布指标"""
 
@@ -147,6 +156,7 @@ class ChipDistributionMetrics(BaseModel):
     cost_70_low: Optional[float] = Field(None, description="70% 筹码成本下限")
     cost_70_high: Optional[float] = Field(None, description="70% 筹码成本上限")
     concentration_70: Optional[float] = Field(None, description="70% 筹码集中度，0-1")
+    distribution: List[ChipDistributionPoint] = Field(default_factory=list, description="逐价位筹码分布")
     chip_status: Optional[str] = Field(None, description="基于现价推导的筹码状态")
 
 

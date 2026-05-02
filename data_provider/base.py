@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 
 
 # === 标准化列名定义 ===
-STANDARD_COLUMNS = ['date', 'open', 'high', 'low', 'close', 'volume', 'amount', 'pct_chg']
+STANDARD_COLUMNS = ['date', 'open', 'high', 'low', 'close', 'volume', 'amount', 'pct_chg', 'turnover_rate']
 INTRADAY_PERIOD_TO_MINUTES = {
     "1m": 1,
     "5m": 5,
@@ -322,8 +322,8 @@ class BaseFetcher(ABC):
         """
         标准化数据列名（子类必须实现）
 
-        将不同数据源的列名统一为：
-        ['date', 'open', 'high', 'low', 'close', 'volume', 'amount', 'pct_chg']
+        将不同数据源的列名统一为 STANDARD_COLUMNS；turnover_rate 为可选字段，
+        A 股筹码模型会在存在时复用它计算本地筹码峰兜底。
         """
         pass
 
@@ -535,7 +535,7 @@ class BaseFetcher(ABC):
             df['date'] = pd.to_datetime(df['date'])
         
         # 数值列类型转换
-        numeric_cols = ['open', 'high', 'low', 'close', 'volume', 'amount', 'pct_chg']
+        numeric_cols = ['open', 'high', 'low', 'close', 'volume', 'amount', 'pct_chg', 'turnover_rate']
         for col in numeric_cols:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors='coerce')
@@ -978,8 +978,12 @@ class DataFetcherManager:
           3. BaostockFetcher (Priority 3)
           4. YfinanceFetcher (Priority 4)
           5. LongbridgeFetcher (Priority 5) - 长桥（美股/港股兜底）
+          98. LocalChipModelFetcher (Priority 98, chip_priority 2) - 仅筹码模型兜底
+          99. IfindChipFetcher (Priority 99, chip_priority -2) - 仅筹码源
         """
         from .efinance_fetcher import EfinanceFetcher
+        from .ifind_chip_fetcher import IfindChipFetcher
+        from .local_chip_model_fetcher import LocalChipModelFetcher
         from .akshare_fetcher import AkshareFetcher
         from .tushare_fetcher import TushareFetcher
         from .pytdx_fetcher import PytdxFetcher
@@ -987,6 +991,8 @@ class DataFetcherManager:
         from .yfinance_fetcher import YfinanceFetcher
         from .longbridge_fetcher import LongbridgeFetcher
         # 创建所有数据源实例（优先级在各 Fetcher 的 __init__ 中确定）
+        ifind_chip = IfindChipFetcher()
+        local_chip_model = LocalChipModelFetcher()
         efinance = EfinanceFetcher()
         akshare = AkshareFetcher()
         tushare = TushareFetcher()  # 会根据 Token 配置自动调整优先级
@@ -999,9 +1005,11 @@ class DataFetcherManager:
         self._ensure_concurrency_guards()
         with self._fetchers_lock:
             self._fetchers = [
+                ifind_chip,
                 efinance,
                 akshare,
                 tushare,
+                local_chip_model,
                 pytdx,
                 baostock,
                 yfinance,
@@ -1604,8 +1612,13 @@ class DataFetcherManager:
 
         circuit_breaker = get_chip_circuit_breaker()
 
-        # 直接遍历管理器已经按 priority 排好序的数据源列表
-        for fetcher in self._get_fetchers_snapshot():
+        chip_fetchers = sorted(
+            self._get_fetchers_snapshot(),
+            key=lambda item: getattr(item, "chip_priority", item.priority),
+        )
+
+        # 筹码接口可以使用独立 chip_priority，避免只服务筹码的数据源影响 K 线排序。
+        for fetcher in chip_fetchers:
             # 只处理实现了筹码分布逻辑的数据源
             if not hasattr(fetcher, 'get_chip_distribution'):
                 continue

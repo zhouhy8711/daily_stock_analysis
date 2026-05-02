@@ -32,6 +32,8 @@
 
 from .base import BaseFetcher, DataFetcherManager
 from .efinance_fetcher import EfinanceFetcher
+from .ifind_chip_fetcher import IfindChipFetcher
+from .local_chip_model_fetcher import LocalChipModelFetcher
 from .akshare_fetcher import AkshareFetcher, is_hk_stock_code
 from .tushare_fetcher import TushareFetcher
 from .pytdx_fetcher import PytdxFetcher
@@ -44,6 +46,8 @@ __all__ = [
     'BaseFetcher',
     'DataFetcherManager',
     'EfinanceFetcher',
+    'IfindChipFetcher',
+    'LocalChipModelFetcher',
     'AkshareFetcher',
     'TushareFetcher',
     'PytdxFetcher',
