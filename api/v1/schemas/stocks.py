@@ -142,6 +142,24 @@ class ChipDistributionPoint(BaseModel):
     percent: float = Field(..., description="该价位筹码占比，0-1")
 
 
+class ChipDistributionSnapshot(BaseModel):
+    """单个交易日的筹码分布快照"""
+
+    code: str = Field(..., description="股票代码")
+    date: Optional[str] = Field(None, description="数据日期")
+    source: Optional[str] = Field(None, description="筹码数据源")
+    profit_ratio: Optional[float] = Field(None, description="获利比例，0-1")
+    avg_cost: Optional[float] = Field(None, description="平均持仓成本")
+    cost_90_low: Optional[float] = Field(None, description="90% 筹码成本下限")
+    cost_90_high: Optional[float] = Field(None, description="90% 筹码成本上限")
+    concentration_90: Optional[float] = Field(None, description="90% 筹码集中度，0-1")
+    cost_70_low: Optional[float] = Field(None, description="70% 筹码成本下限")
+    cost_70_high: Optional[float] = Field(None, description="70% 筹码成本上限")
+    concentration_70: Optional[float] = Field(None, description="70% 筹码集中度，0-1")
+    distribution: List[ChipDistributionPoint] = Field(default_factory=list, description="逐价位筹码分布")
+    chip_status: Optional[str] = Field(None, description="基于现价推导的筹码状态")
+
+
 class ChipDistributionMetrics(BaseModel):
     """筹码分布指标"""
 
@@ -157,6 +175,7 @@ class ChipDistributionMetrics(BaseModel):
     cost_70_high: Optional[float] = Field(None, description="70% 筹码成本上限")
     concentration_70: Optional[float] = Field(None, description="70% 筹码集中度，0-1")
     distribution: List[ChipDistributionPoint] = Field(default_factory=list, description="逐价位筹码分布")
+    snapshots: List[ChipDistributionSnapshot] = Field(default_factory=list, description="按交易日的筹码快照")
     chip_status: Optional[str] = Field(None, description="基于现价推导的筹码状态")
 
 

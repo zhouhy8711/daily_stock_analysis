@@ -61,6 +61,9 @@ def test_local_chip_model_fetcher_uses_injected_history_loader() -> None:
     assert chip.code == "300274"
     assert chip.source == "local_chip_model:unit_loader"
     assert len(chip.distribution) > 0
+    assert len(chip.snapshots) > 0
+    assert chip.snapshots[-1]["date"] == chip.date
+    assert len(chip.snapshots[-1]["distribution"]) > 0
 
 
 def test_local_chip_model_returns_none_without_turnover() -> None:

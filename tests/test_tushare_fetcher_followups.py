@@ -158,7 +158,42 @@ class TestTushareFetcherFollowUps(unittest.TestCase):
         self.assertAlmostEqual(chip.distribution[0].percent, 0.2)
         self.assertAlmostEqual(chip.distribution[1].percent, 0.5)
         self.assertAlmostEqual(chip.distribution[2].percent, 0.3)
+        self.assertEqual(len(chip.snapshots), 1)
+        self.assertEqual(chip.snapshots[0]["date"], "2026-03-17")
         self.assertEqual(rate_limit_mock.call_count, 3)
+
+    def test_get_chip_distribution_returns_daily_snapshots_for_timeline_linkage(self) -> None:
+        fetcher = self._make_fetcher()
+        fetcher._api.trade_cal.return_value = pd.DataFrame(
+            {"cal_date": ["20260319", "20260318", "20260317"], "is_open": [1, 1, 1]}
+        )
+        fetcher._api.cyq_chips.return_value = pd.DataFrame(
+            {
+                "trade_date": ["20260317", "20260317", "20260318", "20260318", "20260319", "20260319"],
+                "price": [9.0, 10.0, 9.5, 10.5, 10.0, 11.0],
+                "percent": [40.0, 60.0, 50.0, 50.0, 25.0, 75.0],
+            }
+        )
+        fetcher._api.daily.return_value = pd.DataFrame(
+            {
+                "trade_date": ["20260317", "20260318", "20260319"],
+                "close": [9.8, 10.2, 10.8],
+            }
+        )
+
+        with patch.object(fetcher, "_get_china_now", return_value=datetime(2026, 3, 19, 20, 0)), patch.object(
+            fetcher, "_check_rate_limit"
+        ):
+            chip = fetcher.get_chip_distribution("600519")
+
+        self.assertIsNotNone(chip)
+        if chip is None:
+            self.fail("expected chip distribution data")
+        self.assertEqual(chip.date, "2026-03-19")
+        self.assertEqual(len(chip.snapshots), 3)
+        self.assertEqual([snapshot["date"] for snapshot in chip.snapshots], ["2026-03-17", "2026-03-18", "2026-03-19"])
+        self.assertEqual(len(chip.snapshots[0]["distribution"]), 2)
+        self.assertEqual(len(chip.distribution), 2)
 
     def test_convert_stock_code_accepts_exchange_prefixed_a_share(self) -> None:
         fetcher = self._make_fetcher()

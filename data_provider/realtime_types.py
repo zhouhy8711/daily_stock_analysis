@@ -216,6 +216,7 @@ class ChipDistribution:
     cost_70_high: float = 0.0     # 70%筹码成本上限
     concentration_70: float = 0.0  # 70%筹码集中度
     distribution: List[ChipDistributionPoint] = field(default_factory=list)  # 逐价位筹码分布
+    snapshots: List[Dict[str, Any]] = field(default_factory=list)  # 按交易日的筹码快照
     
     def to_dict(self) -> Dict[str, Any]:
         """转换为字典"""
@@ -232,6 +233,7 @@ class ChipDistribution:
             'cost_70_high': self.cost_70_high,
             'concentration_70': self.concentration_70,
             'distribution': [point.to_dict() for point in self.distribution],
+            'snapshots': self.snapshots,
         }
     
     def get_chip_status(self, current_price: float) -> str:

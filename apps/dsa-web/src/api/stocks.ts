@@ -76,6 +76,7 @@ export type ChipDistributionMetrics = {
   cost70High?: number | null;
   concentration70?: number | null;
   distribution: ChipDistributionPoint[];
+  snapshots?: ChipDistributionMetrics[];
   chipStatus?: string | null;
 };
 
@@ -179,7 +180,8 @@ function normalizeChipDistribution(item: unknown): ChipDistributionMetrics | nul
         : null;
     })
     .filter((point): point is ChipDistributionPoint => point !== null);
-  return {
+  const rawSnapshots = Array.isArray(data.snapshots) ? data.snapshots : [];
+  const normalized: ChipDistributionMetrics = {
     code: String(data.code ?? ''),
     date: toNullableString(data.date),
     source: toNullableString(data.source),
@@ -194,6 +196,10 @@ function normalizeChipDistribution(item: unknown): ChipDistributionMetrics | nul
     distribution,
     chipStatus: toNullableString(data.chip_status ?? data.chipStatus),
   };
+  normalized.snapshots = rawSnapshots
+    .map(normalizeChipDistribution)
+    .filter((snapshot): snapshot is ChipDistributionMetrics => snapshot !== null);
+  return normalized;
 }
 
 function normalizeMajorHolder(item: Record<string, unknown>): MajorHolder | null {

@@ -247,6 +247,65 @@ class StockService:
         try:
             chip = manager.get_chip_distribution(stock_code)
             if chip is not None:
+                def normalize_distribution_points(raw_points):
+                    normalized = []
+                    for point in raw_points or []:
+                        if isinstance(point, dict):
+                            price = _to_optional_float(point.get("price"))
+                            percent = _to_optional_float(point.get("percent"))
+                        else:
+                            price = _to_optional_float(getattr(point, "price", None))
+                            percent = _to_optional_float(getattr(point, "percent", None))
+                        if price is not None and price > 0 and percent is not None and percent > 0:
+                            normalized.append({"price": price, "percent": percent})
+                    return normalized
+
+                def normalize_snapshot(snapshot):
+                    if not isinstance(snapshot, dict):
+                        return None
+                    distribution = normalize_distribution_points(snapshot.get("distribution"))
+                    if not distribution:
+                        return None
+                    return {
+                        "code": snapshot.get("code") or getattr(chip, "code", stock_code),
+                        "date": snapshot.get("date"),
+                        "source": snapshot.get("source") or getattr(chip, "source", None),
+                        "profit_ratio": _to_optional_float(snapshot.get("profit_ratio")),
+                        "avg_cost": _to_optional_float(snapshot.get("avg_cost")),
+                        "cost_90_low": _to_optional_float(snapshot.get("cost_90_low")),
+                        "cost_90_high": _to_optional_float(snapshot.get("cost_90_high")),
+                        "concentration_90": _to_optional_float(snapshot.get("concentration_90")),
+                        "cost_70_low": _to_optional_float(snapshot.get("cost_70_low")),
+                        "cost_70_high": _to_optional_float(snapshot.get("cost_70_high")),
+                        "concentration_70": _to_optional_float(snapshot.get("concentration_70")),
+                        "distribution": distribution,
+                        "chip_status": snapshot.get("chip_status"),
+                    }
+
+                distribution = normalize_distribution_points(getattr(chip, "distribution", []) or [])
+                snapshots = []
+                for snapshot in getattr(chip, "snapshots", []) or []:
+                    normalized_snapshot = normalize_snapshot(snapshot)
+                    if normalized_snapshot is not None:
+                        snapshots.append(normalized_snapshot)
+
+                if not snapshots and distribution:
+                    snapshots.append({
+                        "code": getattr(chip, "code", stock_code),
+                        "date": getattr(chip, "date", None),
+                        "source": getattr(chip, "source", None),
+                        "profit_ratio": _to_optional_float(getattr(chip, "profit_ratio", None)),
+                        "avg_cost": _to_optional_float(getattr(chip, "avg_cost", None)),
+                        "cost_90_low": _to_optional_float(getattr(chip, "cost_90_low", None)),
+                        "cost_90_high": _to_optional_float(getattr(chip, "cost_90_high", None)),
+                        "concentration_90": _to_optional_float(getattr(chip, "concentration_90", None)),
+                        "cost_70_low": _to_optional_float(getattr(chip, "cost_70_low", None)),
+                        "cost_70_high": _to_optional_float(getattr(chip, "cost_70_high", None)),
+                        "concentration_70": _to_optional_float(getattr(chip, "concentration_70", None)),
+                        "distribution": distribution,
+                        "chip_status": None,
+                    })
+
                 raw_distribution = getattr(chip, "distribution", []) or []
                 distribution = []
                 for point in raw_distribution:
@@ -272,6 +331,7 @@ class StockService:
                     "cost_70_high": _to_optional_float(getattr(chip, "cost_70_high", None)),
                     "concentration_70": _to_optional_float(getattr(chip, "concentration_70", None)),
                     "distribution": distribution,
+                    "snapshots": snapshots,
                     "chip_status": None,
                 }
         except Exception as e:

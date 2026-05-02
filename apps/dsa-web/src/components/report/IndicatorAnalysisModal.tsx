@@ -534,6 +534,53 @@ function getChipConcentration(chip: ChipDistributionMetrics | null, rangeLevel: 
   return rangeLevel === '90' ? chip?.concentration90 : chip?.concentration70;
 }
 
+function normalizeDateKey(date?: string | null): string | null {
+  return typeof date === 'string' && date.length >= 10 ? date.slice(0, 10) : null;
+}
+
+function pickChipSnapshot(chip: ChipDistributionMetrics | null, date?: string | null): ChipDistributionMetrics | null {
+  if (!chip) {
+    return null;
+  }
+  const dateKey = normalizeDateKey(date);
+  if (!dateKey) {
+    return chip;
+  }
+  const snapshots = (chip.snapshots ?? [])
+    .map((snapshot) => ({ snapshot, dateKey: normalizeDateKey(snapshot.date) }))
+    .filter((item): item is { snapshot: ChipDistributionMetrics; dateKey: string } => item.dateKey !== null);
+  const exact = snapshots.find((item) => item.dateKey === dateKey);
+  if (exact) {
+    return exact.snapshot;
+  }
+  if (snapshots.length === 0) {
+    return chip;
+  }
+  const targetTime = Date.parse(dateKey);
+  if (!Number.isNaN(targetTime)) {
+    return snapshots.reduce((nearest, item) => {
+      const nearestDistance = Math.abs(Date.parse(nearest.dateKey) - targetTime);
+      const itemDistance = Math.abs(Date.parse(item.dateKey) - targetTime);
+      return itemDistance < nearestDistance ? item : nearest;
+    }).snapshot;
+  }
+  return snapshots.find((item) => item.dateKey <= dateKey)?.snapshot ?? snapshots[0]?.snapshot ?? chip;
+}
+
+function isChipForDate(chip: ChipDistributionMetrics | null, date?: string | null): boolean {
+  const chipDate = normalizeDateKey(chip?.date);
+  const pointDate = normalizeDateKey(date);
+  return !!chipDate && !!pointDate && chipDate === pointDate;
+}
+
+function findPointByDate(points: ChartPoint[], date?: string | null): ChartPoint | undefined {
+  const dateKey = normalizeDateKey(date);
+  if (!dateKey) {
+    return undefined;
+  }
+  return points.find((point) => normalizeDateKey(point.date) === dateKey);
+}
+
 function formatHolderLabel(holder: MajorHolder): string {
   const ratio = formatPlainPct(holder.holdingRatio);
   return ratio === '--' ? holder.name : `${holder.name} ${ratio}`;
@@ -1998,16 +2045,15 @@ const MacdSignalChart: React.FC<{
 
 const ChipPeakPanel: React.FC<{
   points: ChartPoint[];
+  currentPoint?: ChartPoint | null;
   chip: ChipDistributionMetrics | null;
   mainChip: ChipDistributionMetrics | null;
-  mainHolderCount: number;
-  isEstimated: boolean;
   requiresRealChipData: boolean;
-}> = ({ points, chip, mainChip, mainHolderCount, isEstimated, requiresRealChipData }) => {
+}> = ({ points, currentPoint, chip, mainChip, requiresRealChipData }) => {
   const [activeScope, setActiveScope] = useState<ChipPanelScope>('all');
   const [activeRange, setActiveRange] = useState<ChipRangeLevel>('90');
   const activeChip = activeScope === 'main' ? mainChip : chip;
-  const latestClose = points.at(-1)?.close;
+  const latestClose = currentPoint?.close ?? points.at(-1)?.close;
   const rows = useMemo(
     () => (activeChip ? buildChipPeakRows(activeChip, latestClose) : []),
     [activeChip, latestClose],
@@ -2037,17 +2083,6 @@ const ChipPeakPanel: React.FC<{
   const profitRatio = activeChip?.profitRatio;
   const trappedRatio = typeof profitRatio === 'number' ? 1 - profitRatio : undefined;
   const concentration = getChipConcentration(activeChip, activeRange);
-  const chipNote = activeChip
-    ? activeScope === 'main'
-      ? activeChip.chipStatus || activeChip.source || '同源主力筹码明细'
-      : activeChip.chipStatus || (isEstimated ? '历史成交量估算，真实筹码源恢复后自动切换' : activeChip.source || '实时成本分布')
-    : activeScope === 'main'
-      ? mainHolderCount > 0
-        ? '暂无同源主力筹码明细，未使用股东持仓估算'
-        : '暂无主力筹码明细'
-    : requiresRealChipData
-      ? '真实筹码源与本地筹码模型均不可用，已停止展示历史成交量估算值，避免与同花顺口径混用'
-      : '暂无筹码分布说明';
 
   return (
     <aside
@@ -2062,15 +2097,6 @@ const ChipPeakPanel: React.FC<{
             <Layers3 className="h-4 w-4" style={{ color: TERMINAL_COLORS.cyan }} />
             <h3 className="text-sm font-semibold" style={{ color: TERMINAL_COLORS.text }}>筹码峰</h3>
           </div>
-          <p className="mt-1 text-[11px]" style={{ color: TERMINAL_COLORS.muted }}>
-            {!activeChip && activeScope === 'main'
-              ? '同源主力明细不可用'
-              : !activeChip && requiresRealChipData
-                ? '真实筹码与模型均不可用'
-                : isEstimated
-                  ? '历史成交量估算'
-                  : activeChip?.source || '实时成本分布'}
-          </p>
         </div>
         {activeChip?.date ? <span className="font-mono text-[11px]" style={{ color: TERMINAL_COLORS.muted }}>{activeChip.date}</span> : null}
       </div>
@@ -2193,13 +2219,9 @@ const ChipPeakPanel: React.FC<{
             <dt style={{ color: TERMINAL_COLORS.chipBlue }}>套牢盘</dt>
             <dd className="font-semibold tabular-nums" style={{ color: TERMINAL_COLORS.chipBlue }}>{formatRatioPct(trappedRatio)}</dd>
           </div>
-          <div className="flex items-center justify-between gap-2">
+          <div className="col-span-2 flex items-center justify-between gap-2">
             <dt style={{ color: TERMINAL_COLORS.yellow }}>平均成本</dt>
             <dd className="font-semibold tabular-nums" style={{ color: TERMINAL_COLORS.yellow }}>{formatNumber(activeChip?.avgCost)}</dd>
-          </div>
-          <div className="flex items-center justify-between gap-2">
-            <dt style={{ color: TERMINAL_COLORS.muted }}>筹码来源</dt>
-            <dd className="truncate text-right tabular-nums" style={{ color: TERMINAL_COLORS.text }}>{activeScope === 'main' ? (activeChip?.source || '--') : (isEstimated ? '历史估算' : activeChip?.source || '--')}</dd>
           </div>
         </dl>
 
@@ -2244,10 +2266,6 @@ const ChipPeakPanel: React.FC<{
           <div className="flex items-center justify-between gap-3">
             <dt style={{ color: TERMINAL_COLORS.muted }}>集中度</dt>
             <dd className="font-semibold tabular-nums" style={{ color: TERMINAL_COLORS.text }}>{formatRatioPct(concentration)}</dd>
-          </div>
-          <div className="flex items-start justify-between gap-3">
-            <dt className="shrink-0" style={{ color: TERMINAL_COLORS.muted }}>筹码分布说明</dt>
-            <dd className="min-w-0 text-right leading-5" style={{ color: TERMINAL_COLORS.text }}>{chipNote}</dd>
           </div>
         </dl>
       </div>
@@ -2315,19 +2333,17 @@ const OrderFlowMonitor: React.FC<{
 const IndicatorSidePanel: React.FC<{
   points: ChartPoint[];
   chipPoints: ChartPoint[];
+  chipPoint?: ChartPoint | null;
   chip: ChipDistributionMetrics | null;
   mainChip: ChipDistributionMetrics | null;
-  mainHolderCount: number;
-  isEstimatedChip: boolean;
   requiresRealChipData: boolean;
   quote: StockQuote | null;
 }> = ({
   points,
   chipPoints,
+  chipPoint,
   chip,
   mainChip,
-  mainHolderCount,
-  isEstimatedChip,
   requiresRealChipData,
   quote,
 }) => {
@@ -2372,10 +2388,9 @@ const IndicatorSidePanel: React.FC<{
         {activeTab === 'chip' ? (
           <ChipPeakPanel
             points={chipPoints}
+            currentPoint={chipPoint}
             chip={chip}
             mainChip={mainChip}
-            mainHolderCount={mainHolderCount}
-            isEstimated={isEstimatedChip}
             requiresRealChipData={requiresRealChipData}
           />
         ) : (
@@ -3168,9 +3183,14 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
   const chipPoints = points;
   const requiresRealChipData = marketKind === 'cn';
   const estimatedChip: ChipDistributionMetrics | null = null;
-  const chip = metrics?.chipDistribution ?? null;
-  const isEstimatedChip = false;
-  const majorHolders = metrics?.majorHolders ?? EMPTY_HOLDERS;
+  const visibleAnchorPoint = visiblePoints.at(-1) ?? latest;
+  const selectedPoint = safeHoveredIndex !== null ? points[safeHoveredIndex] : visibleAnchorPoint;
+  const baseChip = metrics?.chipDistribution ?? null;
+  const chip = useMemo(() => pickChipSnapshot(baseChip, selectedPoint?.date), [baseChip, selectedPoint?.date]);
+  const chipPoint = useMemo(
+    () => (isChipForDate(chip, selectedPoint?.date) ? selectedPoint : findPointByDate(points, chip?.date) ?? selectedPoint ?? latest),
+    [chip, latest, points, selectedPoint],
+  );
   const mainChip: ChipDistributionMetrics | null = null;
   const modal = variant === 'modal';
 
@@ -3327,10 +3347,9 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
                   <IndicatorSidePanel
                     points={points}
                     chipPoints={chipPoints}
+                    chipPoint={chipPoint}
                     chip={chip}
                     mainChip={mainChip}
-                    mainHolderCount={majorHolders.length}
-                    isEstimatedChip={isEstimatedChip}
                     requiresRealChipData={requiresRealChipData}
                     quote={quote}
                   />

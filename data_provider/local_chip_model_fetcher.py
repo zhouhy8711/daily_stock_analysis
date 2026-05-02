@@ -72,6 +72,7 @@ class LocalChipModelFetcher(BaseFetcher):
                 history_source=history_source,
                 window_days=self.window_days,
                 max_price_points=self.max_price_points,
+                include_snapshots=True,
             )
             if chip is not None:
                 logger.info(
@@ -224,6 +225,7 @@ def compute_chip_distribution_from_history(
     history_source: str = "history",
     window_days: int = 180,
     max_price_points: int = 180,
+    include_snapshots: bool = False,
 ) -> Optional[ChipDistribution]:
     prepared = _prepare_history(history_df, window_days)
     if prepared.empty or len(prepared) < 2:
@@ -234,6 +236,7 @@ def compute_chip_distribution_from_history(
         return None
 
     chips = np.zeros(prices.size, dtype=float)
+    snapshots: list[dict[str, Any]] = []
 
     for _, row in prepared.iterrows():
         turnover = _normalize_turnover(row["turnover_rate"])
@@ -250,16 +253,47 @@ def compute_chip_distribution_from_history(
         chips *= 1 - turnover
         chips += weights * turnover
 
+        if include_snapshots:
+            total = float(chips.sum())
+            if total > 0:
+                snapshot = _build_chip_distribution(
+                    stock_code=stock_code,
+                    source=f"local_chip_model:{history_source}",
+                    prices=prices,
+                    chips=chips / total,
+                    latest=row,
+                )
+                if snapshot is not None:
+                    snapshots.append(_chip_to_snapshot_dict(snapshot))
+
     total = float(chips.sum())
     if total <= 0:
         return None
 
-    chips = chips / total
-    latest = prepared.iloc[-1]
+    chip = _build_chip_distribution(
+        stock_code=stock_code,
+        source=f"local_chip_model:{history_source}",
+        prices=prices,
+        chips=chips / total,
+        latest=prepared.iloc[-1],
+    )
+    if chip is None:
+        return None
+    if include_snapshots:
+        chip.snapshots = snapshots[-120:]
+    return chip
+
+
+def _build_chip_distribution(
+    stock_code: str,
+    source: str,
+    prices: np.ndarray,
+    chips: np.ndarray,
+    latest: pd.Series,
+) -> Optional[ChipDistribution]:
     current_price = float(latest["close"])
     date_value = latest["date"]
     date_text = date_value.strftime("%Y-%m-%d") if hasattr(date_value, "strftime") else str(date_value)
-
     profit_ratio = float(chips[prices <= current_price].sum())
     avg_cost = float(np.average(prices, weights=chips))
     cost_90_low, cost_90_high = _weighted_price_interval(prices, chips, 0.90)
@@ -276,7 +310,7 @@ def compute_chip_distribution_from_history(
     return ChipDistribution(
         code=stock_code,
         date=date_text,
-        source=f"local_chip_model:{history_source}",
+        source=source,
         profit_ratio=round(profit_ratio, 6),
         avg_cost=round(avg_cost, 4),
         cost_90_low=round(cost_90_low, 4),
@@ -287,6 +321,23 @@ def compute_chip_distribution_from_history(
         concentration_70=round(_concentration(cost_70_low, cost_70_high), 6),
         distribution=distribution,
     )
+
+
+def _chip_to_snapshot_dict(chip: ChipDistribution) -> dict[str, Any]:
+    return {
+        "code": chip.code,
+        "date": chip.date,
+        "source": chip.source,
+        "profit_ratio": chip.profit_ratio,
+        "avg_cost": chip.avg_cost,
+        "cost_90_low": chip.cost_90_low,
+        "cost_90_high": chip.cost_90_high,
+        "concentration_90": chip.concentration_90,
+        "cost_70_low": chip.cost_70_low,
+        "cost_70_high": chip.cost_70_high,
+        "concentration_70": chip.concentration_70,
+        "distribution": [point.to_dict() for point in chip.distribution],
+    }
 
 
 def _prepare_history(history_df: pd.DataFrame, window_days: int) -> pd.DataFrame:

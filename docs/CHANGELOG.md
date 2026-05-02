@@ -22,7 +22,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [改进] Web 指标分析图表支持点击固定联动光标，并用左右方向键同步移动 K线、成交量与 MACD 选中日期
 - [新功能] 新增 iFinD/同花顺 A 股筹码数据源，配置授权账号和筹码指标代码后优先获取同花顺口径筹码数据，并在缺失时降级到 Tushare / AkShare
 - [新功能] 新增 A 股本地筹码模型兜底，复用 Efinance/AkShare 日 K 换手率或由成交额与流通市值推导换手率，按逐日换手衰减生成筹码峰明细，并在来源中标注 `local_chip_model`
+- [改进] 本地筹码模型返回按交易日的筹码快照，Web 指标页点击或键盘移动 K 线日期时筹码峰同步切换到对应日期
 - [修复] 指标页筹码峰不再用历史成交量或股东持仓估算筹码峰/主力筹码；真实逐价位源缺失时仅使用明确标注的本地筹码模型，否则显示不可用
+- [改进] Web 指标页筹码峰去除内部数据源与分布说明文案，仅保留日期、图形和核心筹码指标
+- [修复] Web 指标页筹码峰跟随左侧 K 线悬停、键盘移动和时间窗口切换选择对应日期快照，避免始终停留在最新交易日
 <!-- 每条独立一行追加到本段末尾，无需分类标题，合并时冲突最小 -->
 - [修复] Pipeline Agent 5 个 K 线工具（get_daily_history / analyze_trend / calculate_ma / get_volume_analysis / analyze_pattern）改为 DB-first 加载，消除同一只股票 9x5=45 次重复 HTTP 请求 (Fixes #1066)
 - [修复] Pipeline Agent 执行前按需预热 240 天 K 线历史到 DB，正常情况下 K 线工具调用无需重复网络请求

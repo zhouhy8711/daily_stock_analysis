@@ -1142,10 +1142,12 @@ class TushareFetcher(BaseFetcher):
             return None
         
         try:
-            # 19点之后才有当天数据
-            start_date = self.get_trade_time(early_time='00:00', late_time='19:00') 
-            if not start_date:
+            # 19点之后才有当天数据。为了支持 Web K 线联动，拉取一段
+            # cyq_chips 明细并按交易日生成 snapshots，而不是只取最新一天。
+            end_date = self.get_trade_time(early_time='00:00', late_time='19:00')
+            if not end_date:
                 return None
+            start_date = (datetime.strptime(end_date, '%Y%m%d') - timedelta(days=180)).strftime('%Y%m%d')
 
             ts_code = self._convert_stock_code(stock_code)
 
@@ -1153,35 +1155,82 @@ class TushareFetcher(BaseFetcher):
                 "cyq_chips",
                 ts_code=ts_code,
                 start_date=start_date,
-                end_date=start_date,
+                end_date=end_date,
             )
             if df is not None and not df.empty:
                 daily_df = self._call_api_with_rate_limit(
                     "daily",
                     ts_code=ts_code,
                     start_date=start_date,
-                    end_date=start_date,
+                    end_date=end_date,
                 )
                 if daily_df is None or daily_df.empty:
                     return None
-                current_price = daily_df.iloc[0]['close']
-                metrics = self.compute_cyq_metrics(df, current_price)
-                distribution = self.build_cyq_distribution(df)
+                close_by_date: Dict[str, float] = {}
+                if "trade_date" in daily_df.columns:
+                    for _, row in daily_df.iterrows():
+                        close_by_date[str(row.get("trade_date"))] = float(row.get("close"))
+                else:
+                    close_by_date[end_date] = float(daily_df.iloc[0]["close"])
+
+                if "trade_date" in df.columns:
+                    grouped_chips = sorted(
+                        ((str(trade_date), group) for trade_date, group in df.groupby("trade_date")),
+                        key=lambda item: item[0],
+                    )
+                else:
+                    grouped_chips = [(end_date, df)]
+
+                snapshots: List[Dict[str, Any]] = []
+                latest_distribution: List[ChipDistributionPoint] = []
+                for trade_date, day_df in grouped_chips:
+                    current_price = close_by_date.get(trade_date)
+                    if current_price is None:
+                        continue
+                    metrics = self.compute_cyq_metrics(day_df, current_price)
+                    distribution = self.build_cyq_distribution(day_df)
+                    if not distribution:
+                        continue
+                    snapshot = {
+                        "code": stock_code,
+                        "date": self._format_trade_date(trade_date),
+                        "source": "tushare_cyq_chips",
+                        "profit_ratio": metrics['获利比例'],
+                        "avg_cost": metrics['平均成本'],
+                        "cost_90_low": metrics['90成本-低'],
+                        "cost_90_high": metrics['90成本-高'],
+                        "concentration_90": metrics['90集中度'],
+                        "cost_70_low": metrics['70成本-低'],
+                        "cost_70_high": metrics['70成本-高'],
+                        "concentration_70": metrics['70集中度'],
+                        "distribution": [
+                            {"price": point.price, "percent": point.percent}
+                            for point in distribution
+                        ],
+                    }
+                    snapshots.append(snapshot)
+                    latest_distribution = distribution
+
+                if not snapshots or not latest_distribution:
+                    return None
+
+                latest = snapshots[-1]
 
                 chip = ChipDistribution(
                     code=stock_code,
                     source="tushare_cyq_chips",
-                    date=datetime.strptime(start_date, '%Y%m%d').strftime('%Y-%m-%d'),
-                    profit_ratio=metrics['获利比例'],
-                    avg_cost=metrics['平均成本'],
-                    cost_90_low=metrics['90成本-低'],
-                    cost_90_high=metrics['90成本-高'],
-                    concentration_90=metrics['90集中度'],
-                    cost_70_low=metrics['70成本-低'],
-                    cost_70_high=metrics['70成本-高'],
-                    concentration_70=metrics['70集中度'],
-                    distribution=distribution,
+                    date=latest["date"],
+                    profit_ratio=latest["profit_ratio"],
+                    avg_cost=latest["avg_cost"],
+                    cost_90_low=latest["cost_90_low"],
+                    cost_90_high=latest["cost_90_high"],
+                    concentration_90=latest["concentration_90"],
+                    cost_70_low=latest["cost_70_low"],
+                    cost_70_high=latest["cost_70_high"],
+                    concentration_70=latest["concentration_70"],
+                    distribution=latest_distribution,
                 )
+                chip.snapshots = snapshots[-120:]
                 
                 logger.info(f"[筹码分布] {stock_code} 日期={chip.date}: 获利比例={chip.profit_ratio:.1%}, "
                         f"平均成本={chip.avg_cost}, 90%集中度={chip.concentration_90:.2%}, "
@@ -1191,6 +1240,14 @@ class TushareFetcher(BaseFetcher):
         except Exception as e:
             logger.warning(f"[Tushare] 获取筹码分布失败 {stock_code}: {e}")
             return None
+
+    @staticmethod
+    def _format_trade_date(trade_date: Any) -> str:
+        value = str(trade_date)
+        try:
+            return datetime.strptime(value, "%Y%m%d").strftime("%Y-%m-%d")
+        except ValueError:
+            return value
 
     def build_cyq_distribution(self, df: pd.DataFrame) -> List[ChipDistributionPoint]:
         """

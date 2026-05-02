@@ -26,8 +26,52 @@ function makeHistory(period: KLinePeriod): KLineData[] {
       volume: 10000 + index,
       amount: close * (10000 + index),
       changePercent: 0.1,
+      turnoverRate: 1 + index * 0.02,
     };
   });
+}
+
+function makeDailyHistory(length: number, startDate = '2026-01-01'): KLineData[] {
+  const [year, month, day] = startDate.split('-').map(Number);
+  const startTime = Date.UTC(year, month - 1, day);
+  return Array.from({ length }, (_, index) => {
+    const close = 120 + index * 0.1;
+    const date = new Date(startTime + index * 86_400_000).toISOString().slice(0, 10);
+    return {
+      date,
+      open: close - 0.1,
+      high: close + 0.2,
+      low: close - 0.2,
+      close,
+      volume: 10000 + index,
+      amount: close * (10000 + index),
+      changePercent: 0.1,
+      turnoverRate: 1 + index * 0.02,
+    };
+  });
+}
+
+function makeChipSnapshot(date: string, avgCost: number, profitRatio: number) {
+  return {
+    code: '600519',
+    date,
+    source: 'local_chip_model:unit',
+    profitRatio,
+    avgCost,
+    cost90Low: avgCost - 6,
+    cost90High: avgCost + 8,
+    concentration90: 0.055,
+    cost70Low: avgCost - 3,
+    cost70High: avgCost + 4,
+    concentration70: 0.027,
+    distribution: [
+      { price: avgCost - 6, percent: 0.16 },
+      { price: avgCost - 3, percent: 0.24 },
+      { price: avgCost, percent: 0.36 },
+      { price: avgCost + 4, percent: 0.16 },
+      { price: avgCost + 8, percent: 0.08 },
+    ],
+  };
 }
 
 async function flushPromises() {
@@ -88,7 +132,14 @@ describe('IndicatorAnalysisModal', () => {
             { price: 138.6, percent: 0.1 },
           ],
         }
-        : null,
+        : {
+          ...makeChipSnapshot('2026-04-30', 122.3, 0.66),
+          snapshots: [
+            makeChipSnapshot('2026-04-23', 121.8, 0.58),
+            makeChipSnapshot('2026-04-24', 121.9, 0.61),
+            makeChipSnapshot('2026-04-30', 122.3, 0.66),
+          ],
+        },
       majorHolders: [],
       majorHolderStatus: 'not_supported',
       sourceChain: [],
@@ -177,14 +228,19 @@ describe('IndicatorAnalysisModal', () => {
     expect(screen.getByRole('img', { name: 'MACD指标图' })).toBeInTheDocument();
     const sidePanel = screen.getByTestId('indicator-side-panel');
     expect(within(sidePanel).getByRole('tab', { name: '筹码峰' })).toHaveAttribute('aria-selected', 'true');
-    expect(screen.getByTestId('chip-peak-panel')).toBeInTheDocument();
+    const chipPeakPanel = screen.getByTestId('chip-peak-panel');
+    expect(chipPeakPanel).toBeInTheDocument();
     expect(screen.queryByTestId('order-flow-monitor')).not.toBeInTheDocument();
-    expect(within(screen.getByTestId('chip-peak-panel')).getByRole('tab', { name: '全部筹码' })).toHaveAttribute('aria-selected', 'true');
-    expect(within(screen.getByTestId('chip-peak-panel')).getByText('收盘获利')).toBeInTheDocument();
-    expect(within(screen.getByTestId('chip-peak-panel')).getAllByText('平均成本').length).toBeGreaterThan(0);
-    expect(within(screen.getByTestId('chip-peak-panel')).getByText('价格区间')).toBeInTheDocument();
-    expect(within(screen.getByTestId('chip-peak-panel')).getByText('集中度')).toBeInTheDocument();
-    fireEvent.click(within(screen.getByTestId('chip-peak-panel')).getByRole('tab', { name: '主力筹码' }));
+    expect(within(chipPeakPanel).getByRole('tab', { name: '全部筹码' })).toHaveAttribute('aria-selected', 'true');
+    expect(within(chipPeakPanel).getByText('收盘获利')).toBeInTheDocument();
+    expect(within(chipPeakPanel).getByText('套牢盘')).toBeInTheDocument();
+    expect(within(chipPeakPanel).getAllByText('平均成本').length).toBeGreaterThan(0);
+    expect(within(chipPeakPanel).getByText('价格区间')).toBeInTheDocument();
+    expect(within(chipPeakPanel).getByText('集中度')).toBeInTheDocument();
+    expect(within(chipPeakPanel).queryByText('筹码来源')).not.toBeInTheDocument();
+    expect(within(chipPeakPanel).queryByText('筹码分布说明')).not.toBeInTheDocument();
+    expect(within(chipPeakPanel).queryByText(/local_chip_model/)).not.toBeInTheDocument();
+    fireEvent.click(within(chipPeakPanel).getByRole('tab', { name: '主力筹码' }));
     expect(within(screen.getByTestId('chip-peak-panel')).getByRole('tab', { name: '主力筹码' })).toHaveAttribute('aria-selected', 'true');
     expect(within(screen.getByTestId('chip-peak-panel')).getByText('暂无同源主力筹码峰明细')).toBeInTheDocument();
     fireEvent.click(within(screen.getByTestId('chip-peak-panel')).getByRole('tab', { name: '全部筹码' }));
@@ -204,7 +260,8 @@ describe('IndicatorAnalysisModal', () => {
     expect(within(screen.getByTestId('indicator-volume-tooltip')).getByText('2026-04-24')).toBeInTheDocument();
     expect(within(screen.getByTestId('indicator-momentum-tooltip')).getByText('2026-04-24')).toBeInTheDocument();
     if (stockCode === '600519') {
-      expect(within(screen.getByTestId('chip-peak-panel')).getByText('真实筹码明细与本地模型均不可用，无法与同花顺对齐')).toBeInTheDocument();
+      expect(within(screen.getByTestId('chip-peak-panel')).getByText('2026-04-24')).toBeInTheDocument();
+      expect(screen.getByRole('img', { name: '筹码峰分布图' })).toBeInTheDocument();
     } else {
       expect(within(screen.getByTestId('chip-peak-panel')).getByText('2026-04-30')).toBeInTheDocument();
       expect(screen.getByRole('img', { name: '筹码峰分布图' })).toBeInTheDocument();
@@ -227,7 +284,7 @@ describe('IndicatorAnalysisModal', () => {
   it('pins the shared indicator cursor and moves it with left and right keys', async () => {
     const onClose = vi.fn();
     const { unmount } = render(
-      <IndicatorAnalysisModal stockCode="BABA" stockName="阿里巴巴" onClose={onClose} />,
+      <IndicatorAnalysisModal stockCode="600519" stockName="贵州茅台" onClose={onClose} />,
     );
     await flushPromises();
 
@@ -238,21 +295,62 @@ describe('IndicatorAnalysisModal', () => {
     expect(within(screen.getByTestId('indicator-chart-tooltip')).getByText('2026-04-24')).toBeInTheDocument();
     expect(within(screen.getByTestId('indicator-volume-tooltip')).getByText('2026-04-24')).toBeInTheDocument();
     expect(within(screen.getByTestId('indicator-momentum-tooltip')).getByText('2026-04-24')).toBeInTheDocument();
-    expect(within(screen.getByTestId('chip-peak-panel')).getByText('2026-04-30')).toBeInTheDocument();
+    expect(within(screen.getByTestId('chip-peak-panel')).getByText('2026-04-24')).toBeInTheDocument();
 
     fireEvent.keyDown(window, { key: 'ArrowLeft' });
     expect(within(screen.getByTestId('indicator-chart-tooltip')).getByText('2026-04-23')).toBeInTheDocument();
     expect(within(screen.getByTestId('indicator-volume-tooltip')).getByText('2026-04-23')).toBeInTheDocument();
     expect(within(screen.getByTestId('indicator-momentum-tooltip')).getByText('2026-04-23')).toBeInTheDocument();
-    expect(within(screen.getByTestId('chip-peak-panel')).getByText('2026-04-30')).toBeInTheDocument();
+    expect(within(screen.getByTestId('chip-peak-panel')).getByText('2026-04-23')).toBeInTheDocument();
 
     fireEvent.keyDown(window, { key: 'ArrowRight' });
     expect(within(screen.getByTestId('indicator-chart-tooltip')).getByText('2026-04-24')).toBeInTheDocument();
-    expect(within(screen.getByTestId('chip-peak-panel')).getByText('2026-04-30')).toBeInTheDocument();
+    expect(within(screen.getByTestId('chip-peak-panel')).getByText('2026-04-24')).toBeInTheDocument();
 
     fireEvent.keyDown(window, { key: 'Escape' });
     expect(onClose).not.toHaveBeenCalled();
     expect(screen.queryByTestId('indicator-chart-tooltip')).not.toBeInTheDocument();
+
+    unmount();
+  });
+
+  it('syncs the chip peak date with the current visible K-line window', async () => {
+    const longHistory = makeDailyHistory(120);
+    const windowSnapshotDate = longHistory[89].date;
+    vi.mocked(stocksApi.getHistory).mockImplementation(async (stockCode, _days, period = 'daily') => ({
+      stockCode,
+      stockName: '贵州茅台',
+      period,
+      data: period === 'daily' ? longHistory : makeHistory(period),
+    }));
+    vi.mocked(stocksApi.getIndicatorMetrics).mockResolvedValue({
+      stockCode: '600519',
+      stockName: '贵州茅台',
+      chipDistribution: {
+        ...makeChipSnapshot('2026-04-30', 122.3, 0.66),
+        snapshots: [
+          makeChipSnapshot(windowSnapshotDate, 121.4, 0.57),
+          makeChipSnapshot('2026-04-30', 122.3, 0.66),
+        ],
+      },
+      majorHolders: [],
+      majorHolderStatus: 'not_supported',
+      sourceChain: [],
+      errors: [],
+      updateTime: '2026-04-30T23:50:00',
+    });
+
+    const { unmount } = render(
+      <IndicatorAnalysisModal stockCode="600519" stockName="贵州茅台" onClose={vi.fn()} />,
+    );
+    await flushPromises();
+
+    expect(within(screen.getByTestId('chip-peak-panel')).getByText('2026-04-30')).toBeInTheDocument();
+
+    fireEvent.change(screen.getByRole('slider', { name: 'K线时间窗口' }), { target: { value: '10' } });
+
+    expect(within(screen.getByTestId('chip-peak-panel')).getByText(windowSnapshotDate)).toBeInTheDocument();
+    expect(within(screen.getByTestId('chip-peak-panel')).queryByText('2026-04-30')).not.toBeInTheDocument();
 
     unmount();
   });
