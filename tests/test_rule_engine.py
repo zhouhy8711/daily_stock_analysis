@@ -1,5 +1,5 @@
 from src.rules.engine import evaluate_rule, evaluate_rule_history
-from src.rules.metrics import build_metric_frame
+from src.rules.metrics import build_metric_frame, get_metric_registry
 from src.services.rule_service import RuleService, RuleValidationError
 
 
@@ -136,7 +136,16 @@ def test_metric_frame_maps_chip_ratios_to_percent_values():
             "chip_distribution": {
                 "profit_ratio": 0.82,
                 "concentration_90": 0.14,
+                "concentration_70": 0.08,
                 "avg_cost": 12.3,
+                "cost_90_low": 9.8,
+                "cost_90_high": 13.2,
+                "cost_70_low": 10.1,
+                "cost_70_high": 12.7,
+                "distribution": [
+                    {"price": 10.0, "percent": 0.2},
+                    {"price": 12.0, "percent": 0.5},
+                ],
             }
         },
     )
@@ -144,8 +153,67 @@ def test_metric_frame_maps_chip_ratios_to_percent_values():
     latest = frame.iloc[-1]
 
     assert latest["profit_ratio"] == 82
+    assert latest["trapped_ratio"] == 18
     assert round(latest["chip_concentration_90"], 6) == 14
+    assert round(latest["chip_concentration_70"], 6) == 8
     assert latest["avg_cost"] == 12.3
+    assert latest["cost_90_low"] == 9.8
+    assert latest["cost_90_high"] == 13.2
+    assert latest["cost_70_low"] == 10.1
+    assert latest["cost_70_high"] == 12.7
+    assert latest["price_range_90_mid"] == 11.5
+    assert round(latest["price_range_90_width"], 6) == 3.4
+    assert round(latest["price_range_90_width_pct"], 6) == round(3.4 / 11.5 * 100, 6)
+    assert latest["chip_peak_price"] == 12.0
+    assert latest["chip_peak_percent"] == 50
+    assert round(latest["chip_peak_distance_pct"], 6) == round((14 - 12) / 12 * 100, 6)
+
+
+def test_metric_registry_groups_indicator_page_metrics_by_chart_area():
+    registry = {item["key"]: item for item in get_metric_registry()}
+
+    assert registry["close"]["category"] == "K线图"
+    assert registry["volume_ma5"]["category"] == "成交量图"
+    assert registry["macd_dif"]["category"] == "MACD图"
+    assert registry["rsi24"]["category"] == "RSI图"
+    assert registry["trapped_ratio"]["category"] == "筹码峰-全部筹码"
+    assert registry["main_profit_ratio"]["category"] == "筹码峰-主力筹码"
+    assert registry["main_force_net"]["category"] == "实时监控"
+
+
+def test_metric_frame_maps_main_chip_distribution_when_available():
+    frame = build_metric_frame(
+        _history(),
+        extra_metrics={
+            "main_chip_distribution": {
+                "profit_ratio": 0.6,
+                "avg_cost": 13,
+                "cost_90_low": 11,
+                "cost_90_high": 15,
+                "concentration_90": 0.15,
+            }
+        },
+    )
+    latest = frame.iloc[-1]
+
+    assert latest["main_profit_ratio"] == 60
+    assert latest["main_trapped_ratio"] == 40
+    assert latest["main_avg_cost"] == 13
+    assert latest["main_price_range_90_mid"] == 13
+    assert latest["main_price_range_90_width"] == 4
+    assert latest["main_chip_concentration_90"] == 15
+    assert round(latest["main_price_to_avg_cost_pct"], 6) == round((14 - 13) / 13 * 100, 6)
+
+
+def test_metric_frame_calculates_indicator_page_metrics_for_rules():
+    frame = build_metric_frame(_history())
+    latest = frame.iloc[-1]
+
+    assert latest["change"] == 1
+    assert round(latest["volume_ratio"], 6) == round(2500 / 1600, 6)
+    assert latest["amount_ma5"] == 19920
+    assert latest["main_force_net"] > 0
+    assert round(latest["net_super_large_order"], 6) == round(latest["main_force_net"] * 0.44, 6)
 
 
 def test_metric_frame_maps_chip_snapshots_by_date():

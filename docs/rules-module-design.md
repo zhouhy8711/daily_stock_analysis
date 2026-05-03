@@ -116,14 +116,15 @@
 
 指标不直接写死在页面里，而是通过指标注册表暴露。每个指标 key 包含展示名、单位、类型、可用周期和支持的关系。
 
-第一版建议支持：
+第一版按指标分析页的大图表区域分组支持：
 
-- 基础行情：`open`、`high`、`low`、`close`、`volume`、`amount`、`pct_chg`
-- 实时行情：`current_price`、`change_percent`、`turnover_rate`、`volume_ratio`、`amplitude`
-- 均线：`ma5`、`ma10`、`ma20`、`ma30`、`ma60`
-- 成交量均线：`volume_ma5`、`volume_ma10`、`volume_ma20`
-- 技术指标：`ema12`、`ema26`、`macd_dif`、`macd_dea`、`macd`、`rsi6`、`rsi12`
-- 筹码指标：`profit_ratio`（解套率）、`chip_concentration_90`（筹码集中度）、`avg_cost`
+- K线图：`open`、`high`、`low`、`close`、`prev_close`、`change`、`pct_chg`、`change_percent`、`amplitude`、`current_price`、`ma5`、`ma10`、`ma20`、`ma30`、`ma60`、`volume_ratio`
+- 成交量图：`volume`、`amount`、`volume_ma5`、`volume_ma10`、`volume_ma20`、`amount_ma5`、`amount_ma10`
+- MACD图：`ema12`、`ema26`、`macd_dif`、`macd_dea`、`macd`
+- RSI图：`rsi6`、`rsi12`、`rsi24`
+- 筹码峰-全部筹码：`profit_ratio`（收盘获利）、`trapped_ratio`（套牢盘）、`profit_trapped_spread`、`avg_cost`、`price_to_avg_cost_pct`、`cost_90_low`、`cost_90_high`、`price_range_90_mid`、`price_range_90_width`、`price_range_90_width_pct`、`chip_concentration_90`、`cost_70_low`、`cost_70_high`、`price_range_70_mid`、`price_range_70_width`、`price_range_70_width_pct`、`chip_concentration_70`、`chip_peak_price`、`chip_peak_percent`、`chip_peak_distance_pct`
+- 筹码峰-主力筹码：`main_profit_ratio`、`main_trapped_ratio`、`main_profit_trapped_spread`、`main_avg_cost`、`main_price_to_avg_cost_pct`、`main_cost_90_low`、`main_cost_90_high`、`main_price_range_90_mid`、`main_price_range_90_width`、`main_price_range_90_width_pct`、`main_chip_concentration_90`、`main_cost_70_low`、`main_cost_70_high`、`main_price_range_70_mid`、`main_price_range_70_width`、`main_price_range_70_width_pct`、`main_chip_concentration_70`、`main_chip_peak_price`、`main_chip_peak_percent`、`main_chip_peak_distance_pct`
+- 实时监控：`turnover_rate`、`main_force_net`、`net_super_large_order`、`net_large_order`、`net_medium_order`、`net_small_order`
 
 主力持仓、估值、行业和新闻情绪类指标可作为二期扩展。
 

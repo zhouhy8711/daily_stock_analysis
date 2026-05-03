@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 
-from src.rules.metrics import metric_label
+from src.rules.metrics import METRIC_DEFINITIONS, metric_label
 
 COMPARE_OPERATORS = {">", ">=", "<", "<=", "=", "!="}
 AGGREGATE_METHODS = {"max", "min", "avg", "sum", "median", "std"}
@@ -290,19 +290,7 @@ def _snapshot_at(metric_frame: pd.DataFrame, index: int) -> Dict[str, Optional[f
     row = metric_frame.iloc[index]
     return {
         key: _to_float(row.get(key))
-        for key in (
-            "close",
-            "pct_chg",
-            "volume",
-            "ma5",
-            "ma10",
-            "ma20",
-            "volume_ratio",
-            "rsi6",
-            "macd",
-            "profit_ratio",
-            "chip_concentration_90",
-        )
+        for key in (definition.key for definition in METRIC_DEFINITIONS)
         if key in metric_frame.columns
     }
 

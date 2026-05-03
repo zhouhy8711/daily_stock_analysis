@@ -3,6 +3,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   Activity,
   CopyPlus,
+  HelpCircle,
   ListFilter,
   Maximize2,
   Minimize2,
@@ -17,7 +18,7 @@ import { rulesApi } from '../api/rules';
 import { getParsedApiError } from '../api/error';
 import { historyApi } from '../api/history';
 import { systemConfigApi } from '../api/systemConfig';
-import { AppPage, Badge, Button, ConfirmDialog, EmptyState, InlineAlert, Input, PageHeader } from '../components/common';
+import { AppPage, Badge, Button, ConfirmDialog, EmptyState, InlineAlert, Input, PageHeader, Tooltip } from '../components/common';
 import { useStockIndex } from '../hooks/useStockIndex';
 import type { StockIndexItem } from '../types/stockIndex';
 import type {
@@ -49,6 +50,11 @@ const TEXTAREA_CLASS =
   'input-surface input-focus-glow min-h-[92px] w-full resize-y rounded-xl border bg-transparent px-3 py-2 text-sm text-foreground transition-all placeholder:text-muted-text focus:outline-none disabled:cursor-not-allowed disabled:opacity-60';
 const STOCK_CODES_TEXTAREA_CLASS = `${TEXTAREA_CLASS} font-mono`;
 const WATCHLIST_HISTORY_LIMIT = 20;
+const OFFSET_HELP_TEXT = (
+  <span>
+    偏移按交易日计算：0 表示当前判断日，也就是最新交易日；1 表示前 1 个交易日；2 表示前 2 个交易日。历史聚合里会先按偏移跳过对应交易日，再向前取窗口，例如窗口 5、偏移 1 就是跳过最新日，取前 5 个交易日。
+  </span>
+);
 
 type StockListDisplayItem = {
   code: string;
@@ -94,6 +100,11 @@ const AGGREGATE_OPTIONS: Array<{ value: RuleAggregateMethod; label: string }> = 
   { value: 'median', label: '中位数' },
   { value: 'std', label: '标准差' },
 ];
+
+type MetricGroup = {
+  category: string;
+  items: RuleMetricItem[];
+};
 
 function createLiteral(value = 0): RuleValueExpression {
   return { type: 'literal', value };
@@ -334,6 +345,26 @@ function metricLabel(metrics: RuleMetricItem[], metricKey: string): string {
   return metrics.find((metric) => metric.key === metricKey)?.label ?? metricKey;
 }
 
+function metricOptionLabel(metric: RuleMetricItem): string {
+  return metric.unit ? `${metric.label} · ${metric.key} (${metric.unit})` : `${metric.label} · ${metric.key}`;
+}
+
+function groupMetricsByCategory(metrics: RuleMetricItem[]): MetricGroup[] {
+  const groups: MetricGroup[] = [];
+  const groupByCategory = new Map<string, MetricGroup>();
+  for (const metric of metrics) {
+    const category = metric.category || '未分类';
+    let group = groupByCategory.get(category);
+    if (!group) {
+      group = { category, items: [] };
+      groupByCategory.set(category, group);
+      groups.push(group);
+    }
+    group.items.push(metric);
+  }
+  return groups;
+}
+
 function valueSummary(metrics: RuleMetricItem[], value?: RuleValueExpression): string {
   if (!value) return '无右侧值';
   if (value.type === 'literal') return formatNumber(value.value);
@@ -398,22 +429,84 @@ function SelectField<T extends string>({
   );
 }
 
+function MetricSelectField({
+  label,
+  value,
+  metrics,
+  onChange,
+}: {
+  label: string;
+  value: string;
+  metrics: RuleMetricItem[];
+  onChange: (value: string) => void;
+}) {
+  const groups = groupMetricsByCategory(metrics);
+  const hasSelectedMetric = metrics.some((metric) => metric.key === value);
+
+  return (
+    <label className="flex flex-col gap-1 text-xs text-muted-text">
+      <span>{label}</span>
+      <select
+        value={value}
+        onChange={(event) => onChange(event.target.value)}
+        className={INPUT_CLASS}
+      >
+        {!hasSelectedMetric && value ? (
+          <option value={value} className="bg-elevated text-foreground">
+            {value}
+          </option>
+        ) : null}
+        {groups.map((group) => (
+          <optgroup key={group.category} label={group.category} className="bg-elevated text-foreground">
+            {group.items.map((metric) => (
+              <option key={metric.key} value={metric.key} className="bg-elevated text-foreground">
+                {metricOptionLabel(metric)}
+              </option>
+            ))}
+          </optgroup>
+        ))}
+      </select>
+    </label>
+  );
+}
+
+function FieldLabel({ label, help }: { label: string; help?: React.ReactNode }) {
+  return (
+    <span className="inline-flex items-center gap-1">
+      <span>{label}</span>
+      {help ? (
+        <Tooltip content={help} side="bottom" contentClassName="max-w-[22rem]">
+          <button
+            type="button"
+            className="inline-flex h-4 w-4 items-center justify-center rounded-full text-muted-text transition-colors hover:text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/45"
+            aria-label={`${label}说明`}
+          >
+            <HelpCircle className="h-3.5 w-3.5" />
+          </button>
+        </Tooltip>
+      ) : null}
+    </span>
+  );
+}
+
 function NumberField({
   label,
   value,
   min,
   onChange,
   className = '',
+  help,
 }: {
   label: string;
   value: number | undefined;
   min?: number;
   onChange: (value: number) => void;
   className?: string;
+  help?: React.ReactNode;
 }) {
   return (
     <label className={`flex flex-col gap-1 text-xs text-muted-text ${className}`}>
-      <span>{label}</span>
+      <FieldLabel label={label} help={help} />
       <input
         type="number"
         min={min}
@@ -434,7 +527,6 @@ function ValueEditor({
   metrics: RuleMetricItem[];
   onChange: (value: RuleValueExpression) => void;
 }) {
-  const metricOptions = metrics.map((metric) => ({ value: metric.key, label: metric.label }));
   const typeOptions: Array<{ value: RuleValueExpression['type']; label: string }> = [
     { value: 'literal', label: '固定数值' },
     { value: 'metric', label: '指标引用' },
@@ -481,14 +573,15 @@ function ValueEditor({
       ) : null}
       {value.type === 'metric' ? (
         <>
-          <SelectField
+          <MetricSelectField
             label="指标"
             value={value.metric}
-            options={metricOptions}
+            metrics={metrics}
             onChange={(metric) => onChange({ ...value, metric })}
           />
           <NumberField
-            label="偏移"
+            label="取值日偏移"
+            help={OFFSET_HELP_TEXT}
             min={0}
             value={value.offset ?? 0}
             onChange={(offset) => onChange({ ...value, offset })}
@@ -502,10 +595,10 @@ function ValueEditor({
       ) : null}
       {value.type === 'aggregate' ? (
         <>
-          <SelectField
+          <MetricSelectField
             label="指标"
             value={value.metric}
-            options={metricOptions}
+            metrics={metrics}
             onChange={(metric) => onChange({ ...value, metric })}
           />
           <SelectField
@@ -522,7 +615,8 @@ function ValueEditor({
               onChange={(window) => onChange({ ...value, window })}
             />
             <NumberField
-              label="偏移"
+              label="取值日偏移"
+              help={OFFSET_HELP_TEXT}
               min={0}
               value={value.offset ?? 1}
               onChange={(offset) => onChange({ ...value, offset })}
@@ -550,7 +644,6 @@ function ConditionEditor({
   onChange: (condition: RuleCondition) => void;
   onRemove: () => void;
 }) {
-  const metricOptions = metrics.map((metric) => ({ value: metric.key, label: metric.label }));
   const updateOperator = (operator: RuleOperator) => {
     if (operator === 'between' || operator === 'not_between') {
       onChange({ ...condition, operator, right: createRange() });
@@ -574,10 +667,10 @@ function ConditionEditor({
   return (
     <div className="rounded-xl border border-border/55 bg-elevated/35 p-3">
       <div className="grid gap-2 xl:grid-cols-[minmax(9rem,1fr)_10rem_5rem_auto]">
-        <SelectField
+        <MetricSelectField
           label="指标 key"
           value={condition.left.metric}
-          options={metricOptions}
+          metrics={metrics}
           onChange={(metric) => onChange({ ...condition, left: { ...condition.left, metric } })}
         />
         <SelectField
@@ -587,7 +680,8 @@ function ConditionEditor({
           onChange={updateOperator}
         />
         <NumberField
-          label="偏移"
+          label="取值日偏移"
+          help={OFFSET_HELP_TEXT}
           min={0}
           value={condition.left.offset ?? 0}
           onChange={(offset) => onChange({ ...condition, left: { ...condition.left, offset } })}

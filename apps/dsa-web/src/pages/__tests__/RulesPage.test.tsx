@@ -20,7 +20,61 @@ const metricItems = [
   {
     key: 'close',
     label: '收盘价',
-    category: '基础行情',
+    category: 'K线图',
+    valueType: 'number',
+    unit: '元',
+    periods: ['daily'],
+    description: '',
+  },
+  {
+    key: 'volume_ma5',
+    label: 'MAVOL5',
+    category: '成交量图',
+    valueType: 'number',
+    unit: '股',
+    periods: ['daily'],
+    description: '',
+  },
+  {
+    key: 'macd_dif',
+    label: 'DIF',
+    category: 'MACD图',
+    valueType: 'number',
+    unit: null,
+    periods: ['daily'],
+    description: '',
+  },
+  {
+    key: 'rsi6',
+    label: 'RSI6',
+    category: 'RSI图',
+    valueType: 'number',
+    unit: null,
+    periods: ['daily'],
+    description: '',
+  },
+  {
+    key: 'profit_ratio',
+    label: '收盘获利',
+    category: '筹码峰-全部筹码',
+    valueType: 'number',
+    unit: '%',
+    periods: ['daily'],
+    description: '',
+  },
+  {
+    key: 'main_profit_ratio',
+    label: '主力收盘获利',
+    category: '筹码峰-主力筹码',
+    valueType: 'number',
+    unit: '%',
+    periods: ['daily'],
+    description: '',
+  },
+  {
+    key: 'main_force_net',
+    label: '主力净额',
+    category: '实时监控',
     valueType: 'number',
     unit: '元',
     periods: ['daily'],
@@ -207,6 +261,35 @@ describe('RulesPage', () => {
         }),
       }));
     });
+  });
+
+  it('labels trading-day offsets and shows help text from the question icon', async () => {
+    render(<RulesPage />);
+
+    await screen.findByLabelText('股票代码 / 股票名称');
+
+    expect(screen.getAllByText('取值日偏移').length).toBeGreaterThan(0);
+
+    fireEvent.mouseEnter(screen.getAllByRole('button', { name: '取值日偏移说明' })[0]);
+
+    expect(await screen.findByRole('tooltip')).toHaveTextContent('偏移按交易日计算');
+    expect(screen.getByRole('tooltip')).toHaveTextContent('窗口 5、偏移 1');
+  });
+
+  it('groups metric selectors by indicator chart category', async () => {
+    render(<RulesPage />);
+
+    await screen.findByLabelText('股票代码 / 股票名称');
+
+    const metricSelect = screen.getByLabelText('指标 key') as HTMLSelectElement;
+    const groupLabels = Array.from(metricSelect.querySelectorAll('optgroup')).map((group) => group.label);
+    const chipGroup = metricSelect.querySelector('optgroup[label="筹码峰-全部筹码"]');
+    const mainChipGroup = metricSelect.querySelector('optgroup[label="筹码峰-主力筹码"]');
+
+    expect(groupLabels).toEqual(['K线图', '成交量图', 'MACD图', 'RSI图', '筹码峰-全部筹码', '筹码峰-主力筹码', '实时监控']);
+    expect(metricSelect.querySelector('option[value="volume_ma5"]')?.textContent).toContain('MAVOL5');
+    expect(chipGroup?.querySelector('option[value="profit_ratio"]')?.textContent).toContain('收盘获利');
+    expect(mainChipGroup?.querySelector('option[value="main_profit_ratio"]')?.textContent).toContain('主力收盘获利');
   });
 
   it('refreshes the stock code list when switching back to watchlist scope', async () => {
