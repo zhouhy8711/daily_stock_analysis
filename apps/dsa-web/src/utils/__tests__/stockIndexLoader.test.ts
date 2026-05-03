@@ -31,6 +31,7 @@ describe('stockIndexLoader', () => {
       assetType: 'stock',
       active: true,
       popularity: 100,
+      industry: '白酒',
     },
     {
       canonicalCode: '000001.SZ',
@@ -119,6 +120,23 @@ describe('stockIndexLoader', () => {
       expect(result.data).toHaveLength(2);
       expect(result.data[0].canonicalCode).toBe('600519.SH');
       expect(result.data[0].nameZh).toBe('贵州茅台');
+      expect(result.data[0].industry).toBeUndefined();
+    });
+
+    test('successfully loads compressed format index with industry field', async () => {
+      const compressedData = [
+        ['600519.SH', '600519', '贵州茅台', 'guizhoumaotai', 'gzmt', ['茅台'], 'CN', 'stock', true, 100, '白酒'],
+      ];
+
+      mockFetch.mockResolvedValueOnce({
+        ok: true,
+        json: async () => compressedData,
+      } as unknown as Response);
+
+      const result = await loadStockIndex();
+
+      expect(result.loaded).toBe(true);
+      expect(result.data[0].industry).toBe('白酒');
     });
 
     test('returns fallback mode on network error', async () => {
@@ -205,6 +223,7 @@ describe('stockIndexLoader', () => {
         'stock',
         true,
         100,
+        '白酒',
       ]);
     });
 
@@ -248,6 +267,21 @@ describe('stockIndexLoader', () => {
       const compressed = compressIndex(itemWithUndefinedAliases);
 
       expect(compressed[0][5]).toEqual([]);
+    });
+
+    test('keeps the optional industry slot for A-shares without industry data', () => {
+      const compressed = compressIndex([{
+        canonicalCode: '000001.SZ',
+        displayCode: '000001',
+        nameZh: '平安银行',
+        market: 'CN',
+        assetType: 'stock',
+        active: true,
+        popularity: 50,
+      }]);
+
+      expect(compressed[0]).toHaveLength(11);
+      expect(compressed[0][10]).toBeUndefined();
     });
 
     test('handles empty array', () => {

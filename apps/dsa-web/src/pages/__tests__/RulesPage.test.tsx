@@ -16,6 +16,9 @@ const stockIndexHookState = vi.hoisted(() => ({
   },
 }));
 
+const STOCK_LIST_LABEL = '行业 / 股票代码 / 股票名称';
+const WATCHLIST_STOCK_TEXT = '未分类 300274.SZ 阳光电源\n未分类 688521.SH 芯原股份\n未分类 BABA 阿里巴巴\n未分类 002439.SZ 启明星辰\n未分类 600126.SH 杭钢股份\n未分类 002436.SZ 兴森科技';
+
 const metricItems = [
   {
     key: 'close',
@@ -121,6 +124,7 @@ describe('RulesPage', () => {
           market: 'CN',
           assetType: 'stock',
           active: true,
+          industry: '白酒',
         },
         {
           canonicalCode: '000001.SZ',
@@ -129,6 +133,7 @@ describe('RulesPage', () => {
           market: 'CN',
           assetType: 'stock',
           active: true,
+          industry: '银行',
         },
         {
           canonicalCode: 'AAPL.US',
@@ -241,9 +246,9 @@ describe('RulesPage', () => {
   it('fills the stock list from the same current watchlist shown on the home page', async () => {
     render(<RulesPage />);
 
-    const textarea = await screen.findByLabelText('股票代码 / 股票名称');
+    const textarea = await screen.findByLabelText(STOCK_LIST_LABEL);
 
-    expect(textarea).toHaveValue('300274.SZ 阳光电源\n688521.SH 芯原股份\nBABA 阿里巴巴\n002439.SZ 启明星辰\n600126.SH 杭钢股份\n002436.SZ 兴森科技');
+    expect(textarea).toHaveValue(WATCHLIST_STOCK_TEXT);
     expect(textarea).not.toBeDisabled();
     expect(textarea).toHaveAttribute('readonly');
     expect(textarea).toHaveClass('font-mono');
@@ -266,7 +271,7 @@ describe('RulesPage', () => {
   it('labels trading-day offsets and shows help text from the question icon', async () => {
     render(<RulesPage />);
 
-    await screen.findByLabelText('股票代码 / 股票名称');
+    await screen.findByLabelText(STOCK_LIST_LABEL);
 
     expect(screen.getAllByText('取值日偏移').length).toBeGreaterThan(0);
 
@@ -279,7 +284,7 @@ describe('RulesPage', () => {
   it('groups metric selectors by indicator chart category', async () => {
     render(<RulesPage />);
 
-    await screen.findByLabelText('股票代码 / 股票名称');
+    await screen.findByLabelText(STOCK_LIST_LABEL);
 
     const metricSelect = screen.getByLabelText('指标 key') as HTMLSelectElement;
     const groupLabels = Array.from(metricSelect.querySelectorAll('optgroup')).map((group) => group.label);
@@ -295,55 +300,68 @@ describe('RulesPage', () => {
   it('refreshes the stock code list when switching back to watchlist scope', async () => {
     render(<RulesPage />);
 
-    const textarea = await screen.findByLabelText('股票代码 / 股票名称');
+    const textarea = await screen.findByLabelText(STOCK_LIST_LABEL);
     const scopeSelect = screen.getByLabelText('股票范围');
 
     fireEvent.change(scopeSelect, { target: { value: 'custom' } });
     fireEvent.change(textarea, { target: { value: 'TSLA' } });
-    expect(textarea).toHaveValue('TSLA');
+    expect(textarea).toHaveValue('未分类 TSLA');
     expect(textarea).not.toHaveAttribute('readonly');
 
     fireEvent.change(scopeSelect, { target: { value: 'watchlist' } });
 
-    expect(textarea).toHaveValue('300274.SZ 阳光电源\n688521.SH 芯原股份\nBABA 阿里巴巴\n002439.SZ 启明星辰\n600126.SH 杭钢股份\n002436.SZ 兴森科技');
+    expect(textarea).toHaveValue(WATCHLIST_STOCK_TEXT);
     expect(textarea).toHaveAttribute('readonly');
   });
 
   it('opens an expanded stock list, filters by code or name, and removes one stock', async () => {
     render(<RulesPage />);
 
-    await screen.findByLabelText('股票代码 / 股票名称');
+    await screen.findByLabelText(STOCK_LIST_LABEL);
 
     fireEvent.click(screen.getByRole('button', { name: '最大化股票列表' }));
     expect(screen.getByRole('dialog', { name: '股票列表最大化' })).toBeInTheDocument();
 
     const expandedList = screen.getByRole('list', { name: '最大化股票列表内容' });
-    expect(within(expandedList).getByText('300274.SZ 阳光电源')).toBeInTheDocument();
-    expect(within(expandedList).getByText('BABA 阿里巴巴')).toBeInTheDocument();
+    expect(within(expandedList).getByText('未分类 300274.SZ 阳光电源')).toBeInTheDocument();
+    expect(within(expandedList).getByText('未分类 BABA 阿里巴巴')).toBeInTheDocument();
 
     fireEvent.change(screen.getByLabelText('筛选股票列表'), { target: { value: '阿里' } });
-    expect(within(expandedList).getByText('BABA 阿里巴巴')).toBeInTheDocument();
-    expect(within(expandedList).queryByText('300274.SZ 阳光电源')).not.toBeInTheDocument();
+    expect(within(expandedList).getByText('未分类 BABA 阿里巴巴')).toBeInTheDocument();
+    expect(within(expandedList).queryByText('未分类 300274.SZ 阳光电源')).not.toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole('button', { name: '移除 BABA 阿里巴巴' }));
-    expect(within(expandedList).queryByText('BABA 阿里巴巴')).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '移除 未分类 BABA 阿里巴巴' }));
+    expect(within(expandedList).queryByText('未分类 BABA 阿里巴巴')).not.toBeInTheDocument();
     expect(screen.getByText('没有匹配的股票')).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole('button', { name: '收起股票列表' }));
     expect(screen.queryByRole('dialog', { name: '股票列表最大化' })).not.toBeInTheDocument();
-    expect((screen.getByLabelText('股票代码 / 股票名称') as HTMLTextAreaElement).value).not.toContain('BABA');
+    expect((screen.getByLabelText(STOCK_LIST_LABEL) as HTMLTextAreaElement).value).not.toContain('BABA');
   });
 
   it('fills all A-share stocks when selecting the all A-shares scope', async () => {
     render(<RulesPage />);
 
-    const textarea = await screen.findByLabelText('股票代码 / 股票名称');
+    const textarea = await screen.findByLabelText(STOCK_LIST_LABEL);
     const scopeSelect = screen.getByLabelText('股票范围');
 
     fireEvent.change(scopeSelect, { target: { value: 'all_a_shares' } });
 
-    expect(textarea).toHaveValue('000001 平安银行\n600519 贵州茅台');
+    expect(textarea).toHaveValue('银行 000001 平安银行\n白酒 600519 贵州茅台');
     expect(textarea).toHaveAttribute('readonly');
+
+    fireEvent.click(screen.getByRole('button', { name: '最大化股票列表' }));
+    const expandedList = screen.getByRole('list', { name: '最大化股票列表内容' });
+    fireEvent.change(screen.getByLabelText('筛选行业类别'), { target: { value: '银行' } });
+
+    expect(within(expandedList).getByText('银行 000001 平安银行')).toBeInTheDocument();
+    expect(within(expandedList).queryByText('白酒 600519 贵州茅台')).not.toBeInTheDocument();
+
+    fireEvent.change(screen.getByLabelText('筛选股票列表'), { target: { value: '茅台' } });
+    expect(screen.getByText('没有匹配的股票')).toBeInTheDocument();
+
+    fireEvent.change(screen.getByLabelText('筛选行业类别'), { target: { value: '白酒' } });
+    expect(within(expandedList).getByText('白酒 600519 贵州茅台')).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole('button', { name: '保存' }));
 
@@ -388,7 +406,7 @@ describe('RulesPage', () => {
 
     render(<RulesPage />);
 
-    expect(await screen.findByLabelText('股票代码 / 股票名称')).toHaveValue('300274.SZ 阳光电源\n688521.SH 芯原股份\nBABA 阿里巴巴\n002439.SZ 启明星辰\n600126.SH 杭钢股份\n002436.SZ 兴森科技');
+    expect(await screen.findByLabelText(STOCK_LIST_LABEL)).toHaveValue(WATCHLIST_STOCK_TEXT);
   });
 
   it('saves the current stock code list before running a saved rule', async () => {
@@ -439,11 +457,11 @@ describe('RulesPage', () => {
 
     render(<RulesPage />);
 
-    const textarea = await screen.findByLabelText('股票代码 / 股票名称');
+    const textarea = await screen.findByLabelText(STOCK_LIST_LABEL);
     const scopeSelect = screen.getByLabelText('股票范围');
 
     fireEvent.change(scopeSelect, { target: { value: 'custom' } });
-    fireEvent.change(textarea, { target: { value: '000001 平安银行\nTSLA 特斯拉' } });
+    fireEvent.change(textarea, { target: { value: '银行 000001 平安银行\n未分类 TSLA 特斯拉\nIT服务 300123 测试' } });
     fireEvent.click(screen.getByRole('button', { name: '运行' }));
 
     await waitFor(() => {
@@ -451,7 +469,7 @@ describe('RulesPage', () => {
         definition: expect.objectContaining({
           target: {
             scope: 'custom',
-            stockCodes: ['000001', 'TSLA'],
+            stockCodes: ['000001', 'TSLA', '300123'],
           },
         }),
       }));

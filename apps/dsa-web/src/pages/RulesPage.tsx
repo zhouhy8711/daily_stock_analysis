@@ -59,11 +59,18 @@ const OFFSET_HELP_TEXT = (
 type StockListDisplayItem = {
   code: string;
   name?: string;
+  industry?: string;
 };
 
 type StockListLineItem = StockListDisplayItem & {
   sourceCode: string;
   line: string;
+  industryLabel: string;
+};
+
+type StockListIndustryOption = {
+  name: string;
+  count: number;
 };
 
 const OPERATOR_OPTIONS: Array<{ value: RuleOperator; label: string }> = [
@@ -100,6 +107,8 @@ const AGGREGATE_OPTIONS: Array<{ value: RuleAggregateMethod; label: string }> = 
   { value: 'median', label: '中位数' },
   { value: 'std', label: '标准差' },
 ];
+const UNCLASSIFIED_INDUSTRY = '未分类';
+const ALL_STOCK_LIST_INDUSTRIES = '__all__';
 
 type MetricGroup = {
   category: string;
@@ -148,11 +157,14 @@ function createDefinition(metric = 'close', stockCodes: string[] = []): RuleDefi
 }
 
 function normalizeRuleStockCode(value: string): string {
-  const firstCode = value
-    .trim()
-    .toUpperCase()
-    .match(/(?:SH|SZ|BJ)\d{6}|\d{6}\.(?:SH|SZ|SS|BJ)|HK\d{1,5}|\d{1,5}\.HK|\d{6}|\d{5}|[A-Z]{1,5}(?:\.US)?/);
-  const code = firstCode?.[0] ?? '';
+  const normalizedValue = value.trim().toUpperCase();
+  const strongCode = normalizedValue.match(
+    /(?:SH|SZ|BJ)\d{6}|\d{6}\.(?:SH|SZ|SS|BJ)|HK\d{1,5}|\d{1,5}\.HK|\d{6}|\d{5}/,
+  );
+  const usCode = normalizedValue
+    .split(/[\s,，;；]+/)
+    .find((part) => /^[A-Z]{1,5}(?:\.US)?$/.test(part));
+  const code = strongCode?.[0] ?? usCode ?? '';
   const hkPrefix = code.match(/^HK(\d{1,5})$/);
   if (hkPrefix) {
     return `HK${hkPrefix[1].padStart(5, '0')}`;
@@ -246,6 +258,7 @@ function buildStockLookup(
     const displayItem = {
       code: getStockDisplayCode(item),
       name: item.nameZh || item.nameEn,
+      industry: item.industry,
     };
     for (const key of getStockLookupKeys(item.canonicalCode).concat(getStockLookupKeys(item.displayCode))) {
       lookup.set(key, displayItem);
@@ -261,6 +274,7 @@ function buildStockLookup(
     const displayItem = {
       code: item.code,
       name: item.name || existing?.name,
+      industry: item.industry || existing?.industry,
     };
     for (const key of getStockLookupKeys(item.code)) {
       lookup.set(key, displayItem);
@@ -279,10 +293,19 @@ function getDisplayItemForCode(code: string, lookup: Map<string, StockListDispla
   return { code: normalizeRuleStockCode(code) };
 }
 
+function getStockIndustryLabel(item: StockListDisplayItem): string {
+  return item.industry?.trim() || UNCLASSIFIED_INDUSTRY;
+}
+
+function formatStockListLine(item: StockListDisplayItem): string {
+  const industry = getStockIndustryLabel(item);
+  return item.name ? `${industry} ${item.code} ${item.name}` : `${industry} ${item.code}`;
+}
+
 function formatStockListText(codes: string[], lookup: Map<string, StockListDisplayItem>): string {
   return codes
     .map((code) => getDisplayItemForCode(code, lookup))
-    .map((item) => (item.name ? `${item.code} ${item.name}` : item.code))
+    .map(formatStockListLine)
     .join('\n');
 }
 
@@ -295,17 +318,46 @@ function buildStockListLineItems(
     return {
       ...item,
       sourceCode,
-      line: item.name ? `${item.code} ${item.name}` : item.code,
+      line: formatStockListLine(item),
+      industryLabel: getStockIndustryLabel(item),
     };
   });
 }
 
-function filterStockListItems(items: StockListLineItem[], query: string): StockListLineItem[] {
-  const normalizedQuery = query.trim().toUpperCase();
-  if (!normalizedQuery) {
-    return items;
+function buildStockListIndustryOptions(items: StockListLineItem[]): StockListIndustryOption[] {
+  const counts = new Map<string, number>();
+  for (const item of items) {
+    counts.set(item.industryLabel, (counts.get(item.industryLabel) ?? 0) + 1);
   }
-  return items.filter((item) => item.line.toUpperCase().includes(normalizedQuery));
+  return Array.from(counts.entries())
+    .map(([name, count]) => ({ name, count }))
+    .sort((left, right) => {
+      if (left.name === UNCLASSIFIED_INDUSTRY) {
+        return 1;
+      }
+      if (right.name === UNCLASSIFIED_INDUSTRY) {
+        return -1;
+      }
+      return left.name.localeCompare(right.name, 'zh-Hans-CN');
+    });
+}
+
+function filterStockListItems(
+  items: StockListLineItem[],
+  query: string,
+  industryFilter: string,
+): StockListLineItem[] {
+  const normalizedQuery = query.trim().toUpperCase();
+  return items.filter((item) => {
+    const matchesIndustry = industryFilter === ALL_STOCK_LIST_INDUSTRIES || item.industryLabel === industryFilter;
+    if (!matchesIndustry) {
+      return false;
+    }
+    if (!normalizedQuery) {
+      return true;
+    }
+    return item.code.toUpperCase().includes(normalizedQuery) || (item.name ?? '').toUpperCase().includes(normalizedQuery);
+  });
 }
 
 function hydrateDefinitionTarget(
@@ -822,6 +874,7 @@ const RulesPage: React.FC = () => {
   const [watchlistItems, setWatchlistItems] = useState<StockListDisplayItem[]>([]);
   const [isStockListExpanded, setIsStockListExpanded] = useState(false);
   const [stockListFilter, setStockListFilter] = useState('');
+  const [stockListIndustryFilter, setStockListIndustryFilter] = useState(ALL_STOCK_LIST_INDUSTRIES);
   const watchlistCodes = useMemo(
     () => watchlistItems.map((item) => item.code),
     [watchlistItems],
@@ -903,6 +956,7 @@ const RulesPage: React.FC = () => {
       event.preventDefault();
       setIsStockListExpanded(false);
       setStockListFilter('');
+      setStockListIndustryFilter(ALL_STOCK_LIST_INDUSTRIES);
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
@@ -1021,11 +1075,15 @@ const RulesPage: React.FC = () => {
     () => buildStockListLineItems(definition.target.stockCodes, stockLookup),
     [definition.target.stockCodes, stockLookup],
   );
-  const filteredStockListItems = useMemo(
-    () => filterStockListItems(stockListItems, stockListFilter),
-    [stockListFilter, stockListItems],
+  const stockListIndustryOptions = useMemo(
+    () => buildStockListIndustryOptions(stockListItems),
+    [stockListItems],
   );
-  const hasStockListFilter = stockListFilter.trim().length > 0;
+  const filteredStockListItems = useMemo(
+    () => filterStockListItems(stockListItems, stockListFilter, stockListIndustryFilter),
+    [stockListFilter, stockListIndustryFilter, stockListItems],
+  );
+  const hasStockListFilter = stockListFilter.trim().length > 0 || stockListIndustryFilter !== ALL_STOCK_LIST_INDUSTRIES;
   const updateTargetCodesFromText = useCallback((value: string) => {
     setDefinition((current) => ({
       ...current,
@@ -1047,6 +1105,7 @@ const RulesPage: React.FC = () => {
   const closeStockListExpanded = useCallback(() => {
     setIsStockListExpanded(false);
     setStockListFilter('');
+    setStockListIndustryFilter(ALL_STOCK_LIST_INDUSTRIES);
   }, []);
   const scopeOptions: Array<{ value: RuleTargetScope; label: string }> = [
     { value: 'watchlist', label: '自选股 STOCK_LIST' },
@@ -1131,30 +1190,34 @@ const RulesPage: React.FC = () => {
                 label="股票范围"
                 value={definition.target.scope}
                 options={scopeOptions}
-                onChange={(scope) => setDefinition((current) => ({
-                  ...current,
-                  target: {
-                    ...current.target,
-                    scope,
-                    stockCodes: scope === 'watchlist'
-                      ? watchlistCodes
-                      : scope === 'all_a_shares'
-                        ? allAshareCodes
-                        : current.target.stockCodes,
-                  },
-                }))}
+                onChange={(scope) => {
+                  setStockListFilter('');
+                  setStockListIndustryFilter(ALL_STOCK_LIST_INDUSTRIES);
+                  setDefinition((current) => ({
+                    ...current,
+                    target: {
+                      ...current.target,
+                      scope,
+                      stockCodes: scope === 'watchlist'
+                        ? watchlistCodes
+                        : scope === 'all_a_shares'
+                          ? allAshareCodes
+                          : current.target.stockCodes,
+                    },
+                  }));
+                }}
               />
               <div className="flex min-w-0 flex-col gap-1 text-xs text-muted-text">
-                <span>股票代码 / 股票名称</span>
+                <span>行业 / 股票代码 / 股票名称</span>
                 <div className="relative">
                   <textarea
-                    aria-label="股票代码 / 股票名称"
+                    aria-label="行业 / 股票代码 / 股票名称"
                     value={targetCodesText}
                     onChange={(event) => updateTargetCodesFromText(event.target.value)}
                     readOnly={targetListReadOnly}
                     className={`${STOCK_CODES_TEXTAREA_CLASS} pr-12`}
                     style={{ fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace' }}
-                    placeholder="600519 贵州茅台&#10;000001 平安银行&#10;AAPL Apple"
+                    placeholder="白酒 600519 贵州茅台&#10;银行 000001 平安银行&#10;未分类 AAPL Apple"
                   />
                   <button
                     type="button"
@@ -1352,13 +1415,31 @@ const RulesPage: React.FC = () => {
           >
             <div className="flex flex-col gap-3 border-b border-border/60 p-3 md:flex-row md:items-center md:justify-between md:p-4">
               <div>
-                <h2 className="text-lg font-semibold text-foreground">股票代码 / 股票名称</h2>
+                <h2 className="text-lg font-semibold text-foreground">行业 / 股票代码 / 股票名称</h2>
                 <p className="mt-1 text-xs text-muted-text">
                   {hasStockListFilter ? `${filteredStockListItems.length} / ` : ''}
                   {definition.target.stockCodes.length} 只股票
                 </p>
               </div>
               <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+                <label className="block sm:w-44">
+                  <span className="sr-only">筛选行业类别</span>
+                  <select
+                    value={stockListIndustryFilter}
+                    onChange={(event) => setStockListIndustryFilter(event.target.value)}
+                    className={INPUT_CLASS}
+                    aria-label="筛选行业类别"
+                  >
+                    <option value={ALL_STOCK_LIST_INDUSTRIES} className="bg-elevated text-foreground">
+                      全部行业
+                    </option>
+                    {stockListIndustryOptions.map((option) => (
+                      <option key={option.name} value={option.name} className="bg-elevated text-foreground">
+                        {option.name} ({option.count})
+                      </option>
+                    ))}
+                  </select>
+                </label>
                 <label className="relative block sm:w-72">
                   <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-text" />
                   <input

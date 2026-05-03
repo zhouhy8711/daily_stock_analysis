@@ -79,6 +79,7 @@ function unpackTuples(tuples: StockIndexTuple[]): StockIndexItem[] {
     assetType: tuple[INDEX_FIELD.ASSET_TYPE],
     active: tuple[INDEX_FIELD.ACTIVE],
     popularity: tuple[INDEX_FIELD.POPULARITY],
+    industry: tuple[INDEX_FIELD.INDUSTRY] || undefined,
   }));
 }
 
@@ -88,18 +89,24 @@ function unpackTuples(tuples: StockIndexTuple[]): StockIndexItem[] {
  * For reducing index file size
  */
 export function compressIndex(items: StockIndexItem[]): StockIndexTuple[] {
-  return items.map(item => [
-    item.canonicalCode,
-    item.displayCode,
-    item.nameZh,
-    item.pinyinFull,
-    item.pinyinAbbr,
-    item.aliases || [],
-    item.market,
-    item.assetType,
-    item.active,
-    item.popularity,
-  ]);
+  return items.map(item => {
+    const tuple: StockIndexTuple = [
+      item.canonicalCode,
+      item.displayCode,
+      item.nameZh,
+      item.pinyinFull,
+      item.pinyinAbbr,
+      item.aliases || [],
+      item.market,
+      item.assetType,
+      item.active,
+      item.popularity,
+    ];
+    if (item.industry !== undefined || item.market === 'CN' || item.market === 'BSE') {
+      tuple.push(item.industry);
+    }
+    return tuple;
+  });
 }
 
 /**

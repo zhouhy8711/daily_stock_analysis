@@ -20,7 +20,7 @@ import re
 import sys
 import unicodedata
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 # Add the project root to sys.path.
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -52,7 +52,9 @@ def normalize_name_for_pinyin(name: str) -> str:
     return normalized.strip() or unicodedata.normalize('NFKC', name).strip()
 
 
-def generate_stock_index_from_map() -> List[Dict[str, Any]]:
+def generate_stock_index_from_map(
+    industry_by_code: Optional[Dict[str, str]] = None,
+) -> List[Dict[str, Any]]:
     """
     Generate index from STOCK_NAME_MAP (MVP)
 
@@ -81,6 +83,9 @@ def generate_stock_index_from_map() -> List[Dict[str, Any]]:
 
         # Generate short aliases.
         aliases = generate_aliases(name)
+        industry = None
+        if market in {'CN', 'BSE'} and industry_by_code:
+            industry = industry_by_code.get(code)
 
         index.append({
             "canonicalCode": build_canonical_code(code, market),
@@ -93,6 +98,7 @@ def generate_stock_index_from_map() -> List[Dict[str, Any]]:
             "assetType": asset_type,
             "active": True,
             "popularity": 100,  # Default popularity
+            "industry": industry,
         })
 
     return index
@@ -239,7 +245,7 @@ def compress_index(index: List[Dict[str, Any]]) -> List[List]:
     """
     compressed = []
     for item in index:
-        compressed.append([
+        row = [
             item["canonicalCode"],
             item["displayCode"],
             item["nameZh"],
@@ -250,7 +256,10 @@ def compress_index(index: List[Dict[str, Any]]) -> List[List]:
             item["assetType"],
             item["active"],
             item.get("popularity", 0),
-        ])
+        ]
+        if item.get("industry") is not None or item.get("market") in {"CN", "BSE"}:
+            row.append(item.get("industry"))
+        compressed.append(row)
     return compressed
 
 
@@ -277,12 +286,28 @@ def main():
         action='store_true',
         help='详细模式：显示前10条数据预览'
     )
+    parser.add_argument(
+        '--skip-industry',
+        action='store_true',
+        help='跳过同花顺行业映射抓取，仅生成基础股票索引'
+    )
     args = parser.parse_args()
 
     print("开始生成股票索引...")
 
+    industry_by_code: Dict[str, str] = {}
+    if args.skip_industry:
+        print("已跳过同花顺行业映射")
+    else:
+        try:
+            from generate_index_from_csv import fetch_ths_industry_map
+
+            industry_by_code = fetch_ths_industry_map()
+        except Exception as exc:
+            print(f"[Warning] 获取同花顺行业映射失败，将继续生成无行业索引：{exc}")
+
     # 生成索引（MVP：使用现有映射）
-    index = generate_stock_index_from_map()
+    index = generate_stock_index_from_map(industry_by_code=industry_by_code)
     print(f"共生成 {len(index)} 条索引")
 
     # 按市场统计

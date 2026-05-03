@@ -194,6 +194,24 @@ describe('HomePage', () => {
   });
 
   it('renders the watchlist workspace and opens the selected report as an overlay', async () => {
+    stockIndexHookState.current = {
+      index: [
+        {
+          canonicalCode: '600519.SH',
+          displayCode: '600519',
+          nameZh: '贵州茅台',
+          market: 'CN',
+          assetType: 'stock',
+          active: true,
+          popularity: 100,
+          industry: '白酒',
+        },
+      ],
+      loading: false,
+      error: null,
+      fallback: false,
+      loaded: true,
+    };
     vi.mocked(historyApi.getList).mockResolvedValue({
       total: 1,
       page: 1,
@@ -222,6 +240,8 @@ describe('HomePage', () => {
     expect(screen.getByPlaceholderText('输入股票代码或名称，如 600519、贵州茅台、AAPL')).toBeInTheDocument();
     expect(await screen.findByText('自选')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: '查看 贵州茅台 报告' })).toBeInTheDocument();
+    expect(screen.getByText('行业')).toBeInTheDocument();
+    expect(screen.getByText('白酒')).toBeInTheDocument();
     expect(screen.queryByTestId('report-overlay')).not.toBeInTheDocument();
 
     fireEvent.click(screen.getByRole('button', { name: '查看 贵州茅台 报告' }));
@@ -497,6 +517,7 @@ describe('HomePage', () => {
           assetType: 'stock',
           active: true,
           popularity: 100,
+          industry: '白酒',
         },
         {
           canonicalCode: '000001.SZ',
@@ -509,6 +530,7 @@ describe('HomePage', () => {
           assetType: 'stock',
           active: true,
           popularity: 90,
+          industry: '银行',
         },
         {
           canonicalCode: 'BABA',
@@ -569,9 +591,37 @@ describe('HomePage', () => {
       expect(stocksApi.getQuotes).toHaveBeenCalledWith(['000001', '600519']);
     });
     expect(await screen.findByText('11.230')).toBeInTheDocument();
+    expect(within(board).getByText('行业')).toBeInTheDocument();
+    expect(within(board).getByText('银行')).toBeInTheDocument();
+    expect(within(board).getByText('白酒')).toBeInTheDocument();
     expect(screen.getByText('+0.42%')).toBeInTheDocument();
     expect(screen.getByText('1688.50')).toBeInTheDocument();
     expect(screen.getByText('-1.25%')).toBeInTheDocument();
+
+    fireEvent.click(within(board).getByRole('button', { name: /行业 全部/ }));
+    const industrySearch = within(board).getByLabelText('搜索行业');
+    fireEvent.change(industrySearch, { target: { value: 'yh' } });
+    expect(within(board).getByLabelText('筛选行业 银行')).toBeInTheDocument();
+    expect(within(board).queryByLabelText('筛选行业 白酒')).not.toBeInTheDocument();
+
+    fireEvent.click(within(board).getByLabelText('筛选行业 银行'));
+    expect(within(board).getAllByRole('button', { name: /查看 .* 报告/ })
+      .map((button) => button.getAttribute('aria-label'))).toEqual([
+      '查看 平安银行 报告',
+    ]);
+
+    fireEvent.change(industrySearch, { target: { value: '白' } });
+    expect(within(board).getByLabelText('筛选行业 白酒')).toBeInTheDocument();
+    expect(within(board).queryByLabelText('筛选行业 银行')).not.toBeInTheDocument();
+
+    fireEvent.click(within(board).getByLabelText('筛选行业 白酒'));
+    expect(within(board).getAllByRole('button', { name: /查看 .* 报告/ })
+      .map((button) => button.getAttribute('aria-label'))).toEqual([
+      '查看 平安银行 报告',
+      '查看 贵州茅台 报告',
+    ]);
+
+    fireEvent.click(within(board).getByRole('button', { name: '清空行业筛选' }));
 
     fireEvent.click(within(board).getByRole('button', { name: '最新价排序' }));
     expect(within(board).getAllByRole('button', { name: /查看 .* 报告/ })

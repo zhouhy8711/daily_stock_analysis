@@ -7,10 +7,12 @@ import {
   BarChart3,
   Check,
   CheckSquare,
+  Filter,
   Plus,
   RefreshCw,
   Search,
   Square,
+  X,
 } from 'lucide-react';
 import { Badge, Button, EmptyState } from '../common';
 import { DashboardStateBlock } from '../dashboard';
@@ -28,6 +30,7 @@ export interface WatchlistItem {
   createdAt?: string;
   source: 'config' | 'history' | 'index';
   isInWatchlist?: boolean;
+  industry?: string;
 }
 
 interface WatchlistBoardProps {
@@ -60,6 +63,103 @@ type MarketFilter = 'all' | 'cn' | 'hk' | 'us';
 type SortField = 'currentPrice' | 'changePct';
 type SortDirection = 'asc' | 'desc';
 type SortState = { field: SortField; direction: SortDirection } | null;
+type IndustryOption = { name: string; count: number };
+
+const UNCLASSIFIED_INDUSTRY = '未分类';
+
+const INDUSTRY_PINYIN_ABBR: Record<string, string> = {
+  半导体: 'bdt',
+  白酒: 'bj',
+  白色家电: 'bsjd',
+  保险: 'bx',
+  包装印刷: 'bzys',
+  厨卫电器: 'cwdq',
+  电池: 'dc',
+  电机: 'dj',
+  电力: 'dl',
+  电网设备: 'dwsb',
+  多元金融: 'dyjr',
+  电子化学品: 'dzhxp',
+  房地产: 'fdc',
+  风电设备: 'fdsb',
+  非金属材料: 'fjscl',
+  服装家纺: 'fzjf',
+  纺织制造: 'fzzz',
+  工程机械: 'gcjx',
+  光伏设备: 'gfsb',
+  贵金属: 'gjs',
+  轨交设备: 'gjsb',
+  港口航运: 'gkhy',
+  公路铁路运输: 'gltlys',
+  钢铁: 'gt',
+  光学光电子: 'gxgdz',
+  工业金属: 'gyjs',
+  环保设备: 'hbsb',
+  环境治理: 'hjzl',
+  互联网电商: 'hlwds',
+  黑色家电: 'hsjd',
+  化学纤维: 'hxxw',
+  化学原料: 'hxyl',
+  化学制品: 'hxzp',
+  化学制药: 'hxzy',
+  IT服务: 'itfw',
+  机场航运: 'jchy',
+  军工电子: 'jgdz',
+  军工装备: 'jgzb',
+  家居用品: 'jjyp',
+  计算机设备: 'jsjsb',
+  金属新材料: 'jsxcl',
+  教育: 'jy',
+  建筑材料: 'jzcl',
+  建筑装饰: 'jzzs',
+  零售: 'ls',
+  旅游及酒店: 'lyjjd',
+  美容护理: 'mrhl',
+  煤炭开采加工: 'mtkcjg',
+  贸易: 'my',
+  农产品加工: 'ncpjg',
+  农化制品: 'nhzp',
+  能源金属: 'nyjs',
+  汽车服务及其他: 'qcfwjqt',
+  汽车零部件: 'qclbj',
+  汽车整车: 'qczc',
+  其他电源设备: 'qtdysb',
+  其他电子: 'qtdz',
+  其他社会服务: 'qtshfw',
+  软件开发: 'rjkf',
+  燃气: 'rq',
+  塑料制品: 'slzp',
+  食品加工制造: 'spjgzz',
+  生物制品: 'swzp',
+  石油加工贸易: 'syjgmy',
+  通信服务: 'txfw',
+  通信设备: 'txsb',
+  通用设备: 'tysb',
+  文化传媒: 'whcm',
+  物流: 'wl',
+  消费电子: 'xfdz',
+  小家电: 'xjd',
+  小金属: 'xjs',
+  橡胶制品: 'xjzp',
+  元件: 'yj',
+  医疗服务: 'ylfw',
+  医疗器械: 'ylqx',
+  饮料制造: 'ylzz',
+  油气开采及服务: 'yqkcyfw',
+  影视院线: 'ysyx',
+  游戏: 'yx',
+  银行: 'yh',
+  医药商业: 'yysy',
+  养殖业: 'yzy',
+  自动化设备: 'zdhsb',
+  综合: 'zh',
+  证券: 'zq',
+  中药: 'zy',
+  专用设备: 'zysb',
+  造纸: 'zz',
+  种植业与林业: 'zzyyly',
+  [UNCLASSIFIED_INDUSTRY]: 'wfl',
+};
 
 const BOARD_TABS: Array<{ key: BoardTab; label: string }> = [
   { key: 'watchlist', label: '自选' },
@@ -146,6 +246,24 @@ function getAdviceVariant(advice?: string): 'success' | 'warning' | 'danger' | '
   return 'info';
 }
 
+function getIndustryLabel(item: WatchlistItem): string {
+  return item.industry?.trim() || UNCLASSIFIED_INDUSTRY;
+}
+
+function normalizeIndustryQuery(value: string): string {
+  return value.trim().toLowerCase().replace(/\s+/g, '');
+}
+
+function matchesIndustryQuery(option: IndustryOption, query: string): boolean {
+  if (!query) {
+    return true;
+  }
+
+  const name = normalizeIndustryQuery(option.name);
+  const pinyinAbbr = INDUSTRY_PINYIN_ABBR[option.name]?.toLowerCase() ?? '';
+  return name.includes(query) || pinyinAbbr.includes(query);
+}
+
 export const WatchlistBoard: React.FC<WatchlistBoardProps> = ({
   items,
   allShareItems,
@@ -173,14 +291,21 @@ export const WatchlistBoard: React.FC<WatchlistBoardProps> = ({
   const [activeBoardTab, setActiveBoardTab] = useState<BoardTab>('watchlist');
   const [activeMarket, setActiveMarket] = useState<MarketFilter>('all');
   const [selectionMode, setSelectionMode] = useState(false);
+  const [industryFilterOpen, setIndustryFilterOpen] = useState(false);
+  const [industryFilterQuery, setIndustryFilterQuery] = useState('');
+  const [selectedIndustriesByTab, setSelectedIndustriesByTab] = useState<Record<BoardTab, string[]>>({
+    watchlist: [],
+    'all-cn': [],
+  });
   const [sortByTab, setSortByTab] = useState<Record<BoardTab, SortState>>({
     watchlist: null,
     'all-cn': null,
   });
   const isAllShareView = activeBoardTab === 'all-cn';
   const activeSort = sortByTab[activeBoardTab];
+  const selectedIndustries = selectedIndustriesByTab[activeBoardTab];
 
-  const filteredItems = useMemo(() => {
+  const marketFilteredItems = useMemo(() => {
     if (isAllShareView) {
       return allShareItems;
     }
@@ -189,6 +314,39 @@ export const WatchlistBoard: React.FC<WatchlistBoardProps> = ({
       ? items
       : items.filter((item) => getMarket(item.stockCode) === activeMarket);
   }, [activeMarket, allShareItems, isAllShareView, items]);
+
+  const industryOptions = useMemo<IndustryOption[]>(() => {
+    const counts = new Map<string, number>();
+    for (const item of marketFilteredItems) {
+      const label = getIndustryLabel(item);
+      counts.set(label, (counts.get(label) ?? 0) + 1);
+    }
+    return Array.from(counts.entries())
+      .map(([name, count]) => ({ name, count }))
+      .sort((left, right) => {
+        if (left.name === UNCLASSIFIED_INDUSTRY) {
+          return 1;
+        }
+        if (right.name === UNCLASSIFIED_INDUSTRY) {
+          return -1;
+        }
+        return left.name.localeCompare(right.name, 'zh-Hans-CN');
+      });
+  }, [marketFilteredItems]);
+
+  const normalizedIndustryFilterQuery = normalizeIndustryQuery(industryFilterQuery);
+  const visibleIndustryOptions = useMemo(
+    () => industryOptions.filter((option) => matchesIndustryQuery(option, normalizedIndustryFilterQuery)),
+    [industryOptions, normalizedIndustryFilterQuery],
+  );
+
+  const filteredItems = useMemo(() => {
+    if (selectedIndustries.length === 0) {
+      return marketFilteredItems;
+    }
+    const selectedIndustrySet = new Set(selectedIndustries);
+    return marketFilteredItems.filter((item) => selectedIndustrySet.has(getIndustryLabel(item)));
+  }, [marketFilteredItems, selectedIndustries]);
 
   const visibleItems = useMemo(() => {
     if (!activeSort) {
@@ -208,14 +366,22 @@ export const WatchlistBoard: React.FC<WatchlistBoardProps> = ({
   const activeLoading = isAllShareView ? isLoadingAllShares : isLoading;
   const activeError = isAllShareView ? allShareError : loadError;
   const normalizedAllShareQuery = allShareQuery.trim();
-  const gridTemplateClass = 'grid-cols-[minmax(12rem,1.6fr)_minmax(5.5rem,0.7fr)_minmax(5.5rem,0.7fr)_minmax(6rem,0.7fr)_minmax(8rem,1fr)]';
+  const industryFilterActive = selectedIndustries.length > 0;
+  const gridTemplateClass = 'grid-cols-[minmax(12rem,1.45fr)_minmax(7rem,0.7fr)_minmax(5.5rem,0.65fr)_minmax(5.5rem,0.65fr)_minmax(6rem,0.65fr)_minmax(8rem,0.9fr)]';
   const subtitle = isAllShareView
-    ? normalizedAllShareQuery
+    ? normalizedAllShareQuery || industryFilterActive
       ? `匹配 ${visibleItems.length} / 共 ${allShareTotal} 只A股股票`
       : `共 ${allShareTotal} 只A股股票${isLoadingAllShareQuotes ? '，行情加载中' : ''}`
     : items.length > 0
-      ? `共 ${items.length} 只监控股票`
+      ? industryFilterActive
+        ? `匹配 ${visibleItems.length} / 共 ${items.length} 只监控股票`
+        : `共 ${items.length} 只监控股票`
       : '从自选股配置或最近历史生成监控列表';
+  const industryFilterLabel = selectedIndustries.length === 0
+    ? '行业 全部'
+    : selectedIndustries.length === 1
+      ? selectedIndustries[0]
+      : `行业 ${selectedIndustries.length}`;
 
   const toggleSelectionMode = () => {
     setSelectionMode((current) => !current);
@@ -232,6 +398,26 @@ export const WatchlistBoard: React.FC<WatchlistBoardProps> = ({
         [activeBoardTab]: nextSort,
       };
     });
+  };
+
+  const toggleIndustry = (industry: string) => {
+    setSelectedIndustriesByTab((current) => {
+      const currentIndustries = current[activeBoardTab];
+      const nextIndustries = currentIndustries.includes(industry)
+        ? currentIndustries.filter((item) => item !== industry)
+        : [...currentIndustries, industry];
+      return {
+        ...current,
+        [activeBoardTab]: nextIndustries,
+      };
+    });
+  };
+
+  const clearIndustryFilter = () => {
+    setSelectedIndustriesByTab((current) => ({
+      ...current,
+      [activeBoardTab]: [],
+    }));
   };
 
   const renderSortHeader = (field: SortField) => {
@@ -275,6 +461,8 @@ export const WatchlistBoard: React.FC<WatchlistBoardProps> = ({
                       aria-pressed={active}
                       onClick={() => {
                         setActiveBoardTab(tab.key);
+                        setIndustryFilterOpen(false);
+                        setIndustryFilterQuery('');
                         if (tab.key !== 'watchlist') {
                           setSelectionMode(false);
                           onShowAllShares();
@@ -302,6 +490,78 @@ export const WatchlistBoard: React.FC<WatchlistBoardProps> = ({
                   已选 {selectedCodes.size}
                 </Badge>
               ) : null}
+              <div className="relative">
+                <Button
+                  variant="home-action-ai"
+                  size="sm"
+                  disabled={industryOptions.length === 0}
+                  aria-haspopup="menu"
+                  aria-expanded={industryFilterOpen}
+                  onClick={() => setIndustryFilterOpen((current) => !current)}
+                  className="min-w-[7.5rem] max-w-[10rem] justify-start"
+                >
+                  <Filter className="h-4 w-4 shrink-0" />
+                  <span className="min-w-0 truncate">{industryFilterLabel}</span>
+                </Button>
+                {industryFilterOpen ? (
+                  <div
+                    role="menu"
+                    className="absolute right-0 z-30 mt-2 w-64 overflow-hidden rounded-xl border border-subtle bg-elevated/95 shadow-2xl backdrop-blur"
+                  >
+                    <div className="flex items-center justify-between gap-2 border-b border-subtle px-3 py-2">
+                      <span className="text-xs font-semibold text-foreground">行业筛选</span>
+                      <button
+                        type="button"
+                        aria-label="清空行业筛选"
+                        disabled={selectedIndustries.length === 0}
+                        onClick={clearIndustryFilter}
+                        className="inline-flex h-7 items-center gap-1 rounded-md px-2 text-xs text-secondary-text transition-colors hover:bg-hover hover:text-foreground disabled:pointer-events-none disabled:opacity-40"
+                      >
+                        <X className="h-3.5 w-3.5" />
+                        清空
+                      </button>
+                    </div>
+                    <div className="border-b border-subtle px-3 py-2">
+                      <div className="flex h-9 items-center gap-2 rounded-lg border border-subtle bg-surface/80 px-2">
+                        <Search className="h-4 w-4 shrink-0 text-muted-text" />
+                        <input
+                          type="search"
+                          value={industryFilterQuery}
+                          onChange={(event) => setIndustryFilterQuery(event.target.value)}
+                          placeholder="中文 / 拼音首字母"
+                          aria-label="搜索行业"
+                          className="min-w-0 flex-1 bg-transparent text-sm text-foreground outline-none placeholder:text-muted-text"
+                        />
+                      </div>
+                    </div>
+                    <div className="max-h-72 overflow-y-auto p-2">
+                      {visibleIndustryOptions.length === 0 ? (
+                        <div className="px-3 py-6 text-center text-sm text-muted-text">
+                          没有匹配的行业
+                        </div>
+                      ) : visibleIndustryOptions.map((option) => {
+                        const checked = selectedIndustries.includes(option.name);
+                        return (
+                          <label
+                            key={option.name}
+                            className="flex cursor-pointer items-center gap-2 rounded-lg px-2 py-1.5 text-sm text-secondary-text transition-colors hover:bg-hover hover:text-foreground"
+                          >
+                            <input
+                              type="checkbox"
+                              checked={checked}
+                              onChange={() => toggleIndustry(option.name)}
+                              aria-label={`筛选行业 ${option.name}`}
+                              className="h-3.5 w-3.5 rounded border-subtle-hover bg-transparent accent-primary focus:ring-primary/30"
+                            />
+                            <span className="min-w-0 flex-1 truncate">{option.name}</span>
+                            <span className="shrink-0 text-xs text-muted-text">{option.count}</span>
+                          </label>
+                        );
+                      })}
+                    </div>
+                  </div>
+                ) : null}
+              </div>
               {!isAllShareView ? (
                 <Button
                   variant="home-action-ai"
@@ -370,6 +630,7 @@ export const WatchlistBoard: React.FC<WatchlistBoardProps> = ({
 
         <div className={`grid ${gridTemplateClass} items-center gap-4 border-b border-subtle px-4 py-2 text-xs text-muted-text md:px-6`}>
           <span>股票</span>
+          <span>行业</span>
           <span className="flex justify-end">{renderSortHeader('currentPrice')}</span>
           <span className="flex justify-end">{renderSortHeader('changePct')}</span>
           <span className="text-right">指标分析</span>
@@ -390,7 +651,9 @@ export const WatchlistBoard: React.FC<WatchlistBoardProps> = ({
             <EmptyState
               title={isAllShareView ? '暂无匹配的A股股票' : '暂无监控股票'}
               description={
-                isAllShareView
+                industryFilterActive
+                  ? '清空行业筛选，或选择其他行业。'
+                  : isAllShareView
                   ? '换一个股票代码或名称试试。'
                   : '在设置里维护 STOCK_LIST，或先完成一次分析后这里会展示最近关注的股票。'
               }
@@ -401,6 +664,7 @@ export const WatchlistBoard: React.FC<WatchlistBoardProps> = ({
             <div className="divide-y divide-subtle">
               {visibleItems.map((item) => {
                 const stockName = item.stockName || item.stockCode;
+                const industryLabel = item.industry?.trim() || '未分类';
                 const selected = !isAllShareView && selectedCodes.has(item.stockCode);
                 const watchlistCode = item.watchlistCode || item.stockCode;
                 const addingCurrent = addingWatchlistCode === watchlistCode;
@@ -468,6 +732,19 @@ export const WatchlistBoard: React.FC<WatchlistBoardProps> = ({
                           {item.isInWatchlist ? <Check className="h-4 w-4" /> : <Plus className="h-4 w-4" />}
                         </Button>
                       ) : null}
+                    </span>
+
+                    <span className="min-w-0">
+                      <span
+                        title={industryLabel}
+                        className={`inline-block max-w-full truncate rounded-md border px-2 py-1 text-[11px] font-semibold ${
+                          item.industry
+                            ? 'border-cyan/25 bg-cyan/10 text-cyan'
+                            : 'border-border/45 bg-elevated/60 text-muted-text'
+                        }`}
+                      >
+                        {industryLabel}
+                      </span>
                     </span>
 
                     <span className={`text-right text-base font-semibold ${changeClass}`}>

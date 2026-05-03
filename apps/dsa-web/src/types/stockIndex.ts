@@ -33,6 +33,8 @@ export interface StockIndexItem {
   active: boolean;
   /** Popularity */
   popularity?: number;
+  /** THS industry label for A-shares */
+  industry?: string;
 }
 
 /**
@@ -69,6 +71,7 @@ export type StockIndexTuple = [
   AssetType,
   boolean, // active
   number | undefined, // popularity
+  string?, // industry
 ];
 
 /**

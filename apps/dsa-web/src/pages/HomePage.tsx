@@ -13,6 +13,7 @@ import { ReportMarkdown, ReportSummary } from '../components/report';
 import { WatchlistBoard, type WatchlistItem } from '../components/watchlist';
 import { useDashboardLifecycle, useHomeDashboardState } from '../hooks';
 import { useStockIndex } from '../hooks/useStockIndex';
+import type { StockIndexItem } from '../types/stockIndex';
 import { normalizeQuery } from '../utils/normalizeQuery';
 import { getReportText, normalizeReportLanguage } from '../utils/reportLanguage';
 import {
@@ -138,6 +139,22 @@ const HomePage: React.FC = () => {
     return keys;
   }, [watchlistCodes]);
 
+  const stockIndexByLookupKey = useMemo(() => {
+    const map = new Map<string, StockIndexItem>();
+    for (const item of stockIndex) {
+      const keys = [
+        ...getWatchlistLookupKeys(item.canonicalCode),
+        ...getWatchlistLookupKeys(item.displayCode),
+      ];
+      for (const key of keys) {
+        if (!map.has(key)) {
+          map.set(key, item);
+        }
+      }
+    }
+    return map;
+  }, [stockIndex]);
+
   const watchlistItems = useMemo<WatchlistItem[]>(() => {
     const sourceCodes = watchlistCodes.length > 0
       ? watchlistCodes
@@ -153,10 +170,15 @@ const HomePage: React.FC = () => {
       const history = getWatchlistLookupKeys(code)
         .map((key) => latestHistoryByCode.get(key))
         .find((item) => item !== undefined);
+      const lookupKeys = getWatchlistLookupKeys(code)
+        .concat(history?.stockCode ? getWatchlistLookupKeys(history.stockCode) : []);
+      const stockIndexItem = lookupKeys
+        .map((key) => stockIndexByLookupKey.get(key))
+        .find((item) => item !== undefined);
       return {
         stockCode: history?.stockCode || code,
         watchlistCode: code,
-        stockName: history?.stockName,
+        stockName: history?.stockName || stockIndexItem?.nameZh,
         recordId: history?.id,
         currentPrice: history?.currentPrice,
         changePct: history?.changePct,
@@ -165,9 +187,10 @@ const HomePage: React.FC = () => {
         createdAt: history?.createdAt,
         source: watchlistCodes.length > 0 ? 'config' : 'history',
         isInWatchlist: true,
+        industry: stockIndexItem?.industry,
       };
     });
-  }, [historyItems, latestHistoryByCode, watchlistCodes]);
+  }, [historyItems, latestHistoryByCode, stockIndexByLookupKey, watchlistCodes]);
 
   const allShareIndexItems = useMemo(
     () => stockIndex
@@ -213,6 +236,7 @@ const HomePage: React.FC = () => {
           createdAt: history?.createdAt,
           source: 'index',
           isInWatchlist,
+          industry: item.industry,
         };
       });
   }, [allShareIndexItems, allShareQuoteByKey, latestHistoryByCode, query, watchlistLookupSet]);

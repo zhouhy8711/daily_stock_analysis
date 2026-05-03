@@ -21,10 +21,14 @@ from generate_index_from_csv import (
     parse_stock_row,
     determine_market,
     generate_aliases,
+    parse_ths_constituent_codes,
+    parse_ths_industry_links,
+    parse_ths_page_count,
     normalize_name_for_pinyin,
     generate_pinyin,
     compress_index,
     build_stock_index,
+    fetch_ths_industry_map,
     load_tushare_data,
     load_akshare_data,
 )
@@ -281,6 +285,61 @@ class TestAliases:
         assert result == []
 
 
+class TestThsIndustry:
+    """测试同花顺行业解析与映射"""
+
+    def test_parse_ths_industry_links(self):
+        html = '''
+        <a href="http://q.10jqka.com.cn/thshy/detail/code/881155/" target="_blank">银行</a>
+        <a href="http://q.10jqka.com.cn/thshy/detail/code/881121/" target="_blank">半导体</a>
+        '''
+
+        result = parse_ths_industry_links(html)
+
+        assert result == [
+            {'name': '银行', 'code': '881155'},
+            {'name': '半导体', 'code': '881121'},
+        ]
+
+    def test_parse_ths_constituents_and_page_count(self):
+        html = '''
+        <td><a href="http://stockpage.10jqka.com.cn/000001/" target="_blank">000001</a></td>
+        <td><a href="http://stockpage.10jqka.com.cn/000001" target="_blank">平安银行</a></td>
+        <td><a href="http://stockpage.10jqka.com.cn/688699/" target="_blank">688699</a></td>
+        <span class="page_info">1/3</span>
+        '''
+
+        assert parse_ths_constituent_codes(html) == ['000001', '688699']
+        assert parse_ths_page_count(html) == 3
+
+    def test_fetch_ths_industry_map_keeps_first_duplicate(self):
+        pages = {
+            'https://q.10jqka.com.cn/thshy/': '''
+                <a href="http://q.10jqka.com.cn/thshy/detail/code/881155/" target="_blank">银行</a>
+                <a href="http://q.10jqka.com.cn/thshy/detail/code/881121/" target="_blank">半导体</a>
+            ''',
+            'https://q.10jqka.com.cn/thshy/detail/code/881155/page/1/': '''
+                <a href="http://stockpage.10jqka.com.cn/000001/" target="_blank">000001</a>
+                <span class="page_info">1/2</span>
+            ''',
+            'https://q.10jqka.com.cn/thshy/detail/code/881155/page/2/': '''
+                <a href="http://stockpage.10jqka.com.cn/600000/" target="_blank">600000</a>
+            ''',
+            'https://q.10jqka.com.cn/thshy/detail/code/881121/page/1/': '''
+                <a href="http://stockpage.10jqka.com.cn/000001/" target="_blank">000001</a>
+                <a href="http://stockpage.10jqka.com.cn/688699/" target="_blank">688699</a>
+            ''',
+        }
+
+        result = fetch_ths_industry_map(lambda url: pages[url], verbose=False)
+
+        assert result == {
+            '000001': '银行',
+            '600000': '银行',
+            '688699': '半导体',
+        }
+
+
 class TestOutputFormat:
     """测试输出格式"""
 
@@ -297,6 +356,7 @@ class TestOutputFormat:
             "assetType": "stock",
             "active": True,
             "popularity": 100,
+            "industry": "银行",
         }]
 
         compressed = compress_index(index)
@@ -315,24 +375,40 @@ class TestOutputFormat:
         assert item[7] == "stock"          # assetType
         assert item[8] == True             # active
         assert item[9] == 100              # popularity
+        assert item[10] == "银行"          # industry
 
     def test_compress_index_field_count(self):
         """测试压缩格式的字段数量"""
         index = [{
-            "canonicalCode": "AAPL",
-            "displayCode": "AAPL",
-            "nameZh": "Apple Inc.",
+            "canonicalCode": "000001.SZ",
+            "displayCode": "000001",
+            "nameZh": "平安银行",
             "pinyinFull": None,
             "pinyinAbbr": None,
             "aliases": [],
-            "market": "US",
+            "market": "CN",
             "assetType": "stock",
             "active": True,
             "popularity": 100,
         }]
 
         compressed = compress_index(index)
-        assert len(compressed[0]) == 10  # 10个字段
+        assert len(compressed[0]) == 11  # A股保留第11个行业字段
+        assert compressed[0][10] is None
+
+    def test_build_stock_index_merges_ths_industry_for_a_shares(self):
+        """测试 A股索引合并同花顺行业标签"""
+        stocks = [
+            {'ts_code': '000001.SZ', 'symbol': '000001', 'name': '平安银行', 'market': 'CN'},
+            {'ts_code': '832566.BJ', 'symbol': '832566', 'name': '梓橦宫', 'market': 'BSE'},
+            {'ts_code': '00700.HK', 'symbol': '00700', 'name': '腾讯控股', 'market': 'HK'},
+        ]
+
+        index = build_stock_index(stocks, industry_by_code={'000001': '银行', '832566': '中药'})
+
+        assert index[0]['industry'] == '银行'
+        assert index[1]['industry'] == '中药'
+        assert index[2]['industry'] is None
 
     def test_json_serialization(self):
         """测试 JSON 序列化"""
@@ -414,9 +490,12 @@ class TestIntegration:
         # 验证压缩
         assert len(compressed) == 3
 
-        # 验证字段数量
+        # 验证字段数量：A股带可选行业字段，其他市场保持旧 10 字段格式
         for item in compressed:
-            assert len(item) == 10
+            if item[6] in {'CN', 'BSE'}:
+                assert len(item) == 11
+            else:
+                assert len(item) == 10
 
     def test_market_distribution(self, tmp_path):
         """测试市场分布统计"""

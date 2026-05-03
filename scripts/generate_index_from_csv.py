@@ -22,7 +22,9 @@ import re
 import sys
 import unicodedata
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+from typing import Callable, List, Dict, Any, Optional
+
+import requests
 
 # Add the project root to sys.path.
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -34,6 +36,32 @@ except ImportError:
     PYPINYIN_AVAILABLE = False
     print("[Warning] pypinyin not available, pinyin fields will be empty")
     print("[Info] Install with: pip install pypinyin")
+
+
+THS_EXPECTED_INDUSTRIES = (
+    "半导体", "白酒", "白色家电", "保险", "包装印刷", "厨卫电器", "电池", "电机", "电力", "电网设备",
+    "多元金融", "电子化学品", "房地产", "风电设备", "非金属材料", "服装家纺", "纺织制造", "工程机械",
+    "光伏设备", "贵金属", "轨交设备", "港口航运", "公路铁路运输", "钢铁", "光学光电子", "工业金属",
+    "环保设备", "环境治理", "互联网电商", "黑色家电", "化学纤维", "化学原料", "化学制品", "化学制药",
+    "IT服务", "机场航运", "军工电子", "军工装备", "家居用品", "计算机设备", "金属新材料", "教育",
+    "建筑材料", "建筑装饰", "零售", "旅游及酒店", "美容护理", "煤炭开采加工", "贸易", "农产品加工",
+    "农化制品", "能源金属", "汽车服务及其他", "汽车零部件", "汽车整车", "其他电源设备", "其他电子",
+    "其他社会服务", "软件开发", "燃气", "塑料制品", "食品加工制造", "生物制品", "石油加工贸易",
+    "通信服务", "通信设备", "通用设备", "文化传媒", "物流", "消费电子", "小家电", "小金属",
+    "橡胶制品", "元件", "医疗服务", "医疗器械", "饮料制造", "油气开采及服务", "影视院线", "游戏",
+    "银行", "医药商业", "养殖业", "自动化设备", "综合", "证券", "中药", "专用设备", "造纸",
+    "种植业与林业",
+)
+
+THS_INDUSTRY_INDEX_URL = "https://q.10jqka.com.cn/thshy/"
+THS_INDUSTRY_DETAIL_URL = "https://q.10jqka.com.cn/thshy/detail/code/{board_code}/page/{page}/"
+THS_REQUEST_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+    ),
+    "Referer": "https://q.10jqka.com.cn/thshy/",
+}
 
 
 def load_csv_data(csv_path: Path) -> List[Dict[str, Any]]:
@@ -201,6 +229,117 @@ def load_akshare_data(logs_dir: Path) -> List[Dict[str, Any]]:
 
     print(f"    ✓ 共读取 {len(stocks)} 只股票")
     return stocks
+
+
+def fetch_text(url: str, timeout: float = 12.0) -> str:
+    """Fetch a GBK/UTF-8 webpage and return decoded text."""
+    response = requests.get(url, headers=THS_REQUEST_HEADERS, timeout=timeout)
+    response.raise_for_status()
+    response.encoding = response.apparent_encoding or "gbk"
+    return response.text
+
+
+def parse_ths_industry_links(html: str) -> List[Dict[str, str]]:
+    """Parse industry board names and board codes from the THS industry page."""
+    links: List[Dict[str, str]] = []
+    seen_codes = set()
+    pattern = re.compile(
+        r'<a\s+href="[^"]*/thshy/detail/code/(?P<code>\d+)/?"[^>]*>(?P<name>[^<]+)</a>',
+        re.IGNORECASE,
+    )
+    for match in pattern.finditer(html):
+        board_code = match.group("code").strip()
+        name = re.sub(r"\s+", "", match.group("name")).strip()
+        if not board_code or not name or board_code in seen_codes:
+            continue
+        links.append({"name": name, "code": board_code})
+        seen_codes.add(board_code)
+    return links
+
+
+def validate_ths_industry_names(industry_names: List[str]) -> tuple[List[str], List[str]]:
+    """Return missing and unexpected THS industry names compared with the pinned 90-name list."""
+    expected = set(THS_EXPECTED_INDUSTRIES)
+    actual = set(industry_names)
+    missing = sorted(expected - actual)
+    unexpected = sorted(actual - expected)
+    return missing, unexpected
+
+
+def parse_ths_page_count(html: str) -> int:
+    """Parse total page count from a THS constituent page."""
+    match = re.search(r'<span\s+class="page_info">\s*\d+\s*/\s*(\d+)\s*</span>', html)
+    if not match:
+        return 1
+    try:
+        return max(1, int(match.group(1)))
+    except ValueError:
+        return 1
+
+
+def parse_ths_constituent_codes(html: str) -> List[str]:
+    """Parse unique six-digit stock codes from a THS industry constituent page."""
+    codes = re.findall(r"stockpage\.10jqka\.com\.cn/(\d{6})(?:/|\"|')", html)
+    return list(dict.fromkeys(codes))
+
+
+def assign_industry_code(
+    industry_by_code: Dict[str, str],
+    stock_code: str,
+    industry: str,
+    conflicts: List[tuple[str, str, str]],
+) -> None:
+    """Assign the first THS industry found for a stock and record conflicting duplicates."""
+    existing = industry_by_code.get(stock_code)
+    if existing and existing != industry:
+        conflicts.append((stock_code, existing, industry))
+        return
+    industry_by_code.setdefault(stock_code, industry)
+
+
+def fetch_ths_industry_map(
+    fetcher: Callable[[str], str] = fetch_text,
+    *,
+    verbose: bool = True,
+) -> Dict[str, str]:
+    """
+    Fetch THS industry constituents and return a map keyed by six-digit A-share code.
+
+    The fetch happens at index-generation time only. Runtime UI code consumes the static
+    industry field in stocks.index.json and never calls THS directly.
+    """
+    index_html = fetcher(THS_INDUSTRY_INDEX_URL)
+    industry_links = parse_ths_industry_links(index_html)
+    industry_names = [item["name"] for item in industry_links]
+    missing, unexpected = validate_ths_industry_names(industry_names)
+    if verbose and (missing or unexpected):
+        print(
+            "[Warning] 同花顺行业清单与固定 90 类不一致："
+            f"missing={missing or '[]'}, unexpected={unexpected or '[]'}"
+        )
+
+    industry_by_code: Dict[str, str] = {}
+    conflicts: List[tuple[str, str, str]] = []
+    for industry_link in industry_links:
+        industry = industry_link["name"]
+        board_code = industry_link["code"]
+        first_page_url = THS_INDUSTRY_DETAIL_URL.format(board_code=board_code, page=1)
+        first_page_html = fetcher(first_page_url)
+        page_count = parse_ths_page_count(first_page_html)
+        for code in parse_ths_constituent_codes(first_page_html):
+            assign_industry_code(industry_by_code, code, industry, conflicts)
+
+        for page in range(2, page_count + 1):
+            page_url = THS_INDUSTRY_DETAIL_URL.format(board_code=board_code, page=page)
+            page_html = fetcher(page_url)
+            for code in parse_ths_constituent_codes(page_html):
+                assign_industry_code(industry_by_code, code, industry, conflicts)
+
+    if verbose:
+        print(f"      同花顺行业映射：{len(industry_by_code)} 只 A 股")
+        if conflicts:
+            print(f"      [Warning] 发现 {len(conflicts)} 个重复行业归属，已保留首次归属")
+    return industry_by_code
 
 
 def generate_pinyin(name: str) -> tuple:
@@ -476,12 +615,16 @@ def generate_aliases(name: str, market: str) -> List[str]:
     return aliases
 
 
-def build_stock_index(stocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def build_stock_index(
+    stocks: List[Dict[str, Any]],
+    industry_by_code: Optional[Dict[str, str]] = None,
+) -> List[Dict[str, Any]]:
     """
     Build the stock index.
 
     Args:
         stocks: Raw stock rows（已包含 market 字段）
+        industry_by_code: THS industry map keyed by six-digit A-share code
 
     Returns:
         Stock index entries
@@ -503,6 +646,9 @@ def build_stock_index(stocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
         # Generate aliases.
         aliases = generate_aliases(name, market)
+        industry = None
+        if market in {'CN', 'BSE'} and industry_by_code:
+            industry = industry_by_code.get(symbol)
 
         index.append({
             "canonicalCode": ts_code,    # Example: 000001.SZ, AAPL
@@ -515,6 +661,7 @@ def build_stock_index(stocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             "assetType": "stock",
             "active": True,
             "popularity": 100,
+            "industry": industry,
         })
 
     return index
@@ -532,7 +679,7 @@ def compress_index(index: List[Dict[str, Any]]) -> List[List]:
     """
     compressed = []
     for item in index:
-        compressed.append([
+        row = [
             item["canonicalCode"],
             item["displayCode"],
             item["nameZh"],
@@ -543,7 +690,10 @@ def compress_index(index: List[Dict[str, Any]]) -> List[List]:
             item["assetType"],
             item["active"],
             item.get("popularity", 0),
-        ])
+        ]
+        if item.get("industry") is not None or item.get("market") in {"CN", "BSE"}:
+            row.append(item.get("industry"))
+        compressed.append(row)
     return compressed
 
 
@@ -560,6 +710,11 @@ def main():
         '--test', '-t',
         action='store_true',
         help='测试模式：只验证不写入文件'
+    )
+    parser.add_argument(
+        '--skip-industry',
+        action='store_true',
+        help='跳过同花顺行业映射抓取，仅生成基础股票索引'
     )
     args = parser.parse_args()
 
@@ -591,8 +746,18 @@ def main():
         print("\n[提示] 安装 pypinyin 可获得拼音搜索功能：")
         print("       pip install pypinyin")
 
-    print("\n[2/5] 生成索引数据...")
-    index = build_stock_index(stocks)
+    print("\n[2/6] 获取同花顺行业映射...")
+    industry_by_code: Dict[str, str] = {}
+    if args.skip_industry:
+        print("      已跳过行业映射")
+    else:
+        try:
+            industry_by_code = fetch_ths_industry_map()
+        except Exception as exc:
+            print(f"      [Warning] 获取同花顺行业映射失败，将继续生成无行业索引：{exc}")
+
+    print("\n[3/6] 生成索引数据...")
+    index = build_stock_index(stocks, industry_by_code=industry_by_code)
 
     # 输出路径
     output_path = (
@@ -600,15 +765,15 @@ def main():
     )
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    print("\n[3/5] 压缩索引数据...")
+    print("\n[4/6] 压缩索引数据...")
     compressed = compress_index(index)
 
     if args.test:
-        print("\n[4/5] 测试模式：跳过写入文件")
+        print("\n[5/6] 测试模式：跳过写入文件")
         print(f"      输出路径：{output_path}")
 
         # 验证数据
-        print("\n[5/5] 验证数据...")
+        print("\n[6/6] 验证数据...")
         print(f"      压缩前：{len(index)} 条记录")
         print(f"      压缩后：{len(compressed)} 条记录")
 
@@ -618,7 +783,7 @@ def main():
             for i, item in enumerate(compressed[:5]):
                 print(f"        {i + 1}. {item}")
     else:
-        print("\n[4/5] 写入文件：{output_path}")
+        print(f"\n[5/6] 写入文件：{output_path}")
         with open(output_path, 'w', encoding='utf-8') as f:
             f.write('[\n')
             for i, item in enumerate(compressed):
@@ -633,7 +798,7 @@ def main():
         print(f"      文件大小：{file_size / 1024:.2f} KB")
 
         # 验证文件
-        print("\n[5/5] 验证文件...")
+        print("\n[6/6] 验证文件...")
         with open(output_path, 'r', encoding='utf-8') as f:
             test_data = json.load(f)
             print(f"      验证通过：{len(test_data)} 条记录")
