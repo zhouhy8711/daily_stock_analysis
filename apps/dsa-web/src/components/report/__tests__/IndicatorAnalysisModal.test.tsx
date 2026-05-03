@@ -81,6 +81,40 @@ async function flushPromises() {
   });
 }
 
+function installSvgPointerMocks() {
+  const createPointDescriptor = Object.getOwnPropertyDescriptor(SVGSVGElement.prototype, 'createSVGPoint');
+  const screenCtmDescriptor = Object.getOwnPropertyDescriptor(SVGSVGElement.prototype, 'getScreenCTM');
+
+  Object.defineProperty(SVGSVGElement.prototype, 'createSVGPoint', {
+    configurable: true,
+    value: () => {
+      const point = {
+        x: 0,
+        y: 0,
+        matrixTransform: () => ({ x: point.x, y: point.y }),
+      };
+      return point as unknown as SVGPoint;
+    },
+  });
+  Object.defineProperty(SVGSVGElement.prototype, 'getScreenCTM', {
+    configurable: true,
+    value: () => ({ inverse: () => ({}) }) as DOMMatrix,
+  });
+
+  return () => {
+    if (createPointDescriptor) {
+      Object.defineProperty(SVGSVGElement.prototype, 'createSVGPoint', createPointDescriptor);
+    } else {
+      delete (SVGSVGElement.prototype as unknown as Record<string, unknown>).createSVGPoint;
+    }
+    if (screenCtmDescriptor) {
+      Object.defineProperty(SVGSVGElement.prototype, 'getScreenCTM', screenCtmDescriptor);
+    } else {
+      delete (SVGSVGElement.prototype as unknown as Record<string, unknown>).getScreenCTM;
+    }
+  };
+}
+
 describe('IndicatorAnalysisModal', () => {
   beforeEach(() => {
     vi.useFakeTimers();
@@ -312,6 +346,50 @@ describe('IndicatorAnalysisModal', () => {
     expect(screen.queryByTestId('indicator-chart-tooltip')).not.toBeInTheDocument();
 
     unmount();
+  });
+
+  it('lets the indicator tooltip be dragged and resets it when the selected candle changes', async () => {
+    const restoreSvgPointerMocks = installSvgPointerMocks();
+
+    try {
+      const { unmount } = render(
+        <IndicatorAnalysisModal stockCode="600519" stockName="贵州茅台" onClose={vi.fn()} />,
+      );
+      await flushPromises();
+
+      fireEvent.mouseEnter(screen.getByTestId('indicator-chart-bar-2026-04-24'));
+
+      const initialTooltip = screen.getByTestId('indicator-chart-tooltip');
+      const initialTransform = initialTooltip.getAttribute('transform');
+      expect(initialTransform).toBeTruthy();
+
+      fireEvent.pointerDown(initialTooltip, {
+        button: 0,
+        pointerId: 1,
+        clientX: 100,
+        clientY: 100,
+      });
+      fireEvent.pointerMove(window, {
+        pointerId: 1,
+        clientX: 160,
+        clientY: 140,
+      });
+      fireEvent.pointerUp(window, { pointerId: 1 });
+
+      const draggedTransform = screen.getByTestId('indicator-chart-tooltip').getAttribute('transform');
+      expect(draggedTransform).toBeTruthy();
+      expect(draggedTransform).not.toBe(initialTransform);
+
+      fireEvent.keyDown(window, { key: 'ArrowLeft' });
+
+      const resetTooltip = screen.getByTestId('indicator-chart-tooltip');
+      expect(within(resetTooltip).getByText('2026-04-23')).toBeInTheDocument();
+      expect(resetTooltip.getAttribute('transform')).not.toBe(draggedTransform);
+
+      unmount();
+    } finally {
+      restoreSvgPointerMocks();
+    }
   });
 
   it('syncs the chip peak date with the current visible K-line window', async () => {

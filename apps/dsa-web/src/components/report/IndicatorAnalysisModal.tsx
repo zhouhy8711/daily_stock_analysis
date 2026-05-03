@@ -125,6 +125,15 @@ type ChartMenuState = {
   y: number;
 };
 
+type TooltipPlacementKey = 'price' | 'volume' | 'momentum';
+
+type TooltipPosition = {
+  x: number;
+  y: number;
+};
+
+type TooltipPositions = Partial<Record<TooltipPlacementKey, TooltipPosition>>;
+
 type HoverStepDirection = -1 | 1;
 
 type VolumeIndicatorMode = 'volume' | 'amount' | 'volumeMa';
@@ -588,6 +597,89 @@ function formatHolderLabel(holder: MajorHolder): string {
 
 function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value));
+}
+
+function clampTooltipPosition(
+  position: TooltipPosition,
+  tooltipWidth: number,
+  tooltipHeight: number,
+  boundsWidth: number,
+  boundsHeight: number,
+): TooltipPosition {
+  return {
+    x: clamp(position.x, 0, Math.max(boundsWidth - tooltipWidth, 0)),
+    y: clamp(position.y, 0, Math.max(boundsHeight - tooltipHeight, 0)),
+  };
+}
+
+function getSvgPointerPosition(svg: SVGSVGElement, event: Pick<PointerEvent, 'clientX' | 'clientY'>): TooltipPosition | null {
+  const matrix = svg.getScreenCTM();
+  if (matrix && typeof svg.createSVGPoint === 'function') {
+    const point = svg.createSVGPoint();
+    point.x = event.clientX;
+    point.y = event.clientY;
+    const transformed = point.matrixTransform(matrix.inverse());
+    return { x: transformed.x, y: transformed.y };
+  }
+
+  const rect = svg.getBoundingClientRect();
+  const viewBox = svg.viewBox.baseVal;
+  if (rect.width <= 0 || rect.height <= 0 || viewBox.width <= 0 || viewBox.height <= 0) {
+    return null;
+  }
+  return {
+    x: viewBox.x + ((event.clientX - rect.left) / rect.width) * viewBox.width,
+    y: viewBox.y + ((event.clientY - rect.top) / rect.height) * viewBox.height,
+  };
+}
+
+function startTooltipDrag(
+  event: React.PointerEvent<SVGGElement>,
+  currentPosition: TooltipPosition,
+  onPositionChange: (position: TooltipPosition) => void,
+) {
+  if (event.button !== 0) {
+    return;
+  }
+  const svg = event.currentTarget.ownerSVGElement;
+  if (!svg) {
+    return;
+  }
+  const start = getSvgPointerPosition(svg, event);
+  if (!start) {
+    return;
+  }
+
+  const offsetX = start.x - currentPosition.x;
+  const offsetY = start.y - currentPosition.y;
+  event.preventDefault();
+  event.stopPropagation();
+  event.currentTarget.setPointerCapture?.(event.pointerId);
+
+  const handleMove = (moveEvent: PointerEvent) => {
+    const next = getSvgPointerPosition(svg, moveEvent);
+    if (!next) {
+      return;
+    }
+    onPositionChange({
+      x: next.x - offsetX,
+      y: next.y - offsetY,
+    });
+  };
+
+  const stopDragging = () => {
+    window.removeEventListener('pointermove', handleMove);
+    window.removeEventListener('pointerup', stopDragging);
+    window.removeEventListener('pointercancel', stopDragging);
+  };
+
+  window.addEventListener('pointermove', handleMove);
+  window.addEventListener('pointerup', stopDragging);
+  window.addEventListener('pointercancel', stopDragging);
+}
+
+function isTooltipPanelTarget(target: EventTarget | null): boolean {
+  return target instanceof Element && target.closest('[data-indicator-tooltip-panel="true"]') !== null;
 }
 
 function getVisiblePointCount(total: number, zoomLevel: number): number {
@@ -1172,6 +1264,8 @@ const CandlestickChart: React.FC<{
   onStepHoverIndex: (direction: HoverStepDirection) => void;
   onWindowStartChange: (value: number) => void;
   onOpenChartMenu: (event: React.MouseEvent) => void;
+  tooltipPosition?: TooltipPosition;
+  onTooltipPositionChange: (position: TooltipPosition) => void;
   period: KLinePeriod;
   periodLabel: string;
   recentLabel: string;
@@ -1193,6 +1287,8 @@ const CandlestickChart: React.FC<{
   onStepHoverIndex,
   onWindowStartChange,
   onOpenChartMenu,
+  tooltipPosition,
+  onTooltipPositionChange,
   period,
   periodLabel,
   recentLabel,
@@ -1246,6 +1342,13 @@ const CandlestickChart: React.FC<{
   const tooltipHeight = 206;
   const tooltipX = hoveredX > plotRight - tooltipWidth - 18 ? hoveredX - tooltipWidth - 14 : hoveredX + 14;
   const tooltipY = priceTop + 12;
+  const activeTooltipPosition = clampTooltipPosition(
+    tooltipPosition ?? { x: tooltipX, y: tooltipY },
+    tooltipWidth,
+    tooltipHeight,
+    width,
+    chartBottom,
+  );
   const latestCloseY = typeof visibleLast?.close === 'number' ? yForPrice(visibleLast.close) : null;
 
   const shiftWindow = (direction: -1 | 1) => {
@@ -1264,6 +1367,12 @@ const CandlestickChart: React.FC<{
     }
     event.preventDefault();
     onStepHoverIndex(event.button === 3 ? -1 : 1);
+  };
+  const handleTooltipPointerDown = (event: React.PointerEvent<SVGGElement>) => {
+    onHoverPinnedChange(true);
+    startTooltipDrag(event, activeTooltipPosition, (position) => {
+      onTooltipPositionChange(clampTooltipPosition(position, tooltipWidth, tooltipHeight, width, chartBottom));
+    });
   };
 
   return (
@@ -1426,8 +1535,8 @@ const CandlestickChart: React.FC<{
                     setVisibleHoverIndex(index);
                   }
                 }}
-                onMouseLeave={() => {
-                  if (!isHoverPinned) {
+                onMouseLeave={(event) => {
+                  if (!isHoverPinned && !isTooltipPanelTarget(event.relatedTarget)) {
                     onHoverIndexChange(null);
                   }
                 }}
@@ -1451,27 +1560,41 @@ const CandlestickChart: React.FC<{
           })}
 
           {hoveredPoint ? (
-            <g data-testid="indicator-chart-tooltip" pointerEvents="none">
-              <line
-                x1={hoveredX}
-                y1={priceTop}
-                x2={hoveredX}
-                y2={priceTop + priceHeight}
-                stroke={TERMINAL_COLORS.white}
-                strokeDasharray="4 5"
-                strokeWidth="1"
-                opacity="0.45"
-              />
-              <rect
-                x={hoveredX - Math.max(bodyWidth, 8) / 2}
-                y={priceTop}
-                width={Math.max(bodyWidth, 8)}
-                height={priceHeight}
-                fill={TERMINAL_COLORS.cyan}
-                opacity="0.10"
-                rx="3"
-              />
-              <g transform={`translate(${tooltipX}, ${tooltipY})`}>
+            <>
+              <g pointerEvents="none">
+                <line
+                  x1={hoveredX}
+                  y1={priceTop}
+                  x2={hoveredX}
+                  y2={priceTop + priceHeight}
+                  stroke={TERMINAL_COLORS.white}
+                  strokeDasharray="4 5"
+                  strokeWidth="1"
+                  opacity="0.45"
+                />
+                <rect
+                  x={hoveredX - Math.max(bodyWidth, 8) / 2}
+                  y={priceTop}
+                  width={Math.max(bodyWidth, 8)}
+                  height={priceHeight}
+                  fill={TERMINAL_COLORS.cyan}
+                  opacity="0.10"
+                  rx="3"
+                />
+              </g>
+              <g
+                data-testid="indicator-chart-tooltip"
+                data-indicator-tooltip-panel="true"
+                pointerEvents="all"
+                transform={`translate(${activeTooltipPosition.x}, ${activeTooltipPosition.y})`}
+                onPointerDown={handleTooltipPointerDown}
+                onMouseLeave={(event) => {
+                  if (!isHoverPinned && event.buttons !== 1) {
+                    onHoverIndexChange(null);
+                  }
+                }}
+                style={{ cursor: 'move' }}
+              >
                 <rect
                   width={tooltipWidth}
                   height={tooltipHeight}
@@ -1505,7 +1628,7 @@ const CandlestickChart: React.FC<{
                   </g>
                 ))}
               </g>
-            </g>
+            </>
           ) : null}
         </svg>
       </div>
@@ -1568,6 +1691,9 @@ const VolumeActivityChart: React.FC<{
   onHoverPinnedChange: (value: boolean) => void;
   onStepHoverIndex: (direction: HoverStepDirection) => void;
   onOpenChartMenu: (event: React.MouseEvent) => void;
+  tooltipPosition?: TooltipPosition;
+  onTooltipPositionChange: (position: TooltipPosition) => void;
+  onTooltipPositionReset: () => void;
   period: KLinePeriod;
 }> = ({
   points,
@@ -1579,6 +1705,9 @@ const VolumeActivityChart: React.FC<{
   onHoverPinnedChange,
   onStepHoverIndex,
   onOpenChartMenu,
+  tooltipPosition,
+  onTooltipPositionChange,
+  onTooltipPositionReset,
   period,
 }) => {
   const [mode, setMode] = useState<VolumeIndicatorMode>('volume');
@@ -1632,7 +1761,16 @@ const VolumeActivityChart: React.FC<{
     : null;
   const hoveredPoint = hoveredVisibleIndex === null ? null : visible[hoveredVisibleIndex];
   const hoveredX = hoveredVisibleIndex === null ? 0 : hoveredVisibleIndex * step;
-  const tooltipX = hoveredX > plotRight - 236 ? hoveredX - 222 : hoveredX + 12;
+  const tooltipWidth = 210;
+  const tooltipHeight = 108;
+  const tooltipX = hoveredX > plotRight - tooltipWidth - 26 ? hoveredX - tooltipWidth - 12 : hoveredX + 12;
+  const activeTooltipPosition = clampTooltipPosition(
+    tooltipPosition ?? { x: tooltipX, y: top + 12 },
+    tooltipWidth,
+    tooltipHeight,
+    width,
+    bottom,
+  );
   const latest = visible.at(-1);
   const setVisibleHoverIndex = (index: number) => {
     onHoverIndexChange(visibleStartIndex + index);
@@ -1643,6 +1781,12 @@ const VolumeActivityChart: React.FC<{
     }
     event.preventDefault();
     onStepHoverIndex(event.button === 3 ? -1 : 1);
+  };
+  const handleTooltipPointerDown = (event: React.PointerEvent<SVGGElement>) => {
+    onHoverPinnedChange(true);
+    startTooltipDrag(event, activeTooltipPosition, (position) => {
+      onTooltipPositionChange(clampTooltipPosition(position, tooltipWidth, tooltipHeight, width, bottom));
+    });
   };
 
   return (
@@ -1744,8 +1888,8 @@ const VolumeActivityChart: React.FC<{
                     setVisibleHoverIndex(index);
                   }
                 }}
-                onMouseLeave={() => {
-                  if (!isHoverPinned) {
+                onMouseLeave={(event) => {
+                  if (!isHoverPinned && !isTooltipPanelTarget(event.relatedTarget)) {
                     onHoverIndexChange(null);
                   }
                 }}
@@ -1769,10 +1913,24 @@ const VolumeActivityChart: React.FC<{
           })}
 
           {hoveredPoint ? (
-            <g data-testid="indicator-volume-tooltip" pointerEvents="none">
-              <line x1={hoveredX} y1={top} x2={hoveredX} y2={top + height} stroke={TERMINAL_COLORS.white} strokeDasharray="4 5" opacity="0.45" />
-              <g transform={`translate(${tooltipX}, ${top + 12})`}>
-                <rect width="210" height="108" rx="4" fill={TERMINAL_COLORS.tooltipBg} stroke={TERMINAL_COLORS.tooltipBorder} opacity="0.96" />
+            <>
+              <g pointerEvents="none">
+                <line x1={hoveredX} y1={top} x2={hoveredX} y2={top + height} stroke={TERMINAL_COLORS.white} strokeDasharray="4 5" opacity="0.45" />
+              </g>
+              <g
+                data-testid="indicator-volume-tooltip"
+                data-indicator-tooltip-panel="true"
+                pointerEvents="all"
+                transform={`translate(${activeTooltipPosition.x}, ${activeTooltipPosition.y})`}
+                onPointerDown={handleTooltipPointerDown}
+                onMouseLeave={(event) => {
+                  if (!isHoverPinned && event.buttons !== 1) {
+                    onHoverIndexChange(null);
+                  }
+                }}
+                style={{ cursor: 'move' }}
+              >
+                <rect width={tooltipWidth} height={tooltipHeight} rx="4" fill={TERMINAL_COLORS.tooltipBg} stroke={TERMINAL_COLORS.tooltipBorder} opacity="0.96" />
                 <text x="12" y="22" fill={TERMINAL_COLORS.yellow} className="text-[12px] font-semibold">{hoveredPoint.date}</text>
                 {[
                   ['成交量', formatCompactNumber(hoveredPoint.volume)],
@@ -1786,14 +1944,20 @@ const VolumeActivityChart: React.FC<{
                   </g>
                 ))}
               </g>
-            </g>
+            </>
           ) : null}
         </svg>
       </div>
       <TerminalTabs
         labels={tabs.map((tab) => tab.label)}
         activeIndex={Math.max(tabs.findIndex((tab) => tab.mode === activeMode), 0)}
-        onSelect={(index) => setMode(tabs[index]?.mode ?? 'volume')}
+        onSelect={(index) => {
+          const nextMode = tabs[index]?.mode ?? 'volume';
+          if (nextMode !== activeMode) {
+            onTooltipPositionReset();
+          }
+          setMode(nextMode);
+        }}
       />
     </div>
   );
@@ -1809,6 +1973,9 @@ const MacdSignalChart: React.FC<{
   onHoverPinnedChange: (value: boolean) => void;
   onStepHoverIndex: (direction: HoverStepDirection) => void;
   onOpenChartMenu: (event: React.MouseEvent) => void;
+  tooltipPosition?: TooltipPosition;
+  onTooltipPositionChange: (position: TooltipPosition) => void;
+  onTooltipPositionReset: () => void;
   period: KLinePeriod;
 }> = ({
   points,
@@ -1820,6 +1987,9 @@ const MacdSignalChart: React.FC<{
   onHoverPinnedChange,
   onStepHoverIndex,
   onOpenChartMenu,
+  tooltipPosition,
+  onTooltipPositionChange,
+  onTooltipPositionReset,
   period,
 }) => {
   const [mode, setMode] = useState<MomentumIndicatorMode>('macd');
@@ -1861,7 +2031,16 @@ const MacdSignalChart: React.FC<{
     : null;
   const hoveredX = hoveredVisibleIndex === null ? 0 : hoveredVisibleIndex * step;
   const hoveredPoint = hoveredVisibleIndex === null ? null : visible[hoveredVisibleIndex];
-  const tooltipX = hoveredX > plotRight - 218 ? hoveredX - 204 : hoveredX + 12;
+  const tooltipWidth = 192;
+  const tooltipHeight = 92;
+  const tooltipX = hoveredX > plotRight - tooltipWidth - 26 ? hoveredX - tooltipWidth - 12 : hoveredX + 12;
+  const activeTooltipPosition = clampTooltipPosition(
+    tooltipPosition ?? { x: tooltipX, y: top + 8 },
+    tooltipWidth,
+    tooltipHeight,
+    width,
+    bottom,
+  );
   const setVisibleHoverIndex = (index: number) => {
     onHoverIndexChange(visibleStartIndex + index);
   };
@@ -1871,6 +2050,12 @@ const MacdSignalChart: React.FC<{
     }
     event.preventDefault();
     onStepHoverIndex(event.button === 3 ? -1 : 1);
+  };
+  const handleTooltipPointerDown = (event: React.PointerEvent<SVGGElement>) => {
+    onHoverPinnedChange(true);
+    startTooltipDrag(event, activeTooltipPosition, (position) => {
+      onTooltipPositionChange(clampTooltipPosition(position, tooltipWidth, tooltipHeight, width, bottom));
+    });
   };
 
   return (
@@ -1971,8 +2156,8 @@ const MacdSignalChart: React.FC<{
                     setVisibleHoverIndex(index);
                   }
                 }}
-                onMouseLeave={() => {
-                  if (!isHoverPinned) {
+                onMouseLeave={(event) => {
+                  if (!isHoverPinned && !isTooltipPanelTarget(event.relatedTarget)) {
                     onHoverIndexChange(null);
                   }
                 }}
@@ -1994,12 +2179,37 @@ const MacdSignalChart: React.FC<{
               />
             );
           })}
+          {activeMode === 'macd' ? (
+            <>
+              <path d={difPath} fill="none" stroke={TERMINAL_COLORS.yellow} strokeWidth="2" pointerEvents="none" />
+              <path d={deaPath} fill="none" stroke={TERMINAL_COLORS.purple} strokeWidth="2" pointerEvents="none" />
+              <path d={rsi6Path} fill="none" stroke={TERMINAL_COLORS.green} strokeWidth="1.5" opacity="0.9" pointerEvents="none" />
+              <path d={rsi12Path} fill="none" stroke={TERMINAL_COLORS.blue} strokeWidth="1.5" opacity="0.9" pointerEvents="none" />
+            </>
+          ) : (
+            <>
+              <path d={rsi6Path} fill="none" stroke={TERMINAL_COLORS.green} strokeWidth="2" pointerEvents="none" />
+              <path d={rsi12Path} fill="none" stroke={TERMINAL_COLORS.blue} strokeWidth="2" pointerEvents="none" />
+            </>
+          )}
           {hoveredVisibleIndex !== null ? (
-            <line x1={hoveredX} y1={top} x2={hoveredX} y2={top + height} stroke={TERMINAL_COLORS.white} strokeDasharray="4 5" opacity="0.45" />
+            <line x1={hoveredX} y1={top} x2={hoveredX} y2={top + height} stroke={TERMINAL_COLORS.white} strokeDasharray="4 5" opacity="0.45" pointerEvents="none" />
           ) : null}
           {hoveredPoint ? (
-            <g data-testid="indicator-momentum-tooltip" pointerEvents="none" transform={`translate(${tooltipX}, ${top + 8})`}>
-              <rect width="192" height="92" rx="4" fill={TERMINAL_COLORS.tooltipBg} stroke={TERMINAL_COLORS.tooltipBorder} opacity="0.96" />
+            <g
+              data-testid="indicator-momentum-tooltip"
+              data-indicator-tooltip-panel="true"
+              pointerEvents="all"
+              transform={`translate(${activeTooltipPosition.x}, ${activeTooltipPosition.y})`}
+              onPointerDown={handleTooltipPointerDown}
+              onMouseLeave={(event) => {
+                if (!isHoverPinned && event.buttons !== 1) {
+                  onHoverIndexChange(null);
+                }
+              }}
+              style={{ cursor: 'move' }}
+            >
+              <rect width={tooltipWidth} height={tooltipHeight} rx="4" fill={TERMINAL_COLORS.tooltipBg} stroke={TERMINAL_COLORS.tooltipBorder} opacity="0.96" />
               <text x="12" y="21" fill={TERMINAL_COLORS.yellow} className="text-[12px] font-semibold">{hoveredPoint.date}</text>
               {(activeMode === 'rsi'
                 ? [
@@ -2019,25 +2229,18 @@ const MacdSignalChart: React.FC<{
               ))}
             </g>
           ) : null}
-          {activeMode === 'macd' ? (
-            <>
-              <path d={difPath} fill="none" stroke={TERMINAL_COLORS.yellow} strokeWidth="2" />
-              <path d={deaPath} fill="none" stroke={TERMINAL_COLORS.purple} strokeWidth="2" />
-              <path d={rsi6Path} fill="none" stroke={TERMINAL_COLORS.green} strokeWidth="1.5" opacity="0.9" />
-              <path d={rsi12Path} fill="none" stroke={TERMINAL_COLORS.blue} strokeWidth="1.5" opacity="0.9" />
-            </>
-          ) : (
-            <>
-              <path d={rsi6Path} fill="none" stroke={TERMINAL_COLORS.green} strokeWidth="2" />
-              <path d={rsi12Path} fill="none" stroke={TERMINAL_COLORS.blue} strokeWidth="2" />
-            </>
-          )}
         </svg>
       </div>
       <TerminalTabs
         labels={tabs.map((tab) => tab.label)}
         activeIndex={Math.max(tabs.findIndex((tab) => tab.mode === activeMode), 0)}
-        onSelect={(index) => setMode(tabs[index]?.mode ?? 'macd')}
+        onSelect={(index) => {
+          const nextMode = tabs[index]?.mode ?? 'macd';
+          if (nextMode !== activeMode) {
+            onTooltipPositionReset();
+          }
+          setMode(nextMode);
+        }}
       />
     </div>
   );
@@ -2775,6 +2978,7 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
   const [timelineZoom, setTimelineZoom] = useState(0);
   const [windowStart, setWindowStart] = useState(0);
   const [chartMenu, setChartMenu] = useState<ChartMenuState | null>(null);
+  const [tooltipPositions, setTooltipPositions] = useState<TooltipPositions>({});
   const [historyCache, setHistoryCache] = useState<HistoryCache>(() => ({
     daily: createHistoryState(stockCode, 'daily'),
   }));
@@ -2783,10 +2987,22 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
   const selectedRefreshTokenRef = useRef<string | null>(null);
   const marketKind = useMemo(() => getMarketKind(stockCode), [stockCode]);
 
+  const resetTooltipPositions = useCallback(() => {
+    setTooltipPositions((current) => (Object.keys(current).length === 0 ? current : {}));
+  }, []);
+
+  const setTooltipPosition = useCallback((key: TooltipPlacementKey, position: TooltipPosition) => {
+    setTooltipPositions((current) => ({
+      ...current,
+      [key]: position,
+    }));
+  }, []);
+
   const handlePeriodChange = useCallback((period: KLinePeriod) => {
+    resetTooltipPositions();
     selectedRefreshTokenRef.current = null;
     setSelectedPeriod(period);
-  }, []);
+  }, [resetTooltipPositions]);
 
   useEffect(() => {
     setSelectedPeriod('daily');
@@ -2795,13 +3011,15 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
     setTimelineZoom(0);
     setWindowStart(0);
     setChartMenu(null);
-  }, [stockCode]);
+    resetTooltipPositions();
+  }, [resetTooltipPositions, stockCode]);
 
   useEffect(() => {
     setHoveredIndex(null);
     setIsHoverPinned(false);
     setChartMenu(null);
-  }, [selectedPeriod]);
+    resetTooltipPositions();
+  }, [resetTooltipPositions, selectedPeriod]);
 
   useEffect(() => {
     if (!chartMenu) {
@@ -2823,6 +3041,7 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
       }
       if (isHoverPinned) {
         event.preventDefault();
+        resetTooltipPositions();
         setIsHoverPinned(false);
         setHoveredIndex(null);
         return;
@@ -2834,7 +3053,7 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [isHoverPinned, onClose]);
+  }, [isHoverPinned, onClose, resetTooltipPositions]);
 
   useEffect(() => {
     let ignore = false;
@@ -3161,7 +3380,18 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
   const maxWindowStart = Math.max(points.length - visibleCount, 0);
   const safeWindowStart = clamp(windowStart, 0, maxWindowStart);
   const visiblePoints = points.slice(safeWindowStart, safeWindowStart + visibleCount);
+  const handleHoverIndexChange = useCallback((index: number | null) => {
+    if (hoveredIndex !== index) {
+      resetTooltipPositions();
+    }
+    setHoveredIndex(index);
+  }, [hoveredIndex, resetTooltipPositions]);
+  const handleWindowStartChange = useCallback((value: number) => {
+    resetTooltipPositions();
+    setWindowStart(value);
+  }, [resetTooltipPositions]);
   const stepHoverIndex = useCallback((direction: HoverStepDirection) => {
+    resetTooltipPositions();
     if (points.length === 0) {
       setHoveredIndex(null);
       setIsHoverPinned(false);
@@ -3175,7 +3405,16 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
     });
     setIsHoverPinned(true);
     setChartMenu(null);
-  }, [points.length]);
+  }, [points.length, resetTooltipPositions]);
+  const setPriceTooltipPosition = useCallback((position: TooltipPosition) => {
+    setTooltipPosition('price', position);
+  }, [setTooltipPosition]);
+  const setVolumeTooltipPosition = useCallback((position: TooltipPosition) => {
+    setTooltipPosition('volume', position);
+  }, [setTooltipPosition]);
+  const setMomentumTooltipPosition = useCallback((position: TooltipPosition) => {
+    setTooltipPosition('momentum', position);
+  }, [setTooltipPosition]);
   const safeHoveredIndex = hoveredIndex !== null && hoveredIndex >= 0 && hoveredIndex < points.length ? hoveredIndex : null;
   const latest = points.at(-1);
   const displayVolume = quote?.volume ?? latest?.volume;
@@ -3195,8 +3434,9 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
   const modal = variant === 'modal';
 
   useEffect(() => {
+    resetTooltipPositions();
     setWindowStart(maxWindowStart);
-  }, [effectivePeriod, stockCode, points.length, visibleCount, maxWindowStart]);
+  }, [effectivePeriod, maxWindowStart, points.length, resetTooltipPositions, stockCode, visibleCount]);
 
   useEffect(() => {
     if (hoveredIndex === null) {
@@ -3225,6 +3465,7 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
   };
 
   const adjustTimelineZoom = (delta: number) => {
+    resetTooltipPositions();
     setTimelineZoom((current) => clamp(current + delta, -1, 4));
     setIsHoverPinned(false);
     setHoveredIndex(null);
@@ -3291,11 +3532,13 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
                       maxWindowStart={maxWindowStart}
                       hoveredIndex={safeHoveredIndex}
                       isHoverPinned={isHoverPinned}
-                      onHoverIndexChange={setHoveredIndex}
+                      onHoverIndexChange={handleHoverIndexChange}
                       onHoverPinnedChange={setIsHoverPinned}
                       onStepHoverIndex={stepHoverIndex}
-                      onWindowStartChange={setWindowStart}
+                      onWindowStartChange={handleWindowStartChange}
                       onOpenChartMenu={openChartMenu}
+                      tooltipPosition={tooltipPositions.price}
+                      onTooltipPositionChange={setPriceTooltipPosition}
                       period={effectivePeriod}
                       periodLabel={periodMeta.label}
                       recentLabel={periodMeta.recentLabel}
@@ -3316,10 +3559,13 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
                       visibleStartIndex={safeWindowStart}
                       hoveredIndex={safeHoveredIndex}
                       isHoverPinned={isHoverPinned}
-                      onHoverIndexChange={setHoveredIndex}
+                      onHoverIndexChange={handleHoverIndexChange}
                       onHoverPinnedChange={setIsHoverPinned}
                       onStepHoverIndex={stepHoverIndex}
                       onOpenChartMenu={openChartMenu}
+                      tooltipPosition={tooltipPositions.volume}
+                      onTooltipPositionChange={setVolumeTooltipPosition}
+                      onTooltipPositionReset={resetTooltipPositions}
                       period={effectivePeriod}
                     />
                   </section>
@@ -3334,10 +3580,13 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
                       visibleStartIndex={safeWindowStart}
                       hoveredIndex={safeHoveredIndex}
                       isHoverPinned={isHoverPinned}
-                      onHoverIndexChange={setHoveredIndex}
+                      onHoverIndexChange={handleHoverIndexChange}
                       onHoverPinnedChange={setIsHoverPinned}
                       onStepHoverIndex={stepHoverIndex}
                       onOpenChartMenu={openChartMenu}
+                      tooltipPosition={tooltipPositions.momentum}
+                      onTooltipPositionChange={setMomentumTooltipPosition}
+                      onTooltipPositionReset={resetTooltipPositions}
                       period={effectivePeriod}
                     />
                   </section>
@@ -3400,6 +3649,7 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
             type="button"
             className="block w-full px-3 py-1.5 text-left hover:bg-white/10"
             onClick={() => {
+              resetTooltipPositions();
               setTimelineZoom(0);
               setIsHoverPinned(false);
               setHoveredIndex(null);
