@@ -8,6 +8,7 @@ import type {
   RuleItem,
   RuleMatchItem,
   RuleMetricItem,
+  RuleRunMode,
   RuleRunResponse,
   RuleUpdatePayload,
   RuleValueExpression,
@@ -180,10 +181,12 @@ function serializePayload(payload: RuleCreatePayload | RuleUpdatePayload): Recor
 function normalizeMatch(raw: Record<string, unknown>): RuleMatchItem {
   const matchedGroups = raw.matched_groups ?? raw.matchedGroups;
   const matchedDates = raw.matched_dates ?? raw.matchedDates;
+  const matchedEvents = raw.matched_events ?? raw.matchedEvents;
   return {
     stockCode: toString(raw.stock_code ?? raw.stockCode),
     stockName: toNullableString(raw.stock_name ?? raw.stockName),
     matchedDates: toStringArray(matchedDates),
+    matchedEvents: Array.isArray(matchedEvents) ? matchedEvents as Array<Record<string, unknown>> : [],
     matchedGroups: Array.isArray(matchedGroups) ? matchedGroups as Array<Record<string, unknown>> : [],
     snapshot: raw.snapshot && typeof raw.snapshot === 'object'
       ? raw.snapshot as Record<string, unknown>
@@ -228,9 +231,10 @@ export const rulesApi = {
     await apiClient.delete(`/api/v1/rules/${encodeURIComponent(String(ruleId))}`);
   },
 
-  async run(ruleId: number): Promise<RuleRunResponse> {
+  async run(ruleId: number, payload?: { mode?: RuleRunMode }): Promise<RuleRunResponse> {
     const response = await apiClient.post<Record<string, unknown>>(
       `/api/v1/rules/${encodeURIComponent(String(ruleId))}/run`,
+      payload ?? {},
     );
     const rawMatches = Array.isArray(response.data.matches) ? response.data.matches : [];
     return {
@@ -239,6 +243,8 @@ export const rulesApi = {
       status: toString(response.data.status),
       targetCount: toNumber(response.data.target_count ?? response.data.targetCount),
       matchCount: toNumber(response.data.match_count ?? response.data.matchCount),
+      eventCount: toNumber(response.data.event_count ?? response.data.eventCount),
+      mode: toString(response.data.mode || payload?.mode || 'history'),
       durationMs: toNumber(response.data.duration_ms ?? response.data.durationMs),
       matches: (rawMatches as Array<Record<string, unknown>>).map(normalizeMatch),
       errors: Array.isArray(response.data.errors) ? response.data.errors.map(toString) : [],

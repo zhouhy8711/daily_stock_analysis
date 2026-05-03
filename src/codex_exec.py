@@ -22,13 +22,16 @@ DEFAULT_CODEX_EXEC_ARGS = (
     "--ignore-user-config --ignore-rules --skip-git-repo-check --ephemeral "
     "--disable plugins --disable apps --disable browser_use --disable computer_use "
     "--disable in_app_browser --disable shell_tool --disable tool_search "
-    "--disable web_search_cached --disable web_search_request --disable general_analytics "
+    "--disable web_search_cached --disable web_search_request "
     "-c 'model_reasoning_effort=\"low\"' -c 'support_websocket=false'"
 )
 DEFAULT_CODEX_AGENT_ARGS = "--dangerously-bypass-approvals-and-sandbox"
 DEFAULT_CODEX_EXEC_TIMEOUT_SECONDS = 180
 DEFAULT_CODEX_AGENT_TIMEOUT_SECONDS = 600
 DEFAULT_CODEX_AGENT_BACKGROUND_TIMEOUT_SECONDS = 7200
+
+_LEGACY_CODEX_FEATURE_FLAGS = {"general_analytics"}
+_CODEX_FEATURE_FLAG_OPTIONS = {"--disable", "--enable"}
 
 _COMPLETION_GUARD = """IMPORTANT:
 You are being used as a plain LLM completion backend for another application, not as a coding agent.
@@ -85,6 +88,32 @@ def _content_to_text(content: Any) -> str:
     if isinstance(content, str):
         return content
     return json.dumps(content, ensure_ascii=False)
+
+
+def _strip_legacy_codex_feature_args(args: List[str]) -> List[str]:
+    """Drop feature flags that older DSA config examples used but current Codex rejects."""
+    filtered: List[str] = []
+    skip_next = False
+    for index, arg in enumerate(args):
+        if skip_next:
+            skip_next = False
+            continue
+
+        if (
+            arg in _CODEX_FEATURE_FLAG_OPTIONS
+            and index + 1 < len(args)
+            and args[index + 1] in _LEGACY_CODEX_FEATURE_FLAGS
+        ):
+            skip_next = True
+            continue
+
+        option, separator, value = arg.partition("=")
+        if separator and option in _CODEX_FEATURE_FLAG_OPTIONS and value in _LEGACY_CODEX_FEATURE_FLAGS:
+            continue
+
+        filtered.append(arg)
+
+    return filtered
 
 
 class CodexExecClient:
@@ -179,7 +208,7 @@ class CodexExecClient:
         if command_parts[-1] != "exec":
             command_parts.append("exec")
 
-        arg_parts = shlex.split(extra_args)
+        arg_parts = _strip_legacy_codex_feature_args(shlex.split(extra_args))
         with tempfile.NamedTemporaryFile(prefix="dsa-codex-", suffix=".txt", delete=False) as tmp_file:
             output_path = Path(tmp_file.name)
 

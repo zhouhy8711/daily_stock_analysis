@@ -64,7 +64,7 @@ If Codex CLI is installed and authenticated locally, the project can call models
 ```env
 CODEX_EXEC_ENABLED=true
 CODEX_EXEC_MODEL=gpt-5.4
-CODEX_EXEC_ARGS=--dangerously-bypass-approvals-and-sandbox --ignore-user-config --ignore-rules --skip-git-repo-check --ephemeral --disable plugins --disable apps --disable browser_use --disable computer_use --disable in_app_browser --disable shell_tool --disable tool_search --disable web_search_cached --disable web_search_request --disable general_analytics -c 'model_reasoning_effort="low"' -c 'support_websocket=false'
+CODEX_EXEC_ARGS=--dangerously-bypass-approvals-and-sandbox --ignore-user-config --ignore-rules --skip-git-repo-check --ephemeral --disable plugins --disable apps --disable browser_use --disable computer_use --disable in_app_browser --disable shell_tool --disable tool_search --disable web_search_cached --disable web_search_request -c 'model_reasoning_effort="low"' -c 'support_websocket=false'
 CODEX_EXEC_AGENT_ARGS=--dangerously-bypass-approvals-and-sandbox
 CODEX_EXEC_TIMEOUT_SECONDS=180
 CODEX_EXEC_AGENT_TIMEOUT_SECONDS=600
@@ -86,6 +86,7 @@ codex exec --dangerously-bypass-approvals-and-sandbox -m gpt-5.4 "What model are
 Optional settings:
 - `CODEX_EXEC_COMMAND`: defaults to `codex`; set it only when the binary is not on PATH.
 - `CODEX_EXEC_ARGS`: defaults to `--dangerously-bypass-approvals-and-sandbox` plus isolation flags for user config, project rules, plugins, and tools, so analysis prompts are not treated as full Codex agent tasks. You can replace it with other Codex CLI sandbox flags.
+- If an older config contains `--disable general_analytics`, remove it; runtime calls also filter that deprecated Codex CLI feature flag for compatibility.
 - `CODEX_EXEC_AGENT_ARGS`: arguments used when Agent Q&A runs a selected custom Codex skill. The default only adds `--dangerously-bypass-approvals-and-sandbox`, preserving local Codex skills, web search, and tools so behavior stays close to invoking the skill directly in Codex.
 - `CODEX_EXEC_TIMEOUT_SECONDS`: timeout for regular isolated Codex CLI completion calls, default 180 seconds.
 - `CODEX_EXEC_AGENT_TIMEOUT_SECONDS`: timeout for Agent Q&A requests that run through Codex CLI, default 600 seconds, intended for custom skills that may search the web and prepare supporting material.

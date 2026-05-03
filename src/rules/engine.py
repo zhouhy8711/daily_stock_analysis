@@ -267,6 +267,7 @@ def _evaluate_new_high_low(df: pd.DataFrame, condition: Dict[str, Any], index: i
 
 
 def evaluate_condition(df: pd.DataFrame, condition: Dict[str, Any], index: int) -> Dict[str, Any]:
+    left_expr = condition.get("left") or {}
     operator = str(condition.get("operator") or "")
     if operator == "consecutive":
         matched, explanation, values = _evaluate_consecutive(df, condition, index)
@@ -280,6 +281,8 @@ def evaluate_condition(df: pd.DataFrame, condition: Dict[str, Any], index: int) 
         matched, explanation, values = _evaluate_basic(df, condition, index)
     return {
         "id": condition.get("id"),
+        "left_metric": left_expr.get("metric"),
+        "operator": operator,
         "matched": matched,
         "explanation": explanation,
         "values": values,
@@ -348,6 +351,7 @@ def evaluate_rule_history(definition: Dict[str, Any], metric_frame: pd.DataFrame
             "date": str(row.get("date") or index),
             "index": index,
             "matched_groups": result.get("matched_groups") or [],
+            "condition_results": result.get("condition_results") or [],
             "snapshot": result.get("snapshot") or {},
         })
     return events

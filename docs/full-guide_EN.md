@@ -772,7 +772,7 @@ For local or self-hosted environments where Codex CLI is installed and authentic
 ```env
 CODEX_EXEC_ENABLED=true
 CODEX_EXEC_MODEL=gpt-5.4
-CODEX_EXEC_ARGS=--dangerously-bypass-approvals-and-sandbox --ignore-user-config --ignore-rules --skip-git-repo-check --ephemeral --disable plugins --disable apps --disable browser_use --disable computer_use --disable in_app_browser --disable shell_tool --disable tool_search --disable web_search_cached --disable web_search_request --disable general_analytics -c 'model_reasoning_effort="low"' -c 'support_websocket=false'
+CODEX_EXEC_ARGS=--dangerously-bypass-approvals-and-sandbox --ignore-user-config --ignore-rules --skip-git-repo-check --ephemeral --disable plugins --disable apps --disable browser_use --disable computer_use --disable in_app_browser --disable shell_tool --disable tool_search --disable web_search_cached --disable web_search_request -c 'model_reasoning_effort="low"' -c 'support_websocket=false'
 CODEX_EXEC_AGENT_ARGS=--dangerously-bypass-approvals-and-sandbox
 CODEX_EXEC_TIMEOUT_SECONDS=180
 CODEX_EXEC_AGENT_TIMEOUT_SECONDS=600

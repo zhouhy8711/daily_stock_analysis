@@ -314,6 +314,87 @@ def test_rule_engine_uses_dated_chip_snapshots_for_history_matches():
     events = evaluate_rule_history(definition, frame)
 
     assert [event["date"] for event in events] == ["2026-04-03"]
+    assert events[0]["matched_groups"][0]["conditions"][0]["left_metric"] == "profit_ratio"
+
+
+class _FakeRuleRepo:
+    def __init__(self, rule):
+        self.rule = rule
+        self.finished_matches = None
+
+    def get_rule(self, rule_id):
+        return self.rule if rule_id == self.rule["id"] else None
+
+    def create_run(self, rule_id, target_count):
+        return 101
+
+    def finish_run(self, **kwargs):
+        self.finished_matches = kwargs["matches"]
+        return len(kwargs["matches"]), 12
+
+
+class _FakeStockService:
+    def get_history_data(self, stock_code, period="daily", days=30):
+        return {
+            "stock_code": stock_code,
+            "stock_name": "测试股票",
+            "period": period,
+            "data": [
+                {"date": "2026-04-01", "open": 10, "high": 11, "low": 9, "close": 10, "volume": 1000, "amount": 10000, "pct_chg": 0},
+                {"date": "2026-04-02", "open": 10, "high": 16, "low": 10, "close": 15, "volume": 3000, "amount": 45000, "pct_chg": 50},
+                {"date": "2026-04-03", "open": 15, "high": 15, "low": 9, "close": 10, "volume": 1200, "amount": 12000, "pct_chg": -33.33},
+            ],
+        }
+
+    def get_realtime_quote(self, stock_code):
+        return None
+
+    def get_indicator_metrics(self, stock_code):
+        return {}
+
+
+def _service_rule_for_run_mode():
+    return {
+        "id": 1,
+        "name": "测试规则",
+        "lookback_days": 36500,
+        "definition": {
+            "period": "daily",
+            "lookback_days": 36500,
+            "target": {"scope": "custom", "stock_codes": ["600519"]},
+            "groups": [
+                {
+                    "id": "g1",
+                    "conditions": [
+                        {
+                            "id": "c1",
+                            "left": {"metric": "close", "offset": 0},
+                            "operator": ">",
+                            "right": {"type": "literal", "value": 12},
+                        }
+                    ],
+                }
+            ],
+        },
+    }
+
+
+def test_rule_service_run_modes_separate_latest_from_history():
+    repo = _FakeRuleRepo(_service_rule_for_run_mode())
+    service = RuleService(repo=repo, stock_service=_FakeStockService())
+
+    latest_result = service.run_rule(1, mode="latest")
+    history_result = service.run_rule(1, mode="history")
+
+    assert latest_result["mode"] == "latest"
+    assert latest_result["match_count"] == 0
+    assert latest_result["event_count"] == 0
+    assert history_result["mode"] == "history"
+    assert history_result["match_count"] == 1
+    assert history_result["event_count"] == 1
+    assert history_result["matches"][0]["matched_dates"] == ["2026-04-02"]
+    assert history_result["matches"][0]["matched_events"][0]["date"] == "2026-04-02"
+    assert history_result["matches"][0]["matched_events"][0]["snapshot"]["close"] == 15
 
 
 def test_rule_service_rejects_cross_operators():

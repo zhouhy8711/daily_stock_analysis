@@ -30,6 +30,7 @@ import type {
   RuleItem,
   RuleMetricItem,
   RuleOperator,
+  RuleRunMode,
   RuleRunResponse,
   RuleTargetScope,
   RuleValueExpression,
@@ -391,6 +392,51 @@ function formatNumber(value: unknown): string {
     return numberValue.toLocaleString('zh-CN', { maximumFractionDigits: 2 });
   }
   return numberValue.toLocaleString('zh-CN', { maximumFractionDigits: 4 });
+}
+
+function asRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === 'object' ? value as Record<string, unknown> : {};
+}
+
+function getEventDate(event: Record<string, unknown>): string {
+  return typeof event.date === 'string' && event.date ? event.date : '--';
+}
+
+function getEventSnapshotValue(event: Record<string, unknown>, key: string): unknown {
+  return asRecord(event.snapshot)[key];
+}
+
+function getEventConditionValueByMetric(
+  event: Record<string, unknown>,
+  metricKey: string,
+  key: string,
+  fallbackConditionId?: string,
+): unknown {
+  const groups = Array.isArray(event.matched_groups)
+    ? event.matched_groups
+    : Array.isArray(event.matchedGroups)
+      ? event.matchedGroups
+      : [];
+  for (const group of groups) {
+    const conditions = Array.isArray(asRecord(group).conditions) ? asRecord(group).conditions as unknown[] : [];
+    for (const condition of conditions) {
+      const item = asRecord(condition);
+      const leftMetric = item.left_metric ?? item.leftMetric;
+      if (leftMetric !== metricKey && item.id !== fallbackConditionId) continue;
+      return asRecord(item.values)[key];
+    }
+  }
+  return undefined;
+}
+
+function getEventMetricValue(
+  event: Record<string, unknown>,
+  snapshotKey: string,
+  fallbackConditionId?: string,
+  valueKey = 'left',
+): unknown {
+  const conditionValue = getEventConditionValueByMetric(event, snapshotKey, valueKey, fallbackConditionId);
+  return conditionValue ?? getEventSnapshotValue(event, snapshotKey);
 }
 
 function metricLabel(metrics: RuleMetricItem[], metricKey: string): string {
@@ -870,6 +916,7 @@ const RulesPage: React.FC = () => {
   const [error, setError] = useState<string | null>(null);
   const [feedback, setFeedback] = useState<string | null>(null);
   const [runResult, setRunResult] = useState<RuleRunResponse | null>(null);
+  const [runMode, setRunMode] = useState<RuleRunMode>('latest');
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
   const [watchlistItems, setWatchlistItems] = useState<StockListDisplayItem[]>([]);
   const [isStockListExpanded, setIsStockListExpanded] = useState(false);
@@ -1057,10 +1104,11 @@ const RulesPage: React.FC = () => {
       setDescription(saved.description ?? '');
       setIsActive(saved.isActive);
       setDefinition(saved.definition);
-      const result = await rulesApi.run(selectedRuleId);
-      const dateCount = result.matches.reduce((count, match) => count + match.matchedDates.length, 0);
+      const result = await rulesApi.run(selectedRuleId, { mode: runMode });
+      const dateCount = result.eventCount || result.matches.reduce((count, match) => count + match.matchedDates.length, 0);
+      const modeLabel = result.mode === 'latest' ? '最新日扫描' : '历史回测';
       setRunResult(result);
-      setFeedback(`运行完成：扫描 ${result.targetCount} 只，命中 ${result.matchCount} 只，命中 ${dateCount} 个交易日。`);
+      setFeedback(`${modeLabel}完成：扫描 ${result.targetCount} 只，命中 ${result.matchCount} 只，命中 ${dateCount} 个交易日。`);
       setRules(await rulesApi.list());
     } catch (err) {
       setError(getParsedApiError(err).message);
@@ -1113,8 +1161,30 @@ const RulesPage: React.FC = () => {
     { value: 'custom', label: '自定义股票列表' },
   ];
   const matchedDateCount = runResult
-    ? runResult.matches.reduce((count, match) => count + match.matchedDates.length, 0)
+    ? runResult.eventCount || runResult.matches.reduce((count, match) => count + match.matchedDates.length, 0)
     : 0;
+  const runEventRows = useMemo(() => {
+    if (!runResult) return [];
+    return runResult.matches.flatMap((match) => {
+      if (match.matchedEvents.length > 0) {
+        return match.matchedEvents.map((event) => ({
+          stockCode: match.stockCode,
+          stockName: match.stockName,
+          event: asRecord(event),
+        }));
+      }
+      return match.matchedDates.map((date) => ({
+        stockCode: match.stockCode,
+        stockName: match.stockName,
+        event: {
+          date,
+          snapshot: match.snapshot,
+          matched_groups: match.matchedGroups,
+          explanation: match.explanation,
+        } as Record<string, unknown>,
+      }));
+    });
+  }, [runResult]);
 
   return (
     <AppPage className="max-w-[1500px]">
@@ -1323,10 +1393,29 @@ const RulesPage: React.FC = () => {
                 <Activity className="h-5 w-5 text-primary" />
                 <div>
                   <h2 className="text-lg font-semibold text-foreground">运行结果</h2>
-                  <p className="text-sm text-secondary-text">保存规则后可手动运行，结果会记录到后端。</p>
+                  <p className="text-sm text-secondary-text">最新日扫描只判断最后一个交易日；历史回测会逐日判断历史窗口内每个交易日。</p>
                 </div>
               </div>
               <div className="flex flex-wrap items-center gap-2">
+                <div className="inline-flex overflow-hidden rounded-xl border border-border/70 bg-elevated/40 p-1" aria-label="运行模式">
+                  {([
+                    { value: 'latest' as const, label: '最新日' },
+                    { value: 'history' as const, label: '历史回测' },
+                  ]).map((item) => (
+                    <button
+                      key={item.value}
+                      type="button"
+                      onClick={() => setRunMode(item.value)}
+                      className={`rounded-lg px-3 py-1.5 text-sm transition-all ${
+                        runMode === item.value
+                          ? 'bg-primary text-background shadow-glow-primary'
+                          : 'text-secondary-text hover:bg-hover hover:text-foreground'
+                      }`}
+                    >
+                      {item.label}
+                    </button>
+                  ))}
+                </div>
                 <Button variant="danger-subtle" size="sm" onClick={() => setShowDeleteConfirm(true)} disabled={!selectedRuleId}>
                   <Trash2 className="h-4 w-4" />
                   删除
@@ -1344,6 +1433,7 @@ const RulesPage: React.FC = () => {
               <div className="space-y-3">
                 <div className="flex flex-wrap items-center gap-2 text-sm">
                   <Badge variant={runResult.status === 'completed' ? 'success' : 'warning'}>{runResult.status}</Badge>
+                  <span className="text-secondary-text">{runResult.mode === 'latest' ? '最新日扫描' : '历史回测'}</span>
                   <span className="text-secondary-text">扫描 {runResult.targetCount} 只</span>
                   <span className="text-secondary-text">命中 {runResult.matchCount} 只</span>
                   <span className="text-secondary-text">命中 {matchedDateCount} 个交易日</span>
@@ -1352,41 +1442,35 @@ const RulesPage: React.FC = () => {
                 {runResult.errors.length > 0 ? (
                   <InlineAlert variant="warning" message={`部分股票运行失败：${runResult.errors.join('；')}`} />
                 ) : null}
-                {runResult.matches.length === 0 ? (
+                {runEventRows.length === 0 ? (
                   <EmptyState title="未命中" description="本次运行没有股票满足任一条件组。" className="border-dashed" />
                 ) : (
                   <div className="overflow-x-auto rounded-xl border border-border/60">
-                    <table className="min-w-[760px] w-full text-sm">
+                    <table className="min-w-[980px] w-full text-sm">
                       <thead className="bg-elevated/70 text-left text-xs uppercase text-muted-text">
                         <tr>
                           <th className="px-3 py-2">股票</th>
-                          <th className="px-3 py-2">命中日期</th>
-                          <th className="px-3 py-2">快照</th>
+                          <th className="px-3 py-2">日期</th>
+                          <th className="px-3 py-2">成交量</th>
+                          <th className="px-3 py-2">前5日均量*倍数</th>
+                          <th className="px-3 py-2">筹码集中度</th>
+                          <th className="px-3 py-2">解套率</th>
                           <th className="px-3 py-2">命中解释</th>
                         </tr>
                       </thead>
                       <tbody>
-                        {runResult.matches.map((match) => (
-                          <tr key={match.stockCode} className="border-t border-border/50">
+                        {runEventRows.map((row, index) => (
+                          <tr key={`${row.stockCode}-${getEventDate(row.event)}-${index}`} className="border-t border-border/50">
                             <td className="px-3 py-3">
-                              <div className="font-semibold text-foreground">{match.stockName || match.stockCode}</div>
-                              <div className="font-mono text-xs text-muted-text">{match.stockCode}</div>
+                              <div className="font-semibold text-foreground">{row.stockName || row.stockCode}</div>
+                              <div className="font-mono text-xs text-muted-text">{row.stockCode}</div>
                             </td>
-                            <td className="px-3 py-3">
-                              <div className="flex max-w-[260px] flex-wrap gap-1">
-                                {match.matchedDates.length > 0 ? match.matchedDates.map((date) => (
-                                  <Badge key={`${match.stockCode}-${date}`} variant="info">{date}</Badge>
-                                )) : <span className="text-secondary-text">--</span>}
-                              </div>
-                            </td>
-                            <td className="px-3 py-3 text-xs text-secondary-text">
-                              {Object.entries(match.snapshot).map(([key, value]) => (
-                                <span key={key} className="mr-3 inline-block">
-                                  {key}: {formatNumber(value)}
-                                </span>
-                              ))}
-                            </td>
-                            <td className="px-3 py-3 text-secondary-text">{match.explanation || '--'}</td>
+                            <td className="px-3 py-3 font-mono text-xs text-secondary-text">{getEventDate(row.event)}</td>
+                            <td className="px-3 py-3 text-secondary-text">{formatNumber(getEventMetricValue(row.event, 'volume', 'cond-latest-volume-gt-prev5avg'))}</td>
+                            <td className="px-3 py-3 text-secondary-text">{formatNumber(getEventConditionValueByMetric(row.event, 'volume', 'right', 'cond-latest-volume-gt-prev5avg'))}</td>
+                            <td className="px-3 py-3 text-secondary-text">{formatNumber(getEventMetricValue(row.event, 'chip_concentration_90', 'cond-chip-concentration-lt-015'))}</td>
+                            <td className="px-3 py-3 text-secondary-text">{formatNumber(getEventMetricValue(row.event, 'profit_ratio', 'cond-profit-ratio-eq-0'))}</td>
+                            <td className="px-3 py-3 text-secondary-text">{typeof row.event.explanation === 'string' && row.event.explanation ? row.event.explanation : '--'}</td>
                           </tr>
                         ))}
                       </tbody>

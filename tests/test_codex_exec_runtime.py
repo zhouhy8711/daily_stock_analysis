@@ -2,6 +2,7 @@
 """Tests for Codex CLI based LLM runtime."""
 
 import os
+import subprocess
 import sys
 import tempfile
 import time
@@ -22,7 +23,7 @@ from src.agent.llm_adapter import LLMToolAdapter
 from src.agent.executor import AgentExecutor
 from src.agent.tools.registry import ToolDefinition, ToolParameter, ToolRegistry
 from src.config import Config
-from src.codex_exec import CodexExecClient
+from src.codex_exec import DEFAULT_CODEX_EXEC_ARGS, CodexExecClient
 from src.services.codex_skill_job_service import CodexSkillJobResult, start_codex_skill_background_job
 from src.services.codex_skill_service import list_codex_skills, load_codex_skill_instructions
 
@@ -139,6 +140,34 @@ class CodexExecRuntimeTestCase(unittest.TestCase):
         self.assertIn("plain LLM completion backend", prompt)
         self.assertIn("Do not use web search", prompt)
         self.assertIn("USER:\nhello", prompt)
+
+    def test_codex_exec_strips_legacy_general_analytics_flag(self) -> None:
+        config = Config(
+            stock_list=["600519"],
+            codex_exec_model="gpt-5.4",
+            codex_exec_args=(
+                "--disable plugins --disable general_analytics "
+                "--disable=general_analytics --enable general_analytics "
+                "-c 'support_websocket=false'"
+            ),
+            llm_model_list=[],
+        )
+        captured = {}
+
+        def fake_run(cmd, **_kwargs):
+            captured["cmd"] = cmd
+            output_path = Path(cmd[cmd.index("--output-last-message") + 1])
+            output_path.write_text("ok", encoding="utf-8")
+            return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+
+        with patch("src.codex_exec.subprocess.run", side_effect=fake_run):
+            text = CodexExecClient(config).complete_prompt("hello", model="codex/gpt-5.4", timeout=1)
+
+        self.assertEqual(text, "ok")
+        self.assertNotIn("general_analytics", DEFAULT_CODEX_EXEC_ARGS)
+        self.assertNotIn("general_analytics", captured["cmd"])
+        self.assertIn("--disable", captured["cmd"])
+        self.assertIn("plugins", captured["cmd"])
 
     def test_llm_tool_adapter_parses_codex_tool_call_protocol(self) -> None:
         config = Config(

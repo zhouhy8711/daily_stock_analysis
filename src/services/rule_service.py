@@ -4,12 +4,14 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
+
+import pandas as pd
 
 from src.config import get_config
 from src.repositories.rule_repo import RuleRepository
-from src.rules.engine import AGGREGATE_METHODS, COMPARE_OPERATORS, evaluate_rule_history
+from src.rules.engine import AGGREGATE_METHODS, COMPARE_OPERATORS, evaluate_rule_at_index, evaluate_rule_history
 from src.rules.metrics import METRIC_BY_KEY, build_metric_frame, get_metric_registry
 from src.services.stock_service import StockService
 
@@ -35,6 +37,7 @@ ALLOWED_OPERATORS = {
 }
 DISABLED_OPERATORS = {"cross_up", "cross_down"}
 MAX_RULE_TARGET_CODES = 10000
+RUN_MODES = {"latest", "history"}
 
 
 def _model_to_dict(value: Any) -> Dict[str, Any]:
@@ -160,13 +163,14 @@ class RuleService:
             if int(expr.get("window") or 0) <= 0:
                 raise RuleValidationError("历史聚合需要 window")
 
-    def run_rule(self, rule_id: int) -> Dict[str, Any]:
+    def run_rule(self, rule_id: int, mode: str = "history") -> Dict[str, Any]:
         rule = self.repo.get_rule(rule_id)
         if rule is None:
             raise KeyError(f"rule not found: {rule_id}")
 
         definition = rule.get("definition") or {}
         self.validate_definition(definition)
+        run_mode = self._normalize_run_mode(mode)
         stock_codes = self._resolve_target_codes(definition.get("target") or {})
         run_id = self.repo.create_run(rule_id, len(stock_codes))
         started_at = datetime.now()
@@ -176,7 +180,7 @@ class RuleService:
         try:
             for code in stock_codes:
                 try:
-                    match = self._evaluate_stock(rule, definition, code)
+                    match = self._evaluate_stock(rule, definition, code, run_mode)
                 except Exception as exc:
                     logger.warning("规则 %s 执行 %s 失败: %s", rule_id, code, exc)
                     errors.append(f"{code}:{type(exc).__name__}")
@@ -199,6 +203,8 @@ class RuleService:
                 "status": status,
                 "target_count": len(stock_codes),
                 "match_count": match_count,
+                "event_count": self._count_match_events(matches),
+                "mode": run_mode,
                 "duration_ms": duration_ms,
                 "matches": matches,
                 "errors": errors,
@@ -214,7 +220,24 @@ class RuleService:
             )
             raise
 
-    def _evaluate_stock(self, rule: Dict[str, Any], definition: Dict[str, Any], stock_code: str) -> Optional[Dict[str, Any]]:
+    @staticmethod
+    def _normalize_run_mode(mode: str) -> str:
+        run_mode = str(mode or "history").strip().lower()
+        if run_mode not in RUN_MODES:
+            raise RuleValidationError("运行模式仅支持 latest/history")
+        return run_mode
+
+    @staticmethod
+    def _count_match_events(matches: List[Dict[str, Any]]) -> int:
+        return sum(len(match.get("matched_events") or []) for match in matches)
+
+    def _evaluate_stock(
+        self,
+        rule: Dict[str, Any],
+        definition: Dict[str, Any],
+        stock_code: str,
+        mode: str,
+    ) -> Optional[Dict[str, Any]]:
         lookback_days = int(definition.get("lookback_days") or rule.get("lookback_days") or 120)
         history = self.stock_service.get_history_data(stock_code, period="daily", days=lookback_days)
         history_rows = history.get("data") or []
@@ -224,21 +247,74 @@ class RuleService:
         quote = self.stock_service.get_realtime_quote(stock_code)
         indicator_metrics = self.stock_service.get_indicator_metrics(stock_code)
         metric_frame = build_metric_frame(history_rows, quote, indicator_metrics)
-        events = evaluate_rule_history(definition, metric_frame)
+        if metric_frame.empty:
+            return None
+
+        if mode == "latest":
+            events = self._evaluate_latest_event(definition, metric_frame)
+        else:
+            events = self._evaluate_history_events(definition, metric_frame, lookback_days)
         if not events:
             return None
 
-        latest_event = events[-1]
+        matched_events = [self._build_match_event(event) for event in events]
+        latest_event = matched_events[-1]
         matched_groups = latest_event.get("matched_groups") or []
-        matched_dates = [str(event.get("date")) for event in events if event.get("date")]
-        explanation = self._build_history_match_explanation(events)
+        matched_dates = [str(event.get("date")) for event in matched_events if event.get("date")]
+        explanation = self._build_history_match_explanation(matched_events)
         return {
             "stock_code": stock_code,
             "stock_name": history.get("stock_name") or (quote or {}).get("stock_name"),
             "matched_groups": matched_groups,
             "matched_dates": matched_dates,
+            "matched_events": matched_events,
             "snapshot": latest_event.get("snapshot") or {},
             "explanation": explanation,
+        }
+
+    def _evaluate_latest_event(self, definition: Dict[str, Any], metric_frame: pd.DataFrame) -> List[Dict[str, Any]]:
+        latest_index = len(metric_frame) - 1
+        result = evaluate_rule_at_index(definition, metric_frame, latest_index)
+        if not result.get("matched"):
+            return []
+        row = metric_frame.iloc[latest_index]
+        return [{
+            "date": str(row.get("date") or latest_index),
+            "index": latest_index,
+            "matched_groups": result.get("matched_groups") or [],
+            "condition_results": result.get("condition_results") or [],
+            "snapshot": result.get("snapshot") or {},
+        }]
+
+    def _evaluate_history_events(
+        self,
+        definition: Dict[str, Any],
+        metric_frame: pd.DataFrame,
+        lookback_days: int,
+    ) -> List[Dict[str, Any]]:
+        events = evaluate_rule_history(definition, metric_frame)
+        if not events:
+            return []
+        cutoff = datetime.now() - timedelta(days=lookback_days)
+        filtered_events: List[Dict[str, Any]] = []
+        for event in events:
+            parsed = pd.to_datetime(event.get("date"), errors="coerce")
+            if pd.isna(parsed):
+                filtered_events.append(event)
+                continue
+            if parsed.to_pydatetime() >= cutoff:
+                filtered_events.append(event)
+        return filtered_events
+
+    def _build_match_event(self, event: Dict[str, Any]) -> Dict[str, Any]:
+        matched_groups = event.get("matched_groups") or []
+        return {
+            "date": str(event.get("date") or ""),
+            "index": event.get("index"),
+            "matched_groups": matched_groups,
+            "condition_results": event.get("condition_results") or [],
+            "snapshot": event.get("snapshot") or {},
+            "explanation": self._build_match_explanation(matched_groups),
         }
 
     def _build_history_match_explanation(self, events: List[Dict[str, Any]]) -> str:

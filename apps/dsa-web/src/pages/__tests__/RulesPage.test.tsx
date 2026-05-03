@@ -450,6 +450,8 @@ describe('RulesPage', () => {
       status: 'completed',
       targetCount: 2,
       matchCount: 0,
+      eventCount: 0,
+      mode: 'latest',
       durationMs: 12,
       matches: [],
       errors: [],
@@ -473,7 +475,7 @@ describe('RulesPage', () => {
           },
         }),
       }));
-      expect(rulesApi.run).toHaveBeenCalledWith(7);
+      expect(rulesApi.run).toHaveBeenCalledWith(7, { mode: 'latest' });
     });
     expect(vi.mocked(rulesApi.update).mock.invocationCallOrder[0])
       .toBeLessThan(vi.mocked(rulesApi.run).mock.invocationCallOrder[0]);

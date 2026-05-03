@@ -9,6 +9,7 @@ from api.v1.schemas.rules import (
     RuleItem,
     RuleListResponse,
     RuleMetricRegistryResponse,
+    RuleRunRequest,
     RuleRunResponse,
     RuleUpdateRequest,
 )
@@ -103,10 +104,11 @@ def delete_rule(rule_id: int) -> None:
     },
     summary="手动运行规则",
 )
-def run_rule(rule_id: int) -> RuleRunResponse:
+def run_rule(rule_id: int, payload: RuleRunRequest | None = None) -> RuleRunResponse:
     service = RuleService()
     try:
-        return RuleRunResponse(**service.run_rule(rule_id))
+        mode = payload.mode if payload is not None else "history"
+        return RuleRunResponse(**service.run_rule(rule_id, mode=mode))
     except KeyError as exc:
         raise HTTPException(status_code=404, detail={"error": "not_found", "message": "规则不存在"}) from exc
     except RuleValidationError as exc:

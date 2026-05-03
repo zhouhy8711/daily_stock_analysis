@@ -167,6 +167,7 @@ class RuleRepository:
             for match in matches:
                 snapshot = dict(match.get("snapshot") or {})
                 snapshot["_matched_dates"] = match.get("matched_dates") or []
+                snapshot["_matched_events"] = match.get("matched_events") or []
                 session.add(
                     StockRuleMatch(
                         run_id=run_id,
@@ -190,6 +191,7 @@ class RuleRepository:
             for row in rows:
                 snapshot = _json_loads(row.snapshot_json, {}) or {}
                 matched_dates = snapshot.pop("_matched_dates", [])
+                matched_events = snapshot.pop("_matched_events", [])
                 items.append({
                     "id": row.id,
                     "run_id": row.run_id,
@@ -197,6 +199,7 @@ class RuleRepository:
                     "stock_code": row.stock_code,
                     "stock_name": row.stock_name,
                     "matched_dates": matched_dates,
+                    "matched_events": matched_events,
                     "matched_groups": _json_loads(row.matched_groups_json, []),
                     "snapshot": snapshot,
                     "explanation": row.explanation,

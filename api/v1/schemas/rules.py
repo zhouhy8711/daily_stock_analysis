@@ -64,6 +64,10 @@ class RuleUpdateRequest(BaseModel):
     definition: Optional[RuleDefinition] = None
 
 
+class RuleRunRequest(BaseModel):
+    mode: str = Field("history", description="latest/history")
+
+
 class RuleItem(BaseModel):
     id: int
     name: str
@@ -102,6 +106,7 @@ class RuleMatchItem(BaseModel):
     stock_code: str
     stock_name: Optional[str] = None
     matched_dates: List[str] = Field(default_factory=list)
+    matched_events: List[Dict[str, Any]] = Field(default_factory=list)
     matched_groups: List[Dict[str, Any]] = Field(default_factory=list)
     snapshot: Dict[str, Any] = Field(default_factory=dict)
     explanation: Optional[str] = None
@@ -113,6 +118,8 @@ class RuleRunResponse(BaseModel):
     status: str
     target_count: int
     match_count: int
+    event_count: int = 0
+    mode: str = "history"
     duration_ms: int = 0
     matches: List[RuleMatchItem] = Field(default_factory=list)
     errors: List[str] = Field(default_factory=list)

@@ -10,6 +10,7 @@ from __future__ import annotations
 from copy import deepcopy
 from typing import Any, Dict, List, Optional
 
+from src.codex_exec import DEFAULT_CODEX_EXEC_ARGS
 from src.config import AGENT_MAX_STEPS_DEFAULT
 
 SCHEMA_VERSION = "2026-04-25"
@@ -221,7 +222,7 @@ _FIELD_DEFINITIONS: Dict[str, Dict[str, Any]] = {
         "is_sensitive": False,
         "is_required": False,
         "is_editable": True,
-        "default_value": "--dangerously-bypass-approvals-and-sandbox --ignore-user-config --ignore-rules --skip-git-repo-check --ephemeral --disable plugins --disable apps --disable browser_use --disable computer_use --disable in_app_browser --disable shell_tool --disable tool_search --disable web_search_cached --disable web_search_request --disable general_analytics -c 'model_reasoning_effort=\"low\"' -c 'support_websocket=false'",
+        "default_value": DEFAULT_CODEX_EXEC_ARGS,
         "options": [],
         "validation": {},
         "display_order": 9,

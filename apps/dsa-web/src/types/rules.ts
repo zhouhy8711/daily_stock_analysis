@@ -1,5 +1,6 @@
 export type RuleTargetScope = 'watchlist' | 'all_a_shares' | 'custom';
 export type RulePeriod = 'daily';
+export type RuleRunMode = 'latest' | 'history';
 export type RuleAggregateMethod = 'max' | 'min' | 'avg' | 'sum' | 'median' | 'std';
 export type RuleOperator =
   | '>'
@@ -106,6 +107,7 @@ export type RuleMatchItem = {
   stockCode: string;
   stockName?: string | null;
   matchedDates: string[];
+  matchedEvents: Array<Record<string, unknown>>;
   matchedGroups: Array<Record<string, unknown>>;
   snapshot: Record<string, unknown>;
   explanation?: string | null;
@@ -117,6 +119,8 @@ export type RuleRunResponse = {
   status: string;
   targetCount: number;
   matchCount: number;
+  eventCount: number;
+  mode: RuleRunMode | string;
   durationMs: number;
   matches: RuleMatchItem[];
   errors: string[];
