@@ -226,6 +226,7 @@ def compute_chip_distribution_from_history(
     window_days: int = 180,
     max_price_points: int = 180,
     include_snapshots: bool = False,
+    snapshot_limit: Optional[int] = 120,
 ) -> Optional[ChipDistribution]:
     prepared = _prepare_history(history_df, window_days)
     if prepared.empty or len(prepared) < 2:
@@ -280,7 +281,11 @@ def compute_chip_distribution_from_history(
     if chip is None:
         return None
     if include_snapshots:
-        chip.snapshots = snapshots[-120:]
+        if snapshot_limit is None:
+            chip.snapshots = snapshots
+        else:
+            limit = max(0, int(snapshot_limit))
+            chip.snapshots = snapshots[-limit:] if limit else []
     return chip
 
 

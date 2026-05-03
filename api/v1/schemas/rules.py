@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """Schemas for stock rules."""
 
+from datetime import date
 from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
@@ -66,6 +67,26 @@ class RuleUpdateRequest(BaseModel):
 
 class RuleRunRequest(BaseModel):
     mode: str = Field("history", description="latest/history")
+    target: Optional[RuleTarget] = Field(None, description="Optional runtime target override")
+    start_date: Optional[date] = Field(None, description="Optional backtest start date")
+    end_date: Optional[date] = Field(None, description="Optional backtest end date")
+
+
+class RuleRunHistoryItem(BaseModel):
+    id: int
+    rule_id: int
+    rule_name: Optional[str] = None
+    status: str
+    target_count: int = 0
+    match_count: int = 0
+    error: Optional[str] = None
+    started_at: Optional[str] = None
+    finished_at: Optional[str] = None
+    duration_ms: Optional[int] = None
+
+
+class RuleRunHistoryResponse(BaseModel):
+    items: List[RuleRunHistoryItem] = Field(default_factory=list)
 
 
 class RuleItem(BaseModel):
@@ -123,3 +144,7 @@ class RuleRunResponse(BaseModel):
     duration_ms: int = 0
     matches: List[RuleMatchItem] = Field(default_factory=list)
     errors: List[str] = Field(default_factory=list)
+
+
+class RuleRunMatchListResponse(BaseModel):
+    items: List[RuleMatchItem] = Field(default_factory=list)

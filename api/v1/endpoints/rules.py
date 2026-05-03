@@ -9,6 +9,8 @@ from api.v1.schemas.rules import (
     RuleItem,
     RuleListResponse,
     RuleMetricRegistryResponse,
+    RuleRunHistoryResponse,
+    RuleRunMatchListResponse,
     RuleRunRequest,
     RuleRunResponse,
     RuleUpdateRequest,
@@ -32,6 +34,36 @@ def get_rule_metrics() -> RuleMetricRegistryResponse:
 def list_rules() -> RuleListResponse:
     service = RuleService()
     return RuleListResponse(items=[RuleItem(**item) for item in service.list_rules()])
+
+
+@router.get("/runs", response_model=RuleRunHistoryResponse, summary="获取规则运行历史")
+def list_rule_runs(limit: int = 30) -> RuleRunHistoryResponse:
+    service = RuleService()
+    bounded_limit = min(max(int(limit or 30), 1), 100)
+    return RuleRunHistoryResponse(items=service.list_runs(limit=bounded_limit))
+
+
+@router.get(
+    "/runs/{run_id}/matches",
+    response_model=RuleRunMatchListResponse,
+    responses={404: {"description": "运行记录不存在", "model": ErrorResponse}},
+    summary="获取规则运行命中明细",
+)
+def list_rule_run_matches(run_id: int) -> RuleRunMatchListResponse:
+    service = RuleService()
+    return RuleRunMatchListResponse(items=service.list_run_matches(run_id))
+
+
+@router.delete(
+    "/runs/{run_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    responses={404: {"description": "运行记录不存在", "model": ErrorResponse}},
+    summary="删除规则运行记录",
+)
+def delete_rule_run(run_id: int) -> None:
+    service = RuleService()
+    if not service.delete_run(run_id):
+        raise HTTPException(status_code=404, detail={"error": "not_found", "message": "运行记录不存在"})
 
 
 @router.post(
@@ -108,7 +140,14 @@ def run_rule(rule_id: int, payload: RuleRunRequest | None = None) -> RuleRunResp
     service = RuleService()
     try:
         mode = payload.mode if payload is not None else "history"
-        return RuleRunResponse(**service.run_rule(rule_id, mode=mode))
+        target = payload.target.model_dump() if payload is not None and payload.target is not None else None
+        return RuleRunResponse(**service.run_rule(
+            rule_id,
+            mode=mode,
+            target_override=target,
+            start_date=payload.start_date if payload is not None else None,
+            end_date=payload.end_date if payload is not None else None,
+        ))
     except KeyError as exc:
         raise HTTPException(status_code=404, detail={"error": "not_found", "message": "规则不存在"}) from exc
     except RuleValidationError as exc:

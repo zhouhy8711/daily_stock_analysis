@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
@@ -85,6 +85,9 @@ class RuleService:
     def delete_rule(self, rule_id: int) -> bool:
         return self.repo.delete_rule(rule_id)
 
+    def delete_run(self, run_id: int) -> bool:
+        return self.repo.delete_run(run_id)
+
     def validate_definition(self, definition: Dict[str, Any]) -> None:
         if str(definition.get("period") or "daily") != "daily":
             raise RuleValidationError("第一版规则模块仅支持 daily 周期")
@@ -163,14 +166,33 @@ class RuleService:
             if int(expr.get("window") or 0) <= 0:
                 raise RuleValidationError("历史聚合需要 window")
 
-    def run_rule(self, rule_id: int, mode: str = "history") -> Dict[str, Any]:
+    def list_runs(self, limit: int = 30) -> List[Dict[str, Any]]:
+        return self.repo.list_runs(limit=limit)
+
+    def list_run_matches(self, run_id: int) -> List[Dict[str, Any]]:
+        return self.repo.list_matches(run_id)
+
+    def run_rule(
+        self,
+        rule_id: int,
+        mode: str = "history",
+        target_override: Optional[Dict[str, Any]] = None,
+        start_date: Any = None,
+        end_date: Any = None,
+    ) -> Dict[str, Any]:
         rule = self.repo.get_rule(rule_id)
         if rule is None:
             raise KeyError(f"rule not found: {rule_id}")
 
         definition = rule.get("definition") or {}
+        if target_override is not None:
+            definition = {
+                **definition,
+                "target": target_override,
+            }
         self.validate_definition(definition)
         run_mode = self._normalize_run_mode(mode)
+        date_from, date_to = self._normalize_date_range(start_date, end_date)
         stock_codes = self._resolve_target_codes(definition.get("target") or {})
         run_id = self.repo.create_run(rule_id, len(stock_codes))
         started_at = datetime.now()
@@ -180,7 +202,7 @@ class RuleService:
         try:
             for code in stock_codes:
                 try:
-                    match = self._evaluate_stock(rule, definition, code, run_mode)
+                    match = self._evaluate_stock(rule, definition, code, run_mode, date_from, date_to)
                 except Exception as exc:
                     logger.warning("规则 %s 执行 %s 失败: %s", rule_id, code, exc)
                     errors.append(f"{code}:{type(exc).__name__}")
@@ -231,21 +253,44 @@ class RuleService:
     def _count_match_events(matches: List[Dict[str, Any]]) -> int:
         return sum(len(match.get("matched_events") or []) for match in matches)
 
+    @classmethod
+    def _normalize_date_range(cls, start_date: Any, end_date: Any) -> tuple[Optional[date], Optional[date]]:
+        date_from = cls._coerce_date(start_date)
+        date_to = cls._coerce_date(end_date)
+        if date_from and date_to and date_from > date_to:
+            raise RuleValidationError("开始日期不能晚于结束日期")
+        return date_from, date_to
+
+    @staticmethod
+    def _coerce_date(value: Any) -> Optional[date]:
+        if value is None or value == "":
+            return None
+        if isinstance(value, datetime):
+            return value.date()
+        if isinstance(value, date):
+            return value
+        parsed = pd.to_datetime(value, errors="coerce")
+        if pd.isna(parsed):
+            raise RuleValidationError("日期格式需要为 YYYY-MM-DD")
+        return parsed.date()
+
     def _evaluate_stock(
         self,
         rule: Dict[str, Any],
         definition: Dict[str, Any],
         stock_code: str,
         mode: str,
+        start_date: Optional[date] = None,
+        end_date: Optional[date] = None,
     ) -> Optional[Dict[str, Any]]:
-        lookback_days = int(definition.get("lookback_days") or rule.get("lookback_days") or 120)
+        lookback_days = self._resolve_history_fetch_days(definition, rule, start_date)
         history = self.stock_service.get_history_data(stock_code, period="daily", days=lookback_days)
         history_rows = history.get("data") or []
         if not history_rows:
             return None
 
-        quote = self.stock_service.get_realtime_quote(stock_code)
-        indicator_metrics = self.stock_service.get_indicator_metrics(stock_code)
+        quote = self.stock_service.get_realtime_quote(stock_code) if mode == "latest" else None
+        indicator_metrics = self._get_indicator_metrics(stock_code, history_rows, mode)
         metric_frame = build_metric_frame(history_rows, quote, indicator_metrics)
         if metric_frame.empty:
             return None
@@ -253,7 +298,7 @@ class RuleService:
         if mode == "latest":
             events = self._evaluate_latest_event(definition, metric_frame)
         else:
-            events = self._evaluate_history_events(definition, metric_frame, lookback_days)
+            events = self._evaluate_history_events(definition, metric_frame, lookback_days, start_date, end_date)
         if not events:
             return None
 
@@ -291,19 +336,27 @@ class RuleService:
         definition: Dict[str, Any],
         metric_frame: pd.DataFrame,
         lookback_days: int,
+        start_date: Optional[date] = None,
+        end_date: Optional[date] = None,
     ) -> List[Dict[str, Any]]:
         events = evaluate_rule_history(definition, metric_frame)
         if not events:
             return []
-        cutoff = datetime.now() - timedelta(days=lookback_days)
+        cutoff = datetime.now().date() - timedelta(days=lookback_days)
         filtered_events: List[Dict[str, Any]] = []
         for event in events:
             parsed = pd.to_datetime(event.get("date"), errors="coerce")
             if pd.isna(parsed):
                 filtered_events.append(event)
                 continue
-            if parsed.to_pydatetime() >= cutoff:
-                filtered_events.append(event)
+            event_date = parsed.date()
+            if start_date and event_date < start_date:
+                continue
+            if end_date and event_date > end_date:
+                continue
+            if start_date is None and event_date < cutoff:
+                continue
+            filtered_events.append(event)
         return filtered_events
 
     def _build_match_event(self, event: Dict[str, Any]) -> Dict[str, Any]:
@@ -325,6 +378,41 @@ class RuleService:
             parts.append(f"{date_text}: {explanation}" if explanation else date_text)
         prefix = f"共 {len(events)} 个交易日命中"
         return f"{prefix}；" + " / ".join(parts)
+
+    def _get_indicator_metrics(
+        self,
+        stock_code: str,
+        history_rows: List[Dict[str, Any]],
+        mode: str,
+    ) -> Dict[str, Any]:
+        if mode == "history":
+            local_metrics = self._build_history_chip_metrics(stock_code, history_rows)
+            if local_metrics.get("chip_distribution"):
+                return local_metrics
+        return self.stock_service.get_indicator_metrics(stock_code)
+
+    def _build_history_chip_metrics(self, stock_code: str, history_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+        if not history_rows:
+            return {}
+        try:
+            from data_provider.base import normalize_stock_code
+            from data_provider.local_chip_model_fetcher import compute_chip_distribution_from_history
+
+            history_df = pd.DataFrame(history_rows)
+            chip = compute_chip_distribution_from_history(
+                normalize_stock_code(stock_code),
+                history_df,
+                history_source="rule_backtest",
+                window_days=max(len(history_rows), 2),
+                include_snapshots=True,
+                snapshot_limit=None,
+            )
+            if chip is None:
+                return {}
+            return {"chip_distribution": chip.to_dict()}
+        except Exception as exc:
+            logger.debug("规则历史回测本地筹码模型失败 %s: %s", stock_code, exc)
+            return {}
 
     def _build_match_explanation(self, matched_groups: List[Dict[str, Any]]) -> str:
         parts: List[str] = []
@@ -366,3 +454,15 @@ class RuleService:
             seen.add(code)
             normalized.append(code)
         return normalized
+
+    @staticmethod
+    def _resolve_history_fetch_days(
+        definition: Dict[str, Any],
+        rule: Dict[str, Any],
+        start_date: Optional[date] = None,
+    ) -> int:
+        lookback_days = int(definition.get("lookback_days") or rule.get("lookback_days") or 120)
+        if start_date is None:
+            return lookback_days
+        calendar_days = (datetime.now().date() - start_date).days + 10
+        return max(lookback_days, calendar_days)

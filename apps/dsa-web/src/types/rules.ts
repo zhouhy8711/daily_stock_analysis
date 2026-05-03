@@ -126,6 +126,29 @@ export type RuleRunResponse = {
   errors: string[];
 };
 
+export type RuleRunPayload = {
+  mode?: RuleRunMode;
+  target?: {
+    scope: RuleTargetScope;
+    stockCodes: string[];
+  };
+  startDate?: string;
+  endDate?: string;
+};
+
+export type RuleRunHistoryItem = {
+  id: number;
+  ruleId: number;
+  ruleName?: string | null;
+  status: string;
+  targetCount: number;
+  matchCount: number;
+  error?: string | null;
+  startedAt?: string | null;
+  finishedAt?: string | null;
+  durationMs?: number | null;
+};
+
 export type RuleCreatePayload = {
   name: string;
   description?: string | null;

@@ -1,10 +1,10 @@
-import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { historyApi } from '../../api/history';
 import { rulesApi } from '../../api/rules';
 import { systemConfigApi } from '../../api/systemConfig';
-import RulesPage from '../RulesPage';
 import type { StockIndexItem } from '../../types/stockIndex';
+import RulesPage from '../RulesPage';
 
 const stockIndexHookState = vi.hoisted(() => ({
   current: {
@@ -16,73 +16,11 @@ const stockIndexHookState = vi.hoisted(() => ({
   },
 }));
 
-const STOCK_LIST_LABEL = '行业 / 股票代码 / 股票名称';
-const WATCHLIST_STOCK_TEXT = '未分类 300274.SZ 阳光电源\n未分类 688521.SH 芯原股份\n未分类 BABA 阿里巴巴\n未分类 002439.SZ 启明星辰\n未分类 600126.SH 杭钢股份\n未分类 002436.SZ 兴森科技';
-
 const metricItems = [
-  {
-    key: 'close',
-    label: '收盘价',
-    category: 'K线图',
-    valueType: 'number',
-    unit: '元',
-    periods: ['daily'],
-    description: '',
-  },
-  {
-    key: 'volume_ma5',
-    label: 'MAVOL5',
-    category: '成交量图',
-    valueType: 'number',
-    unit: '股',
-    periods: ['daily'],
-    description: '',
-  },
-  {
-    key: 'macd_dif',
-    label: 'DIF',
-    category: 'MACD图',
-    valueType: 'number',
-    unit: null,
-    periods: ['daily'],
-    description: '',
-  },
-  {
-    key: 'rsi6',
-    label: 'RSI6',
-    category: 'RSI图',
-    valueType: 'number',
-    unit: null,
-    periods: ['daily'],
-    description: '',
-  },
-  {
-    key: 'profit_ratio',
-    label: '收盘获利',
-    category: '筹码峰-全部筹码',
-    valueType: 'number',
-    unit: '%',
-    periods: ['daily'],
-    description: '',
-  },
-  {
-    key: 'main_profit_ratio',
-    label: '主力收盘获利',
-    category: '筹码峰-主力筹码',
-    valueType: 'number',
-    unit: '%',
-    periods: ['daily'],
-    description: '',
-  },
-  {
-    key: 'main_force_net',
-    label: '主力净额',
-    category: '实时监控',
-    valueType: 'number',
-    unit: '元',
-    periods: ['daily'],
-    description: '',
-  },
+  { key: 'close', label: '收盘价', category: 'K线图', valueType: 'number', unit: '元', periods: ['daily'], description: '' },
+  { key: 'volume_ma5', label: 'MAVOL5', category: '成交量图', valueType: 'number', unit: '股', periods: ['daily'], description: '' },
+  { key: 'profit_ratio', label: '收盘获利', category: '筹码峰-全部筹码', valueType: 'number', unit: '%', periods: ['daily'], description: '' },
+  { key: 'main_profit_ratio', label: '主力收盘获利', category: '筹码峰-主力筹码', valueType: 'number', unit: '%', periods: ['daily'], description: '' },
 ];
 
 vi.mock('../../api/rules', () => ({
@@ -92,7 +30,6 @@ vi.mock('../../api/rules', () => ({
     create: vi.fn(),
     update: vi.fn(),
     delete: vi.fn(),
-    run: vi.fn(),
   },
 }));
 
@@ -126,31 +63,6 @@ describe('RulesPage', () => {
           active: true,
           industry: '白酒',
         },
-        {
-          canonicalCode: '000001.SZ',
-          displayCode: '000001',
-          nameZh: '平安银行',
-          market: 'CN',
-          assetType: 'stock',
-          active: true,
-          industry: '银行',
-        },
-        {
-          canonicalCode: 'AAPL.US',
-          displayCode: 'AAPL',
-          nameZh: 'Apple',
-          market: 'US',
-          assetType: 'stock',
-          active: true,
-        },
-        {
-          canonicalCode: '000300.SH',
-          displayCode: '000300',
-          nameZh: '沪深300',
-          market: 'INDEX',
-          assetType: 'index',
-          active: true,
-        },
       ],
       loading: false,
       error: null,
@@ -167,11 +79,11 @@ describe('RulesPage', () => {
       period: 'daily',
       lookbackDays: 120,
       targetScope: 'watchlist',
-      targetCodes: ['300274.SZ', '688521.SH', 'BABA', '002439.SZ', '600126.SH', '002436.SZ'],
+      targetCodes: ['300274.SZ', '688521.SH'],
       definition: {
         period: 'daily',
         lookbackDays: 120,
-        target: { scope: 'watchlist', stockCodes: ['300274.SZ', '688521.SH', 'BABA', '002439.SZ', '600126.SH', '002436.SZ'] },
+        target: { scope: 'watchlist', stockCodes: ['300274.SZ', '688521.SH'] },
         groups: [],
       },
       lastMatchCount: 0,
@@ -182,78 +94,29 @@ describe('RulesPage', () => {
       items: [{ key: 'STOCK_LIST', value: '', rawValueExists: false, isMasked: false }],
     });
     vi.mocked(historyApi.getList).mockResolvedValue({
-      total: 6,
+      total: 2,
       page: 1,
       limit: 20,
       items: [
-        {
-          id: 1,
-          queryId: 'q-1',
-          stockCode: '300274.SZ',
-          stockName: '阳光电源',
-          currentPrice: 133.79,
-          changePct: -0.53,
-          createdAt: '2026-04-25T22:46:00',
-        },
-        {
-          id: 2,
-          queryId: 'q-2',
-          stockCode: '688521.SH',
-          stockName: '芯原股份',
-          currentPrice: 228.71,
-          changePct: -2.88,
-          createdAt: '2026-04-25T22:36:00',
-        },
-        {
-          id: 3,
-          queryId: 'q-3',
-          stockCode: 'BABA',
-          stockName: '阿里巴巴',
-          currentPrice: 135.82,
-          createdAt: '2026-04-25T22:36:00',
-        },
-        {
-          id: 4,
-          queryId: 'q-4',
-          stockCode: '002439.SZ',
-          stockName: '启明星辰',
-          currentPrice: 14.94,
-          changePct: -0.86,
-          createdAt: '2026-04-25T22:14:00',
-        },
-        {
-          id: 5,
-          queryId: 'q-5',
-          stockCode: '600126.SH',
-          stockName: '杭钢股份',
-          currentPrice: 10.48,
-          changePct: 0.48,
-          createdAt: '2026-04-25T22:14:00',
-        },
-        {
-          id: 6,
-          queryId: 'q-6',
-          stockCode: '002436.SZ',
-          stockName: '兴森科技',
-          currentPrice: 28.52,
-          changePct: 0.42,
-          createdAt: '2026-04-25T22:11:00',
-        },
+        { id: 1, queryId: 'q-1', stockCode: '300274.SZ', stockName: '阳光电源', createdAt: '2026-04-25T22:46:00' },
+        { id: 2, queryId: 'q-2', stockCode: '688521.SH', stockName: '芯原股份', createdAt: '2026-04-25T22:36:00' },
       ],
     });
   });
 
-  it('fills the stock list from the same current watchlist shown on the home page', async () => {
+  it('keeps rule editing focused on base settings and condition groups', async () => {
     render(<RulesPage />);
 
-    const textarea = await screen.findByLabelText(STOCK_LIST_LABEL);
+    expect(await screen.findByText('基础设置')).toBeInTheDocument();
+    expect(screen.getByText('条件设置')).toBeInTheDocument();
+    expect(screen.queryByLabelText('股票范围')).not.toBeInTheDocument();
+    expect(screen.queryByText('运行结果')).not.toBeInTheDocument();
+  });
 
-    expect(textarea).toHaveValue(WATCHLIST_STOCK_TEXT);
-    expect(textarea).not.toBeDisabled();
-    expect(textarea).toHaveAttribute('readonly');
-    expect(textarea).toHaveClass('font-mono');
-    expect(textarea).toHaveClass('text-foreground');
+  it('saves the current watchlist target without showing stock target controls', async () => {
+    render(<RulesPage />);
 
+    await screen.findByText('基础设置');
     fireEvent.click(screen.getByRole('button', { name: '保存' }));
 
     await waitFor(() => {
@@ -261,7 +124,7 @@ describe('RulesPage', () => {
         definition: expect.objectContaining({
           target: {
             scope: 'watchlist',
-            stockCodes: ['300274.SZ', '688521.SH', 'BABA', '002439.SZ', '600126.SH', '002436.SZ'],
+            stockCodes: ['300274.SZ', '688521.SH'],
           },
         }),
       }));
@@ -271,8 +134,7 @@ describe('RulesPage', () => {
   it('labels trading-day offsets and shows help text from the question icon', async () => {
     render(<RulesPage />);
 
-    await screen.findByLabelText(STOCK_LIST_LABEL);
-
+    await screen.findByText('基础设置');
     expect(screen.getAllByText('取值日偏移').length).toBeGreaterThan(0);
 
     fireEvent.mouseEnter(screen.getAllByRole('button', { name: '取值日偏移说明' })[0]);
@@ -284,200 +146,12 @@ describe('RulesPage', () => {
   it('groups metric selectors by indicator chart category', async () => {
     render(<RulesPage />);
 
-    await screen.findByLabelText(STOCK_LIST_LABEL);
-
+    await screen.findByText('基础设置');
     const metricSelect = screen.getByLabelText('指标 key') as HTMLSelectElement;
     const groupLabels = Array.from(metricSelect.querySelectorAll('optgroup')).map((group) => group.label);
-    const chipGroup = metricSelect.querySelector('optgroup[label="筹码峰-全部筹码"]');
-    const mainChipGroup = metricSelect.querySelector('optgroup[label="筹码峰-主力筹码"]');
 
-    expect(groupLabels).toEqual(['K线图', '成交量图', 'MACD图', 'RSI图', '筹码峰-全部筹码', '筹码峰-主力筹码', '实时监控']);
+    expect(groupLabels).toEqual(['K线图', '成交量图', '筹码峰-全部筹码', '筹码峰-主力筹码']);
     expect(metricSelect.querySelector('option[value="volume_ma5"]')?.textContent).toContain('MAVOL5');
-    expect(chipGroup?.querySelector('option[value="profit_ratio"]')?.textContent).toContain('收盘获利');
-    expect(mainChipGroup?.querySelector('option[value="main_profit_ratio"]')?.textContent).toContain('主力收盘获利');
-  });
-
-  it('refreshes the stock code list when switching back to watchlist scope', async () => {
-    render(<RulesPage />);
-
-    const textarea = await screen.findByLabelText(STOCK_LIST_LABEL);
-    const scopeSelect = screen.getByLabelText('股票范围');
-
-    fireEvent.change(scopeSelect, { target: { value: 'custom' } });
-    fireEvent.change(textarea, { target: { value: 'TSLA' } });
-    expect(textarea).toHaveValue('未分类 TSLA');
-    expect(textarea).not.toHaveAttribute('readonly');
-
-    fireEvent.change(scopeSelect, { target: { value: 'watchlist' } });
-
-    expect(textarea).toHaveValue(WATCHLIST_STOCK_TEXT);
-    expect(textarea).toHaveAttribute('readonly');
-  });
-
-  it('opens an expanded stock list, filters by code or name, and removes one stock', async () => {
-    render(<RulesPage />);
-
-    await screen.findByLabelText(STOCK_LIST_LABEL);
-
-    fireEvent.click(screen.getByRole('button', { name: '最大化股票列表' }));
-    expect(screen.getByRole('dialog', { name: '股票列表最大化' })).toBeInTheDocument();
-
-    const expandedList = screen.getByRole('list', { name: '最大化股票列表内容' });
-    expect(within(expandedList).getByText('未分类 300274.SZ 阳光电源')).toBeInTheDocument();
-    expect(within(expandedList).getByText('未分类 BABA 阿里巴巴')).toBeInTheDocument();
-
-    fireEvent.change(screen.getByLabelText('筛选股票列表'), { target: { value: '阿里' } });
-    expect(within(expandedList).getByText('未分类 BABA 阿里巴巴')).toBeInTheDocument();
-    expect(within(expandedList).queryByText('未分类 300274.SZ 阳光电源')).not.toBeInTheDocument();
-
-    fireEvent.click(screen.getByRole('button', { name: '移除 未分类 BABA 阿里巴巴' }));
-    expect(within(expandedList).queryByText('未分类 BABA 阿里巴巴')).not.toBeInTheDocument();
-    expect(screen.getByText('没有匹配的股票')).toBeInTheDocument();
-
-    fireEvent.click(screen.getByRole('button', { name: '收起股票列表' }));
-    expect(screen.queryByRole('dialog', { name: '股票列表最大化' })).not.toBeInTheDocument();
-    expect((screen.getByLabelText(STOCK_LIST_LABEL) as HTMLTextAreaElement).value).not.toContain('BABA');
-  });
-
-  it('fills all A-share stocks when selecting the all A-shares scope', async () => {
-    render(<RulesPage />);
-
-    const textarea = await screen.findByLabelText(STOCK_LIST_LABEL);
-    const scopeSelect = screen.getByLabelText('股票范围');
-
-    fireEvent.change(scopeSelect, { target: { value: 'all_a_shares' } });
-
-    expect(textarea).toHaveValue('银行 000001 平安银行\n白酒 600519 贵州茅台');
-    expect(textarea).toHaveAttribute('readonly');
-
-    fireEvent.click(screen.getByRole('button', { name: '最大化股票列表' }));
-    const expandedList = screen.getByRole('list', { name: '最大化股票列表内容' });
-    fireEvent.change(screen.getByLabelText('筛选行业类别'), { target: { value: '银行' } });
-
-    expect(within(expandedList).getByText('银行 000001 平安银行')).toBeInTheDocument();
-    expect(within(expandedList).queryByText('白酒 600519 贵州茅台')).not.toBeInTheDocument();
-
-    fireEvent.change(screen.getByLabelText('筛选股票列表'), { target: { value: '茅台' } });
-    expect(screen.getByText('没有匹配的股票')).toBeInTheDocument();
-
-    fireEvent.change(screen.getByLabelText('筛选行业类别'), { target: { value: '白酒' } });
-    expect(within(expandedList).getByText('白酒 600519 贵州茅台')).toBeInTheDocument();
-
-    fireEvent.click(screen.getByRole('button', { name: '保存' }));
-
-    await waitFor(() => {
-      expect(rulesApi.create).toHaveBeenCalledWith(expect.objectContaining({
-        definition: expect.objectContaining({
-          target: {
-            scope: 'all_a_shares',
-            stockCodes: ['000001', '600519'],
-          },
-        }),
-      }));
-    });
-  });
-
-  it('replaces stale saved watchlist codes with the current home watchlist on selection', async () => {
-    vi.mocked(rulesApi.list).mockResolvedValue([{
-      id: 2,
-      name: '旧规则',
-      description: null,
-      isActive: true,
-      period: 'daily',
-      lookbackDays: 120,
-      targetScope: 'watchlist',
-      targetCodes: ['OLD'],
-      definition: {
-        period: 'daily',
-        lookbackDays: 120,
-        target: { scope: 'watchlist', stockCodes: ['OLD'] },
-        groups: [{
-          id: 'group-1',
-          conditions: [{
-            id: 'cond-1',
-            left: { metric: 'close', offset: 0 },
-            operator: '>' as const,
-            right: { type: 'literal' as const, value: 1 },
-          }],
-        }],
-      },
-      lastMatchCount: 0,
-    }]);
-
-    render(<RulesPage />);
-
-    expect(await screen.findByLabelText(STOCK_LIST_LABEL)).toHaveValue(WATCHLIST_STOCK_TEXT);
-  });
-
-  it('saves the current stock code list before running a saved rule', async () => {
-    const existingRule = {
-      id: 7,
-      name: '放量观察',
-      description: null,
-      isActive: true,
-      period: 'daily',
-      lookbackDays: 120,
-      targetScope: 'watchlist',
-      targetCodes: [],
-      definition: {
-        period: 'daily' as const,
-        lookbackDays: 120,
-        target: { scope: 'watchlist' as const, stockCodes: [] },
-        groups: [{
-          id: 'group-1',
-          conditions: [{
-            id: 'cond-1',
-            left: { metric: 'close', offset: 0 },
-            operator: '>' as const,
-            right: { type: 'literal' as const, value: 1 },
-          }],
-        }],
-      },
-      lastMatchCount: 0,
-    };
-    vi.mocked(rulesApi.list).mockResolvedValue([existingRule]);
-    vi.mocked(rulesApi.update).mockResolvedValue({
-      ...existingRule,
-      targetCodes: ['000001', 'TSLA'],
-      definition: {
-        ...existingRule.definition,
-        target: { scope: 'watchlist', stockCodes: ['000001', 'TSLA'] },
-      },
-    });
-    vi.mocked(rulesApi.run).mockResolvedValue({
-      runId: 11,
-      ruleId: 7,
-      status: 'completed',
-      targetCount: 2,
-      matchCount: 0,
-      eventCount: 0,
-      mode: 'latest',
-      durationMs: 12,
-      matches: [],
-      errors: [],
-    });
-
-    render(<RulesPage />);
-
-    const textarea = await screen.findByLabelText(STOCK_LIST_LABEL);
-    const scopeSelect = screen.getByLabelText('股票范围');
-
-    fireEvent.change(scopeSelect, { target: { value: 'custom' } });
-    fireEvent.change(textarea, { target: { value: '银行 000001 平安银行\n未分类 TSLA 特斯拉\nIT服务 300123 测试' } });
-    fireEvent.click(screen.getByRole('button', { name: '运行' }));
-
-    await waitFor(() => {
-      expect(rulesApi.update).toHaveBeenCalledWith(7, expect.objectContaining({
-        definition: expect.objectContaining({
-          target: {
-            scope: 'custom',
-            stockCodes: ['000001', 'TSLA', '300123'],
-          },
-        }),
-      }));
-      expect(rulesApi.run).toHaveBeenCalledWith(7, { mode: 'latest' });
-    });
-    expect(vi.mocked(rulesApi.update).mock.invocationCallOrder[0])
-      .toBeLessThan(vi.mocked(rulesApi.run).mock.invocationCallOrder[0]);
+    expect(metricSelect.querySelector('option[value="profit_ratio"]')?.textContent).toContain('收盘获利');
   });
 });

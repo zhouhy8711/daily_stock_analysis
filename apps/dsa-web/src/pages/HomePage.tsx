@@ -30,6 +30,15 @@ import {
 
 const ALL_SHARE_QUOTE_BATCH_SIZE = 6000;
 
+function removeEquivalentWatchlistCodes(codes: string[], targets: string[]): string[] {
+  const targetKeys = new Set(targets.flatMap(getWatchlistLookupKeys));
+  if (targetKeys.size === 0) {
+    return codes;
+  }
+
+  return codes.filter((code) => !getWatchlistLookupKeys(code).some((key) => targetKeys.has(key)));
+}
+
 const HomePage: React.FC = () => {
   const navigate = useNavigate();
   const { setSidebarAction } = useShellSidebarAction();
@@ -43,6 +52,7 @@ const HomePage: React.FC = () => {
   const [isLoadingWatchlist, setIsLoadingWatchlist] = useState(false);
   const [watchlistError, setWatchlistError] = useState<string | null>(null);
   const [addingWatchlistCode, setAddingWatchlistCode] = useState<string | null>(null);
+  const [isRemovingWatchlist, setIsRemovingWatchlist] = useState(false);
   const [reportHistoryStockCode, setReportHistoryStockCode] = useState<string | null>(null);
   const [shouldLoadAllShareQuotes, setShouldLoadAllShareQuotes] = useState(false);
   const [isLoadingAllShareQuotes, setIsLoadingAllShareQuotes] = useState(false);
@@ -296,14 +306,19 @@ const HomePage: React.FC = () => {
     [selectedWatchlistCodes],
   );
 
-  const selectedWatchlistTargets = useMemo(
+  const selectedWatchlistItems = useMemo(
     () => watchlistItems
-      .filter((item) => selectedWatchlistSet.has(item.stockCode))
+      .filter((item) => selectedWatchlistSet.has(item.stockCode)),
+    [selectedWatchlistSet, watchlistItems],
+  );
+
+  const selectedWatchlistTargets = useMemo(
+    () => selectedWatchlistItems
       .map((item) => ({
         stockCode: item.stockCode,
         stockName: item.stockName,
       })),
-    [selectedWatchlistSet, watchlistItems],
+    [selectedWatchlistItems],
   );
 
   const reanalyzeButtonText = selectedWatchlistTargets.length > 1
@@ -510,6 +525,80 @@ const HomePage: React.FC = () => {
     watchlistMaskToken,
   ]);
 
+  const handleAutocompleteSelection = useCallback((stockCode: string, stockName?: string) => {
+    const stockIndexItem = getWatchlistLookupKeys(stockCode)
+      .map((key) => stockIndexByLookupKey.get(key))
+      .find((item) => item !== undefined);
+    const watchlistCode = normalizeWatchlistCode(stockIndexItem?.displayCode || stockCode);
+    setQuery(watchlistCode);
+    void handleAddToWatchlist({
+      stockCode,
+      watchlistCode,
+      stockName: stockName || stockIndexItem?.nameZh,
+      industry: stockIndexItem?.industry,
+      source: 'index',
+      isInWatchlist: false,
+    });
+  }, [handleAddToWatchlist, setQuery, stockIndexByLookupKey]);
+
+  const handleRemoveSelectedFromWatchlist = useCallback(async () => {
+    if (selectedWatchlistItems.length === 0) {
+      return;
+    }
+
+    const selectedCodesToRemove = selectedWatchlistItems.flatMap((item) => [
+      item.watchlistCode || item.stockCode,
+      item.stockCode,
+    ]);
+    setIsRemovingWatchlist(true);
+    setWatchlistError(null);
+
+    try {
+      const config = watchlistConfigVersion
+        ? {
+          configVersion: watchlistConfigVersion,
+          maskToken: watchlistMaskToken,
+          codes: watchlistCodes,
+        }
+        : await readWatchlistConfig();
+      const nextCodes = removeEquivalentWatchlistCodes(config.codes, selectedCodesToRemove);
+
+      if (nextCodes.length === config.codes.length) {
+        setWatchlistCodes(config.codes);
+        setSelectedWatchlistCodes([]);
+        return;
+      }
+
+      try {
+        await saveWatchlistCodes(nextCodes, config.configVersion, config.maskToken);
+      } catch (error) {
+        if (!(error instanceof SystemConfigConflictError)) {
+          throw error;
+        }
+
+        const refreshedConfig = await readWatchlistConfig();
+        const refreshedCodes = removeEquivalentWatchlistCodes(refreshedConfig.codes, selectedCodesToRemove);
+        await saveWatchlistCodes(refreshedCodes, refreshedConfig.configVersion, refreshedConfig.maskToken);
+      }
+
+      const removedKeys = new Set(selectedCodesToRemove.flatMap(getWatchlistLookupKeys));
+      setSelectedWatchlistCodes((current) => current.filter((code) => (
+        !getWatchlistLookupKeys(code).some((key) => removedKeys.has(key))
+      )));
+    } catch (error) {
+      setWatchlistError(error instanceof Error ? error.message : '取消关注失败');
+    } finally {
+      setIsRemovingWatchlist(false);
+    }
+  }, [
+    readWatchlistConfig,
+    saveWatchlistCodes,
+    selectedWatchlistItems,
+    watchlistCodes,
+    watchlistConfigVersion,
+    watchlistMaskToken,
+  ]);
+
   const sidebarProgressTasks = useMemo(
     () => activeTasks.filter((task) => task.status === 'pending' || task.status === 'processing'),
     [activeTasks],
@@ -640,6 +729,10 @@ const HomePage: React.FC = () => {
                 value={query}
                 onChange={setQuery}
                 onSubmit={(stockCode, stockName, selectionSource) => {
+                  if (selectionSource === 'autocomplete') {
+                    handleAutocompleteSelection(stockCode, stockName);
+                    return;
+                  }
                   handleSubmitAnalysis(stockCode, stockName, selectionSource);
                 }}
                 placeholder="输入股票代码或名称，如 600519、贵州茅台、AAPL"
@@ -719,6 +812,7 @@ const HomePage: React.FC = () => {
               loadError={watchlistError}
               allShareError={stockIndexError?.message ?? null}
               addingWatchlistCode={addingWatchlistCode}
+              isRemovingWatchlist={isRemovingWatchlist}
               reanalyzeLabel={reanalyzeButtonText}
               reanalyzeDisabled={selectedWatchlistTargets.length === 0}
               onRefresh={() => {
@@ -736,6 +830,7 @@ const HomePage: React.FC = () => {
               onToggleSelection={toggleWatchlistSelection}
               onSelectVisible={selectVisibleWatchlist}
               onClearSelection={clearWatchlistSelection}
+              onRemoveSelectedFromWatchlist={handleRemoveSelectedFromWatchlist}
             />
           </div>
         </section>

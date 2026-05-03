@@ -397,6 +397,18 @@ def test_rule_service_run_modes_separate_latest_from_history():
     assert history_result["matches"][0]["matched_events"][0]["snapshot"]["close"] == 15
 
 
+def test_rule_service_history_mode_respects_date_range():
+    service = RuleService(repo=_FakeRuleRepo(_service_rule_for_run_mode()), stock_service=_FakeStockService())
+
+    included = service.run_rule(1, mode="history", start_date="2026-04-02", end_date="2026-04-02")
+    excluded = service.run_rule(1, mode="history", start_date="2026-04-03", end_date="2026-04-03")
+
+    assert included["event_count"] == 1
+    assert included["matches"][0]["matched_dates"] == ["2026-04-02"]
+    assert excluded["event_count"] == 0
+    assert excluded["matches"] == []
+
+
 def test_rule_service_rejects_cross_operators():
     definition = {
         "period": "daily",

@@ -667,6 +667,126 @@ describe('HomePage', () => {
     });
   });
 
+  it('adds an autocomplete selection to the watchlist without starting analysis', async () => {
+    stockIndexHookState.current = {
+      index: [
+        {
+          canonicalCode: '600519.SH',
+          displayCode: '600519',
+          nameZh: '贵州茅台',
+          pinyinFull: 'guizhoumaotai',
+          pinyinAbbr: 'gzmt',
+          aliases: ['茅台'],
+          market: 'CN',
+          assetType: 'stock',
+          active: true,
+          popularity: 100,
+          industry: '白酒',
+        },
+      ],
+      loading: false,
+      error: null,
+      fallback: false,
+      loaded: true,
+    };
+    vi.mocked(historyApi.getList).mockResolvedValue({
+      total: 0,
+      page: 1,
+      limit: 20,
+      items: [],
+    });
+    vi.mocked(analysisApi.analyzeAsync).mockResolvedValue({
+      taskId: 'task-autocomplete',
+      status: 'pending',
+    });
+
+    render(
+      <MemoryRouter>
+        <HomePage />
+      </MemoryRouter>,
+    );
+
+    const input = await screen.findByPlaceholderText('输入股票代码或名称，如 600519、贵州茅台、AAPL');
+    fireEvent.change(input, { target: { value: 'gzmt' } });
+    fireEvent.click(await screen.findByRole('option', { name: /贵州茅台/ }));
+
+    await waitFor(() => {
+      expect(systemConfigApi.update).toHaveBeenCalledWith(expect.objectContaining({
+        configVersion: 'v1',
+        maskToken: '******',
+        reloadNow: true,
+        items: [{ key: 'STOCK_LIST', value: '600519' }],
+      }));
+    });
+
+    expect(analysisApi.analyzeAsync).not.toHaveBeenCalled();
+    expect(await screen.findByRole('button', { name: '查看 贵州茅台 报告' })).toBeInTheDocument();
+    expect(screen.getByText('待分析')).toBeInTheDocument();
+    expect(screen.getByText('暂无报告')).toBeInTheDocument();
+  });
+
+  it('removes selected watchlist stocks from the panel action', async () => {
+    const watchlistHistoryItems = [
+      {
+        ...historyItem,
+        id: 1,
+        stockCode: '000001',
+        stockName: '平安银行',
+      },
+      {
+        ...historyItem,
+        id: 2,
+        stockCode: '300274.SZ',
+        stockName: '阳光电源',
+      },
+      {
+        ...historyItem,
+        id: 3,
+        stockCode: '688521.SH',
+        stockName: '芯原股份',
+      },
+    ];
+
+    vi.mocked(systemConfigApi.getConfig).mockResolvedValue({
+      configVersion: 'v1',
+      maskToken: '******',
+      items: [{ key: 'STOCK_LIST', value: '000001,300274,688521', rawValueExists: true, isMasked: false }],
+    });
+    vi.mocked(historyApi.getList).mockResolvedValue({
+      total: 3,
+      page: 1,
+      limit: 20,
+      items: watchlistHistoryItems,
+    });
+
+    render(
+      <MemoryRouter>
+        <HomePage />
+      </MemoryRouter>,
+    );
+
+    expect(await screen.findByRole('button', { name: '查看 平安银行 报告' })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '多选' }));
+    fireEvent.click(screen.getByRole('button', { name: '全选当前' }));
+    fireEvent.click(screen.getByLabelText('选择 阳光电源 监控股票'));
+    fireEvent.click(screen.getByRole('button', { name: '取消关注已选 2 只股票' }));
+
+    await waitFor(() => {
+      expect(systemConfigApi.update).toHaveBeenCalledWith(expect.objectContaining({
+        configVersion: 'v1',
+        maskToken: '******',
+        reloadNow: true,
+        items: [{ key: 'STOCK_LIST', value: '300274' }],
+      }));
+    });
+
+    await waitFor(() => {
+      expect(screen.queryByRole('button', { name: '查看 平安银行 报告' })).not.toBeInTheDocument();
+      expect(screen.queryByRole('button', { name: '查看 芯原股份 报告' })).not.toBeInTheDocument();
+    });
+    expect(screen.getByRole('button', { name: '查看 阳光电源 报告' })).toBeInTheDocument();
+  });
+
   it('surfaces duplicate task warnings from dashboard submission', async () => {
     vi.mocked(historyApi.getList).mockResolvedValue({
       total: 0,

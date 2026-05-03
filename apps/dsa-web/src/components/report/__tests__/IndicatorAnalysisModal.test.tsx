@@ -81,38 +81,20 @@ async function flushPromises() {
   });
 }
 
-function installSvgPointerMocks() {
-  const createPointDescriptor = Object.getOwnPropertyDescriptor(SVGSVGElement.prototype, 'createSVGPoint');
-  const screenCtmDescriptor = Object.getOwnPropertyDescriptor(SVGSVGElement.prototype, 'getScreenCTM');
+function expectIndicatorHeadersToShow(date: string) {
+  const priceHeader = screen.getByTestId('indicator-price-header');
+  const volumeHeader = screen.getByTestId('indicator-volume-header');
+  const momentumHeader = screen.getByTestId('indicator-momentum-header');
 
-  Object.defineProperty(SVGSVGElement.prototype, 'createSVGPoint', {
-    configurable: true,
-    value: () => {
-      const point = {
-        x: 0,
-        y: 0,
-        matrixTransform: () => ({ x: point.x, y: point.y }),
-      };
-      return point as unknown as SVGPoint;
-    },
-  });
-  Object.defineProperty(SVGSVGElement.prototype, 'getScreenCTM', {
-    configurable: true,
-    value: () => ({ inverse: () => ({}) }) as DOMMatrix,
-  });
-
-  return () => {
-    if (createPointDescriptor) {
-      Object.defineProperty(SVGSVGElement.prototype, 'createSVGPoint', createPointDescriptor);
-    } else {
-      delete (SVGSVGElement.prototype as unknown as Record<string, unknown>).createSVGPoint;
-    }
-    if (screenCtmDescriptor) {
-      Object.defineProperty(SVGSVGElement.prototype, 'getScreenCTM', screenCtmDescriptor);
-    } else {
-      delete (SVGSVGElement.prototype as unknown as Record<string, unknown>).getScreenCTM;
-    }
-  };
+  expect(within(priceHeader).getByText(date)).toBeInTheDocument();
+  expect(within(priceHeader).getByText(/^收盘:/)).toBeInTheDocument();
+  expect(within(priceHeader).getByText(/^MA5:/)).toBeInTheDocument();
+  expect(within(volumeHeader).getByText(date)).toBeInTheDocument();
+  expect(within(volumeHeader).queryByText(/^成交量:/)).not.toBeInTheDocument();
+  expect(within(volumeHeader).queryByText(/^成交额:/)).not.toBeInTheDocument();
+  expect(within(volumeHeader).getByText(/^MAVOL5:/)).toBeInTheDocument();
+  expect(within(momentumHeader).getByText(date)).toBeInTheDocument();
+  expect(within(momentumHeader).getByText(/^DIF:/)).toBeInTheDocument();
 }
 
 describe('IndicatorAnalysisModal', () => {
@@ -288,11 +270,10 @@ describe('IndicatorAnalysisModal', () => {
     fireEvent.click(within(sidePanel).getByRole('tab', { name: '筹码峰' }));
 
     fireEvent.mouseEnter(screen.getByTestId('indicator-chart-bar-2026-04-24'));
-    const priceTooltip = screen.getByTestId('indicator-chart-tooltip');
-    expect(within(priceTooltip).getByText('2026-04-24')).toBeInTheDocument();
-    expect(within(priceTooltip).getByText('收盘')).toBeInTheDocument();
-    expect(within(screen.getByTestId('indicator-volume-tooltip')).getByText('2026-04-24')).toBeInTheDocument();
-    expect(within(screen.getByTestId('indicator-momentum-tooltip')).getByText('2026-04-24')).toBeInTheDocument();
+    expect(screen.queryByTestId('indicator-chart-tooltip')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('indicator-volume-tooltip')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('indicator-momentum-tooltip')).not.toBeInTheDocument();
+    expectIndicatorHeadersToShow('2026-04-24');
     if (stockCode === '600519') {
       expect(within(screen.getByTestId('chip-peak-panel')).getByText('2026-04-24')).toBeInTheDocument();
       expect(screen.getByRole('img', { name: '筹码峰分布图' })).toBeInTheDocument();
@@ -303,9 +284,7 @@ describe('IndicatorAnalysisModal', () => {
     fireEvent.mouseLeave(screen.getByTestId('indicator-chart-bar-2026-04-24'));
 
     fireEvent.mouseEnter(screen.getByTestId('indicator-volume-bar-2026-04-24'));
-    const volumeTooltip = screen.getByTestId('indicator-volume-tooltip');
-    expect(within(volumeTooltip).getByText('成交量')).toBeInTheDocument();
-    expect(within(volumeTooltip).getByText('MAVOL5')).toBeInTheDocument();
+    expectIndicatorHeadersToShow('2026-04-24');
 
     fireEvent.contextMenu(screen.getByRole('img', { name: '成交量图' }), { clientX: 80, clientY: 120 });
     expect(screen.getByRole('menu', { name: '图表缩放菜单' })).toBeInTheDocument();
@@ -326,20 +305,19 @@ describe('IndicatorAnalysisModal', () => {
     fireEvent.click(pinnedBar);
     fireEvent.mouseLeave(pinnedBar);
 
-    expect(within(screen.getByTestId('indicator-chart-tooltip')).getByText('2026-04-24')).toBeInTheDocument();
-    expect(within(screen.getByTestId('indicator-volume-tooltip')).getByText('2026-04-24')).toBeInTheDocument();
-    expect(within(screen.getByTestId('indicator-momentum-tooltip')).getByText('2026-04-24')).toBeInTheDocument();
+    expectIndicatorHeadersToShow('2026-04-24');
     expect(within(screen.getByTestId('chip-peak-panel')).getByText('2026-04-24')).toBeInTheDocument();
 
     fireEvent.keyDown(window, { key: 'ArrowLeft' });
-    expect(within(screen.getByTestId('indicator-chart-tooltip')).getByText('2026-04-23')).toBeInTheDocument();
-    expect(within(screen.getByTestId('indicator-volume-tooltip')).getByText('2026-04-23')).toBeInTheDocument();
-    expect(within(screen.getByTestId('indicator-momentum-tooltip')).getByText('2026-04-23')).toBeInTheDocument();
+    expectIndicatorHeadersToShow('2026-04-23');
     expect(within(screen.getByTestId('chip-peak-panel')).getByText('2026-04-23')).toBeInTheDocument();
 
     fireEvent.keyDown(window, { key: 'ArrowRight' });
-    expect(within(screen.getByTestId('indicator-chart-tooltip')).getByText('2026-04-24')).toBeInTheDocument();
+    expectIndicatorHeadersToShow('2026-04-24');
     expect(within(screen.getByTestId('chip-peak-panel')).getByText('2026-04-24')).toBeInTheDocument();
+
+    fireEvent.mouseEnter(screen.getByTestId('indicator-chart-bar-2026-04-23'));
+    expectIndicatorHeadersToShow('2026-04-23');
 
     fireEvent.keyDown(window, { key: 'Escape' });
     expect(onClose).not.toHaveBeenCalled();
@@ -348,48 +326,91 @@ describe('IndicatorAnalysisModal', () => {
     unmount();
   });
 
-  it('lets the indicator tooltip be dragged and resets it when the selected candle changes', async () => {
-    const restoreSvgPointerMocks = installSvgPointerMocks();
+  it('opens on an initial hit date and highlights it across the indicator charts', async () => {
+    const { unmount } = render(
+      <IndicatorAnalysisModal
+        stockCode="600519"
+        stockName="贵州茅台"
+        initialDate="2026-04-24"
+        initialHistoryDays={365}
+        onClose={vi.fn()}
+      />,
+    );
+    await flushPromises();
 
-    try {
-      const { unmount } = render(
-        <IndicatorAnalysisModal stockCode="600519" stockName="贵州茅台" onClose={vi.fn()} />,
-      );
+    expect(stocksApi.getHistory).toHaveBeenCalledWith('600519', 365, 'daily');
+    expect(screen.getByText('命中日 2026-04-24')).toBeInTheDocument();
+    expect(screen.getByTestId('indicator-hit-highlight-2026-04-24')).toBeInTheDocument();
+    expect(screen.getByTestId('indicator-volume-hit-highlight-2026-04-24')).toBeInTheDocument();
+    expect(screen.getByTestId('indicator-momentum-hit-highlight-2026-04-24')).toBeInTheDocument();
+    expectIndicatorHeadersToShow('2026-04-24');
+    expect(screen.queryByTestId('indicator-chart-tooltip')).not.toBeInTheDocument();
+
+    unmount();
+  });
+
+  it('keeps indicator headers live when the selected candle changes by mouse', async () => {
+    const { unmount } = render(
+      <IndicatorAnalysisModal stockCode="600519" stockName="贵州茅台" onClose={vi.fn()} />,
+    );
+    await flushPromises();
+
+    fireEvent.click(screen.getByTestId('indicator-chart-bar-2026-04-24'));
+    expectIndicatorHeadersToShow('2026-04-24');
+    expect(screen.queryByTestId('indicator-chart-tooltip')).not.toBeInTheDocument();
+
+    fireEvent.mouseEnter(screen.getByTestId('indicator-chart-bar-2026-04-23'));
+    expectIndicatorHeadersToShow('2026-04-23');
+
+    fireEvent.mouseEnter(screen.getByTestId('indicator-volume-bar-2026-04-24'));
+    expectIndicatorHeadersToShow('2026-04-24');
+
+    unmount();
+  });
+
+  it('requests a wider history range for slower intraday periods', async () => {
+    const { unmount } = render(
+      <IndicatorAnalysisModal stockCode="600519" stockName="贵州茅台" onClose={vi.fn()} />,
+    );
+    await flushPromises();
+
+    expect(stocksApi.getHistory).toHaveBeenCalledWith('600519', 3, '1m');
+    expect(stocksApi.getHistory).toHaveBeenCalledWith('600519', 3, '5m');
+    expect(stocksApi.getHistory).toHaveBeenCalledWith('600519', 30, '15m');
+    expect(stocksApi.getHistory).toHaveBeenCalledWith('600519', 30, '30m');
+    expect(stocksApi.getHistory).toHaveBeenCalledWith('600519', 30, '60m');
+
+    unmount();
+  });
+
+  it('keeps the time window axis visible when intraday periods cannot pan', async () => {
+    const shortIntradayPeriods = new Set<KLinePeriod>(['15m', '30m', '60m']);
+    vi.mocked(stocksApi.getHistory).mockImplementation(async (stockCode, _days, period = 'daily') => ({
+      stockCode,
+      stockName: '贵州茅台',
+      period,
+      data: shortIntradayPeriods.has(period) ? makeHistory(period).slice(0, 8) : makeHistory(period),
+    }));
+
+    const { unmount } = render(
+      <IndicatorAnalysisModal stockCode="600519" stockName="贵州茅台" onClose={vi.fn()} />,
+    );
+    await flushPromises();
+
+    for (const label of ['15分', '30分', '60分']) {
+      fireEvent.click(screen.getByRole('tab', { name: label }));
       await flushPromises();
 
-      fireEvent.mouseEnter(screen.getByTestId('indicator-chart-bar-2026-04-24'));
+      const slider = screen.getByRole('slider', { name: 'K线时间窗口' });
 
-      const initialTooltip = screen.getByTestId('indicator-chart-tooltip');
-      const initialTransform = initialTooltip.getAttribute('transform');
-      expect(initialTransform).toBeTruthy();
-
-      fireEvent.pointerDown(initialTooltip, {
-        button: 0,
-        pointerId: 1,
-        clientX: 100,
-        clientY: 100,
-      });
-      fireEvent.pointerMove(window, {
-        pointerId: 1,
-        clientX: 160,
-        clientY: 140,
-      });
-      fireEvent.pointerUp(window, { pointerId: 1 });
-
-      const draggedTransform = screen.getByTestId('indicator-chart-tooltip').getAttribute('transform');
-      expect(draggedTransform).toBeTruthy();
-      expect(draggedTransform).not.toBe(initialTransform);
-
-      fireEvent.keyDown(window, { key: 'ArrowLeft' });
-
-      const resetTooltip = screen.getByTestId('indicator-chart-tooltip');
-      expect(within(resetTooltip).getByText('2026-04-23')).toBeInTheDocument();
-      expect(resetTooltip.getAttribute('transform')).not.toBe(draggedTransform);
-
-      unmount();
-    } finally {
-      restoreSvgPointerMocks();
+      expect(screen.getByTestId('indicator-window-track')).toBeInTheDocument();
+      expect(screen.getByTestId('indicator-window-thumb')).toBeInTheDocument();
+      expect(slider).toBeDisabled();
+      expect(slider).toHaveAttribute('max', '1');
+      expect(slider).toHaveValue('1');
     }
+
+    unmount();
   });
 
   it('syncs the chip peak date with the current visible K-line window', async () => {

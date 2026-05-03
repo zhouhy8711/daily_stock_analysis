@@ -17,6 +17,12 @@ import {
 import { Badge, Button, EmptyState } from '../common';
 import { DashboardStateBlock } from '../dashboard';
 import { formatDateTime } from '../../utils/format';
+import {
+  matchesIndustryQuery,
+  normalizeIndustryQuery,
+  UNCLASSIFIED_INDUSTRY_LABEL,
+  type IndustryOption,
+} from '../../utils/industryFilter';
 
 export interface WatchlistItem {
   stockCode: string;
@@ -45,6 +51,7 @@ interface WatchlistBoardProps {
   loadError?: string | null;
   allShareError?: string | null;
   addingWatchlistCode?: string | null;
+  isRemovingWatchlist?: boolean;
   reanalyzeLabel: string;
   reanalyzeDisabled: boolean;
   onRefresh: () => void;
@@ -56,6 +63,7 @@ interface WatchlistBoardProps {
   onToggleSelection: (stockCode: string) => void;
   onSelectVisible: (stockCodes: string[]) => void;
   onClearSelection: () => void;
+  onRemoveSelectedFromWatchlist: () => void;
 }
 
 type BoardTab = 'watchlist' | 'all-cn';
@@ -63,103 +71,6 @@ type MarketFilter = 'all' | 'cn' | 'hk' | 'us';
 type SortField = 'currentPrice' | 'changePct';
 type SortDirection = 'asc' | 'desc';
 type SortState = { field: SortField; direction: SortDirection } | null;
-type IndustryOption = { name: string; count: number };
-
-const UNCLASSIFIED_INDUSTRY = '未分类';
-
-const INDUSTRY_PINYIN_ABBR: Record<string, string> = {
-  半导体: 'bdt',
-  白酒: 'bj',
-  白色家电: 'bsjd',
-  保险: 'bx',
-  包装印刷: 'bzys',
-  厨卫电器: 'cwdq',
-  电池: 'dc',
-  电机: 'dj',
-  电力: 'dl',
-  电网设备: 'dwsb',
-  多元金融: 'dyjr',
-  电子化学品: 'dzhxp',
-  房地产: 'fdc',
-  风电设备: 'fdsb',
-  非金属材料: 'fjscl',
-  服装家纺: 'fzjf',
-  纺织制造: 'fzzz',
-  工程机械: 'gcjx',
-  光伏设备: 'gfsb',
-  贵金属: 'gjs',
-  轨交设备: 'gjsb',
-  港口航运: 'gkhy',
-  公路铁路运输: 'gltlys',
-  钢铁: 'gt',
-  光学光电子: 'gxgdz',
-  工业金属: 'gyjs',
-  环保设备: 'hbsb',
-  环境治理: 'hjzl',
-  互联网电商: 'hlwds',
-  黑色家电: 'hsjd',
-  化学纤维: 'hxxw',
-  化学原料: 'hxyl',
-  化学制品: 'hxzp',
-  化学制药: 'hxzy',
-  IT服务: 'itfw',
-  机场航运: 'jchy',
-  军工电子: 'jgdz',
-  军工装备: 'jgzb',
-  家居用品: 'jjyp',
-  计算机设备: 'jsjsb',
-  金属新材料: 'jsxcl',
-  教育: 'jy',
-  建筑材料: 'jzcl',
-  建筑装饰: 'jzzs',
-  零售: 'ls',
-  旅游及酒店: 'lyjjd',
-  美容护理: 'mrhl',
-  煤炭开采加工: 'mtkcjg',
-  贸易: 'my',
-  农产品加工: 'ncpjg',
-  农化制品: 'nhzp',
-  能源金属: 'nyjs',
-  汽车服务及其他: 'qcfwjqt',
-  汽车零部件: 'qclbj',
-  汽车整车: 'qczc',
-  其他电源设备: 'qtdysb',
-  其他电子: 'qtdz',
-  其他社会服务: 'qtshfw',
-  软件开发: 'rjkf',
-  燃气: 'rq',
-  塑料制品: 'slzp',
-  食品加工制造: 'spjgzz',
-  生物制品: 'swzp',
-  石油加工贸易: 'syjgmy',
-  通信服务: 'txfw',
-  通信设备: 'txsb',
-  通用设备: 'tysb',
-  文化传媒: 'whcm',
-  物流: 'wl',
-  消费电子: 'xfdz',
-  小家电: 'xjd',
-  小金属: 'xjs',
-  橡胶制品: 'xjzp',
-  元件: 'yj',
-  医疗服务: 'ylfw',
-  医疗器械: 'ylqx',
-  饮料制造: 'ylzz',
-  油气开采及服务: 'yqkcyfw',
-  影视院线: 'ysyx',
-  游戏: 'yx',
-  银行: 'yh',
-  医药商业: 'yysy',
-  养殖业: 'yzy',
-  自动化设备: 'zdhsb',
-  综合: 'zh',
-  证券: 'zq',
-  中药: 'zy',
-  专用设备: 'zysb',
-  造纸: 'zz',
-  种植业与林业: 'zzyyly',
-  [UNCLASSIFIED_INDUSTRY]: 'wfl',
-};
 
 const BOARD_TABS: Array<{ key: BoardTab; label: string }> = [
   { key: 'watchlist', label: '自选' },
@@ -247,21 +158,7 @@ function getAdviceVariant(advice?: string): 'success' | 'warning' | 'danger' | '
 }
 
 function getIndustryLabel(item: WatchlistItem): string {
-  return item.industry?.trim() || UNCLASSIFIED_INDUSTRY;
-}
-
-function normalizeIndustryQuery(value: string): string {
-  return value.trim().toLowerCase().replace(/\s+/g, '');
-}
-
-function matchesIndustryQuery(option: IndustryOption, query: string): boolean {
-  if (!query) {
-    return true;
-  }
-
-  const name = normalizeIndustryQuery(option.name);
-  const pinyinAbbr = INDUSTRY_PINYIN_ABBR[option.name]?.toLowerCase() ?? '';
-  return name.includes(query) || pinyinAbbr.includes(query);
+  return item.industry?.trim() || UNCLASSIFIED_INDUSTRY_LABEL;
 }
 
 export const WatchlistBoard: React.FC<WatchlistBoardProps> = ({
@@ -276,6 +173,7 @@ export const WatchlistBoard: React.FC<WatchlistBoardProps> = ({
   loadError,
   allShareError,
   addingWatchlistCode,
+  isRemovingWatchlist = false,
   reanalyzeLabel,
   reanalyzeDisabled,
   onRefresh,
@@ -287,6 +185,7 @@ export const WatchlistBoard: React.FC<WatchlistBoardProps> = ({
   onToggleSelection,
   onSelectVisible,
   onClearSelection,
+  onRemoveSelectedFromWatchlist,
 }) => {
   const [activeBoardTab, setActiveBoardTab] = useState<BoardTab>('watchlist');
   const [activeMarket, setActiveMarket] = useState<MarketFilter>('all');
@@ -324,10 +223,10 @@ export const WatchlistBoard: React.FC<WatchlistBoardProps> = ({
     return Array.from(counts.entries())
       .map(([name, count]) => ({ name, count }))
       .sort((left, right) => {
-        if (left.name === UNCLASSIFIED_INDUSTRY) {
+        if (left.name === UNCLASSIFIED_INDUSTRY_LABEL) {
           return 1;
         }
-        if (right.name === UNCLASSIFIED_INDUSTRY) {
+        if (right.name === UNCLASSIFIED_INDUSTRY_LABEL) {
           return -1;
         }
         return left.name.localeCompare(right.name, 'zh-Hans-CN');
@@ -589,9 +488,24 @@ export const WatchlistBoard: React.FC<WatchlistBoardProps> = ({
                   {allVisibleSelected ? '清空' : '全选当前'}
                 </Button>
               ) : null}
-              <Button variant="ghost" size="sm" onClick={onRefresh} aria-label="刷新监控股票">
-                <RefreshCw className="h-4 w-4" />
-              </Button>
+              {!isAllShareView && selectionMode && selectedCodes.size > 0 ? (
+                <Button
+                  variant="danger-subtle"
+                  size="sm"
+                  onClick={onRemoveSelectedFromWatchlist}
+                  disabled={isRemovingWatchlist}
+                  isLoading={isRemovingWatchlist}
+                  loadingText="取消中..."
+                  aria-label={`取消关注已选 ${selectedCodes.size} 只股票`}
+                >
+                  <X className="h-4 w-4" />
+                  取消关注
+                </Button>
+              ) : (
+                <Button variant="ghost" size="sm" onClick={onRefresh} aria-label="刷新监控股票">
+                  <RefreshCw className="h-4 w-4" />
+                </Button>
+              )}
             </div>
           </div>
 

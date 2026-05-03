@@ -8,8 +8,10 @@ import type {
   RuleItem,
   RuleMatchItem,
   RuleMetricItem,
-  RuleRunMode,
+  RuleRunHistoryItem,
+  RuleRunPayload,
   RuleRunResponse,
+  RuleTargetScope,
   RuleUpdatePayload,
   RuleValueExpression,
 } from '../types/rules';
@@ -178,6 +180,13 @@ function serializePayload(payload: RuleCreatePayload | RuleUpdatePayload): Recor
   };
 }
 
+function serializeRunTarget(target: { scope: RuleTargetScope; stockCodes: string[] }): Record<string, unknown> {
+  return {
+    scope: target.scope,
+    stock_codes: target.stockCodes,
+  };
+}
+
 function normalizeMatch(raw: Record<string, unknown>): RuleMatchItem {
   const matchedGroups = raw.matched_groups ?? raw.matchedGroups;
   const matchedDates = raw.matched_dates ?? raw.matchedDates;
@@ -192,6 +201,21 @@ function normalizeMatch(raw: Record<string, unknown>): RuleMatchItem {
       ? raw.snapshot as Record<string, unknown>
       : {},
     explanation: toNullableString(raw.explanation),
+  };
+}
+
+function normalizeRunHistory(raw: Record<string, unknown>): RuleRunHistoryItem {
+  return {
+    id: toNumber(raw.id),
+    ruleId: toNumber(raw.rule_id ?? raw.ruleId),
+    ruleName: toNullableString(raw.rule_name ?? raw.ruleName),
+    status: toString(raw.status),
+    targetCount: toNumber(raw.target_count ?? raw.targetCount),
+    matchCount: toNumber(raw.match_count ?? raw.matchCount),
+    error: toNullableString(raw.error),
+    startedAt: toNullableString(raw.started_at ?? raw.startedAt),
+    finishedAt: toNullableString(raw.finished_at ?? raw.finishedAt),
+    durationMs: raw.duration_ms == null && raw.durationMs == null ? null : toNumber(raw.duration_ms ?? raw.durationMs),
   };
 }
 
@@ -231,10 +255,37 @@ export const rulesApi = {
     await apiClient.delete(`/api/v1/rules/${encodeURIComponent(String(ruleId))}`);
   },
 
-  async run(ruleId: number, payload?: { mode?: RuleRunMode }): Promise<RuleRunResponse> {
+  async listRuns(limit = 30): Promise<RuleRunHistoryItem[]> {
+    const response = await apiClient.get<{ items?: Array<Record<string, unknown>> }>('/api/v1/rules/runs', {
+      params: { limit },
+    });
+    return (response.data.items ?? []).map(normalizeRunHistory);
+  },
+
+  async getRunMatches(runId: number): Promise<RuleMatchItem[]> {
+    const response = await apiClient.get<{ items?: Array<Record<string, unknown>> }>(
+      `/api/v1/rules/runs/${encodeURIComponent(String(runId))}/matches`,
+    );
+    return (response.data.items ?? []).map(normalizeMatch);
+  },
+
+  async deleteRun(runId: number): Promise<void> {
+    await apiClient.delete(`/api/v1/rules/runs/${encodeURIComponent(String(runId))}`);
+  },
+
+  async run(
+    ruleId: number,
+    payload?: RuleRunPayload,
+  ): Promise<RuleRunResponse> {
+    const requestPayload = {
+      mode: payload?.mode,
+      target: payload?.target ? serializeRunTarget(payload.target) : undefined,
+      start_date: payload?.startDate || undefined,
+      end_date: payload?.endDate || undefined,
+    };
     const response = await apiClient.post<Record<string, unknown>>(
       `/api/v1/rules/${encodeURIComponent(String(ruleId))}/run`,
-      payload ?? {},
+      requestPayload,
     );
     const rawMatches = Array.isArray(response.data.matches) ? response.data.matches : [];
     return {

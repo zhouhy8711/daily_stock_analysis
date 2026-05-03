@@ -75,6 +75,31 @@ class RuleRepository:
                 items.append(item)
             return items
 
+    @staticmethod
+    def run_to_dict(row: StockRuleRun, rule_name: Optional[str] = None) -> Dict[str, Any]:
+        return {
+            "id": row.id,
+            "rule_id": row.rule_id,
+            "rule_name": rule_name,
+            "status": row.status,
+            "target_count": int(row.target_count or 0),
+            "match_count": int(row.match_count or 0),
+            "error": row.error,
+            "started_at": row.started_at.isoformat() if row.started_at else None,
+            "finished_at": row.finished_at.isoformat() if row.finished_at else None,
+            "duration_ms": row.duration_ms,
+        }
+
+    def list_runs(self, limit: int = 30) -> List[Dict[str, Any]]:
+        with self.db.get_session() as session:
+            rows = session.execute(
+                select(StockRuleRun, StockRule.name)
+                .join(StockRule, StockRule.id == StockRuleRun.rule_id)
+                .order_by(desc(StockRuleRun.started_at), desc(StockRuleRun.id))
+                .limit(limit)
+            ).all()
+            return [self.run_to_dict(run, rule_name) for run, rule_name in rows]
+
     def get_rule(self, rule_id: int) -> Optional[Dict[str, Any]]:
         with self.db.get_session() as session:
             row = session.execute(select(StockRule).where(StockRule.id == rule_id).limit(1)).scalar_one_or_none()
@@ -131,6 +156,16 @@ class RuleRepository:
                 return False
             session.execute(delete(StockRuleMatch).where(StockRuleMatch.rule_id == rule_id))
             session.execute(delete(StockRuleRun).where(StockRuleRun.rule_id == rule_id))
+            session.delete(row)
+            session.commit()
+            return True
+
+    def delete_run(self, run_id: int) -> bool:
+        with self.db.get_session() as session:
+            row = session.execute(select(StockRuleRun).where(StockRuleRun.id == run_id).limit(1)).scalar_one_or_none()
+            if row is None:
+                return False
+            session.execute(delete(StockRuleMatch).where(StockRuleMatch.run_id == run_id))
             session.delete(row)
             session.commit()
             return True

@@ -27,6 +27,20 @@ vi.mock('../../theme/ThemeToggle', () => ({
 }));
 
 describe('SidebarNav', () => {
+  it('places backtest between rules and chat', () => {
+    render(
+      <MemoryRouter initialEntries={['/backtest']}>
+        <SidebarNav />
+      </MemoryRouter>,
+    );
+
+    const labels = screen.getAllByRole('link').map((link) => link.getAttribute('aria-label'));
+
+    expect(labels).toEqual(expect.arrayContaining(['规则', '回测', '问股']));
+    expect(labels.indexOf('规则')).toBeLessThan(labels.indexOf('回测'));
+    expect(labels.indexOf('回测')).toBeLessThan(labels.indexOf('问股'));
+  });
+
   it('shows the shared completion badge only when chat completion is pending', () => {
     completionBadgeState.value = true;
 

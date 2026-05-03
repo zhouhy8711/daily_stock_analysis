@@ -1,18 +1,12 @@
 import type React from 'react';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
-  Activity,
   CopyPlus,
   HelpCircle,
   ListFilter,
-  Maximize2,
-  Minimize2,
-  Play,
   Plus,
   Save,
-  Search,
   Trash2,
-  X,
 } from 'lucide-react';
 import { rulesApi } from '../api/rules';
 import { getParsedApiError } from '../api/error';
@@ -30,9 +24,6 @@ import type {
   RuleItem,
   RuleMetricItem,
   RuleOperator,
-  RuleRunMode,
-  RuleRunResponse,
-  RuleTargetScope,
   RuleValueExpression,
 } from '../types/rules';
 import { getRecentStartDate, getTodayInShanghai } from '../utils/format';
@@ -49,7 +40,6 @@ const INPUT_CLASS =
   'input-surface input-focus-glow h-10 w-full rounded-xl border bg-transparent px-3 text-sm transition-all focus:outline-none disabled:cursor-not-allowed disabled:opacity-60';
 const TEXTAREA_CLASS =
   'input-surface input-focus-glow min-h-[92px] w-full resize-y rounded-xl border bg-transparent px-3 py-2 text-sm text-foreground transition-all placeholder:text-muted-text focus:outline-none disabled:cursor-not-allowed disabled:opacity-60';
-const STOCK_CODES_TEXTAREA_CLASS = `${TEXTAREA_CLASS} font-mono`;
 const WATCHLIST_HISTORY_LIMIT = 20;
 const OFFSET_HELP_TEXT = (
   <span>
@@ -61,17 +51,6 @@ type StockListDisplayItem = {
   code: string;
   name?: string;
   industry?: string;
-};
-
-type StockListLineItem = StockListDisplayItem & {
-  sourceCode: string;
-  line: string;
-  industryLabel: string;
-};
-
-type StockListIndustryOption = {
-  name: string;
-  count: number;
 };
 
 const OPERATOR_OPTIONS: Array<{ value: RuleOperator; label: string }> = [
@@ -108,8 +87,6 @@ const AGGREGATE_OPTIONS: Array<{ value: RuleAggregateMethod; label: string }> = 
   { value: 'median', label: '中位数' },
   { value: 'std', label: '标准差' },
 ];
-const UNCLASSIFIED_INDUSTRY = '未分类';
-const ALL_STOCK_LIST_INDUSTRIES = '__all__';
 
 type MetricGroup = {
   category: string;
@@ -177,67 +154,6 @@ function normalizeRuleStockCode(value: string): string {
   return code;
 }
 
-function parseStockCodes(value: string): string[] {
-  const seen = new Set<string>();
-  return value
-    .split(/[\n\r,，;；]+/)
-    .map(normalizeRuleStockCode)
-    .filter((code) => {
-      if (!code || seen.has(code)) {
-        return false;
-      }
-      seen.add(code);
-      return true;
-    });
-}
-
-function getStockLookupKeys(code: string): string[] {
-  const upperCode = code.trim().toUpperCase();
-  const normalized = normalizeRuleStockCode(upperCode);
-  const keys = new Set<string>([upperCode, normalized]);
-
-  if (upperCode) {
-    keys.add(upperCode);
-  }
-  const [base] = upperCode.split('.');
-  if (base) {
-    keys.add(normalizeRuleStockCode(base));
-  }
-  const prefixedAShare = upperCode.match(/^(SH|SZ|BJ)(\d{6})$/);
-  if (prefixedAShare) {
-    keys.add(prefixedAShare[2]);
-    keys.add(`${prefixedAShare[2]}.${prefixedAShare[1]}`);
-  }
-  const suffixedAShare = upperCode.match(/^(\d{6})\.(SH|SZ|SS|BJ)$/);
-  if (suffixedAShare) {
-    keys.add(suffixedAShare[1]);
-    keys.add(`${suffixedAShare[2] === 'SS' ? 'SH' : suffixedAShare[2]}${suffixedAShare[1]}`);
-  }
-  if (/^\d{6}$/.test(upperCode)) {
-    keys.add(`SH${upperCode}`);
-    keys.add(`SZ${upperCode}`);
-    keys.add(`BJ${upperCode}`);
-    keys.add(`${upperCode}.SH`);
-    keys.add(`${upperCode}.SZ`);
-    keys.add(`${upperCode}.SS`);
-    keys.add(`${upperCode}.BJ`);
-  }
-  if (upperCode.startsWith('HK') && upperCode.length > 2) {
-    keys.add(normalizeRuleStockCode(upperCode.slice(2)));
-  }
-  const hkSuffix = upperCode.match(/^(\d{1,5})\.HK$/);
-  if (hkSuffix) {
-    const padded = hkSuffix[1].padStart(5, '0');
-    keys.add(padded);
-    keys.add(`HK${padded}`);
-  }
-  const usSuffix = upperCode.match(/^([A-Z]{1,5})\.US$/);
-  if (usSuffix) {
-    keys.add(usSuffix[1]);
-  }
-  return Array.from(keys).filter(Boolean);
-}
-
 function getStockDisplayCode(item: StockIndexItem): string {
   return normalizeRuleStockCode(item.displayCode || item.canonicalCode);
 }
@@ -248,117 +164,6 @@ function compareStockListItems(left: StockIndexItem, right: StockIndexItem): num
 
 function isAllAshareItem(item: StockIndexItem): boolean {
   return isAllShareStock(item);
-}
-
-function buildStockLookup(
-  stockIndex: StockIndexItem[],
-  preferredItems: StockListDisplayItem[] = [],
-): Map<string, StockListDisplayItem> {
-  const lookup = new Map<string, StockListDisplayItem>();
-  for (const item of stockIndex) {
-    const displayItem = {
-      code: getStockDisplayCode(item),
-      name: item.nameZh || item.nameEn,
-      industry: item.industry,
-    };
-    for (const key of getStockLookupKeys(item.canonicalCode).concat(getStockLookupKeys(item.displayCode))) {
-      lookup.set(key, displayItem);
-    }
-  }
-  for (const item of preferredItems) {
-    if (!item.code) {
-      continue;
-    }
-    const existing = getStockLookupKeys(item.code)
-      .map((key) => lookup.get(key))
-      .find((displayItem) => displayItem !== undefined);
-    const displayItem = {
-      code: item.code,
-      name: item.name || existing?.name,
-      industry: item.industry || existing?.industry,
-    };
-    for (const key of getStockLookupKeys(item.code)) {
-      lookup.set(key, displayItem);
-    }
-  }
-  return lookup;
-}
-
-function getDisplayItemForCode(code: string, lookup: Map<string, StockListDisplayItem>): StockListDisplayItem {
-  for (const key of getStockLookupKeys(code)) {
-    const item = lookup.get(key);
-    if (item) {
-      return item;
-    }
-  }
-  return { code: normalizeRuleStockCode(code) };
-}
-
-function getStockIndustryLabel(item: StockListDisplayItem): string {
-  return item.industry?.trim() || UNCLASSIFIED_INDUSTRY;
-}
-
-function formatStockListLine(item: StockListDisplayItem): string {
-  const industry = getStockIndustryLabel(item);
-  return item.name ? `${industry} ${item.code} ${item.name}` : `${industry} ${item.code}`;
-}
-
-function formatStockListText(codes: string[], lookup: Map<string, StockListDisplayItem>): string {
-  return codes
-    .map((code) => getDisplayItemForCode(code, lookup))
-    .map(formatStockListLine)
-    .join('\n');
-}
-
-function buildStockListLineItems(
-  codes: string[],
-  lookup: Map<string, StockListDisplayItem>,
-): StockListLineItem[] {
-  return codes.map((sourceCode) => {
-    const item = getDisplayItemForCode(sourceCode, lookup);
-    return {
-      ...item,
-      sourceCode,
-      line: formatStockListLine(item),
-      industryLabel: getStockIndustryLabel(item),
-    };
-  });
-}
-
-function buildStockListIndustryOptions(items: StockListLineItem[]): StockListIndustryOption[] {
-  const counts = new Map<string, number>();
-  for (const item of items) {
-    counts.set(item.industryLabel, (counts.get(item.industryLabel) ?? 0) + 1);
-  }
-  return Array.from(counts.entries())
-    .map(([name, count]) => ({ name, count }))
-    .sort((left, right) => {
-      if (left.name === UNCLASSIFIED_INDUSTRY) {
-        return 1;
-      }
-      if (right.name === UNCLASSIFIED_INDUSTRY) {
-        return -1;
-      }
-      return left.name.localeCompare(right.name, 'zh-Hans-CN');
-    });
-}
-
-function filterStockListItems(
-  items: StockListLineItem[],
-  query: string,
-  industryFilter: string,
-): StockListLineItem[] {
-  const normalizedQuery = query.trim().toUpperCase();
-  return items.filter((item) => {
-    const matchesIndustry = industryFilter === ALL_STOCK_LIST_INDUSTRIES || item.industryLabel === industryFilter;
-    if (!matchesIndustry) {
-      return false;
-    }
-    if (!normalizedQuery) {
-      return true;
-    }
-    return item.code.toUpperCase().includes(normalizedQuery) || (item.name ?? '').toUpperCase().includes(normalizedQuery);
-  });
 }
 
 function hydrateDefinitionTarget(
@@ -392,51 +197,6 @@ function formatNumber(value: unknown): string {
     return numberValue.toLocaleString('zh-CN', { maximumFractionDigits: 2 });
   }
   return numberValue.toLocaleString('zh-CN', { maximumFractionDigits: 4 });
-}
-
-function asRecord(value: unknown): Record<string, unknown> {
-  return value && typeof value === 'object' ? value as Record<string, unknown> : {};
-}
-
-function getEventDate(event: Record<string, unknown>): string {
-  return typeof event.date === 'string' && event.date ? event.date : '--';
-}
-
-function getEventSnapshotValue(event: Record<string, unknown>, key: string): unknown {
-  return asRecord(event.snapshot)[key];
-}
-
-function getEventConditionValueByMetric(
-  event: Record<string, unknown>,
-  metricKey: string,
-  key: string,
-  fallbackConditionId?: string,
-): unknown {
-  const groups = Array.isArray(event.matched_groups)
-    ? event.matched_groups
-    : Array.isArray(event.matchedGroups)
-      ? event.matchedGroups
-      : [];
-  for (const group of groups) {
-    const conditions = Array.isArray(asRecord(group).conditions) ? asRecord(group).conditions as unknown[] : [];
-    for (const condition of conditions) {
-      const item = asRecord(condition);
-      const leftMetric = item.left_metric ?? item.leftMetric;
-      if (leftMetric !== metricKey && item.id !== fallbackConditionId) continue;
-      return asRecord(item.values)[key];
-    }
-  }
-  return undefined;
-}
-
-function getEventMetricValue(
-  event: Record<string, unknown>,
-  snapshotKey: string,
-  fallbackConditionId?: string,
-  valueKey = 'left',
-): unknown {
-  const conditionValue = getEventConditionValueByMetric(event, snapshotKey, valueKey, fallbackConditionId);
-  return conditionValue ?? getEventSnapshotValue(event, snapshotKey);
 }
 
 function metricLabel(metrics: RuleMetricItem[], metricKey: string): string {
@@ -898,11 +658,7 @@ const RulesPage: React.FC = () => {
     document.title = '规则 - DSA';
   }, []);
 
-  const {
-    index: stockIndex,
-    loading: isLoadingStockIndex,
-    error: stockIndexError,
-  } = useStockIndex();
+  const { index: stockIndex } = useStockIndex();
   const [rules, setRules] = useState<RuleItem[]>([]);
   const [metrics, setMetrics] = useState<RuleMetricItem[]>([]);
   const [selectedRuleId, setSelectedRuleId] = useState<number | null>(null);
@@ -912,16 +668,10 @@ const RulesPage: React.FC = () => {
   const [definition, setDefinition] = useState<RuleDefinition>(() => createDefinition());
   const [isLoading, setIsLoading] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
-  const [isRunning, setIsRunning] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [feedback, setFeedback] = useState<string | null>(null);
-  const [runResult, setRunResult] = useState<RuleRunResponse | null>(null);
-  const [runMode, setRunMode] = useState<RuleRunMode>('latest');
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
   const [watchlistItems, setWatchlistItems] = useState<StockListDisplayItem[]>([]);
-  const [isStockListExpanded, setIsStockListExpanded] = useState(false);
-  const [stockListFilter, setStockListFilter] = useState('');
-  const [stockListIndustryFilter, setStockListIndustryFilter] = useState(ALL_STOCK_LIST_INDUSTRIES);
   const watchlistCodes = useMemo(
     () => watchlistItems.map((item) => item.code),
     [watchlistItems],
@@ -931,7 +681,6 @@ const RulesPage: React.FC = () => {
     () => metrics.map((metric) => ({ value: metric.key, label: metric.label })),
     [metrics],
   );
-  const stockLookup = useMemo(() => buildStockLookup(stockIndex, watchlistItems), [stockIndex, watchlistItems]);
   const allAshareCodes = useMemo(
     () => Array.from(new Set(stockIndex
       .filter(isAllAshareItem)
@@ -992,30 +741,12 @@ const RulesPage: React.FC = () => {
     setDefinition((current) => hydrateDefinitionTarget(current, watchlistCodes, allAshareCodes));
   }, [allAshareCodes, watchlistCodes]);
 
-  useEffect(() => {
-    if (!isStockListExpanded) {
-      return undefined;
-    }
-    const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key !== 'Escape') {
-        return;
-      }
-      event.preventDefault();
-      setIsStockListExpanded(false);
-      setStockListFilter('');
-      setStockListIndustryFilter(ALL_STOCK_LIST_INDUSTRIES);
-    };
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [isStockListExpanded]);
-
   const selectRule = (rule: RuleItem) => {
     setSelectedRuleId(rule.id);
     setName(rule.name);
     setDescription(rule.description ?? '');
     setIsActive(rule.isActive);
     setDefinition(hydrateDefinitionTarget(rule.definition, watchlistCodes, allAshareCodes));
-    setRunResult(null);
     setFeedback(null);
     setError(null);
   };
@@ -1027,7 +758,6 @@ const RulesPage: React.FC = () => {
     setDescription('');
     setIsActive(true);
     setDefinition(createDefinition(metric, watchlistCodes));
-    setRunResult(null);
     setFeedback(null);
     setError(null);
     setShowDeleteConfirm(false);
@@ -1092,99 +822,6 @@ const RulesPage: React.FC = () => {
       setError(getParsedApiError(err).message);
     }
   };
-
-  const runRule = async () => {
-    if (!selectedRuleId) return;
-    setIsRunning(true);
-    setError(null);
-    setFeedback(null);
-    try {
-      const saved = await rulesApi.update(selectedRuleId, buildRulePayload());
-      setName(saved.name);
-      setDescription(saved.description ?? '');
-      setIsActive(saved.isActive);
-      setDefinition(saved.definition);
-      const result = await rulesApi.run(selectedRuleId, { mode: runMode });
-      const dateCount = result.eventCount || result.matches.reduce((count, match) => count + match.matchedDates.length, 0);
-      const modeLabel = result.mode === 'latest' ? '最新日扫描' : '历史回测';
-      setRunResult(result);
-      setFeedback(`${modeLabel}完成：扫描 ${result.targetCount} 只，命中 ${result.matchCount} 只，命中 ${dateCount} 个交易日。`);
-      setRules(await rulesApi.list());
-    } catch (err) {
-      setError(getParsedApiError(err).message);
-    } finally {
-      setIsRunning(false);
-    }
-  };
-
-  const targetCodesText = formatStockListText(definition.target.stockCodes, stockLookup);
-  const targetListReadOnly = definition.target.scope !== 'custom';
-  const stockListItems = useMemo(
-    () => buildStockListLineItems(definition.target.stockCodes, stockLookup),
-    [definition.target.stockCodes, stockLookup],
-  );
-  const stockListIndustryOptions = useMemo(
-    () => buildStockListIndustryOptions(stockListItems),
-    [stockListItems],
-  );
-  const filteredStockListItems = useMemo(
-    () => filterStockListItems(stockListItems, stockListFilter, stockListIndustryFilter),
-    [stockListFilter, stockListIndustryFilter, stockListItems],
-  );
-  const hasStockListFilter = stockListFilter.trim().length > 0 || stockListIndustryFilter !== ALL_STOCK_LIST_INDUSTRIES;
-  const updateTargetCodesFromText = useCallback((value: string) => {
-    setDefinition((current) => ({
-      ...current,
-      target: {
-        ...current.target,
-        stockCodes: parseStockCodes(value),
-      },
-    }));
-  }, []);
-  const removeTargetStockCode = useCallback((sourceCode: string) => {
-    setDefinition((current) => ({
-      ...current,
-      target: {
-        ...current.target,
-        stockCodes: current.target.stockCodes.filter((code) => code !== sourceCode),
-      },
-    }));
-  }, []);
-  const closeStockListExpanded = useCallback(() => {
-    setIsStockListExpanded(false);
-    setStockListFilter('');
-    setStockListIndustryFilter(ALL_STOCK_LIST_INDUSTRIES);
-  }, []);
-  const scopeOptions: Array<{ value: RuleTargetScope; label: string }> = [
-    { value: 'watchlist', label: '自选股 STOCK_LIST' },
-    { value: 'all_a_shares', label: '所有 A 股' },
-    { value: 'custom', label: '自定义股票列表' },
-  ];
-  const matchedDateCount = runResult
-    ? runResult.eventCount || runResult.matches.reduce((count, match) => count + match.matchedDates.length, 0)
-    : 0;
-  const runEventRows = useMemo(() => {
-    if (!runResult) return [];
-    return runResult.matches.flatMap((match) => {
-      if (match.matchedEvents.length > 0) {
-        return match.matchedEvents.map((event) => ({
-          stockCode: match.stockCode,
-          stockName: match.stockName,
-          event: asRecord(event),
-        }));
-      }
-      return match.matchedDates.map((date) => ({
-        stockCode: match.stockCode,
-        stockName: match.stockName,
-        event: {
-          date,
-          snapshot: match.snapshot,
-          matched_groups: match.matchedGroups,
-          explanation: match.explanation,
-        } as Record<string, unknown>,
-      }));
-    });
-  }, [runResult]);
 
   return (
     <AppPage className="max-w-[1500px]">
@@ -1255,57 +892,6 @@ const RulesPage: React.FC = () => {
               </label>
             </div>
 
-            <div className="mt-4 grid gap-3 md:grid-cols-[16rem_minmax(0,1fr)]">
-              <SelectField
-                label="股票范围"
-                value={definition.target.scope}
-                options={scopeOptions}
-                onChange={(scope) => {
-                  setStockListFilter('');
-                  setStockListIndustryFilter(ALL_STOCK_LIST_INDUSTRIES);
-                  setDefinition((current) => ({
-                    ...current,
-                    target: {
-                      ...current.target,
-                      scope,
-                      stockCodes: scope === 'watchlist'
-                        ? watchlistCodes
-                        : scope === 'all_a_shares'
-                          ? allAshareCodes
-                          : current.target.stockCodes,
-                    },
-                  }));
-                }}
-              />
-              <div className="flex min-w-0 flex-col gap-1 text-xs text-muted-text">
-                <span>行业 / 股票代码 / 股票名称</span>
-                <div className="relative">
-                  <textarea
-                    aria-label="行业 / 股票代码 / 股票名称"
-                    value={targetCodesText}
-                    onChange={(event) => updateTargetCodesFromText(event.target.value)}
-                    readOnly={targetListReadOnly}
-                    className={`${STOCK_CODES_TEXTAREA_CLASS} pr-12`}
-                    style={{ fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace' }}
-                    placeholder="白酒 600519 贵州茅台&#10;银行 000001 平安银行&#10;未分类 AAPL Apple"
-                  />
-                  <button
-                    type="button"
-                    aria-label="最大化股票列表"
-                    title="最大化股票列表"
-                    onClick={() => setIsStockListExpanded(true)}
-                    className="absolute right-2 top-2 inline-flex h-7 w-7 items-center justify-center rounded-lg border border-border/70 bg-card/90 text-secondary-text shadow-soft-card transition-all hover:border-primary/50 hover:bg-primary/10 hover:text-primary focus-visible:outline-none focus-visible:ring-4 focus-visible:ring-cyan/15"
-                  >
-                    <Maximize2 className="h-3.5 w-3.5" />
-                  </button>
-                </div>
-                <span className="text-[11px] text-muted-text">
-                  {definition.target.stockCodes.length} 只股票
-                  {definition.target.scope === 'all_a_shares' && isLoadingStockIndex ? '，正在加载 A 股列表...' : ''}
-                  {definition.target.scope === 'all_a_shares' && stockIndexError ? '，A 股列表加载失败' : ''}
-                </span>
-              </div>
-            </div>
           </section>
 
           <section className={PANEL_CLASS}>
@@ -1387,199 +973,10 @@ const RulesPage: React.FC = () => {
             </div>
           </section>
 
-          <section className={PANEL_CLASS}>
-            <div className="mb-4 flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
-              <div className="flex items-center gap-2">
-                <Activity className="h-5 w-5 text-primary" />
-                <div>
-                  <h2 className="text-lg font-semibold text-foreground">运行结果</h2>
-                  <p className="text-sm text-secondary-text">最新日扫描只判断最后一个交易日；历史回测会逐日判断历史窗口内每个交易日。</p>
-                </div>
-              </div>
-              <div className="flex flex-wrap items-center gap-2">
-                <div className="inline-flex overflow-hidden rounded-xl border border-border/70 bg-elevated/40 p-1" aria-label="运行模式">
-                  {([
-                    { value: 'latest' as const, label: '最新日' },
-                    { value: 'history' as const, label: '历史回测' },
-                  ]).map((item) => (
-                    <button
-                      key={item.value}
-                      type="button"
-                      onClick={() => setRunMode(item.value)}
-                      className={`rounded-lg px-3 py-1.5 text-sm transition-all ${
-                        runMode === item.value
-                          ? 'bg-primary text-background shadow-glow-primary'
-                          : 'text-secondary-text hover:bg-hover hover:text-foreground'
-                      }`}
-                    >
-                      {item.label}
-                    </button>
-                  ))}
-                </div>
-                <Button variant="danger-subtle" size="sm" onClick={() => setShowDeleteConfirm(true)} disabled={!selectedRuleId}>
-                  <Trash2 className="h-4 w-4" />
-                  删除
-                </Button>
-                <Button variant="primary" size="sm" onClick={runRule} disabled={!selectedRuleId} isLoading={isRunning} loadingText="运行中...">
-                  <Play className="h-4 w-4" />
-                  运行
-                </Button>
-              </div>
-            </div>
-
-            {!runResult ? (
-              <EmptyState title="暂无运行结果" description="选择已保存规则后点击运行，命中股票会展示在这里。" className="border-dashed" />
-            ) : (
-              <div className="space-y-3">
-                <div className="flex flex-wrap items-center gap-2 text-sm">
-                  <Badge variant={runResult.status === 'completed' ? 'success' : 'warning'}>{runResult.status}</Badge>
-                  <span className="text-secondary-text">{runResult.mode === 'latest' ? '最新日扫描' : '历史回测'}</span>
-                  <span className="text-secondary-text">扫描 {runResult.targetCount} 只</span>
-                  <span className="text-secondary-text">命中 {runResult.matchCount} 只</span>
-                  <span className="text-secondary-text">命中 {matchedDateCount} 个交易日</span>
-                  <span className="text-secondary-text">耗时 {runResult.durationMs} ms</span>
-                </div>
-                {runResult.errors.length > 0 ? (
-                  <InlineAlert variant="warning" message={`部分股票运行失败：${runResult.errors.join('；')}`} />
-                ) : null}
-                {runEventRows.length === 0 ? (
-                  <EmptyState title="未命中" description="本次运行没有股票满足任一条件组。" className="border-dashed" />
-                ) : (
-                  <div className="overflow-x-auto rounded-xl border border-border/60">
-                    <table className="min-w-[980px] w-full text-sm">
-                      <thead className="bg-elevated/70 text-left text-xs uppercase text-muted-text">
-                        <tr>
-                          <th className="px-3 py-2">股票</th>
-                          <th className="px-3 py-2">日期</th>
-                          <th className="px-3 py-2">成交量</th>
-                          <th className="px-3 py-2">前5日均量*倍数</th>
-                          <th className="px-3 py-2">筹码集中度</th>
-                          <th className="px-3 py-2">解套率</th>
-                          <th className="px-3 py-2">命中解释</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {runEventRows.map((row, index) => (
-                          <tr key={`${row.stockCode}-${getEventDate(row.event)}-${index}`} className="border-t border-border/50">
-                            <td className="px-3 py-3">
-                              <div className="font-semibold text-foreground">{row.stockName || row.stockCode}</div>
-                              <div className="font-mono text-xs text-muted-text">{row.stockCode}</div>
-                            </td>
-                            <td className="px-3 py-3 font-mono text-xs text-secondary-text">{getEventDate(row.event)}</td>
-                            <td className="px-3 py-3 text-secondary-text">{formatNumber(getEventMetricValue(row.event, 'volume', 'cond-latest-volume-gt-prev5avg'))}</td>
-                            <td className="px-3 py-3 text-secondary-text">{formatNumber(getEventConditionValueByMetric(row.event, 'volume', 'right', 'cond-latest-volume-gt-prev5avg'))}</td>
-                            <td className="px-3 py-3 text-secondary-text">{formatNumber(getEventMetricValue(row.event, 'chip_concentration_90', 'cond-chip-concentration-lt-015'))}</td>
-                            <td className="px-3 py-3 text-secondary-text">{formatNumber(getEventMetricValue(row.event, 'profit_ratio', 'cond-profit-ratio-eq-0'))}</td>
-                            <td className="px-3 py-3 text-secondary-text">{typeof row.event.explanation === 'string' && row.event.explanation ? row.event.explanation : '--'}</td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                  </div>
-                )}
-              </div>
-            )}
-          </section>
         </div>
       </div>
 
       {metricOptions.length === 0 ? null : <span className="sr-only">已加载 {metricOptions.length} 个指标 key</span>}
-
-      {isStockListExpanded ? (
-        <div
-          className="fixed inset-0 z-[70] flex items-stretch justify-center bg-background/75 p-2 backdrop-blur-sm md:p-5"
-          role="dialog"
-          aria-modal="true"
-          aria-label="股票列表最大化"
-          onClick={closeStockListExpanded}
-        >
-          <div
-            className="glass-card flex min-h-0 w-full max-w-7xl flex-col overflow-hidden shadow-2xl"
-            onClick={(event) => event.stopPropagation()}
-          >
-            <div className="flex flex-col gap-3 border-b border-border/60 p-3 md:flex-row md:items-center md:justify-between md:p-4">
-              <div>
-                <h2 className="text-lg font-semibold text-foreground">行业 / 股票代码 / 股票名称</h2>
-                <p className="mt-1 text-xs text-muted-text">
-                  {hasStockListFilter ? `${filteredStockListItems.length} / ` : ''}
-                  {definition.target.stockCodes.length} 只股票
-                </p>
-              </div>
-              <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
-                <label className="block sm:w-44">
-                  <span className="sr-only">筛选行业类别</span>
-                  <select
-                    value={stockListIndustryFilter}
-                    onChange={(event) => setStockListIndustryFilter(event.target.value)}
-                    className={INPUT_CLASS}
-                    aria-label="筛选行业类别"
-                  >
-                    <option value={ALL_STOCK_LIST_INDUSTRIES} className="bg-elevated text-foreground">
-                      全部行业
-                    </option>
-                    {stockListIndustryOptions.map((option) => (
-                      <option key={option.name} value={option.name} className="bg-elevated text-foreground">
-                        {option.name} ({option.count})
-                      </option>
-                    ))}
-                  </select>
-                </label>
-                <label className="relative block sm:w-72">
-                  <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-text" />
-                  <input
-                    value={stockListFilter}
-                    onChange={(event) => setStockListFilter(event.target.value)}
-                    className={`${INPUT_CLASS} pl-9`}
-                    placeholder="筛选代码或名称"
-                    aria-label="筛选股票列表"
-                  />
-                </label>
-                <Button variant="secondary" size="sm" onClick={closeStockListExpanded} aria-label="收起股票列表">
-                  <Minimize2 className="h-4 w-4" />
-                  收起
-                </Button>
-              </div>
-            </div>
-            <div className="min-h-0 flex-1 p-3 md:p-4">
-              <div
-                className={`${TEXTAREA_CLASS} h-full min-h-[65vh] overflow-y-auto px-0 py-0`}
-                role="list"
-                aria-label="最大化股票列表内容"
-              >
-                {filteredStockListItems.length === 0 ? (
-                  <div className="flex h-full min-h-[12rem] items-center justify-center px-4 text-sm text-muted-text">
-                    没有匹配的股票
-                  </div>
-                ) : (
-                  filteredStockListItems.map((item) => (
-                    <div
-                      key={item.sourceCode}
-                      role="listitem"
-                      className="grid grid-cols-[2.25rem_minmax(0,1fr)] items-center border-b border-border/35 px-3 py-1.5 last:border-b-0 hover:bg-hover/70"
-                    >
-                      <button
-                        type="button"
-                        aria-label={`移除 ${item.line}`}
-                        title={`移除 ${item.line}`}
-                        onClick={() => removeTargetStockCode(item.sourceCode)}
-                        className="inline-flex h-6 w-6 items-center justify-center rounded-md text-muted-text transition-all hover:bg-danger/10 hover:text-danger focus-visible:outline-none focus-visible:ring-4 focus-visible:ring-danger/15"
-                      >
-                        <X className="h-3.5 w-3.5" />
-                      </button>
-                      <span
-                        className="min-w-0 whitespace-pre-wrap break-words font-mono text-sm leading-6 text-foreground"
-                        style={{ fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace' }}
-                      >
-                        {item.line}
-                      </span>
-                    </div>
-                  ))
-                )}
-              </div>
-            </div>
-          </div>
-        </div>
-      ) : null}
 
       <ConfirmDialog
         isOpen={showDeleteConfirm}
