@@ -288,9 +288,20 @@ def get_stock_quotes(payload: StockQuotesRequest) -> StockQuotesResponse:
                     prev_close=item.get("prev_close"),
                     volume=item.get("volume"),
                     amount=item.get("amount"),
+                    after_hours_volume=item.get("after_hours_volume"),
+                    after_hours_amount=item.get("after_hours_amount"),
                     volume_ratio=item.get("volume_ratio"),
                     turnover_rate=item.get("turnover_rate"),
                     amplitude=item.get("amplitude"),
+                    pe_ratio=item.get("pe_ratio"),
+                    total_mv=item.get("total_mv"),
+                    circ_mv=item.get("circ_mv"),
+                    total_shares=item.get("total_shares"),
+                    float_shares=item.get("float_shares"),
+                    limit_up_price=item.get("limit_up_price"),
+                    limit_down_price=item.get("limit_down_price"),
+                    price_speed=item.get("price_speed"),
+                    entrust_ratio=item.get("entrust_ratio"),
                     source=item.get("source"),
                     update_time=item.get("update_time"),
                 )
@@ -365,9 +376,20 @@ def get_stock_quote(stock_code: str) -> StockQuote:
             prev_close=result.get("prev_close"),
             volume=result.get("volume"),
             amount=result.get("amount"),
+            after_hours_volume=result.get("after_hours_volume"),
+            after_hours_amount=result.get("after_hours_amount"),
             volume_ratio=result.get("volume_ratio"),
             turnover_rate=result.get("turnover_rate"),
             amplitude=result.get("amplitude"),
+            pe_ratio=result.get("pe_ratio"),
+            total_mv=result.get("total_mv"),
+            circ_mv=result.get("circ_mv"),
+            total_shares=result.get("total_shares"),
+            float_shares=result.get("float_shares"),
+            limit_up_price=result.get("limit_up_price"),
+            limit_down_price=result.get("limit_down_price"),
+            price_speed=result.get("price_speed"),
+            entrust_ratio=result.get("entrust_ratio"),
             source=result.get("source"),
             update_time=result.get("update_time")
         )
@@ -465,8 +487,15 @@ def get_stock_history(
                 low=item.get("low"),
                 close=item.get("close"),
                 volume=item.get("volume"),
+                after_hours_volume=(
+                    item.get("after_hours_volume")
+                    or item.get("afterHoursVolume")
+                    or item.get("post_market_volume")
+                    or item.get("postMarketVolume")
+                ),
                 amount=item.get("amount"),
-                change_percent=item.get("change_percent")
+                change_percent=item.get("change_percent"),
+                turnover_rate=item.get("turnover_rate"),
             )
             for item in result.get("data", [])
         ]

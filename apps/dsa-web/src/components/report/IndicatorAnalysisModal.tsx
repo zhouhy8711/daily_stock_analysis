@@ -9,6 +9,8 @@ import {
   ChevronRight,
   Layers3,
   LineChart,
+  Minus,
+  Plus,
   Radio,
   Users,
   X,
@@ -341,6 +343,11 @@ function formatCompactNumber(value?: number | null): string {
   return value.toFixed(0);
 }
 
+function formatCompactShares(value?: number | null): string {
+  const formatted = formatCompactNumber(value);
+  return formatted === '--' ? '--' : `${formatted}股`;
+}
+
 function formatPct(value?: number | null): string {
   if (typeof value !== 'number' || Number.isNaN(value)) {
     return '--';
@@ -375,6 +382,23 @@ function formatSignedNumber(value?: number | null, digits = 2): string {
     return '--';
   }
   return `${value >= 0 ? '+' : ''}${value.toFixed(digits)}`;
+}
+
+function isValidNumber(value?: number | null): value is number {
+  return typeof value === 'number' && Number.isFinite(value);
+}
+
+function getCnTrendColor(value?: number | null): string {
+  if (!isValidNumber(value)) {
+    return TERMINAL_COLORS.axisText;
+  }
+  if (value > 0) {
+    return TERMINAL_COLORS.hitHighlight;
+  }
+  if (value < 0) {
+    return TERMINAL_COLORS.green;
+  }
+  return TERMINAL_COLORS.axisText;
 }
 
 function formatDateTime(value?: string | null): string {
@@ -485,23 +509,6 @@ function getRecentReturn(points: ChartPoint[], period: number): number | undefin
   return ((latest.close - previous.close) / previous.close) * 100;
 }
 
-function getPointChange(point: ChartPoint, previous?: ChartPoint): number | undefined {
-  if (!previous?.close) {
-    return undefined;
-  }
-  return point.close - previous.close;
-}
-
-function getPointChangePct(point: ChartPoint, previous?: ChartPoint): number | undefined {
-  if (typeof point.changePercent === 'number' && !Number.isNaN(point.changePercent)) {
-    return point.changePercent;
-  }
-  if (!previous?.close) {
-    return undefined;
-  }
-  return ((point.close - previous.close) / previous.close) * 100;
-}
-
 function getPointAmplitude(point: ChartPoint, previous?: ChartPoint): number | undefined {
   const base = previous?.close ?? point.open;
   if (!base) {
@@ -515,6 +522,164 @@ function getPointVolumeRatio(point: ChartPoint): number | undefined {
     return undefined;
   }
   return point.volume / point.volumeMa5;
+}
+
+function deriveShares(marketValue?: number | null, price?: number | null): number | undefined {
+  if (!isValidNumber(marketValue) || !isValidNumber(price) || price <= 0) {
+    return undefined;
+  }
+  const shares = marketValue / price;
+  return Number.isFinite(shares) && shares > 0 ? shares : undefined;
+}
+
+function deriveMarketValue(shares?: number | null, price?: number | null): number | undefined {
+  if (!isValidNumber(shares) || !isValidNumber(price) || price <= 0) {
+    return undefined;
+  }
+  const marketValue = shares * price;
+  return Number.isFinite(marketValue) && marketValue > 0 ? marketValue : undefined;
+}
+
+function getQuoteFloatShares(quote: StockQuote | null): number | undefined {
+  if (isValidNumber(quote?.floatShares) && quote.floatShares > 0) {
+    return quote.floatShares;
+  }
+  return deriveShares(quote?.circMv, quote?.currentPrice);
+}
+
+function resolveQuoteMarketValue(
+  fieldValue: number | null | undefined,
+  shareValue: number | null | undefined,
+  price: number | null | undefined,
+): number | undefined {
+  return isValidNumber(fieldValue) ? fieldValue : deriveMarketValue(shareValue, price);
+}
+
+function resolvePeRatio(
+  quote: StockQuote | null,
+  referenceQuote: StockQuote | null,
+  price: number | null | undefined,
+): number | undefined {
+  if (isValidNumber(quote?.peRatio)) {
+    return quote.peRatio;
+  }
+  if (
+    isValidNumber(referenceQuote?.peRatio)
+    && isValidNumber(referenceQuote?.currentPrice)
+    && referenceQuote.currentPrice > 0
+    && isValidNumber(price)
+    && price > 0
+  ) {
+    return referenceQuote.peRatio * (price / referenceQuote.currentPrice);
+  }
+  return undefined;
+}
+
+function inferVolumeShareMultiplier(points: ChartPoint[], quote: StockQuote | null): number | undefined {
+  const latestPointVolume = points.at(-1)?.volume;
+  if (!isValidNumber(latestPointVolume) || latestPointVolume <= 0) {
+    return undefined;
+  }
+
+  const floatShares = getQuoteFloatShares(quote);
+  if (isValidNumber(floatShares) && floatShares > 0 && isValidNumber(quote?.turnoverRate) && quote.turnoverRate > 0) {
+    const impliedShares = (quote.turnoverRate / 100) * floatShares;
+    const ratio = impliedShares / latestPointVolume;
+    if (ratio >= 50 && ratio <= 150) {
+      return 100;
+    }
+    if (ratio >= 0.5 && ratio <= 1.5) {
+      return 1;
+    }
+  }
+
+  if (isValidNumber(quote?.volume) && quote.volume > 0) {
+    const ratio = quote.volume / latestPointVolume;
+    if (ratio >= 50 && ratio <= 150) {
+      return 100;
+    }
+    if (ratio >= 0.5 && ratio <= 1.5) {
+      return 1;
+    }
+  }
+
+  return undefined;
+}
+
+function resolvePointTurnoverRate(
+  point: ChartPoint | null | undefined,
+  quote: StockQuote | null,
+  points: ChartPoint[],
+  preferRealtimeQuote = false,
+): number | undefined {
+  const quoteTurnoverRate = quote?.turnoverRate;
+  if (preferRealtimeQuote && isValidNumber(quoteTurnoverRate)) {
+    return quoteTurnoverRate;
+  }
+
+  const pointTurnoverRate = point?.turnoverRate;
+  if (isValidNumber(pointTurnoverRate)) {
+    return pointTurnoverRate;
+  }
+
+  const volume = point?.volume;
+  const floatShares = getQuoteFloatShares(quote);
+  if (!isValidNumber(volume) || volume <= 0 || !isValidNumber(floatShares) || floatShares <= 0) {
+    return undefined;
+  }
+
+  const volumeShareMultiplier = inferVolumeShareMultiplier(points, quote);
+  if (!isValidNumber(volumeShareMultiplier)) {
+    return undefined;
+  }
+
+  const turnoverRate = ((volume * volumeShareMultiplier) / floatShares) * 100;
+  return Number.isFinite(turnoverRate) && turnoverRate >= 0 ? turnoverRate : undefined;
+}
+
+function deriveAfterHoursVolume(afterHoursAmount?: number | null, price?: number | null): number | undefined {
+  if (!isValidNumber(afterHoursAmount) || !isValidNumber(price) || price <= 0) {
+    return undefined;
+  }
+  const volume = afterHoursAmount / price / 100;
+  return Number.isFinite(volume) && volume > 0 ? volume : undefined;
+}
+
+function deriveAfterHoursAmount(afterHoursVolume?: number | null, price?: number | null): number | undefined {
+  if (!isValidNumber(afterHoursVolume) || !isValidNumber(price) || price <= 0) {
+    return undefined;
+  }
+  const amount = afterHoursVolume * 100 * price;
+  return Number.isFinite(amount) && amount > 0 ? amount : undefined;
+}
+
+function getMainNetInflow(
+  points: ChartPoint[],
+  quote: StockQuote | null,
+  metrics: StockIndicatorMetrics | null,
+): number | undefined {
+  const actual = metrics?.capitalFlow?.mainNetInflow;
+  if (isValidNumber(actual)) {
+    return actual;
+  }
+  return buildOrderFlowMetrics(points, quote).netTotal;
+}
+
+function getMainNetVolumePct(
+  points: ChartPoint[],
+  quote: StockQuote | null,
+  metrics: StockIndicatorMetrics | null,
+): number | undefined {
+  const actualRatio = metrics?.capitalFlow?.mainNetInflowRatio;
+  if (isValidNumber(actualRatio)) {
+    return actualRatio;
+  }
+  const netInflow = getMainNetInflow(points, quote, metrics);
+  const circMv = quote?.circMv;
+  if (!isValidNumber(netInflow) || !isValidNumber(circMv) || circMv <= 0) {
+    return undefined;
+  }
+  return (netInflow / circMv) * 100;
 }
 
 function formatCostRange(chip?: ChipDistributionMetrics | null): string {
@@ -1122,37 +1287,135 @@ function buildTrendPath<T>(
   }).join(' ');
 }
 
-const ChartLegend: React.FC<{ point?: ChartPoint; previous?: ChartPoint; periodLabel: string }> = ({ point, previous, periodLabel }) => (
-  <div data-testid="indicator-price-header" className="flex flex-wrap items-center gap-x-3 gap-y-1 font-mono text-[11px] leading-none">
-    <span style={{ color: TERMINAL_COLORS.text }}>{periodLabel}</span>
-    <span className="inline-flex items-center gap-1" style={{ color: TERMINAL_COLORS.cyan }}>
-      <i className="h-2 w-4 border" style={{ borderColor: TERMINAL_COLORS.cyan, backgroundColor: TERMINAL_COLORS.cyan }} />阳线
-    </span>
-    <span className="inline-flex items-center gap-1" style={{ color: TERMINAL_COLORS.orange }}>
-      <i className="h-2 w-4 border bg-transparent" style={{ borderColor: TERMINAL_COLORS.orange }} />阴线
-    </span>
-    <span style={{ color: TERMINAL_COLORS.yellow }}>{point?.date ?? '--'}</span>
-    <span style={{ color: (point?.close ?? 0) >= (point?.open ?? 0) ? TERMINAL_COLORS.cyan : TERMINAL_COLORS.orange }}>
-      {point ? (point.close >= point.open ? '阳线' : '阴线') : '--'}
-    </span>
-    <span style={{ color: TERMINAL_COLORS.axisText }}>开盘:{formatNumber(point?.open)}</span>
-    <span style={{ color: TERMINAL_COLORS.axisText }}>最高:{formatNumber(point?.high)}</span>
-    <span style={{ color: TERMINAL_COLORS.axisText }}>收盘:{formatNumber(point?.close)}</span>
-    <span style={{ color: TERMINAL_COLORS.axisText }}>最低:{formatNumber(point?.low)}</span>
-    <span style={{ color: TERMINAL_COLORS.axisText }}>涨跌额:{formatSignedNumber(point ? getPointChange(point, previous) : undefined)}</span>
-    <span style={{ color: TERMINAL_COLORS.axisText }}>涨跌幅:{formatPct(point ? getPointChangePct(point, previous) : undefined)}</span>
-    <span style={{ color: TERMINAL_COLORS.axisText }}>振幅:{formatPct(point ? getPointAmplitude(point, previous) : undefined)}</span>
-    <span style={{ color: TERMINAL_COLORS.axisText }}>量比:{formatNumber(point ? getPointVolumeRatio(point) : undefined, 2)}</span>
-    <span style={{ color: TERMINAL_COLORS.axisText }}>成交量:{formatCompactNumber(point?.volume)}</span>
-    <span style={{ color: TERMINAL_COLORS.axisText }}>成交额:{formatCompactNumber(point?.amount)}</span>
-    <span style={{ color: LINE_COLORS.ma5 }}>MA5:{formatNumber(point?.ma5)}</span>
-    <span style={{ color: LINE_COLORS.ma10 }}>MA10:{formatNumber(point?.ma10)}</span>
-    <span style={{ color: LINE_COLORS.ma20 }}>MA20:{formatNumber(point?.ma20)}</span>
-    <span style={{ color: LINE_COLORS.ma30 }}>MA30:{formatNumber(point?.ma30)}</span>
-    <span style={{ color: LINE_COLORS.ma60 }}>MA60:{formatNumber(point?.ma60)}</span>
-    <span style={{ color: LINE_COLORS.ma10 }}>量均5日:{formatCompactNumber(point?.volumeMa5)}</span>
-  </div>
-);
+type CoreMetricItem = {
+  label: string;
+  value: string;
+  tone?: 'up' | 'down' | 'neutral';
+};
+
+const CoreQuoteMetrics: React.FC<{
+  point?: ChartPoint;
+  previous?: ChartPoint;
+  quote: StockQuote | null;
+  referenceQuote: StockQuote | null;
+  points: ChartPoint[];
+}> = ({ point, previous, quote, referenceQuote, points }) => {
+  const close = quote?.currentPrice ?? point?.close;
+  const previousClose = quote?.prevClose ?? previous?.close;
+  const change = quote?.change
+    ?? (point && isValidNumber(previousClose) && previousClose !== 0 ? point.close - previousClose : undefined);
+  const changePct = quote?.changePercent
+    ?? point?.changePercent
+    ?? (point && isValidNumber(previousClose) && previousClose !== 0 ? ((point.close - previousClose) / previousClose) * 100 : undefined);
+  const toneValue = isValidNumber(changePct) ? changePct : change;
+  const trendColor = getCnTrendColor(toneValue);
+  const metricPrice = quote?.currentPrice ?? point?.close ?? referenceQuote?.currentPrice;
+  const metricQuote = quote ?? referenceQuote;
+  const totalMv = resolveQuoteMarketValue(metricQuote?.totalMv, referenceQuote?.totalShares, metricPrice);
+  const circMv = resolveQuoteMarketValue(metricQuote?.circMv, referenceQuote?.floatShares, metricPrice);
+  const peRatio = resolvePeRatio(quote, referenceQuote, metricPrice);
+  const coreVolumeRatio = quote?.volumeRatio ?? (point ? getPointVolumeRatio(point) : undefined);
+  const coreTurnoverRate = resolvePointTurnoverRate(point, referenceQuote, points, quote !== null);
+  const coreRows: CoreMetricItem[] = [
+    { label: '高', value: formatNumber(quote?.high ?? point?.high), tone: 'up' },
+    { label: '市值', value: formatCompactNumber(totalMv) },
+    { label: '量比', value: formatNumber(coreVolumeRatio, 2), tone: isValidNumber(coreVolumeRatio) && coreVolumeRatio >= 1 ? 'up' : 'down' },
+    { label: '低', value: formatNumber(quote?.low ?? point?.low), tone: 'down' },
+    { label: '流通', value: formatCompactNumber(circMv) },
+    { label: '换', value: formatPlainPct(coreTurnoverRate) },
+    { label: '开', value: formatNumber(quote?.open ?? point?.open), tone: 'up' },
+    { label: '市盈TTM', value: formatNumber(peRatio, 2) },
+    { label: '额', value: formatCompactNumber(quote?.amount ?? point?.amount) },
+  ];
+
+  const getMetricColor = (item: CoreMetricItem) => {
+    if (item.tone === 'up') {
+      return TERMINAL_COLORS.hitHighlight;
+    }
+    if (item.tone === 'down') {
+      return TERMINAL_COLORS.green;
+    }
+    return TERMINAL_COLORS.text;
+  };
+
+  return (
+    <section
+      data-testid="indicator-core-metrics"
+      className="grid gap-3 border px-3 py-2 font-mono md:grid-cols-[9.5rem_minmax(0,1fr)]"
+      style={{ borderColor: TERMINAL_COLORS.redGrid, backgroundColor: TERMINAL_COLORS.panel }}
+      aria-label="核心行情指标"
+    >
+      <div className="min-w-0">
+        <div
+          className="text-[2rem] font-bold leading-none tabular-nums md:text-[2.35rem]"
+          style={{ color: trendColor }}
+        >
+          {formatNumber(close)}
+        </div>
+        <div className="mt-2 flex flex-wrap items-center gap-x-2 gap-y-1 text-[12px] font-semibold tabular-nums" style={{ color: trendColor }}>
+          <span>{formatSignedNumber(change)}</span>
+          <span>{formatPct(changePct)}</span>
+        </div>
+      </div>
+
+      <div className="grid min-w-0 grid-cols-3 gap-x-4 gap-y-1 text-[12px] md:text-[13px]">
+        {coreRows.map((item) => (
+          <div key={item.label} className="grid min-w-0 grid-cols-[2.6rem_minmax(0,1fr)] items-baseline gap-1">
+            <span className="truncate" style={{ color: TERMINAL_COLORS.muted }}>{item.label}</span>
+            <span className="truncate text-right font-semibold tabular-nums" style={{ color: getMetricColor(item) }}>{item.value}</span>
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+};
+
+const ChartLegend: React.FC<{
+  point?: ChartPoint;
+  previous?: ChartPoint;
+  periodLabel: string;
+  latestQuote: StockQuote | null;
+  metrics: StockIndicatorMetrics | null;
+  points: ChartPoint[];
+  showRealtimeMetrics: boolean;
+}> = ({ point, previous, periodLabel, latestQuote, metrics, points, showRealtimeMetrics }) => {
+  const totalMv = latestQuote?.totalMv;
+  const circMv = latestQuote?.circMv;
+  const totalShares = latestQuote?.totalShares ?? deriveShares(totalMv, latestQuote?.currentPrice);
+  const floatShares = latestQuote?.floatShares ?? deriveShares(circMv, latestQuote?.currentPrice);
+  const mainNetInflow = showRealtimeMetrics ? getMainNetInflow(points, latestQuote, metrics) : undefined;
+  const mainNetVolumePct = showRealtimeMetrics ? getMainNetVolumePct(points, latestQuote, metrics) : undefined;
+
+  return (
+    <div data-testid="indicator-price-header" className="flex flex-wrap items-center gap-x-3 gap-y-1 font-mono text-[11px] leading-none">
+      <span style={{ color: TERMINAL_COLORS.text }}>{periodLabel}</span>
+      <span className="inline-flex items-center gap-1" style={{ color: TERMINAL_COLORS.cyan }}>
+        <i className="h-2 w-4 border" style={{ borderColor: TERMINAL_COLORS.cyan, backgroundColor: TERMINAL_COLORS.cyan }} />阳线
+      </span>
+      <span className="inline-flex items-center gap-1" style={{ color: TERMINAL_COLORS.orange }}>
+        <i className="h-2 w-4 border bg-transparent" style={{ borderColor: TERMINAL_COLORS.orange }} />阴线
+      </span>
+      <span style={{ color: TERMINAL_COLORS.yellow }}>{point?.date ?? '--'}</span>
+      <span style={{ color: (point?.close ?? 0) >= (point?.open ?? 0) ? TERMINAL_COLORS.cyan : TERMINAL_COLORS.orange }}>
+        {point ? (point.close >= point.open ? '阳线' : '阴线') : '--'}
+      </span>
+      <span style={{ color: TERMINAL_COLORS.axisText }}>振幅:{formatPct(point ? getPointAmplitude(point, previous) : undefined)}</span>
+      <span style={{ color: TERMINAL_COLORS.axisText }}>流通股本:{formatCompactShares(floatShares)}</span>
+      <span style={{ color: TERMINAL_COLORS.axisText }}>总股本:{formatCompactShares(totalShares)}</span>
+      <span style={{ color: TERMINAL_COLORS.axisText }}>涨幅限价:{formatNumber(latestQuote?.limitUpPrice)}</span>
+      <span style={{ color: TERMINAL_COLORS.axisText }}>跌幅限价:{formatNumber(latestQuote?.limitDownPrice)}</span>
+      <span style={{ color: TERMINAL_COLORS.axisText }}>涨速:{formatPct(latestQuote?.priceSpeed)}</span>
+      <span style={{ color: TERMINAL_COLORS.axisText }}>主力净量:{formatPct(mainNetVolumePct)}</span>
+      <span style={{ color: TERMINAL_COLORS.axisText }}>主力净流入:{formatCompactNumber(mainNetInflow)}</span>
+      <span style={{ color: TERMINAL_COLORS.axisText }}>委比:{formatPct(latestQuote?.entrustRatio)}</span>
+      <span style={{ color: LINE_COLORS.ma5 }}>MA5:{formatNumber(point?.ma5)}</span>
+      <span style={{ color: LINE_COLORS.ma10 }}>MA10:{formatNumber(point?.ma10)}</span>
+      <span style={{ color: LINE_COLORS.ma20 }}>MA20:{formatNumber(point?.ma20)}</span>
+      <span style={{ color: LINE_COLORS.ma30 }}>MA30:{formatNumber(point?.ma30)}</span>
+      <span style={{ color: LINE_COLORS.ma60 }}>MA60:{formatNumber(point?.ma60)}</span>
+    </div>
+  );
+};
 
 const TerminalTabs: React.FC<{
   labels: string[];
@@ -1191,7 +1454,10 @@ const CandlestickChart: React.FC<{
   onHoverPinnedChange: (value: boolean) => void;
   onStepHoverIndex: (direction: HoverStepDirection) => void;
   onWindowStartChange: (value: number) => void;
+  onTimelineZoomChange: (delta: number) => void;
   onOpenChartMenu: (event: React.MouseEvent) => void;
+  canZoomIn: boolean;
+  canZoomOut: boolean;
   period: KLinePeriod;
   periodLabel: string;
   recentLabel: string;
@@ -1200,6 +1466,8 @@ const CandlestickChart: React.FC<{
   selectedPeriod: KLinePeriod;
   onPeriodChange: (period: KLinePeriod) => void;
   highlightedDate?: string;
+  quote: StockQuote | null;
+  metrics: StockIndicatorMetrics | null;
 }> = ({
   points,
   visible,
@@ -1213,7 +1481,10 @@ const CandlestickChart: React.FC<{
   onHoverPinnedChange,
   onStepHoverIndex,
   onWindowStartChange,
+  onTimelineZoomChange,
   onOpenChartMenu,
+  canZoomIn,
+  canZoomOut,
   period,
   periodLabel,
   recentLabel,
@@ -1222,6 +1493,8 @@ const CandlestickChart: React.FC<{
   selectedPeriod,
   onPeriodChange,
   highlightedDate,
+  quote,
+  metrics,
 }) => {
   const width = 1320;
   const axisWidth = 64;
@@ -1271,6 +1544,9 @@ const CandlestickChart: React.FC<{
       ? visibleStartIndex + visible.length - 1
       : null;
   const activePrevious = hoveredPoint ? hoveredPrevious : activePointIndex === null ? undefined : points[activePointIndex - 1];
+  const activeIsLatest = activePointIndex !== null && activePointIndex === points.length - 1;
+  const activeQuote = activeIsLatest ? quote : null;
+  const activeMetrics = activeIsLatest ? metrics : null;
   const latestCloseY = typeof visibleLast?.close === 'number' ? yForPrice(visibleLast.close) : null;
   const highlightedDateKey = normalizeDateKey(highlightedDate);
   const windowSliderMax = Math.max(maxWindowStart, 1);
@@ -1331,13 +1607,21 @@ const CandlestickChart: React.FC<{
               );
             })}
           </div>
-          <ChartLegend point={activePoint} previous={activePrevious} periodLabel={periodLabel} />
+          <ChartLegend
+            point={activePoint}
+            previous={activePrevious}
+            periodLabel={periodLabel}
+            latestQuote={activeQuote}
+            metrics={activeMetrics}
+            points={points}
+            showRealtimeMetrics={activeIsLatest}
+          />
         </div>
         <span className="font-mono text-[11px]" style={{ color: TERMINAL_COLORS.muted }}>
           {recentLabel} {visible.length} {sampleUnit} · {periodLabel} · {timeZoneLabel}
         </span>
       </div>
-      <div className="overflow-x-auto">
+      <div className="relative overflow-x-auto">
         <svg
           viewBox={`0 0 ${width} ${chartBottom}`}
           role="img"
@@ -1518,6 +1802,58 @@ const CandlestickChart: React.FC<{
             </>
           ) : null}
         </svg>
+        <div className="pointer-events-none absolute bottom-4 left-4 right-16 z-10 md:left-10 md:right-24">
+          <div className="mx-auto flex w-full max-w-[42rem] items-center justify-between gap-4">
+            <button
+              type="button"
+              data-testid="indicator-chart-pan-left"
+              aria-label="向左平移K线时间"
+              title="向左平移K线时间"
+              disabled={!canPan || safeWindowStart === 0}
+              onClick={() => shiftWindow(-1)}
+              className="pointer-events-auto inline-flex h-9 w-9 items-center justify-center rounded-full border bg-background/80 shadow-lg backdrop-blur transition-colors hover:bg-muted disabled:cursor-not-allowed disabled:opacity-35"
+              style={{ borderColor: TERMINAL_COLORS.redGrid, color: TERMINAL_COLORS.text }}
+            >
+              <ChevronLeft className="h-5 w-5" />
+            </button>
+            <button
+              type="button"
+              data-testid="indicator-chart-zoom-in"
+              aria-label="放大选中K线日期"
+              title="放大选中K线日期"
+              disabled={!canZoomIn}
+              onClick={() => onTimelineZoomChange(1)}
+              className="pointer-events-auto inline-flex h-9 w-9 items-center justify-center rounded-full border bg-background/80 shadow-lg backdrop-blur transition-colors hover:bg-muted disabled:cursor-not-allowed disabled:opacity-35"
+              style={{ borderColor: TERMINAL_COLORS.redGrid, color: TERMINAL_COLORS.text }}
+            >
+              <Plus className="h-5 w-5" />
+            </button>
+            <button
+              type="button"
+              data-testid="indicator-chart-zoom-out"
+              aria-label="缩小选中K线日期"
+              title="缩小选中K线日期"
+              disabled={!canZoomOut}
+              onClick={() => onTimelineZoomChange(-1)}
+              className="pointer-events-auto inline-flex h-9 w-9 items-center justify-center rounded-full border bg-background/80 shadow-lg backdrop-blur transition-colors hover:bg-muted disabled:cursor-not-allowed disabled:opacity-35"
+              style={{ borderColor: TERMINAL_COLORS.redGrid, color: TERMINAL_COLORS.text }}
+            >
+              <Minus className="h-5 w-5" />
+            </button>
+            <button
+              type="button"
+              data-testid="indicator-chart-pan-right"
+              aria-label="向右平移K线时间"
+              title="向右平移K线时间"
+              disabled={!canPan || safeWindowStart === maxWindowStart}
+              onClick={() => shiftWindow(1)}
+              className="pointer-events-auto inline-flex h-9 w-9 items-center justify-center rounded-full border bg-background/80 shadow-lg backdrop-blur transition-colors hover:bg-muted disabled:cursor-not-allowed disabled:opacity-35"
+              style={{ borderColor: TERMINAL_COLORS.redGrid, color: TERMINAL_COLORS.text }}
+            >
+              <ChevronRight className="h-5 w-5" />
+            </button>
+          </div>
+        </div>
       </div>
       <div className="flex flex-wrap items-center gap-3 border-t px-2 py-1" style={{ borderColor: TERMINAL_COLORS.redGrid, backgroundColor: TERMINAL_COLORS.panel }}>
         <button
@@ -1597,6 +1933,7 @@ const VolumeActivityChart: React.FC<{
   visible: ChartPoint[];
   visibleStartIndex: number;
   hoveredIndex: number | null;
+  quote: StockQuote | null;
   isHoverPinned: boolean;
   onHoverIndexChange: (index: number | null) => void;
   onHoverPinnedChange: (value: boolean) => void;
@@ -1609,6 +1946,7 @@ const VolumeActivityChart: React.FC<{
   visible,
   visibleStartIndex,
   hoveredIndex,
+  quote,
   isHoverPinned,
   onHoverIndexChange,
   onHoverPinnedChange,
@@ -1670,6 +2008,28 @@ const VolumeActivityChart: React.FC<{
   const hoveredX = hoveredVisibleIndex === null ? 0 : hoveredVisibleIndex * step;
   const latest = visible.at(-1);
   const activePoint = hoveredPoint ?? latest;
+  const activePointIndex = hoveredPoint
+    ? hoveredIndex
+    : visible.length > 0
+      ? visibleStartIndex + visible.length - 1
+      : null;
+  const activeIsLatest = activePointIndex !== null && activePointIndex === points.length - 1;
+  const quotePrice = activeIsLatest ? quote?.currentPrice : undefined;
+  const quoteAfterHoursVolume = activeIsLatest ? quote?.afterHoursVolume : undefined;
+  const quoteAfterHoursAmount = activeIsLatest ? quote?.afterHoursAmount : undefined;
+  const inferredQuoteAfterHoursVolume = deriveAfterHoursVolume(quoteAfterHoursAmount, quotePrice);
+  const effectiveQuoteAfterHoursVolume = quoteAfterHoursVolume ?? inferredQuoteAfterHoursVolume;
+  const inferredAfterHoursAmount = deriveAfterHoursAmount(effectiveQuoteAfterHoursVolume, quotePrice);
+  const activePointAfterHoursAmount = deriveAfterHoursAmount(activePoint?.afterHoursVolume, quotePrice);
+  const isAmountMode = activeMode === 'amount';
+  const headerPrimaryLabel = isAmountMode ? '额' : '量';
+  const headerPrimaryValue = isAmountMode ? activePoint?.amount : activePoint?.volume;
+  const headerAfterHoursValue = isAmountMode
+    ? quoteAfterHoursAmount ?? inferredAfterHoursAmount ?? activePointAfterHoursAmount
+    : effectiveQuoteAfterHoursVolume ?? activePoint?.afterHoursVolume;
+  const headerMa5 = isAmountMode ? activePoint?.amountMa5 : activePoint?.volumeMa5;
+  const headerMa10 = isAmountMode ? activePoint?.amountMa10 : activePoint?.volumeMa10;
+  const headerTurnoverRate = resolvePointTurnoverRate(activePoint, quote, points, activeIsLatest);
   const highlightedDateKey = normalizeDateKey(highlightedDate);
   const setVisibleHoverIndex = (index: number) => {
     onHoverIndexChange(visibleStartIndex + index);
@@ -1690,8 +2050,11 @@ const VolumeActivityChart: React.FC<{
       <div data-testid="indicator-volume-header" className="flex flex-wrap items-center gap-3 border-b px-2 py-1 font-mono text-[11px]" style={{ borderColor: TERMINAL_COLORS.redGrid, backgroundColor: TERMINAL_COLORS.panel }}>
         <span style={{ color: TERMINAL_COLORS.text }}>成交量相关指标</span>
         <span style={{ color: TERMINAL_COLORS.yellow }}>{activePoint?.date ?? '--'}</span>
-        <span style={{ color: LINE_COLORS.ma10 }}>{activeMode === 'amount' ? 'MAAMT5' : 'MAVOL5'}:{formatCompactNumber(activeMode === 'amount' ? activePoint?.amountMa5 : activePoint?.volumeMa5)}</span>
-        <span style={{ color: LINE_COLORS.ma5 }}>{activeMode === 'amount' ? 'MAAMT10' : 'MAVOL10'}:{formatCompactNumber(activeMode === 'amount' ? activePoint?.amountMa10 : activePoint?.volumeMa10)}</span>
+        <span style={{ color: TERMINAL_COLORS.axisText }}>{headerPrimaryLabel}:{formatCompactNumber(headerPrimaryValue)}</span>
+        <span style={{ color: TERMINAL_COLORS.axisText }}>盘后:{formatCompactNumber(headerAfterHoursValue)}</span>
+        <span style={{ color: LINE_COLORS.ma10 }}>MA5:{formatCompactNumber(headerMa5)}</span>
+        <span style={{ color: LINE_COLORS.ma5 }}>10:{formatCompactNumber(headerMa10)}</span>
+        <span style={{ color: TERMINAL_COLORS.axisText }}>换手:{formatPlainPct(headerTurnoverRate)}</span>
       </div>
       <div className="overflow-x-auto">
         <svg
@@ -2815,6 +3178,8 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
   const oneMinuteRefreshInFlightRef = useRef(false);
   const dailyCutoffDateRef = useRef<string | null>(null);
   const selectedRefreshTokenRef = useRef<string | null>(null);
+  const lastChartAnchorIndexRef = useRef<number | null>(null);
+  const lastWindowResetKeyRef = useRef<string | null>(null);
   const marketKind = useMemo(() => getMarketKind(stockCode), [stockCode]);
   const initialDateKey = normalizeDateKey(initialDate);
   const dailyHistoryDays = Math.max(1, Math.min(365, Math.round(initialHistoryDays ?? 120)));
@@ -2826,6 +3191,8 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
 
   useEffect(() => {
     setSelectedPeriod('daily');
+    lastChartAnchorIndexRef.current = null;
+    lastWindowResetKeyRef.current = null;
     setHoveredIndex(null);
     setIsHoverPinned(false);
     setTimelineZoom(0);
@@ -2834,6 +3201,8 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
   }, [stockCode]);
 
   useEffect(() => {
+    lastChartAnchorIndexRef.current = null;
+    lastWindowResetKeyRef.current = null;
     setHoveredIndex(null);
     setIsHoverPinned(false);
     setChartMenu(null);
@@ -3197,9 +3566,13 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
   const safeWindowStart = clamp(windowStart, 0, maxWindowStart);
   const visiblePoints = points.slice(safeWindowStart, safeWindowStart + visibleCount);
   const handleHoverIndexChange = useCallback((index: number | null) => {
+    if (index !== null) {
+      lastChartAnchorIndexRef.current = index;
+    }
     setHoveredIndex(index);
   }, []);
   const handleWindowStartChange = useCallback((value: number) => {
+    lastChartAnchorIndexRef.current = null;
     setWindowStart(value);
   }, []);
   const stepHoverIndex = useCallback((direction: HoverStepDirection) => {
@@ -3212,13 +3585,19 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
       const baseIndex = current !== null && current >= 0 && current < points.length
         ? current
         : points.length - 1;
-      return clamp(baseIndex + direction, 0, points.length - 1);
+      const nextIndex = clamp(baseIndex + direction, 0, points.length - 1);
+      lastChartAnchorIndexRef.current = nextIndex;
+      return nextIndex;
     });
     setIsHoverPinned(true);
     setChartMenu(null);
   }, [points.length]);
   const safeHoveredIndex = hoveredIndex !== null && hoveredIndex >= 0 && hoveredIndex < points.length ? hoveredIndex : null;
   const latest = points.at(-1);
+  const corePointIndex = safeHoveredIndex ?? (points.length > 0 ? points.length - 1 : null);
+  const corePoint = corePointIndex !== null ? points[corePointIndex] : latest;
+  const corePreviousPoint = corePointIndex !== null && corePointIndex > 0 ? points[corePointIndex - 1] : undefined;
+  const coreQuote = corePointIndex !== null && corePointIndex === points.length - 1 ? quote : null;
   const displayVolume = quote?.volume ?? latest?.volume;
   const volumeRatio = displayVolume && latest?.volumeMa5 ? displayVolume / latest.volumeMa5 : undefined;
   const chipPoints = points;
@@ -3236,8 +3615,13 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
   const modal = variant === 'modal';
 
   useEffect(() => {
+    const resetKey = `${stockCode}:${effectivePeriod}:${points.length}`;
+    if (lastWindowResetKeyRef.current === resetKey) {
+      return;
+    }
+    lastWindowResetKeyRef.current = resetKey;
     setWindowStart(maxWindowStart);
-  }, [effectivePeriod, maxWindowStart, points.length, stockCode, visibleCount]);
+  }, [effectivePeriod, maxWindowStart, points.length, stockCode]);
 
   useEffect(() => {
     if (!initialDateKey || selectedPeriod !== 'daily' || points.length === 0) {
@@ -3248,6 +3632,7 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
       return;
     }
     setHoveredIndex(targetIndex);
+    lastChartAnchorIndexRef.current = targetIndex;
     setIsHoverPinned(true);
     setChartMenu(null);
     setWindowStart(clamp(targetIndex - Math.floor(visibleCount / 2), 0, maxWindowStart));
@@ -3279,10 +3664,26 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
     setChartMenu({ x: event.clientX, y: event.clientY });
   };
 
+  const canZoomIn = points.length > 0 && getVisiblePointCount(points.length, clamp(timelineZoom + 1, -1, 4)) < visibleCount;
+  const canZoomOut = points.length > 0 && getVisiblePointCount(points.length, clamp(timelineZoom - 1, -1, 4)) > visibleCount;
+
   const adjustTimelineZoom = (delta: number) => {
-    setTimelineZoom((current) => clamp(current + delta, -1, 4));
-    setIsHoverPinned(false);
-    setHoveredIndex(null);
+    if (points.length === 0) {
+      return;
+    }
+    const nextZoom = clamp(timelineZoom + delta, -1, 4);
+    const nextVisibleCount = getVisiblePointCount(points.length, nextZoom);
+    const nextMaxWindowStart = Math.max(points.length - nextVisibleCount, 0);
+    const fallbackAnchorIndex = Math.min(safeWindowStart + visibleCount - 1, points.length - 1);
+    const anchorIndex = safeHoveredIndex
+      ?? lastChartAnchorIndexRef.current
+      ?? fallbackAnchorIndex;
+    const safeAnchorIndex = clamp(anchorIndex, 0, points.length - 1);
+    setTimelineZoom(nextZoom);
+    setWindowStart(clamp(safeAnchorIndex - Math.floor(nextVisibleCount / 2), 0, nextMaxWindowStart));
+    setHoveredIndex(safeAnchorIndex);
+    lastChartAnchorIndexRef.current = safeAnchorIndex;
+    setIsHoverPinned(true);
     setChartMenu(null);
   };
 
@@ -3334,6 +3735,14 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
             <div className="flex h-full min-h-0 flex-col gap-3">
               <section className="grid min-h-0 flex-1 gap-3 xl:grid-cols-[minmax(0,1fr)_20rem] xl:items-start">
                 <div className="grid min-w-0 content-start gap-2 xl:h-full xl:min-h-0">
+                  <CoreQuoteMetrics
+                    point={corePoint}
+                    previous={corePreviousPoint}
+                    quote={coreQuote}
+                    referenceQuote={quote}
+                    points={points}
+                  />
+
                   <section
                     className="min-h-0 overflow-hidden"
                     aria-label="K线图区域"
@@ -3351,7 +3760,10 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
                       onHoverPinnedChange={setIsHoverPinned}
                       onStepHoverIndex={stepHoverIndex}
                       onWindowStartChange={handleWindowStartChange}
+                      onTimelineZoomChange={adjustTimelineZoom}
                       onOpenChartMenu={openChartMenu}
+                      canZoomIn={canZoomIn}
+                      canZoomOut={canZoomOut}
                       period={effectivePeriod}
                       periodLabel={periodMeta.label}
                       recentLabel={periodMeta.recentLabel}
@@ -3360,6 +3772,8 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
                       selectedPeriod={selectedPeriod}
                       onPeriodChange={handlePeriodChange}
                       highlightedDate={initialDateKey ?? undefined}
+                      quote={quote}
+                      metrics={metrics}
                     />
                   </section>
 
@@ -3372,6 +3786,7 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
                       visible={visiblePoints}
                       visibleStartIndex={safeWindowStart}
                       hoveredIndex={safeHoveredIndex}
+                      quote={quote}
                       isHoverPinned={isHoverPinned}
                       onHoverIndexChange={handleHoverIndexChange}
                       onHoverPinnedChange={setIsHoverPinned}
@@ -3459,9 +3874,13 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
             type="button"
             className="block w-full px-3 py-1.5 text-left hover:bg-white/10"
             onClick={() => {
+              const resetVisibleCount = getVisiblePointCount(points.length, 0);
+              const resetMaxWindowStart = Math.max(points.length - resetVisibleCount, 0);
               setTimelineZoom(0);
               setIsHoverPinned(false);
               setHoveredIndex(null);
+              lastChartAnchorIndexRef.current = null;
+              setWindowStart(resetMaxWindowStart);
               setChartMenu(null);
             }}
           >

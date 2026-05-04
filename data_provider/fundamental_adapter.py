@@ -104,6 +104,19 @@ def _pick_by_keywords(row: pd.Series, keywords: List[str]) -> Optional[Any]:
     return None
 
 
+def _pick_by_keywords_excluding(row: pd.Series, keywords: List[str], excludes: List[str]) -> Optional[Any]:
+    """Return first non-empty value matching keywords while excluding noisy columns."""
+    for col in row.index:
+        col_s = str(col)
+        if any(skip in col_s for skip in excludes):
+            continue
+        if any(k in col_s for k in keywords):
+            val = row.get(col)
+            if val is not None and str(val).strip() not in ("", "-", "nan", "None"):
+                return val
+    return None
+
+
 def _parse_dividend_plan_to_per_share(plan_text: str) -> Optional[float]:
     """Parse per-share cash dividend from Chinese plan text."""
     text = _safe_str(plan_text)
@@ -669,11 +682,17 @@ class AkshareFundamentalAdapter:
         if stock_df is not None:
             row = _extract_latest_row(stock_df, stock_code)
             if row is not None:
-                net_inflow = _safe_float(_pick_by_keywords(row, ["主力净流入", "净流入", "净额"]))
+                net_inflow = _safe_float(
+                    _pick_by_keywords_excluding(row, ["主力净流入", "净流入", "净额"], ["净占比", "占比", "比例"])
+                )
+                net_inflow_ratio = _safe_float(
+                    _pick_by_keywords(row, ["主力净流入-净占比", "主力净流入净占比", "净占比"])
+                )
                 inflow_5d = _safe_float(_pick_by_keywords(row, ["5日", "五日"]))
                 inflow_10d = _safe_float(_pick_by_keywords(row, ["10日", "十日"]))
                 result["stock_flow"] = {
                     "main_net_inflow": net_inflow,
+                    "main_net_inflow_ratio": net_inflow_ratio,
                     "inflow_5d": inflow_5d,
                     "inflow_10d": inflow_10d,
                 }

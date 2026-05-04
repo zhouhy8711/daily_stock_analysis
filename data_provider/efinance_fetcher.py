@@ -753,11 +753,13 @@ class EfinanceFetcher(BaseFetcher):
             high_col = '最高' if '最高' in df.columns else 'high'
             low_col = '最低' if '最低' in df.columns else 'low'
             open_col = '开盘' if '开盘' in df.columns else 'open'
+            prev_col = next((col for col in ('昨收', '昨日收盘', 'prev_close', 'pre_close') if col in df.columns), None)
             # efinance 也返回量比、市盈率、市值等字段
             vol_ratio_col = '量比' if '量比' in df.columns else 'volume_ratio'
             pe_col = '市盈率' if '市盈率' in df.columns else 'pe_ratio'
             total_mv_col = '总市值' if '总市值' in df.columns else 'total_mv'
             circ_mv_col = '流通市值' if '流通市值' in df.columns else 'circ_mv'
+            speed_col = '涨速' if '涨速' in df.columns else 'price_speed'
             
             quote = UnifiedRealtimeQuote(
                 code=stock_code,
@@ -773,10 +775,12 @@ class EfinanceFetcher(BaseFetcher):
                 high=safe_float(row.get(high_col)),
                 low=safe_float(row.get(low_col)),
                 open_price=safe_float(row.get(open_col)),
+                pre_close=safe_float(row.get(prev_col)) if prev_col else None,
                 volume_ratio=safe_float(row.get(vol_ratio_col)),  # 量比
                 pe_ratio=safe_float(row.get(pe_col)),  # 市盈率
                 total_mv=safe_float(row.get(total_mv_col)),  # 总市值
                 circ_mv=safe_float(row.get(circ_mv_col)),  # 流通市值
+                price_speed=safe_float(row.get(speed_col)) if speed_col in df.columns else None,
             )
             
             logger.info(f"[实时行情-efinance] {stock_code} {quote.name}: 价格={quote.price}, 涨跌={quote.change_pct}%, "
@@ -851,10 +855,12 @@ class EfinanceFetcher(BaseFetcher):
             high_col = '最高' if '最高' in df.columns else 'high'
             low_col = '最低' if '最低' in df.columns else 'low'
             open_col = '开盘' if '开盘' in df.columns else 'open'
+            prev_col = next((col for col in ('昨收', '昨日收盘', 'prev_close', 'pre_close') if col in df.columns), None)
             vol_ratio_col = '量比' if '量比' in df.columns else 'volume_ratio'
             pe_col = '市盈率' if '市盈率' in df.columns else 'pe_ratio'
             total_mv_col = '总市值' if '总市值' in df.columns else 'total_mv'
             circ_mv_col = '流通市值' if '流通市值' in df.columns else 'circ_mv'
+            speed_col = '涨速' if '涨速' in df.columns else 'price_speed'
 
             code_series = df[code_col].astype(str).str.zfill(6)
             requested_set = set(requested_codes)
@@ -880,10 +886,12 @@ class EfinanceFetcher(BaseFetcher):
                     high=safe_float(row.get(high_col)),
                     low=safe_float(row.get(low_col)),
                     open_price=safe_float(row.get(open_col)),
+                    pre_close=safe_float(row.get(prev_col)) if prev_col else None,
                     volume_ratio=safe_float(row.get(vol_ratio_col)),
                     pe_ratio=safe_float(row.get(pe_col)),
                     total_mv=safe_float(row.get(total_mv_col)),
                     circ_mv=safe_float(row.get(circ_mv_col)),
+                    price_speed=safe_float(row.get(speed_col)) if speed_col in df.columns else None,
                 )
 
             logger.info(f"[实时行情-efinance] 批量匹配 {len(quotes)}/{len(requested_codes)} 只股票")

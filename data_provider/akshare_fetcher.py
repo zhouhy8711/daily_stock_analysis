@@ -74,6 +74,24 @@ TENCENT_REALTIME_ENDPOINT = "qt.gtimg.cn/q"
 CNBC_CHART_ENDPOINT = "https://ts-api.cnbc.com/harmony/app/charts/1D.json"
 
 
+def _calc_entrust_ratio_from_tencent_fields(fields: List[str]) -> Optional[float]:
+    """腾讯行情五档委托量推导委比，字段缺失时保持空值。"""
+    bid_volume = sum(
+        safe_float(fields[index]) or 0
+        for index in (10, 12, 14, 16, 18)
+        if len(fields) > index
+    )
+    ask_volume = sum(
+        safe_float(fields[index]) or 0
+        for index in (20, 22, 24, 26, 28)
+        if len(fields) > index
+    )
+    total = bid_volume + ask_volume
+    if total <= 0:
+        return None
+    return (bid_volume - ask_volume) / total * 100
+
+
 # User-Agent 池，用于随机轮换
 USER_AGENTS = [
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -1412,6 +1430,7 @@ class AkshareFetcher(BaseFetcher):
 
                     volume_lot = safe_int(fields[6]) if len(fields) > 6 else None
                     amount = safe_float(fields[37]) if len(fields) > 37 else None
+                    after_hours_amount_wan = safe_float(fields[58]) if len(fields) > 58 else None
                     circ_mv = safe_float(fields[44]) if len(fields) > 44 else None
                     total_mv = safe_float(fields[45]) if len(fields) > 45 else None
                     quotes[code] = UnifiedRealtimeQuote(
@@ -1423,6 +1442,8 @@ class AkshareFetcher(BaseFetcher):
                         change_amount=safe_float(fields[31]) if len(fields) > 31 else None,
                         volume=volume_lot * 100 if volume_lot is not None else None,
                         amount=amount * 10000 if amount is not None else None,
+                        after_hours_volume=safe_float(fields[59]) if len(fields) > 59 else None,
+                        after_hours_amount=after_hours_amount_wan * 10000 if after_hours_amount_wan is not None else None,
                         open_price=safe_float(fields[5]) if len(fields) > 5 else None,
                         high=safe_float(fields[33]) if len(fields) > 33 else None,
                         low=safe_float(fields[34]) if len(fields) > 34 else None,
@@ -1434,6 +1455,9 @@ class AkshareFetcher(BaseFetcher):
                         pb_ratio=safe_float(fields[46]) if len(fields) > 46 else None,
                         circ_mv=circ_mv * 100000000 if circ_mv is not None else None,
                         total_mv=total_mv * 100000000 if total_mv is not None else None,
+                        limit_up_price=safe_float(fields[47]) if len(fields) > 47 else None,
+                        limit_down_price=safe_float(fields[48]) if len(fields) > 48 else None,
+                        entrust_ratio=_calc_entrust_ratio_from_tencent_fields(fields),
                     )
 
                 logger.info(
@@ -1538,10 +1562,12 @@ class AkshareFetcher(BaseFetcher):
                 open_price=safe_float(row.get('今开')),
                 high=safe_float(row.get('最高')),
                 low=safe_float(row.get('最低')),
+                pre_close=safe_float(row.get('昨收')),
                 pe_ratio=safe_float(row.get('市盈率-动态')),
                 pb_ratio=safe_float(row.get('市净率')),
                 total_mv=safe_float(row.get('总市值')),
                 circ_mv=safe_float(row.get('流通市值')),
+                price_speed=safe_float(row.get('涨速')),
                 change_60d=safe_float(row.get('60日涨跌幅')),
                 high_52w=safe_float(row.get('52周最高')),
                 low_52w=safe_float(row.get('52周最低')),
@@ -1812,7 +1838,10 @@ class AkshareFetcher(BaseFetcher):
             # 9-28:买卖五档 30:时间戳 31:涨跌额 32:涨跌幅(%) 33:最高 34:最低 35:收盘/成交量/成交额
             # 36:成交量(手) 37:成交额(万) 38:换手率(%) 39:市盈率 43:振幅(%)
             # 44:流通市值(亿) 45:总市值(亿) 46:市净率 47:涨停价 48:跌停价 49:量比
+            # 58:盘后定价成交额(万) 59:盘后定价成交量(手)
             # 使用 realtime_types.py 中的统一转换函数
+            amount_wan = safe_float(fields[37]) if len(fields) > 37 else None
+            after_hours_amount_wan = safe_float(fields[58]) if len(fields) > 58 else None
             quote = UnifiedRealtimeQuote(
                 code=stock_code,
                 name=fields[1] if len(fields) > 1 else "",
@@ -1821,6 +1850,9 @@ class AkshareFetcher(BaseFetcher):
                 change_pct=safe_float(fields[32]),
                 change_amount=safe_float(fields[31]) if len(fields) > 31 else None,
                 volume=safe_int(fields[6]) * 100 if fields[6] else None,  # 腾讯返回的是手，转为股
+                amount=amount_wan * 10000 if amount_wan is not None else None,
+                after_hours_volume=safe_float(fields[59]) if len(fields) > 59 else None,
+                after_hours_amount=after_hours_amount_wan * 10000 if after_hours_amount_wan is not None else None,
                 open_price=safe_float(fields[5]),
                 high=safe_float(fields[33]) if len(fields) > 33 else None,  # 修正：字段 33 是最高价
                 low=safe_float(fields[34]) if len(fields) > 34 else None,  # 修正：字段 34 是最低价
@@ -1832,6 +1864,9 @@ class AkshareFetcher(BaseFetcher):
                 pb_ratio=safe_float(fields[46]) if len(fields) > 46 else None,  # 市净率
                 circ_mv=safe_float(fields[44]) * 100000000 if len(fields) > 44 and fields[44] else None,  # 流通市值(亿->元)
                 total_mv=safe_float(fields[45]) * 100000000 if len(fields) > 45 and fields[45] else None,  # 总市值(亿->元)
+                limit_up_price=safe_float(fields[47]) if len(fields) > 47 else None,
+                limit_down_price=safe_float(fields[48]) if len(fields) > 48 else None,
+                entrust_ratio=_calc_entrust_ratio_from_tencent_fields(fields),
             )
             
             logger.info(
@@ -1944,6 +1979,7 @@ class AkshareFetcher(BaseFetcher):
                 low=safe_float(row.get('最低价')),
                 total_mv=safe_float(row.get('总市值')),
                 circ_mv=safe_float(row.get('流通市值')),
+                price_speed=safe_float(row.get('涨速')),
                 high_52w=safe_float(row.get('52周最高')),
                 low_52w=safe_float(row.get('52周最低')),
             )
@@ -2023,6 +2059,7 @@ class AkshareFetcher(BaseFetcher):
                         pb_ratio=safe_float(row.get('市净率')),
                         total_mv=safe_float(row.get('总市值')),
                         circ_mv=safe_float(row.get('流通市值')),
+                        price_speed=safe_float(row.get('涨速')),
                         high_52w=safe_float(row.get('52周最高')),
                         low_52w=safe_float(row.get('52周最低')),
                     )

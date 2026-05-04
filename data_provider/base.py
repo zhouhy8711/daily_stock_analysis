@@ -1462,13 +1462,11 @@ class DataFetcherManager:
                             return primary_quote
                         # Otherwise, continue to try later sources for missing fields
                         logger.debug(f"[实时行情] {stock_code} 部分字段缺失，尝试从后续数据源补充")
-                        supplement_attempts = 0
                     else:
-                        # Supplement missing fields from this source (limit attempts)
-                        supplement_attempts += 1
-                        if supplement_attempts > 1:
-                            logger.debug(f"[实时行情] {stock_code} 补充尝试已达上限，停止继续")
-                            break
+                        # Supplement missing fields from this source. Some fields are
+                        # source-specific: for example A-share after-hours auction
+                        # fields are only exposed by Tencent, which may be later in
+                        # REALTIME_SOURCE_PRIORITY.
                         merged = self._merge_quote_fields(primary_quote, quote)
                         if merged:
                             logger.info(f"[实时行情] {stock_code} 从 {source} 补充了缺失字段: {merged}")
@@ -1500,6 +1498,9 @@ class DataFetcherManager:
     _SUPPLEMENT_FIELDS = [
         'volume_ratio', 'turnover_rate',
         'pe_ratio', 'pb_ratio', 'total_mv', 'circ_mv',
+        'total_shares', 'float_shares',
+        'limit_up_price', 'limit_down_price', 'price_speed', 'entrust_ratio',
+        'after_hours_volume', 'after_hours_amount',
         'amplitude',
     ]
 

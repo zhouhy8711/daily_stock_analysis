@@ -127,6 +127,8 @@ class UnifiedRealtimeQuote:
     # === 量价指标（部分源可能缺失）===
     volume: Optional[int] = None            # 成交量（手）
     amount: Optional[float] = None          # 成交额（元）
+    after_hours_volume: Optional[float] = None  # 盘后定价成交量（手）
+    after_hours_amount: Optional[float] = None  # 盘后定价成交额（元）
     volume_ratio: Optional[float] = None    # 量比
     turnover_rate: Optional[float] = None   # 换手率(%)
     amplitude: Optional[float] = None       # 振幅(%)
@@ -142,8 +144,14 @@ class UnifiedRealtimeQuote:
     pb_ratio: Optional[float] = None        # 市净率
     total_mv: Optional[float] = None        # 总市值(元)
     circ_mv: Optional[float] = None         # 流通市值(元)
+    total_shares: Optional[float] = None    # 总股本(股)
+    float_shares: Optional[float] = None    # 流通股本(股)
     
     # === 其他指标 ===
+    limit_up_price: Optional[float] = None  # 涨停价
+    limit_down_price: Optional[float] = None  # 跌停价
+    price_speed: Optional[float] = None     # 涨速(%)
+    entrust_ratio: Optional[float] = None   # 委比(%)
     change_60d: Optional[float] = None      # 60日涨跌幅(%)
     high_52w: Optional[float] = None        # 52周最高
     low_52w: Optional[float] = None         # 52周最低
@@ -158,9 +166,12 @@ class UnifiedRealtimeQuote:
         # 只添加非 None 的字段
         optional_fields = [
             'price', 'change_pct', 'change_amount', 'volume', 'amount',
+            'after_hours_volume', 'after_hours_amount',
             'volume_ratio', 'turnover_rate', 'amplitude',
             'open_price', 'high', 'low', 'pre_close',
             'pe_ratio', 'pb_ratio', 'total_mv', 'circ_mv',
+            'total_shares', 'float_shares',
+            'limit_up_price', 'limit_down_price', 'price_speed', 'entrust_ratio',
             'change_60d', 'high_52w', 'low_52w'
         ]
         for f in optional_fields:

@@ -28,9 +28,20 @@ class StockQuote(BaseModel):
     prev_close: Optional[float] = Field(None, description="昨收价")
     volume: Optional[float] = Field(None, description="成交量（股）")
     amount: Optional[float] = Field(None, description="成交额（元）")
+    after_hours_volume: Optional[float] = Field(None, description="盘后定价成交量（手）")
+    after_hours_amount: Optional[float] = Field(None, description="盘后定价成交额（元）")
     volume_ratio: Optional[float] = Field(None, description="量比")
     turnover_rate: Optional[float] = Field(None, description="换手率 (%)")
     amplitude: Optional[float] = Field(None, description="振幅 (%)")
+    pe_ratio: Optional[float] = Field(None, description="市盈率 TTM/动态")
+    total_mv: Optional[float] = Field(None, description="总市值（元）")
+    circ_mv: Optional[float] = Field(None, description="流通市值（元）")
+    total_shares: Optional[float] = Field(None, description="总股本（股）")
+    float_shares: Optional[float] = Field(None, description="流通股本（股）")
+    limit_up_price: Optional[float] = Field(None, description="涨停价")
+    limit_down_price: Optional[float] = Field(None, description="跌停价")
+    price_speed: Optional[float] = Field(None, description="涨速 (%)")
+    entrust_ratio: Optional[float] = Field(None, description="委比 (%)")
     source: Optional[str] = Field(None, description="行情数据源")
     update_time: Optional[str] = Field(None, description="更新时间")
     
@@ -48,9 +59,20 @@ class StockQuote(BaseModel):
                 "prev_close": 1785.00,
                 "volume": 10000000,
                 "amount": 18000000000,
+                "after_hours_volume": 104,
+                "after_hours_amount": 1429064,
                 "volume_ratio": 1.2,
                 "turnover_rate": 0.8,
                 "amplitude": 1.6,
+                "pe_ratio": 23.89,
+                "total_mv": 2180000000000,
+                "circ_mv": 2180000000000,
+                "total_shares": 1256197800,
+                "float_shares": 1256197800,
+                "limit_up_price": 1963.5,
+                "limit_down_price": 1606.5,
+                "price_speed": 0.12,
+                "entrust_ratio": 18.5,
                 "source": "efinance",
                 "update_time": "2024-01-01T15:00:00"
             }
@@ -80,6 +102,7 @@ class KLineData(BaseModel):
     low: float = Field(..., description="最低价")
     close: float = Field(..., description="收盘价")
     volume: Optional[float] = Field(None, description="成交量")
+    after_hours_volume: Optional[float] = Field(None, description="盘后成交量")
     amount: Optional[float] = Field(None, description="成交额")
     change_percent: Optional[float] = Field(None, description="涨跌幅 (%)")
     turnover_rate: Optional[float] = Field(None, description="换手率 (%)")
@@ -93,6 +116,7 @@ class KLineData(BaseModel):
                 "low": 1780.00,
                 "close": 1800.00,
                 "volume": 10000000,
+                "after_hours_volume": 10400,
                 "amount": 18000000000,
                 "change_percent": 0.84,
                 "turnover_rate": 0.8
@@ -179,6 +203,16 @@ class ChipDistributionMetrics(BaseModel):
     chip_status: Optional[str] = Field(None, description="基于现价推导的筹码状态")
 
 
+class CapitalFlowMetrics(BaseModel):
+    """资金流向指标"""
+
+    status: str = Field("not_supported", description="资金流数据状态")
+    main_net_inflow: Optional[float] = Field(None, description="主力净流入（元，随数据源口径）")
+    main_net_inflow_ratio: Optional[float] = Field(None, description="主力净流入占比 (%)")
+    inflow_5d: Optional[float] = Field(None, description="5 日主力净流入")
+    inflow_10d: Optional[float] = Field(None, description="10 日主力净流入")
+
+
 class MajorHolder(BaseModel):
     """主力/机构持仓名称与持股摘要"""
 
@@ -201,6 +235,7 @@ class StockIndicatorMetricsResponse(BaseModel):
     stock_code: str = Field(..., description="股票代码")
     stock_name: Optional[str] = Field(None, description="股票名称")
     chip_distribution: Optional[ChipDistributionMetrics] = Field(None, description="筹码分布指标")
+    capital_flow: Optional[CapitalFlowMetrics] = Field(None, description="资金流向指标")
     major_holders: List[MajorHolder] = Field(default_factory=list, description="主力/机构持仓名称")
     major_holder_status: str = Field("not_supported", description="主力/机构持仓数据状态")
     source_chain: List[Dict[str, Any]] = Field(default_factory=list, description="数据源链路")

@@ -1,6 +1,6 @@
 import { act, fireEvent, render, screen, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { stocksApi, type KLineData, type KLinePeriod } from '../../../api/stocks';
+import { stocksApi, type KLineData, type KLinePeriod, type StockQuote } from '../../../api/stocks';
 import { IndicatorAnalysisModal } from '../IndicatorAnalysisModal';
 
 vi.mock('../../../api/stocks', () => ({
@@ -74,6 +74,38 @@ function makeChipSnapshot(date: string, avgCost: number, profitRatio: number) {
   };
 }
 
+function makeQuote(stockCode: string, overrides: Partial<StockQuote> = {}): StockQuote {
+  return {
+    stockCode,
+    stockName: stockCode === 'BABA' ? '阿里巴巴' : '贵州茅台',
+    currentPrice: 132,
+    change: 0.2,
+    changePercent: 0.15,
+    open: 131,
+    high: 133,
+    low: 130,
+    prevClose: 131.8,
+    volume: 1000000,
+    amount: 132000000,
+    afterHoursVolume: 104,
+    afterHoursAmount: 1429064,
+    volumeRatio: 1.2,
+    turnoverRate: 0.8,
+    peRatio: 23.89,
+    totalMv: 264000000000,
+    circMv: 211200000000,
+    totalShares: 2000000000,
+    floatShares: 1600000000,
+    limitUpPrice: 145.2,
+    limitDownPrice: 118.8,
+    priceSpeed: 0.36,
+    entrustRatio: 18.5,
+    source: stockCode === 'BABA' ? 'yfinance' : 'efinance',
+    updateTime: '2026-04-30T23:50:00',
+    ...overrides,
+  };
+}
+
 async function flushPromises() {
   await act(async () => {
     await Promise.resolve();
@@ -87,12 +119,20 @@ function expectIndicatorHeadersToShow(date: string) {
   const momentumHeader = screen.getByTestId('indicator-momentum-header');
 
   expect(within(priceHeader).getByText(date)).toBeInTheDocument();
-  expect(within(priceHeader).getByText(/^收盘:/)).toBeInTheDocument();
   expect(within(priceHeader).getByText(/^MA5:/)).toBeInTheDocument();
+  expect(within(priceHeader).queryByText(/^收盘:/)).not.toBeInTheDocument();
+  expect(within(priceHeader).queryByText(/^总市值:/)).not.toBeInTheDocument();
+  expect(within(priceHeader).queryByText(/^总量:/)).not.toBeInTheDocument();
+  expect(within(priceHeader).queryByText(/^量均5日:/)).not.toBeInTheDocument();
+  expect(within(priceHeader).queryByText(/^总金额:/)).not.toBeInTheDocument();
   expect(within(volumeHeader).getByText(date)).toBeInTheDocument();
-  expect(within(volumeHeader).queryByText(/^成交量:/)).not.toBeInTheDocument();
+  expect(within(volumeHeader).getByText(/^量:/)).toBeInTheDocument();
+  expect(within(volumeHeader).getByText(/^盘后:/)).toBeInTheDocument();
+  expect(within(volumeHeader).getByText(/^MA5:/)).toBeInTheDocument();
+  expect(within(volumeHeader).getByText(/^10:/)).toBeInTheDocument();
+  expect(within(volumeHeader).getByText(/^换手:/)).toBeInTheDocument();
+  expect(within(volumeHeader).queryByText(/^MAVOL5:/)).not.toBeInTheDocument();
   expect(within(volumeHeader).queryByText(/^成交额:/)).not.toBeInTheDocument();
-  expect(within(volumeHeader).getByText(/^MAVOL5:/)).toBeInTheDocument();
   expect(within(momentumHeader).getByText(date)).toBeInTheDocument();
   expect(within(momentumHeader).getByText(/^DIF:/)).toBeInTheDocument();
 }
@@ -107,23 +147,7 @@ describe('IndicatorAnalysisModal', () => {
       period,
       data: makeHistory(period),
     }));
-    vi.mocked(stocksApi.getQuote).mockImplementation(async (stockCode) => ({
-      stockCode,
-      stockName: stockCode === 'BABA' ? '阿里巴巴' : '贵州茅台',
-      currentPrice: 132,
-      change: 0.2,
-      changePercent: 0.15,
-      open: 131,
-      high: 133,
-      low: 130,
-      prevClose: 131.8,
-      volume: 1000000,
-      amount: 132000000,
-      volumeRatio: 1.2,
-      turnoverRate: 0.8,
-      source: stockCode === 'BABA' ? 'yfinance' : 'efinance',
-      updateTime: '2026-04-30T23:50:00',
-    }));
+    vi.mocked(stocksApi.getQuote).mockImplementation(async (stockCode) => makeQuote(stockCode));
     vi.mocked(stocksApi.getIndicatorMetrics).mockImplementation(async (stockCode) => ({
       stockCode,
       stockName: stockCode === 'BABA' ? '阿里巴巴' : '贵州茅台',
@@ -158,6 +182,13 @@ describe('IndicatorAnalysisModal', () => {
         },
       majorHolders: [],
       majorHolderStatus: 'not_supported',
+      capitalFlow: {
+        status: stockCode === 'BABA' ? 'not_supported' : 'ok',
+        mainNetInflow: stockCode === 'BABA' ? null : 52000000,
+        mainNetInflowRatio: stockCode === 'BABA' ? null : 2.46,
+        inflow5d: stockCode === 'BABA' ? null : 120000000,
+        inflow10d: stockCode === 'BABA' ? null : 180000000,
+      },
       sourceChain: [],
       errors: [],
       updateTime: '2026-04-30T23:50:00',
@@ -240,6 +271,41 @@ describe('IndicatorAnalysisModal', () => {
     expect(screen.getByText('成交量相关指标')).toBeInTheDocument();
     expect(screen.getByText('MACD等指标')).toBeInTheDocument();
     expect(screen.getByRole('img', { name: 'K线图' })).toBeInTheDocument();
+    const coreMetrics = screen.getByTestId('indicator-core-metrics');
+    expect(within(coreMetrics).getByText('132.00')).toBeInTheDocument();
+    expect(within(coreMetrics).getByText('+0.20')).toBeInTheDocument();
+    expect(within(coreMetrics).getByText('+0.15%')).toBeInTheDocument();
+    expect(within(coreMetrics).getByText('高')).toBeInTheDocument();
+    expect(within(coreMetrics).getByText('低')).toBeInTheDocument();
+    expect(within(coreMetrics).getByText('开')).toBeInTheDocument();
+    expect(within(coreMetrics).getByText('市值')).toBeInTheDocument();
+    expect(within(coreMetrics).getByText('流通')).toBeInTheDocument();
+    expect(within(coreMetrics).getByText('市盈TTM')).toBeInTheDocument();
+    expect(within(coreMetrics).getByText('量比')).toBeInTheDocument();
+    expect(within(coreMetrics).getByText('换')).toBeInTheDocument();
+    expect(within(coreMetrics).getByText('额')).toBeInTheDocument();
+    expect(within(coreMetrics).getByText('2640.00亿')).toBeInTheDocument();
+    expect(within(coreMetrics).getByText('2112.00亿')).toBeInTheDocument();
+    expect(within(coreMetrics).getByText('23.89')).toBeInTheDocument();
+    const latestPriceHeader = screen.getByTestId('indicator-price-header');
+    expect(within(latestPriceHeader).queryByText(/^流通市值:/)).not.toBeInTheDocument();
+    expect(within(latestPriceHeader).queryByText(/^总市值:/)).not.toBeInTheDocument();
+    expect(within(latestPriceHeader).getByText(/^流通股本:/)).toBeInTheDocument();
+    expect(within(latestPriceHeader).getByText(/^总股本:/)).toBeInTheDocument();
+    expect(within(latestPriceHeader).getByText(/^涨幅限价:/)).toBeInTheDocument();
+    expect(within(latestPriceHeader).getByText(/^涨速:/)).toBeInTheDocument();
+    expect(within(latestPriceHeader).getByText(/^主力净量:/)).toBeInTheDocument();
+    expect(within(latestPriceHeader).getByText(/^主力净流入:/)).toBeInTheDocument();
+    expect(within(latestPriceHeader).queryByText(/^换手:/)).not.toBeInTheDocument();
+    expect(within(latestPriceHeader).getByText(/^委比:/)).toBeInTheDocument();
+    expect(within(latestPriceHeader).queryByText(/^总量:/)).not.toBeInTheDocument();
+    expect(within(latestPriceHeader).queryByText(/^总金额:/)).not.toBeInTheDocument();
+    const latestVolumeHeader = screen.getByTestId('indicator-volume-header');
+    expect(within(latestVolumeHeader).getByText(/^量:/)).toBeInTheDocument();
+    expect(within(latestVolumeHeader).getByText('盘后:104')).toBeInTheDocument();
+    expect(within(latestVolumeHeader).getByText(/^MA5:/)).toBeInTheDocument();
+    expect(within(latestVolumeHeader).getByText(/^10:/)).toBeInTheDocument();
+    expect(within(latestVolumeHeader).getByText('换手:0.80%')).toBeInTheDocument();
     expect(screen.getByRole('img', { name: '成交量图' })).toBeInTheDocument();
     expect(screen.getByRole('img', { name: 'MACD指标图' })).toBeInTheDocument();
     const sidePanel = screen.getByTestId('indicator-side-panel');
@@ -361,9 +427,100 @@ describe('IndicatorAnalysisModal', () => {
 
     fireEvent.mouseEnter(screen.getByTestId('indicator-chart-bar-2026-04-23'));
     expectIndicatorHeadersToShow('2026-04-23');
+    const historicalCoreMetrics = within(screen.getByTestId('indicator-core-metrics'));
+    expect(historicalCoreMetrics.getByText('122.20')).toBeInTheDocument();
+    expect(historicalCoreMetrics.getByText('+0.10')).toBeInTheDocument();
+    expect(historicalCoreMetrics.getByText('+0.10%')).toBeInTheDocument();
 
     fireEvent.mouseEnter(screen.getByTestId('indicator-volume-bar-2026-04-24'));
     expectIndicatorHeadersToShow('2026-04-24');
+    expect(within(screen.getByTestId('indicator-core-metrics')).getByText('132.00')).toBeInTheDocument();
+
+    unmount();
+  });
+
+  it('uses post-market amount when the volume chart switches to amount mode', async () => {
+    const { unmount } = render(
+      <IndicatorAnalysisModal stockCode="600519" stockName="贵州茅台" onClose={vi.fn()} />,
+    );
+    await flushPromises();
+
+    fireEvent.click(screen.getByRole('button', { name: '成交额' }));
+
+    const volumeHeader = within(screen.getByTestId('indicator-volume-header'));
+    expect(volumeHeader.getByText(/^额:/)).toBeInTheDocument();
+    expect(volumeHeader.queryByText(/^量:/)).not.toBeInTheDocument();
+    expect(volumeHeader.getByText('盘后:142.91万')).toBeInTheDocument();
+
+    unmount();
+  });
+
+  it('backs fills post-market volume from post-market amount and latest price', async () => {
+    vi.mocked(stocksApi.getQuote).mockImplementation(async (stockCode) => makeQuote(stockCode, {
+      currentPrice: 137.41,
+      afterHoursVolume: null,
+      afterHoursAmount: 1429064,
+    }));
+
+    const { unmount } = render(
+      <IndicatorAnalysisModal stockCode="600519" stockName="贵州茅台" onClose={vi.fn()} />,
+    );
+    await flushPromises();
+
+    const volumeHeader = within(screen.getByTestId('indicator-volume-header'));
+    expect(volumeHeader.getByText('盘后:104')).toBeInTheDocument();
+
+    unmount();
+  });
+
+  it('derives core market values from share counts when quote market values are missing', async () => {
+    vi.mocked(stocksApi.getQuote).mockImplementation(async (stockCode) => makeQuote(stockCode, {
+      totalMv: null,
+      circMv: null,
+    }));
+
+    const { unmount } = render(
+      <IndicatorAnalysisModal stockCode="600519" stockName="贵州茅台" onClose={vi.fn()} />,
+    );
+    await flushPromises();
+
+    const coreMetrics = within(screen.getByTestId('indicator-core-metrics'));
+    expect(coreMetrics.getByText('2640.00亿')).toBeInTheDocument();
+    expect(coreMetrics.getByText('2112.00亿')).toBeInTheDocument();
+    expect(coreMetrics.getByText('23.89')).toBeInTheDocument();
+
+    unmount();
+  });
+
+  it('derives turnover rate for historical candles when K-line history omits it', async () => {
+    const historyWithoutTurnover = makeHistory('daily').map((point) => ({
+      date: point.date,
+      open: point.open,
+      high: point.high,
+      low: point.low,
+      close: point.close,
+      volume: point.volume,
+      amount: point.amount,
+      changePercent: point.changePercent,
+    }));
+    vi.mocked(stocksApi.getHistory).mockImplementation(async (stockCode, _days, period = 'daily') => ({
+      stockCode,
+      stockName: '贵州茅台',
+      period,
+      data: period === 'daily' ? historyWithoutTurnover : makeHistory(period),
+    }));
+
+    const { unmount } = render(
+      <IndicatorAnalysisModal stockCode="600519" stockName="贵州茅台" onClose={vi.fn()} />,
+    );
+    await flushPromises();
+
+    expect(within(screen.getByTestId('indicator-volume-header')).getByText('换手:0.80%')).toBeInTheDocument();
+
+    fireEvent.mouseEnter(screen.getByTestId('indicator-chart-bar-2026-04-14'));
+
+    expect(within(screen.getByTestId('indicator-volume-header')).getByText('换手:0.06%')).toBeInTheDocument();
+    expect(within(screen.getByTestId('indicator-core-metrics')).getByText('0.06%')).toBeInTheDocument();
 
     unmount();
   });
@@ -450,6 +607,41 @@ describe('IndicatorAnalysisModal', () => {
 
     expect(within(screen.getByTestId('chip-peak-panel')).getByText(windowSnapshotDate)).toBeInTheDocument();
     expect(within(screen.getByTestId('chip-peak-panel')).queryByText('2026-04-30')).not.toBeInTheDocument();
+
+    unmount();
+  });
+
+  it('pans and zooms the K-line window from in-chart controls around the selected candle', async () => {
+    const longHistory = makeDailyHistory(120);
+    vi.mocked(stocksApi.getHistory).mockImplementation(async (stockCode, _days, period = 'daily') => ({
+      stockCode,
+      stockName: '贵州茅台',
+      period,
+      data: period === 'daily' ? longHistory : makeHistory(period),
+    }));
+
+    const { unmount } = render(
+      <IndicatorAnalysisModal stockCode="600519" stockName="贵州茅台" onClose={vi.fn()} />,
+    );
+    await flushPromises();
+
+    const selectedDate = longHistory[89].date;
+    fireEvent.mouseEnter(screen.getByTestId(`indicator-chart-bar-${selectedDate}`));
+    expectIndicatorHeadersToShow(selectedDate);
+
+    fireEvent.click(screen.getByRole('button', { name: '放大选中K线日期' }));
+    expect(screen.getByText(/最近 55 个交易日/)).toBeInTheDocument();
+    expectIndicatorHeadersToShow(selectedDate);
+
+    fireEvent.click(screen.getByRole('button', { name: '缩小选中K线日期' }));
+    expect(screen.getByText(/最近 80 个交易日/)).toBeInTheDocument();
+    expectIndicatorHeadersToShow(selectedDate);
+
+    fireEvent.click(screen.getByRole('button', { name: '向左平移K线时间' }));
+    expect(screen.getByTestId(`indicator-chart-bar-${longHistory[0].date}`)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: '向右平移K线时间' }));
+    expect(screen.getByTestId(`indicator-chart-bar-${longHistory.at(-1)?.date}`)).toBeInTheDocument();
 
     unmount();
   });

@@ -19,6 +19,7 @@ export type KLineData = {
   low: number;
   close: number;
   volume?: number | null;
+  afterHoursVolume?: number | null;
   amount?: number | null;
   changePercent?: number | null;
   turnoverRate?: number | null;
@@ -45,9 +46,20 @@ export type StockQuote = {
   prevClose?: number | null;
   volume?: number | null;
   amount?: number | null;
+  afterHoursVolume?: number | null;
+  afterHoursAmount?: number | null;
   volumeRatio?: number | null;
   turnoverRate?: number | null;
   amplitude?: number | null;
+  peRatio?: number | null;
+  totalMv?: number | null;
+  circMv?: number | null;
+  totalShares?: number | null;
+  floatShares?: number | null;
+  limitUpPrice?: number | null;
+  limitDownPrice?: number | null;
+  priceSpeed?: number | null;
+  entrustRatio?: number | null;
   source?: string | null;
   updateTime?: string | null;
 };
@@ -80,6 +92,14 @@ export type ChipDistributionMetrics = {
   chipStatus?: string | null;
 };
 
+export type CapitalFlowMetrics = {
+  status: string;
+  mainNetInflow?: number | null;
+  mainNetInflowRatio?: number | null;
+  inflow5d?: number | null;
+  inflow10d?: number | null;
+};
+
 export type MajorHolder = {
   name: string;
   holderType?: string | null;
@@ -98,6 +118,7 @@ export type StockIndicatorMetrics = {
   stockCode: string;
   stockName?: string | null;
   chipDistribution?: ChipDistributionMetrics | null;
+  capitalFlow?: CapitalFlowMetrics | null;
   majorHolders: MajorHolder[];
   majorHolderStatus: string;
   sourceChain: Array<Record<string, unknown>>;
@@ -130,6 +151,12 @@ function normalizeKLine(item: Record<string, unknown>): KLineData {
     low: toNumber(item.low),
     close: toNumber(item.close),
     volume: toNullableNumber(item.volume),
+    afterHoursVolume: toNullableNumber(
+      item.after_hours_volume
+        ?? item.afterHoursVolume
+        ?? item.post_market_volume
+        ?? item.postMarketVolume,
+    ),
     amount: toNullableNumber(item.amount),
     changePercent: toNullableNumber(item.change_percent ?? item.changePercent),
     turnoverRate: toNullableNumber(item.turnover_rate ?? item.turnoverRate),
@@ -151,9 +178,20 @@ function normalizeQuote(item: Record<string, unknown>, stockCode: string): Stock
     prevClose: toNullableNumber(item.prev_close ?? item.prevClose),
     volume: toNullableNumber(item.volume),
     amount: toNullableNumber(item.amount),
+    afterHoursVolume: toNullableNumber(item.after_hours_volume ?? item.afterHoursVolume),
+    afterHoursAmount: toNullableNumber(item.after_hours_amount ?? item.afterHoursAmount),
     volumeRatio: toNullableNumber(item.volume_ratio ?? item.volumeRatio),
     turnoverRate: toNullableNumber(item.turnover_rate ?? item.turnoverRate),
     amplitude: toNullableNumber(item.amplitude),
+    peRatio: toNullableNumber(item.pe_ratio ?? item.peRatio),
+    totalMv: toNullableNumber(item.total_mv ?? item.totalMv),
+    circMv: toNullableNumber(item.circ_mv ?? item.circMv),
+    totalShares: toNullableNumber(item.total_shares ?? item.totalShares),
+    floatShares: toNullableNumber(item.float_shares ?? item.floatShares),
+    limitUpPrice: toNullableNumber(item.limit_up_price ?? item.limitUpPrice),
+    limitDownPrice: toNullableNumber(item.limit_down_price ?? item.limitDownPrice),
+    priceSpeed: toNullableNumber(item.price_speed ?? item.priceSpeed),
+    entrustRatio: toNullableNumber(item.entrust_ratio ?? item.entrustRatio),
     source: toNullableString(item.source),
     updateTime: typeof (item.update_time ?? item.updateTime) === 'string'
       ? String(item.update_time ?? item.updateTime)
@@ -202,6 +240,20 @@ function normalizeChipDistribution(item: unknown): ChipDistributionMetrics | nul
   return normalized;
 }
 
+function normalizeCapitalFlow(item: unknown): CapitalFlowMetrics | null {
+  if (!item || typeof item !== 'object') {
+    return null;
+  }
+  const data = item as Record<string, unknown>;
+  return {
+    status: String(data.status ?? 'not_supported'),
+    mainNetInflow: toNullableNumber(data.main_net_inflow ?? data.mainNetInflow),
+    mainNetInflowRatio: toNullableNumber(data.main_net_inflow_ratio ?? data.mainNetInflowRatio),
+    inflow5d: toNullableNumber(data.inflow_5d ?? data.inflow5d),
+    inflow10d: toNullableNumber(data.inflow_10d ?? data.inflow10d),
+  };
+}
+
 function normalizeMajorHolder(item: Record<string, unknown>): MajorHolder | null {
   const name = toNullableString(item.name);
   if (!name) {
@@ -230,6 +282,7 @@ function normalizeIndicatorMetrics(item: Record<string, unknown>, stockCode: str
     stockCode: String(item.stock_code ?? item.stockCode ?? stockCode),
     stockName: toNullableString(item.stock_name ?? item.stockName),
     chipDistribution: normalizeChipDistribution(item.chip_distribution ?? item.chipDistribution),
+    capitalFlow: normalizeCapitalFlow(item.capital_flow ?? item.capitalFlow),
     majorHolders: (rawHolders as Array<Record<string, unknown>>)
       .map(normalizeMajorHolder)
       .filter((holder): holder is MajorHolder => holder !== null),

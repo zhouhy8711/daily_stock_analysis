@@ -12,6 +12,7 @@
 import logging
 from datetime import datetime
 import math
+import re
 from typing import Optional, Dict, Any, List
 
 from src.core import trading_calendar
@@ -39,6 +40,135 @@ def _source_to_string(source: Any) -> Optional[str]:
     if value:
         return str(value)
     return str(source)
+
+
+def _derive_share_count(market_value: Optional[float], price: Optional[float]) -> Optional[float]:
+    if market_value is None or price is None or price <= 0:
+        return None
+    shares = market_value / price
+    return shares if shares > 0 and math.isfinite(shares) else None
+
+
+def _derive_market_value(shares: Optional[float], price: Optional[float]) -> Optional[float]:
+    if shares is None or price is None or price <= 0:
+        return None
+    market_value = shares * price
+    return market_value if market_value > 0 and math.isfinite(market_value) else None
+
+
+def _derive_after_hours_volume(after_hours_amount: Optional[float], price: Optional[float]) -> Optional[float]:
+    if after_hours_amount is None or price is None or price <= 0:
+        return None
+    volume_lot = after_hours_amount / price / 100
+    return round(volume_lot, 2) if volume_lot > 0 and math.isfinite(volume_lot) else None
+
+
+def _derive_after_hours_amount(after_hours_volume: Optional[float], price: Optional[float]) -> Optional[float]:
+    if after_hours_volume is None or price is None or price <= 0:
+        return None
+    amount = after_hours_volume * 100 * price
+    return amount if amount > 0 and math.isfinite(amount) else None
+
+
+def _pure_stock_code(stock_code: str) -> str:
+    value = str(stock_code or "").strip().upper()
+    if "." in value:
+        value = value.split(".", 1)[0]
+    value = re.sub(r"^(SH|SZ|BJ|HK)", "", value)
+    return value
+
+
+def _is_cn_equity_code(stock_code: str) -> bool:
+    code = _pure_stock_code(stock_code)
+    return bool(re.fullmatch(r"\d{6}", code))
+
+
+def _infer_cn_limit_ratio(stock_code: str, stock_name: Optional[str]) -> float:
+    code = _pure_stock_code(stock_code)
+    name = stock_name or ""
+    if "ST" in name.upper() or "退" in name:
+        return 0.05
+    if code.startswith(("300", "301", "688", "689", "8", "4", "920")):
+        return 0.20
+    return 0.10
+
+
+def _round_price(value: float) -> float:
+    return math.floor(value * 100 + 0.5) / 100.0
+
+
+def _infer_limit_price(
+    stock_code: str,
+    stock_name: Optional[str],
+    prev_close: Optional[float],
+    direction: int,
+) -> Optional[float]:
+    if prev_close is None or prev_close <= 0 or not _is_cn_equity_code(stock_code):
+        return None
+    ratio = _infer_cn_limit_ratio(stock_code, stock_name)
+    return _round_price(prev_close * (1 + direction * ratio))
+
+
+def _build_quote_payload(quote: Any, fallback_code: str) -> Dict[str, Any]:
+    stock_code = getattr(quote, "code", fallback_code)
+    stock_name = getattr(quote, "name", None)
+    price = _to_optional_float(getattr(quote, "price", None))
+    total_mv = _to_optional_float(getattr(quote, "total_mv", None))
+    circ_mv = _to_optional_float(getattr(quote, "circ_mv", None))
+    prev_close = _to_optional_float(getattr(quote, "pre_close", None))
+    total_shares = (
+        _to_optional_float(getattr(quote, "total_shares", None))
+        or _derive_share_count(total_mv, price)
+    )
+    float_shares = (
+        _to_optional_float(getattr(quote, "float_shares", None))
+        or _derive_share_count(circ_mv, price)
+    )
+    total_mv = total_mv or _derive_market_value(total_shares, price)
+    circ_mv = circ_mv or _derive_market_value(float_shares, price)
+    limit_up_price = (
+        _to_optional_float(getattr(quote, "limit_up_price", None))
+        or _infer_limit_price(stock_code, stock_name, prev_close, 1)
+    )
+    limit_down_price = (
+        _to_optional_float(getattr(quote, "limit_down_price", None))
+        or _infer_limit_price(stock_code, stock_name, prev_close, -1)
+    )
+    after_hours_volume = _to_optional_float(getattr(quote, "after_hours_volume", None))
+    after_hours_amount = _to_optional_float(getattr(quote, "after_hours_amount", None))
+    if after_hours_volume is None:
+        after_hours_volume = _derive_after_hours_volume(after_hours_amount, price)
+    if after_hours_amount is None:
+        after_hours_amount = _derive_after_hours_amount(after_hours_volume, price)
+    return {
+        "stock_code": stock_code,
+        "stock_name": stock_name,
+        "current_price": price or 0.0,
+        "change": getattr(quote, "change_amount", None),
+        "change_percent": getattr(quote, "change_pct", None),
+        "open": getattr(quote, "open_price", None),
+        "high": getattr(quote, "high", None),
+        "low": getattr(quote, "low", None),
+        "prev_close": prev_close,
+        "volume": getattr(quote, "volume", None),
+        "amount": getattr(quote, "amount", None),
+        "after_hours_volume": after_hours_volume,
+        "after_hours_amount": after_hours_amount,
+        "volume_ratio": getattr(quote, "volume_ratio", None),
+        "turnover_rate": getattr(quote, "turnover_rate", None),
+        "amplitude": getattr(quote, "amplitude", None),
+        "pe_ratio": getattr(quote, "pe_ratio", None),
+        "total_mv": total_mv,
+        "circ_mv": circ_mv,
+        "total_shares": total_shares,
+        "float_shares": float_shares,
+        "limit_up_price": limit_up_price,
+        "limit_down_price": limit_down_price,
+        "price_speed": getattr(quote, "price_speed", None),
+        "entrust_ratio": getattr(quote, "entrust_ratio", None),
+        "source": _source_to_string(getattr(quote, "source", None)),
+        "update_time": datetime.now().isoformat(),
+    }
 
 
 class StockService:
@@ -73,37 +203,7 @@ class StockService:
                 logger.warning(f"获取 {stock_code} 实时行情失败")
                 return None
             
-            # UnifiedRealtimeQuote 是 dataclass，使用 getattr 安全访问字段
-            # 字段映射: UnifiedRealtimeQuote -> API 响应
-            # - code -> stock_code
-            # - name -> stock_name
-            # - price -> current_price
-            # - change_amount -> change
-            # - change_pct -> change_percent
-            # - open_price -> open
-            # - high -> high
-            # - low -> low
-            # - pre_close -> prev_close
-            # - volume -> volume
-            # - amount -> amount
-            return {
-                "stock_code": getattr(quote, "code", stock_code),
-                "stock_name": getattr(quote, "name", None),
-                "current_price": getattr(quote, "price", 0.0) or 0.0,
-                "change": getattr(quote, "change_amount", None),
-                "change_percent": getattr(quote, "change_pct", None),
-                "open": getattr(quote, "open_price", None),
-                "high": getattr(quote, "high", None),
-                "low": getattr(quote, "low", None),
-                "prev_close": getattr(quote, "pre_close", None),
-                "volume": getattr(quote, "volume", None),
-                "amount": getattr(quote, "amount", None),
-                "volume_ratio": getattr(quote, "volume_ratio", None),
-                "turnover_rate": getattr(quote, "turnover_rate", None),
-                "amplitude": getattr(quote, "amplitude", None),
-                "source": _source_to_string(getattr(quote, "source", None)),
-                "update_time": datetime.now().isoformat(),
-            }
+            return _build_quote_payload(quote, stock_code)
             
         except ImportError:
             logger.warning("DataFetcherManager 未找到，使用占位数据")
@@ -174,24 +274,7 @@ class StockService:
                 if quote is None:
                     continue
 
-                items.append({
-                    "stock_code": getattr(quote, "code", original),
-                    "stock_name": getattr(quote, "name", None),
-                    "current_price": getattr(quote, "price", 0.0) or 0.0,
-                    "change": getattr(quote, "change_amount", None),
-                    "change_percent": getattr(quote, "change_pct", None),
-                    "open": getattr(quote, "open_price", None),
-                    "high": getattr(quote, "high", None),
-                    "low": getattr(quote, "low", None),
-                    "prev_close": getattr(quote, "pre_close", None),
-                    "volume": getattr(quote, "volume", None),
-                    "amount": getattr(quote, "amount", None),
-                    "volume_ratio": getattr(quote, "volume_ratio", None),
-                    "turnover_rate": getattr(quote, "turnover_rate", None),
-                    "amplitude": getattr(quote, "amplitude", None),
-                    "source": _source_to_string(getattr(quote, "source", None)),
-                    "update_time": datetime.now().isoformat(),
-                })
+                items.append(_build_quote_payload(quote, original))
 
             found_codes = {
                 normalize_stock_code(str(item.get("stock_code") or ""))
@@ -234,6 +317,7 @@ class StockService:
         manager = DataFetcherManager()
         stock_name = None
         chip_payload = None
+        capital_flow_payload = None
         major_holder_status = "not_supported"
         major_holders: List[Dict[str, Any]] = []
         source_chain: List[Dict[str, Any]] = []
@@ -339,6 +423,35 @@ class StockService:
             errors.append(f"chip_distribution:{type(e).__name__}")
 
         try:
+            capital_context = manager.get_capital_flow_context(stock_code)
+            capital_status = str(capital_context.get("status", "not_supported"))
+            capital_data = capital_context.get("data", {})
+            stock_flow = {}
+            if isinstance(capital_data, dict):
+                raw_stock_flow = capital_data.get("stock_flow", {})
+                if isinstance(raw_stock_flow, dict):
+                    stock_flow = raw_stock_flow
+            capital_flow_payload = {
+                "status": capital_status,
+                "main_net_inflow": _to_optional_float(stock_flow.get("main_net_inflow")),
+                "main_net_inflow_ratio": _to_optional_float(stock_flow.get("main_net_inflow_ratio")),
+                "inflow_5d": _to_optional_float(stock_flow.get("inflow_5d")),
+                "inflow_10d": _to_optional_float(stock_flow.get("inflow_10d")),
+            }
+            source_chain.extend(capital_context.get("source_chain") or [])
+            errors.extend(str(err) for err in (capital_context.get("errors") or []) if err)
+        except Exception as e:
+            logger.debug(f"获取 {stock_code} 资金流失败: {e}")
+            capital_flow_payload = {
+                "status": "failed",
+                "main_net_inflow": None,
+                "main_net_inflow_ratio": None,
+                "inflow_5d": None,
+                "inflow_10d": None,
+            }
+            errors.append(f"capital_flow:{type(e).__name__}")
+
+        try:
             holder_context = manager.get_major_holders_context(stock_code, top_n=20)
             major_holder_status = str(holder_context.get("status", "not_supported"))
             holder_data = holder_context.get("data", {})
@@ -357,6 +470,7 @@ class StockService:
             "stock_code": stock_code,
             "stock_name": stock_name,
             "chip_distribution": chip_payload,
+            "capital_flow": capital_flow_payload,
             "major_holders": major_holders,
             "major_holder_status": major_holder_status,
             "source_chain": source_chain,
@@ -481,9 +595,20 @@ class StockService:
             "prev_close": None,
             "volume": None,
             "amount": None,
+            "after_hours_volume": None,
+            "after_hours_amount": None,
             "volume_ratio": None,
             "turnover_rate": None,
             "amplitude": None,
+            "pe_ratio": None,
+            "total_mv": None,
+            "circ_mv": None,
+            "total_shares": None,
+            "float_shares": None,
+            "limit_up_price": None,
+            "limit_down_price": None,
+            "price_speed": None,
+            "entrust_ratio": None,
             "source": "fallback",
             "update_time": datetime.now().isoformat(),
         }

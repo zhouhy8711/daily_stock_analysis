@@ -552,6 +552,8 @@ class LongbridgeFetcher(BaseFetcher):
         total_mv = None
         circ_mv = None
         name = ""
+        circulating = 0
+        total_shares = 0
 
         if static is not None:
             name = getattr(static, "name_cn", "") or getattr(static, "name_en", "") or ""
@@ -611,6 +613,8 @@ class LongbridgeFetcher(BaseFetcher):
             pb_ratio=pb_ratio,
             total_mv=total_mv,
             circ_mv=circ_mv,
+            total_shares=total_shares if total_shares > 0 else None,
+            float_shares=circulating if circulating > 0 else None,
         )
 
         logger.info(

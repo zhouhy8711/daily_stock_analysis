@@ -4,6 +4,7 @@ from unittest.mock import patch
 
 import pandas as pd
 
+from api.v1.endpoints.stocks import get_stock_history
 from data_provider.realtime_types import RealtimeSource
 from src.services.stock_service import StockService
 
@@ -22,9 +23,18 @@ class _FakeManager:
             pre_close=122.25,
             volume=1000000,
             amount=123450000,
+            after_hours_volume=104,
+            after_hours_amount=1_429_064,
             volume_ratio=1.23,
             turnover_rate=0.86,
             amplitude=2.1,
+            pe_ratio=23.89,
+            total_mv=2_200_000_000_000,
+            circ_mv=2_180_000_000_000,
+            price_speed=0.18,
+            limit_up_price=134.48,
+            limit_down_price=110.02,
+            entrust_ratio=12.5,
             source=RealtimeSource.EFINANCE,
         )
         self.chip = SimpleNamespace(
@@ -58,6 +68,22 @@ class _FakeManager:
     def get_chip_distribution(self, stock_code):
         assert stock_code == "600519"
         return self.chip
+
+    def get_capital_flow_context(self, stock_code, budget_seconds=None):
+        assert stock_code == "600519"
+        return {
+            "status": "ok",
+            "data": {
+                "stock_flow": {
+                    "main_net_inflow": 56_780_000,
+                    "main_net_inflow_ratio": 3.2,
+                    "inflow_5d": 120_000_000,
+                    "inflow_10d": -50_000_000,
+                }
+            },
+            "source_chain": [{"provider": "capital_flow", "result": "ok", "duration_ms": 23}],
+            "errors": [],
+        }
 
     def get_major_holders_context(self, stock_code, top_n=20):
         assert stock_code == "600519"
@@ -98,6 +124,7 @@ class _FakeHistoryManager:
                 "volume": [3865, 1969],
                 "amount": [544054149.0, 277169247.0],
                 "pct_chg": [-0.11, -0.11],
+                "turnover_rate": [0.38, 0.19],
             }
         ), "EfinanceFetcher"
 
@@ -116,7 +143,50 @@ def test_realtime_quote_exposes_volume_turnover_and_source_fields() -> None:
     assert result["volume_ratio"] == 1.23
     assert result["turnover_rate"] == 0.86
     assert result["amplitude"] == 2.1
+    assert result["pe_ratio"] == 23.89
+    assert result["total_mv"] == 2_200_000_000_000
+    assert result["circ_mv"] == 2_180_000_000_000
+    assert result["total_shares"] == 2_200_000_000_000 / 123.45
+    assert result["float_shares"] == 2_180_000_000_000 / 123.45
+    assert result["limit_up_price"] == 134.48
+    assert result["limit_down_price"] == 110.02
+    assert result["price_speed"] == 0.18
+    assert result["entrust_ratio"] == 12.5
+    assert result["after_hours_volume"] == 104
+    assert result["after_hours_amount"] == 1_429_064
     assert result["source"] == "efinance"
+
+
+def test_realtime_quote_derives_after_hours_volume_from_amount_and_price() -> None:
+    manager = _FakeManager()
+    manager.quote.price = 137.41
+    manager.quote.after_hours_volume = None
+    manager.quote.after_hours_amount = 1_429_064
+
+    with patch("data_provider.base.DataFetcherManager", return_value=manager):
+        result = StockService().get_realtime_quote("600519")
+
+    assert result is not None
+    assert result["after_hours_volume"] == 104.0
+    assert result["after_hours_amount"] == 1_429_064
+
+
+def test_realtime_quote_derives_market_values_from_share_counts_and_price() -> None:
+    manager = _FakeManager()
+    manager.quote.price = 137.41
+    manager.quote.total_mv = None
+    manager.quote.circ_mv = None
+    manager.quote.total_shares = 2_073_211_424
+    manager.quote.float_shares = 1_590_014_737
+
+    with patch("data_provider.base.DataFetcherManager", return_value=manager):
+        result = StockService().get_realtime_quote("600519")
+
+    assert result is not None
+    assert result["total_mv"] == 2_073_211_424 * 137.41
+    assert result["circ_mv"] == 1_590_014_737 * 137.41
+    assert result["total_shares"] == 2_073_211_424
+    assert result["float_shares"] == 1_590_014_737
 
 
 def test_indicator_metrics_maps_chip_distribution_and_major_holders() -> None:
@@ -133,6 +203,9 @@ def test_indicator_metrics_maps_chip_distribution_and_major_holders() -> None:
         {"price": 118.5, "percent": 0.5},
         {"price": 130.8, "percent": 0.3},
     ]
+    assert result["capital_flow"]["status"] == "ok"
+    assert result["capital_flow"]["main_net_inflow"] == 56_780_000
+    assert result["capital_flow"]["main_net_inflow_ratio"] == 3.2
     assert result["major_holder_status"] == "ok"
     assert result["major_holders"][0]["name"] == "摩根士丹利"
     assert result["major_holders"][0]["holding_ratio"] == 2.35
@@ -148,6 +221,7 @@ def test_history_data_supports_intraday_period() -> None:
     assert result["stock_name"] == "贵州茅台"
     assert result["data"][0]["date"] == "2026-04-30 09:35"
     assert result["data"][0]["open"] == 1408.0
+    assert result["data"][0]["turnover_rate"] == 0.38
     assert result["data"][1]["change_percent"] == -0.11
 
 
@@ -165,3 +239,29 @@ def test_history_data_anchors_cn_intraday_to_previous_session_when_market_closed
 
     assert result["period"] == "5m"
     assert manager.last_intraday_kwargs["end_date"] == "2026-04-30"
+
+
+def test_history_endpoint_exposes_turnover_rate() -> None:
+    payload = {
+        "stock_name": "贵州茅台",
+        "period": "daily",
+        "data": [
+            {
+                "date": "2026-04-30",
+                "open": 122.0,
+                "high": 125.0,
+                "low": 121.0,
+                "close": 123.45,
+                "volume": 1000000,
+                "amount": 123450000,
+                "change_percent": 0.98,
+                "turnover_rate": 0.86,
+            }
+        ],
+    }
+
+    with patch("api.v1.endpoints.stocks.StockService") as service_class:
+        service_class.return_value.get_history_data.return_value = payload
+        response = get_stock_history("600519", period="daily", days=1)
+
+    assert response.data[0].turnover_rate == 0.86

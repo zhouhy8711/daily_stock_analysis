@@ -40,6 +40,20 @@ class _DummyFetcher:
         return self._result
 
 
+class _AkshareBySourceFetcher:
+    name = "AkshareFetcher"
+    priority = 1
+
+    def __init__(self, results_by_source):
+        self.results_by_source = results_by_source
+        self.calls = []
+
+    def get_realtime_quote(self, *args, **kwargs):
+        source = kwargs.get("source", "em")
+        self.calls.append(source)
+        return self.results_by_source.get(source)
+
+
 def _make_quote(code: str = "600519", name: str = "贵州茅台") -> UnifiedRealtimeQuote:
     return UnifiedRealtimeQuote(
         code=code,
@@ -107,6 +121,69 @@ def test_manager_does_not_warn_when_fallback_source_succeeds(mock_get_config, ca
     assert quote.name == "贵州茅台"
     assert not [record for record in caplog.records if record.levelno >= logging.WARNING]
     assert "所有数据源均不可用" not in caplog.text
+
+
+@patch("src.config.get_config")
+def test_manager_keeps_supplementing_until_tencent_after_hours_fields(mock_get_config):
+    mock_get_config.return_value = SimpleNamespace(
+        enable_realtime_quote=True,
+        realtime_source_priority="efinance,akshare_em,akshare_sina,tencent",
+    )
+    primary_quote = UnifiedRealtimeQuote(
+        code="300274",
+        name="阳光电源",
+        source=RealtimeSource.EFINANCE,
+        price=137.41,
+        change_pct=-0.48,
+    )
+    em_quote = UnifiedRealtimeQuote(
+        code="300274",
+        name="阳光电源",
+        source=RealtimeSource.AKSHARE_EM,
+        price=137.41,
+        volume_ratio=0.78,
+    )
+    sina_quote = UnifiedRealtimeQuote(
+        code="300274",
+        name="阳光电源",
+        source=RealtimeSource.SINA,
+        price=137.41,
+        turnover_rate=4.02,
+    )
+    tencent_quote = UnifiedRealtimeQuote(
+        code="300274",
+        name="阳光电源",
+        source=RealtimeSource.TENCENT,
+        price=137.41,
+        pe_ratio=23.89,
+        total_mv=284_880_000_000,
+        circ_mv=218_484_000_000,
+        after_hours_volume=104,
+        after_hours_amount=1_429_064,
+    )
+    akshare = _AkshareBySourceFetcher({
+        "em": em_quote,
+        "sina": sina_quote,
+        "tencent": tencent_quote,
+    })
+    manager = DataFetcherManager(
+        fetchers=[
+            _DummyFetcher("EfinanceFetcher", 0, result=primary_quote),
+            akshare,
+        ]
+    )
+
+    quote = manager.get_realtime_quote("300274")
+
+    assert quote is primary_quote
+    assert quote.volume_ratio == 0.78
+    assert quote.turnover_rate == 4.02
+    assert quote.pe_ratio == 23.89
+    assert quote.total_mv == 284_880_000_000
+    assert quote.circ_mv == 218_484_000_000
+    assert quote.after_hours_volume == 104
+    assert quote.after_hours_amount == 1_429_064
+    assert akshare.calls == ["em", "sina", "tencent"]
 
 
 def test_pipeline_warns_once_when_all_realtime_sources_fail(caplog):
