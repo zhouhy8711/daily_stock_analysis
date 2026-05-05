@@ -6,6 +6,7 @@ import type {
   RuleDefinition,
   RuleGroup,
   RuleItem,
+  RuleBatchRunPayload,
   RuleMatchItem,
   RuleMetricItem,
   RuleRunHistoryItem,
@@ -15,6 +16,8 @@ import type {
   RuleUpdatePayload,
   RuleValueExpression,
 } from '../types/rules';
+
+const RULE_RUN_TIMEOUT_MS = 10 * 60 * 1000;
 
 function toString(value: unknown): string {
   return typeof value === 'string' ? value : String(value ?? '');
@@ -35,6 +38,10 @@ function toBoolean(value: unknown, fallback = false): boolean {
 
 function toStringArray(value: unknown): string[] {
   return Array.isArray(value) ? value.map(toString) : [];
+}
+
+function toNumberArray(value: unknown): number[] | undefined {
+  return Array.isArray(value) ? value.map((item) => toNumber(item)) : undefined;
 }
 
 function normalizeValueExpression(raw: unknown): RuleValueExpression {
@@ -192,6 +199,8 @@ function normalizeMatch(raw: Record<string, unknown>): RuleMatchItem {
   const matchedDates = raw.matched_dates ?? raw.matchedDates;
   const matchedEvents = raw.matched_events ?? raw.matchedEvents;
   return {
+    runId: raw.run_id == null && raw.runId == null ? undefined : toNumber(raw.run_id ?? raw.runId),
+    ruleId: raw.rule_id == null && raw.ruleId == null ? undefined : toNumber(raw.rule_id ?? raw.ruleId),
     stockCode: toString(raw.stock_code ?? raw.stockCode),
     stockName: toNullableString(raw.stock_name ?? raw.stockName),
     matchedDates: toStringArray(matchedDates),
@@ -207,11 +216,15 @@ function normalizeMatch(raw: Record<string, unknown>): RuleMatchItem {
 function normalizeRunHistory(raw: Record<string, unknown>): RuleRunHistoryItem {
   return {
     id: toNumber(raw.id),
+    runIds: toNumberArray(raw.run_ids ?? raw.runIds),
     ruleId: toNumber(raw.rule_id ?? raw.ruleId),
+    ruleIds: toNumberArray(raw.rule_ids ?? raw.ruleIds),
     ruleName: toNullableString(raw.rule_name ?? raw.ruleName),
+    ruleNames: toStringArray(raw.rule_names ?? raw.ruleNames),
     status: toString(raw.status),
     targetCount: toNumber(raw.target_count ?? raw.targetCount),
     matchCount: toNumber(raw.match_count ?? raw.matchCount),
+    eventCount: toNumber(raw.event_count ?? raw.eventCount),
     error: toNullableString(raw.error),
     startedAt: toNullableString(raw.started_at ?? raw.startedAt),
     finishedAt: toNullableString(raw.finished_at ?? raw.finishedAt),
@@ -286,16 +299,49 @@ export const rulesApi = {
     const response = await apiClient.post<Record<string, unknown>>(
       `/api/v1/rules/${encodeURIComponent(String(ruleId))}/run`,
       requestPayload,
+      { timeout: RULE_RUN_TIMEOUT_MS },
     );
     const rawMatches = Array.isArray(response.data.matches) ? response.data.matches : [];
     return {
       runId: toNumber(response.data.run_id ?? response.data.runId),
       ruleId: toNumber(response.data.rule_id ?? response.data.ruleId),
+      ruleIds: toNumberArray(response.data.rule_ids ?? response.data.ruleIds),
+      ruleNames: toStringArray(response.data.rule_names ?? response.data.ruleNames),
       status: toString(response.data.status),
       targetCount: toNumber(response.data.target_count ?? response.data.targetCount),
       matchCount: toNumber(response.data.match_count ?? response.data.matchCount),
       eventCount: toNumber(response.data.event_count ?? response.data.eventCount),
       mode: toString(response.data.mode || payload?.mode || 'history'),
+      durationMs: toNumber(response.data.duration_ms ?? response.data.durationMs),
+      matches: (rawMatches as Array<Record<string, unknown>>).map(normalizeMatch),
+      errors: Array.isArray(response.data.errors) ? response.data.errors.map(toString) : [],
+    };
+  },
+
+  async runBatch(payload: RuleBatchRunPayload): Promise<RuleRunResponse> {
+    const requestPayload = {
+      rule_ids: payload.ruleIds,
+      mode: payload.mode,
+      target: payload.target ? serializeRunTarget(payload.target) : undefined,
+      start_date: payload.startDate || undefined,
+      end_date: payload.endDate || undefined,
+    };
+    const response = await apiClient.post<Record<string, unknown>>(
+      '/api/v1/rules/run-batch',
+      requestPayload,
+      { timeout: RULE_RUN_TIMEOUT_MS },
+    );
+    const rawMatches = Array.isArray(response.data.matches) ? response.data.matches : [];
+    return {
+      runId: toNumber(response.data.run_id ?? response.data.runId),
+      ruleId: toNumber(response.data.rule_id ?? response.data.ruleId),
+      ruleIds: toNumberArray(response.data.rule_ids ?? response.data.ruleIds),
+      ruleNames: toStringArray(response.data.rule_names ?? response.data.ruleNames),
+      status: toString(response.data.status),
+      targetCount: toNumber(response.data.target_count ?? response.data.targetCount),
+      matchCount: toNumber(response.data.match_count ?? response.data.matchCount),
+      eventCount: toNumber(response.data.event_count ?? response.data.eventCount),
+      mode: toString(response.data.mode || payload.mode || 'history'),
       durationMs: toNumber(response.data.duration_ms ?? response.data.durationMs),
       matches: (rawMatches as Array<Record<string, unknown>>).map(normalizeMatch),
       errors: Array.isArray(response.data.errors) ? response.data.errors.map(toString) : [],

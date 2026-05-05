@@ -1,5 +1,5 @@
 import type React from 'react';
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   CalendarDays,
   ChevronDown,
@@ -700,12 +700,18 @@ function flattenMatches(
   runMeta: { runId?: number; ruleId: number; ruleName?: string | null },
 ): RuleRunEventRow[] {
   return matches.flatMap((match, matchIndex) => {
+    const rowRunMeta = {
+      ...runMeta,
+      runId: match.runId ?? runMeta.runId,
+      ruleId: match.ruleId ?? runMeta.ruleId,
+      ruleName: runMeta.ruleName,
+    };
     if (match.matchedEvents.length > 0) {
       return match.matchedEvents.map((rawEvent, eventIndex) => {
         const event = asRecord(rawEvent);
         return {
-          id: `${runMeta.runId ?? 'pending'}-${match.stockCode}-${getEventDate(event)}-${matchIndex}-${eventIndex}`,
-          ...runMeta,
+          id: `${rowRunMeta.runId ?? 'pending'}-${rowRunMeta.ruleId}-${match.stockCode}-${getEventDate(event)}-${matchIndex}-${eventIndex}`,
+          ...rowRunMeta,
           stockCode: match.stockCode,
           stockName: match.stockName,
           eventDate: getEventDate(event),
@@ -716,8 +722,8 @@ function flattenMatches(
     }
 
     return match.matchedDates.map((date, eventIndex) => ({
-      id: `${runMeta.runId ?? 'pending'}-${match.stockCode}-${date}-${matchIndex}-${eventIndex}`,
-      ...runMeta,
+      id: `${rowRunMeta.runId ?? 'pending'}-${rowRunMeta.ruleId}-${match.stockCode}-${date}-${matchIndex}-${eventIndex}`,
+      ...rowRunMeta,
       stockCode: match.stockCode,
       stockName: match.stockName,
       eventDate: date,
@@ -730,6 +736,137 @@ function flattenMatches(
       explanation: match.explanation,
     }));
   });
+}
+
+function getRunIds(run: RuleRunHistoryItem): number[] {
+  if (Array.isArray(run.runIds) && run.runIds.length > 0) {
+    return run.runIds;
+  }
+  return run.id > 0 ? [run.id] : [];
+}
+
+function getRuleIdsForRun(run: RuleRunHistoryItem | null): number[] {
+  if (!run) return [];
+  if (Array.isArray(run.ruleIds) && run.ruleIds.length > 0) {
+    return run.ruleIds;
+  }
+  return run.ruleId > 0 ? [run.ruleId] : [];
+}
+
+function getRunHistoryEventCount(run: RuleRunHistoryItem, fallbackRows?: number): number {
+  if (typeof run.eventCount === 'number' && Number.isFinite(run.eventCount)) {
+    return Math.max(0, run.eventCount);
+  }
+  if (typeof fallbackRows === 'number' && Number.isFinite(fallbackRows)) {
+    return Math.max(0, fallbackRows);
+  }
+  return run.matchCount;
+}
+
+function getRunHistoryLabel(run: RuleRunHistoryItem): string {
+  const runIds = getRunIds(run);
+  const ruleCount = getRuleIdsForRun(run).length;
+  if (run.id < 0) {
+    return ruleCount > 1 ? `回测中 ${ruleCount} 条规则` : `回测中 ${run.ruleName || `规则 ${run.ruleId}`}`;
+  }
+  if (ruleCount > 1) {
+    const sortedIds = [...runIds].sort((left, right) => left - right);
+    const idText = sortedIds.length > 1
+      ? `#${sortedIds[0]}-${sortedIds[sortedIds.length - 1]}`
+      : `#${run.id}`;
+    return `${idText} 多规则回测`;
+  }
+  return `#${run.id} ${run.ruleName || `规则 ${run.ruleId}`}`;
+}
+
+function parseRunTime(value?: string | null): number | null {
+  if (!value) return null;
+  const parsed = new Date(value).getTime();
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function canGroupLegacyRunBatch(group: RuleRunHistoryItem[], candidate: RuleRunHistoryItem): boolean {
+  if (group.length === 0 || candidate.id <= 0 || candidate.status === 'running') {
+    return false;
+  }
+  if (group.some((run) => run.status === 'running' || run.ruleId === candidate.ruleId)) {
+    return false;
+  }
+  const targetCount = group[0].targetCount;
+  if (candidate.targetCount !== targetCount) {
+    return false;
+  }
+  const minGroupId = Math.min(...group.map((run) => run.id));
+  if (minGroupId - candidate.id !== 1) {
+    return false;
+  }
+  const newestStartedAt = parseRunTime(group[0].startedAt);
+  const candidateStartedAt = parseRunTime(candidate.startedAt);
+  if (newestStartedAt == null || candidateStartedAt == null) {
+    return false;
+  }
+  return Math.abs(newestStartedAt - candidateStartedAt) <= 5 * 60 * 1000;
+}
+
+function mergeLegacyRunBatch(group: RuleRunHistoryItem[]): RuleRunHistoryItem {
+  const ordered = [...group].sort((left, right) => left.id - right.id);
+  const statuses = new Set(ordered.map((run) => run.status));
+  const startedAt = ordered
+    .map((run) => run.startedAt)
+    .filter((value): value is string => Boolean(value))
+    .sort()[0] ?? ordered[0].startedAt;
+  const sortedFinishedAt = ordered
+    .map((run) => run.finishedAt)
+    .filter((value): value is string => Boolean(value))
+    .sort();
+  const finishedAt = sortedFinishedAt.length > 0
+    ? sortedFinishedAt[sortedFinishedAt.length - 1]
+    : ordered[ordered.length - 1].finishedAt;
+  return {
+    id: Math.max(...ordered.map((run) => run.id)),
+    runIds: ordered.map((run) => run.id),
+    ruleId: ordered[0].ruleId,
+    ruleIds: ordered.map((run) => run.ruleId),
+    ruleName: `多规则回测（${ordered.length} 条）`,
+    ruleNames: ordered.map((run) => run.ruleName || `规则 ${run.ruleId}`),
+    status: statuses.has('failed') ? 'failed' : statuses.has('partial') ? 'partial' : 'completed',
+    targetCount: ordered[0].targetCount,
+    matchCount: ordered.reduce((total, run) => total + run.matchCount, 0),
+    eventCount: ordered.reduce((total, run) => total + getRunHistoryEventCount(run), 0),
+    error: ordered.map((run) => run.error).filter(Boolean).join('；') || null,
+    startedAt,
+    finishedAt,
+    durationMs: ordered.reduce((total, run) => total + (run.durationMs ?? 0), 0),
+  };
+}
+
+function groupLegacyRunHistory(runs: RuleRunHistoryItem[]): RuleRunHistoryItem[] {
+  const grouped: RuleRunHistoryItem[] = [];
+  let currentGroup: RuleRunHistoryItem[] = [];
+
+  const flushGroup = () => {
+    if (currentGroup.length > 1) {
+      grouped.push(mergeLegacyRunBatch(currentGroup));
+    } else if (currentGroup.length === 1) {
+      grouped.push(currentGroup[0]);
+    }
+    currentGroup = [];
+  };
+
+  for (const run of runs) {
+    if (currentGroup.length === 0) {
+      currentGroup = [run];
+      continue;
+    }
+    if (canGroupLegacyRunBatch(currentGroup, run)) {
+      currentGroup.push(run);
+      continue;
+    }
+    flushGroup();
+    currentGroup = [run];
+  }
+  flushGroup();
+  return grouped;
 }
 
 function hydrateTarget(
@@ -812,6 +949,8 @@ const BacktestPage: React.FC = () => {
   const [stockListIndustryQuery, setStockListIndustryQuery] = useState('');
   const [selectedStockListIndustries, setSelectedStockListIndustries] = useState<string[]>([]);
   const [expandedResultGroups, setExpandedResultGroups] = useState<Record<string, boolean>>({});
+  const runHeartbeatRef = useRef<number | null>(null);
+  const logScrollerRef = useRef<HTMLDivElement | null>(null);
 
   const setRunHistory = useCallback((action: React.SetStateAction<RuleRunHistoryItem[]>) => {
     updateBacktestRuntime((current) => ({
@@ -901,6 +1040,22 @@ const BacktestPage: React.FC = () => {
     }
   }, []);
 
+  const clearRunHeartbeat = useCallback(() => {
+    if (runHeartbeatRef.current != null) {
+      window.clearInterval(runHeartbeatRef.current);
+      runHeartbeatRef.current = null;
+    }
+  }, []);
+
+  useEffect(() => clearRunHeartbeat, [clearRunHeartbeat]);
+
+  useEffect(() => {
+    if (activeResultTab !== 'logs') return;
+    const node = logScrollerRef.current;
+    if (!node) return;
+    node.scrollTop = node.scrollHeight;
+  }, [activeResultTab, executionLogs.length]);
+
   const watchlistCodes = useMemo(
     () => watchlistItems.map((item) => item.code),
     [watchlistItems],
@@ -943,21 +1098,34 @@ const BacktestPage: React.FC = () => {
     () => rules.find((rule) => rule.id === selectedRun?.ruleId),
     [rules, selectedRun?.ruleId],
   );
-  const runRows = displayRows;
+  const selectedRunRuleIds = useMemo(() => getRuleIdsForRun(selectedRun), [selectedRun]);
+  const selectedRunIdsForRows = useMemo(() => (
+    selectedRun ? new Set(getRunIds(selectedRun)) : null
+  ), [selectedRun]);
+  const runRows = useMemo(() => {
+    if (!selectedRunIdsForRows) return displayRows;
+    if (selectedRunIdsForRows.size === 0) return [];
+    return displayRows.filter((row) => row.runId != null && selectedRunIdsForRows.has(row.runId));
+  }, [displayRows, selectedRunIdsForRows]);
   const resultRules = useMemo(() => {
+    if (selectedRunRuleIds.length > 1) {
+      return selectedRunRuleIds
+        .map((ruleId) => rules.find((rule) => rule.id === ruleId))
+        .filter((rule): rule is RuleItem => rule !== undefined);
+    }
     if (selectedRunRule) {
       return [selectedRunRule];
     }
     return selectedRules;
-  }, [selectedRules, selectedRunRule]);
+  }, [rules, selectedRules, selectedRunRule, selectedRunRuleIds]);
   const resultRuleGroups = useMemo(
     () => buildRuleResultGroups(runRows, resultRules, rules, metrics),
     [metrics, resultRules, rules, runRows],
   );
+  const hasCompletedResultContext = selectedRun !== null && selectedRun.status !== 'running';
   const hasResultContent = resultRuleGroups.length > 0 && (
     runRows.length > 0
-    || selectedRun !== null
-    || executionLogs.length > 0
+    || hasCompletedResultContext
     || runWarning !== null
   );
   const headerControlGridClass = targetScope === 'industry'
@@ -1021,7 +1189,20 @@ const BacktestPage: React.FC = () => {
 
   const loadRunMatches = useCallback(async (run: RuleRunHistoryItem) => {
     if (run.id < 0 || run.status === 'running') {
-      setSelectedRun(run);
+      const now = new Date().toISOString();
+      const runningRun = { ...run, eventCount: 0 };
+      setSelectedRun(runningRun);
+      setDisplayRows([]);
+      setSelectedRow(null);
+      setIndicatorSelection(null);
+      setRunWarning(null);
+      setRunError(null);
+      setExecutionLogs([{
+        id: `${now}-running-${run.id}`,
+        time: now,
+        level: 'info',
+        message: `${getRunHistoryLabel(run)} 仍在执行，暂未生成命中结果`,
+      }]);
       setActiveResultTab('logs');
       return;
     }
@@ -1029,20 +1210,37 @@ const BacktestPage: React.FC = () => {
     setActiveResultTab('results');
     setIsLoadingMatches(true);
     setRunError(null);
+    setRunWarning(null);
+    setSelectedRow(null);
+    setIndicatorSelection(null);
     try {
-      const matches = await rulesApi.getRunMatches(run.id);
-      setDisplayRows(flattenMatches(matches, {
+      const runIds = getRunIds(run);
+      const matchGroups = await Promise.all(runIds.map((runId) => rulesApi.getRunMatches(runId)));
+      const matches = matchGroups.flat();
+      const nextRows = flattenMatches(matches, {
         runId: run.id,
         ruleId: run.ruleId,
         ruleName: run.ruleName,
-      }));
+      });
+      const nextRun = { ...run, eventCount: nextRows.length };
+      setSelectedRun(nextRun);
+      setDisplayRows(nextRows);
+      setRunHistory((current) => current.map((item) => (item.id === run.id ? nextRun : item)));
       setPageError(null);
     } catch (err) {
       setPageError(getParsedApiError(err));
     } finally {
       setIsLoadingMatches(false);
     }
-  }, [setActiveResultTab, setDisplayRows, setRunError, setSelectedRun]);
+  }, [
+    setActiveResultTab,
+    setDisplayRows,
+    setExecutionLogs,
+    setRunError,
+    setRunHistory,
+    setRunWarning,
+    setSelectedRun,
+  ]);
 
   const confirmDeleteRun = useCallback(async () => {
     const run = deleteRunCandidate;
@@ -1052,11 +1250,15 @@ const BacktestPage: React.FC = () => {
 
     setDeletingRunId(run.id);
     try {
-      await rulesApi.deleteRun(run.id);
+      const deleteRunIds = getRunIds(run);
+      await Promise.all(deleteRunIds.map((runId) => rulesApi.deleteRun(runId)));
       setRunHistory((current) => current.filter((item) => item.id !== run.id));
       setRunProgressById((current) => {
         const next = { ...current };
         delete next[run.id];
+        deleteRunIds.forEach((runId) => {
+          delete next[runId];
+        });
         return next;
       });
       if (selectedRun?.id === run.id) {
@@ -1117,10 +1319,11 @@ const BacktestPage: React.FC = () => {
         .filter(isAllShareStock)
         .sort(compareStockIndexById)
         .map(getStockDisplayCode)));
+      const groupedPersistedRuns = groupLegacyRunHistory(persistedRuns);
       const firstRule = ruleItems[0];
       const shouldHydratePersistedRuns = !hasBacktestRuntimeSession();
-      const persistedSelectedRun = shouldHydratePersistedRuns
-        ? persistedRuns.find((run) => run.status !== 'running') ?? persistedRuns[0] ?? null
+      let persistedSelectedRun = shouldHydratePersistedRuns
+        ? groupedPersistedRuns.find((run) => run.status !== 'running') ?? groupedPersistedRuns[0] ?? null
         : null;
       let persistedRows: RuleRunEventRow[] = [];
       let persistedLogs: ExecutionLogEntry[] = [];
@@ -1136,23 +1339,32 @@ const BacktestPage: React.FC = () => {
         }];
         if (persistedSelectedRun.id > 0 && persistedSelectedRun.status !== 'running') {
           try {
-            const persistedMatches = await rulesApi.getRunMatches(persistedSelectedRun.id);
+            const persistedRunIds = getRunIds(persistedSelectedRun);
+            const persistedMatchGroups = await Promise.all(
+              persistedRunIds.map((runId) => rulesApi.getRunMatches(runId)),
+            );
+            const persistedMatches = persistedMatchGroups.flat();
             persistedRows = flattenMatches(persistedMatches, {
               runId: persistedSelectedRun.id,
               ruleId: persistedSelectedRun.ruleId,
               ruleName: persistedSelectedRun.ruleName,
             });
+            persistedSelectedRun = { ...persistedSelectedRun, eventCount: persistedRows.length };
           } catch (err) {
             setPageError(getParsedApiError(err));
           }
         }
       }
+      const selectedHistoryRun = persistedSelectedRun;
+      const nextRunHistory = selectedHistoryRun
+        ? groupedPersistedRuns.map((run) => (run.id === selectedHistoryRun.id ? selectedHistoryRun : run))
+        : groupedPersistedRuns;
 
       setMetrics(metricItems);
       setRules(ruleItems);
       setWatchlistItems(nextWatchlistItems);
       if (shouldHydratePersistedRuns) {
-        setRunHistory(persistedRuns);
+        setRunHistory(nextRunHistory);
         setSelectedRun(persistedSelectedRun);
         setDisplayRows(persistedRows);
         setActiveResultTab(persistedSelectedRun?.status === 'running' ? 'logs' : 'results');
@@ -1265,87 +1477,100 @@ const BacktestPage: React.FC = () => {
     appendExecutionLog(`开始回测：${selectedRuleIds.length} 条规则，${targetCodes.length} 只股票，时间范围 ${startDate || '不限'} 至 ${endDate || '不限'}`);
     let currentTemporaryRunId: number | null = null;
     try {
-      const runMetas: RuleRunHistoryItem[] = [];
-      const nextRows: RuleRunEventRow[] = [];
-      const partialErrors: string[] = [];
-      for (const [ruleIndex, ruleId] of selectedRuleIds.entries()) {
-        const rule = rules.find((item) => item.id === ruleId);
-        const temporaryRunId = -Date.now() - ruleIndex;
-        currentTemporaryRunId = temporaryRunId;
-        const temporaryRun: RuleRunHistoryItem = {
-          id: temporaryRunId,
-          ruleId,
-          ruleName: rule?.name ?? null,
-          status: 'running',
-          targetCount: targetCodes.length,
-          matchCount: 0,
-          startedAt: runStartedAt,
-          finishedAt: null,
-          durationMs: null,
-        };
-        setSelectedRun(temporaryRun);
-        setRunHistory((current) => [temporaryRun, ...current]);
-        updateRunProgress(temporaryRunId, 8, '已加入执行队列');
-        appendExecutionLog(`规则 #${ruleId} ${rule?.name ?? ''} 已加入执行队列`);
-        updateRunProgress(temporaryRunId, 20, '请求后端执行');
-        appendExecutionLog(`规则 #${ruleId} 正在请求后端执行，扫描 ${targetCodes.length} 只股票`);
-        const result = await rulesApi.run(ruleId, {
-          mode: 'history',
-          target: {
-            scope: targetScope === 'industry' ? 'custom' : targetScope,
-            stockCodes: targetCodes,
-          },
-          startDate,
-          endDate,
-        });
-        updateRunProgress(temporaryRunId, 82, '后端已返回结果');
-        appendExecutionLog(`规则 #${ruleId} 后端返回：命中股票 ${result.matchCount} 只，命中记录 ${result.eventCount} 条`);
-        if (result.errors.length > 0) {
-          partialErrors.push(`#${ruleId}: ${result.errors.join('，')}`);
-          appendExecutionLog(`规则 #${ruleId} 存在部分错误：${result.errors.join('，')}`, 'warning');
-        }
-        const now = new Date().toISOString();
-        const runMeta: RuleRunHistoryItem = {
-          id: result.runId,
-          ruleId: result.ruleId,
-          ruleName: rule?.name ?? null,
-          status: result.status,
-          targetCount: result.targetCount,
-          matchCount: result.matchCount,
-          error: result.errors.length > 0 ? result.errors.join('；') : null,
-          startedAt: now,
-          finishedAt: now,
-          durationMs: result.durationMs,
-        };
-        runMetas.push(runMeta);
-        nextRows.push(...flattenMatches(result.matches, {
-          runId: result.runId,
-          ruleId: result.ruleId,
-          ruleName: rule?.name ?? null,
-        }));
-        setRunHistory((current) => current.map((item) => (item.id === temporaryRunId ? runMeta : item)));
-        setRunProgressById((current) => {
-          const next = { ...current };
-          delete next[temporaryRunId];
-          next[result.runId] = { progress: 100, stage: '执行完成' };
-          return next;
-        });
-        currentTemporaryRunId = null;
-        appendExecutionLog(`规则 #${ruleId} 执行完成，耗时 ${result.durationMs} ms`, result.status === 'completed' ? 'success' : 'warning');
-      }
-      setSelectedRun(null);
-      setDisplayRows(nextRows);
-      setRunHistory((current) => {
-        const existingIds = new Set(current.map((item) => item.id));
-        const missingRuns = runMetas.filter((item) => !existingIds.has(item.id));
-        return [...missingRuns, ...current];
+      const temporaryRunId = -Date.now();
+      currentTemporaryRunId = temporaryRunId;
+      const runRuleNames = selectedRuleIds
+        .map((ruleId) => rules.find((item) => item.id === ruleId)?.name ?? `规则 ${ruleId}`);
+      const temporaryRun: RuleRunHistoryItem = {
+        id: temporaryRunId,
+        ruleId: selectedRuleIds[0],
+        ruleIds: selectedRuleIds,
+        ruleName: selectedRuleIds.length > 1 ? `多规则回测（${selectedRuleIds.length} 条）` : runRuleNames[0],
+        ruleNames: runRuleNames,
+        status: 'running',
+        targetCount: targetCodes.length,
+        matchCount: 0,
+        eventCount: 0,
+        startedAt: runStartedAt,
+        finishedAt: null,
+        durationMs: null,
+      };
+      setSelectedRun(temporaryRun);
+      setRunHistory((current) => [temporaryRun, ...current]);
+      updateRunProgress(temporaryRunId, 8, '已加入执行队列');
+      appendExecutionLog(`已加入执行队列：${selectedRuleIds.length} 条规则`);
+      updateRunProgress(temporaryRunId, 20, '请求后端执行');
+      const backendModeText = selectedRuleIds.length > 1 ? '后端并行执行' : '后端执行';
+      appendExecutionLog(`正在请求${backendModeText}，扫描 ${targetCodes.length} 只股票，${selectedRuleIds.length} 条规则`);
+      clearRunHeartbeat();
+      const heartbeatStartedAt = Date.now();
+      let heartbeatTick = 0;
+      runHeartbeatRef.current = window.setInterval(() => {
+        heartbeatTick += 1;
+        const elapsedSeconds = Math.max(1, Math.floor((Date.now() - heartbeatStartedAt) / 1000));
+        const nextProgress = Math.min(80, 32 + heartbeatTick * 6);
+        updateRunProgress(temporaryRunId, nextProgress, `${backendModeText}中，已等待 ${elapsedSeconds} 秒`);
+        appendExecutionLog(`${backendModeText}中：已等待 ${elapsedSeconds} 秒，结果返回后会自动切换`);
+      }, 5000);
+
+      const result = await rulesApi.runBatch({
+        ruleIds: selectedRuleIds,
+        mode: 'history',
+        target: {
+          scope: targetScope === 'industry' ? 'custom' : targetScope,
+          stockCodes: targetCodes,
+        },
+        startDate,
+        endDate,
       });
+      clearRunHeartbeat();
+      updateRunProgress(temporaryRunId, 82, '后端已返回结果');
+      appendExecutionLog(`后端返回：命中股票 ${result.matchCount} 只，命中记录 ${result.eventCount} 条`);
+      if (result.errors.length > 0) {
+        appendExecutionLog(`本次回测存在部分错误：${result.errors.join('，')}`, 'warning');
+      }
+      const now = new Date().toISOString();
+      const resultRuleIds = result.ruleIds && result.ruleIds.length > 0 ? result.ruleIds : selectedRuleIds;
+      const resultRuleNames = result.ruleNames && result.ruleNames.length > 0 ? result.ruleNames : runRuleNames;
+      const resultRuleName = resultRuleIds.length > 1 ? `多规则回测（${resultRuleIds.length} 条）` : resultRuleNames[0] ?? null;
+      const nextRows = flattenMatches(result.matches, {
+        runId: result.runId,
+        ruleId: result.ruleId,
+        ruleName: resultRuleName,
+      });
+      const runMeta: RuleRunHistoryItem = {
+        id: result.runId,
+        runIds: [result.runId],
+        ruleId: result.ruleId,
+        ruleIds: resultRuleIds,
+        ruleName: resultRuleName,
+        ruleNames: resultRuleNames,
+        status: result.status,
+        targetCount: result.targetCount,
+        matchCount: result.matchCount,
+        eventCount: result.eventCount || nextRows.length,
+        error: result.errors.length > 0 ? result.errors.join('；') : null,
+        startedAt: now,
+        finishedAt: now,
+        durationMs: result.durationMs,
+      };
+      setSelectedRun(runMeta);
+      setDisplayRows(nextRows);
+      setRunHistory((current) => current.map((item) => (item.id === temporaryRunId ? runMeta : item)));
+      setRunProgressById((current) => {
+        const next = { ...current };
+        delete next[temporaryRunId];
+        next[result.runId] = { progress: 100, stage: '执行完成' };
+        return next;
+      });
+      currentTemporaryRunId = null;
       setRules(await rulesApi.list());
-      setRunWarning(partialErrors.length > 0 ? partialErrors.join('；') : null);
-      appendExecutionLog(`本次回测完成：共 ${nextRows.length} 条命中记录`, partialErrors.length > 0 ? 'warning' : 'success');
+      setRunWarning(result.errors.length > 0 ? result.errors.join('；') : null);
+      appendExecutionLog(`本次回测完成：共 ${nextRows.length} 条命中记录`, result.errors.length > 0 ? 'warning' : 'success');
       setActiveResultTab('results');
       setPageError(null);
     } catch (err) {
+      clearRunHeartbeat();
       const parsedError = getParsedApiError(err);
       appendExecutionLog(`回测失败：${parsedError.message}`, 'error');
       if (currentTemporaryRunId != null) {
@@ -1375,6 +1600,7 @@ const BacktestPage: React.FC = () => {
       setActiveResultTab('logs');
       setRunError(parsedError);
     } finally {
+      clearRunHeartbeat();
       setIsRunning(false);
     }
   };
@@ -1435,11 +1661,13 @@ const BacktestPage: React.FC = () => {
     : activeResultTab === 'logs' && executionLogs.length > 0
       ? `本次执行日志 · ${executionLogs.length} 条`
       : selectedRun
-        ? `运行 #${selectedRun.id} · 规则 #${selectedRun.ruleId} · ${activeRunEventCount} 条命中记录`
+        ? `${getRunHistoryLabel(selectedRun)} · ${activeRunEventCount} 条命中记录`
         : runRows.length > 0
           ? `本次回测 · ${activeDateRangeText} · ${selectedRuleIds.length} 条规则 · ${activeRunEventCount} 条命中记录`
           : '运行一次规则回测后展示本次命中结果';
-  const resultSetName = selectedRunRule?.name
+  const resultSetName = selectedRun && getRuleIdsForRun(selectedRun).length > 1
+    ? selectedRun.ruleName || `多规则回测（${getRuleIdsForRun(selectedRun).length} 条）`
+    : selectedRunRule?.name
     || selectedRun?.ruleName
     || (selectedRules.length > 1 ? `本次多规则回测（${selectedRules.length} 条）` : selectedRule?.name)
     || '规则回测';
@@ -1649,7 +1877,7 @@ const BacktestPage: React.FC = () => {
                     >
                       <div className="flex items-center justify-between gap-2">
                         <span className="min-w-0 truncate text-sm font-semibold text-foreground">
-                          {run.id < 0 ? '回测中' : `#${run.id}`} {run.ruleName || `规则 ${run.ruleId}`}
+                          {getRunHistoryLabel(run)}
                         </span>
                         <Badge variant={run.status === 'completed' ? 'success' : run.status === 'failed' ? 'danger' : 'warning'}>
                           {formatRunStatus(run.status)}
@@ -1657,7 +1885,7 @@ const BacktestPage: React.FC = () => {
                       </div>
                       <div className="mt-2 grid grid-cols-2 gap-1 text-xs text-secondary-text">
                         <span>扫描 {run.targetCount}</span>
-                        <span>命中 {run.matchCount}</span>
+                        <span>命中记录 {getRunHistoryEventCount(run)}</span>
                         <span className="col-span-2 font-mono text-muted-text">{formatDateTime(run.startedAt)}</span>
                       </div>
                       {progressState ? (
@@ -1771,9 +1999,7 @@ const BacktestPage: React.FC = () => {
                           <div key={runId} className="rounded-lg border border-border/50 bg-card/55 p-3">
                             <div className="flex items-center justify-between gap-3 text-xs">
                               <span className="min-w-0 truncate font-medium text-foreground">
-                                {historyItem
-                                  ? `${historyItem.id < 0 ? '回测中' : `#${historyItem.id}`} ${historyItem.ruleName || `规则 ${historyItem.ruleId}`}`
-                                  : `运行 ${runId}`}
+                                {historyItem ? getRunHistoryLabel(historyItem) : `运行 ${runId}`}
                               </span>
                               <span className="shrink-0 font-mono text-primary">{progressState.progress}%</span>
                             </div>
@@ -1803,7 +2029,7 @@ const BacktestPage: React.FC = () => {
                       <span className="label-uppercase">Execution Log</span>
                       <span className="text-xs text-muted-text">{executionLogs.length} 条</span>
                     </div>
-                    <div className="max-h-[56vh] overflow-y-auto">
+                    <div ref={logScrollerRef} className="max-h-[56vh] overflow-y-auto">
                       {executionLogs.map((log) => (
                         <div
                           key={log.id}

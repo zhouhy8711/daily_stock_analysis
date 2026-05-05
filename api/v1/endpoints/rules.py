@@ -5,6 +5,7 @@ from fastapi import APIRouter, HTTPException, status
 
 from api.v1.schemas.common import ErrorResponse
 from api.v1.schemas.rules import (
+    RuleBatchRunRequest,
     RuleCreateRequest,
     RuleItem,
     RuleListResponse,
@@ -125,6 +126,32 @@ def delete_rule(rule_id: int) -> None:
     service = RuleService()
     if not service.delete_rule(rule_id):
         raise HTTPException(status_code=404, detail={"error": "not_found", "message": "规则不存在"})
+
+
+@router.post(
+    "/run-batch",
+    response_model=RuleRunResponse,
+    responses={
+        400: {"description": "规则无效", "model": ErrorResponse},
+        404: {"description": "规则不存在", "model": ErrorResponse},
+    },
+    summary="批量运行规则",
+)
+def run_rules(payload: RuleBatchRunRequest) -> RuleRunResponse:
+    service = RuleService()
+    try:
+        target = payload.target.model_dump() if payload.target is not None else None
+        return RuleRunResponse(**service.run_rules(
+            payload.rule_ids,
+            mode=payload.mode,
+            target_override=target,
+            start_date=payload.start_date,
+            end_date=payload.end_date,
+        ))
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail={"error": "not_found", "message": "规则不存在"}) from exc
+    except RuleValidationError as exc:
+        raise HTTPException(status_code=400, detail={"error": "invalid_rule", "message": str(exc)}) from exc
 
 
 @router.post(

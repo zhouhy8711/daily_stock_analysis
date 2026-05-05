@@ -144,6 +144,15 @@ const matches = [{
   explanation: '成交量放大',
 }];
 
+const multiEventMatches = [{
+  ...matches[0],
+  matchedDates: ['2026-05-01', '2026-05-02', '2026-05-03'],
+  matchedEvents: ['2026-05-01', '2026-05-02', '2026-05-03'].map((date) => ({
+    ...matches[0].matchedEvents[0],
+    date,
+  })),
+}];
+
 const secondMatches = [{
   stockCode: '688521.SH',
   stockName: '芯原股份',
@@ -208,6 +217,7 @@ vi.mock('../../api/rules', () => ({
     getRunMatches: vi.fn(),
     deleteRun: vi.fn(),
     run: vi.fn(),
+    runBatch: vi.fn(),
   },
 }));
 
@@ -255,7 +265,7 @@ describe('BacktestPage', () => {
     vi.mocked(rulesApi.listRuns).mockResolvedValue([]);
     vi.mocked(rulesApi.getRunMatches).mockResolvedValue(matches);
     vi.mocked(rulesApi.deleteRun).mockResolvedValue(undefined);
-    vi.mocked(rulesApi.run).mockResolvedValue({
+    vi.mocked(rulesApi.runBatch).mockResolvedValue({
       runId: 12,
       ruleId: 7,
       status: 'completed',
@@ -372,47 +382,22 @@ describe('BacktestPage', () => {
 
   it('groups multi-rule backtest results by rule and can collapse a rule group', async () => {
     vi.mocked(rulesApi.list).mockResolvedValue([rule, secondRule, emptyRule]);
-    vi.mocked(rulesApi.run).mockImplementation(async (ruleId) => {
-      if (ruleId === 8) {
-        return {
-          runId: 13,
-          ruleId: 8,
-          status: 'completed',
-          targetCount: 2,
-          matchCount: 1,
-          eventCount: 1,
-          mode: 'history',
-          durationMs: 18,
-          matches: secondMatches,
-          errors: [],
-        };
-      }
-      if (ruleId === 9) {
-        return {
-          runId: 14,
-          ruleId: 9,
-          status: 'completed',
-          targetCount: 2,
-          matchCount: 0,
-          eventCount: 0,
-          mode: 'history',
-          durationMs: 15,
-          matches: [],
-          errors: [],
-        };
-      }
-      return {
-        runId: 12,
-        ruleId: 7,
-        status: 'completed',
-        targetCount: 2,
-        matchCount: 1,
-        eventCount: 1,
-        mode: 'history',
-        durationMs: 20,
-        matches,
-        errors: [],
-      };
+    vi.mocked(rulesApi.runBatch).mockResolvedValue({
+      runId: 12,
+      ruleId: 7,
+      ruleIds: [7, 8, 9],
+      ruleNames: ['放量观察', '低集中度观察', '零命中观察'],
+      status: 'completed',
+      targetCount: 2,
+      matchCount: 2,
+      eventCount: 2,
+      mode: 'history',
+      durationMs: 53,
+      matches: [
+        { ...matches[0], ruleId: 7 },
+        { ...secondMatches[0], ruleId: 8 },
+      ],
+      errors: [],
     });
 
     render(<BacktestPage />);
@@ -443,6 +428,7 @@ describe('BacktestPage', () => {
   });
 
   it('loads persisted run history and restores the latest run result', async () => {
+    vi.mocked(rulesApi.getRunMatches).mockResolvedValueOnce(multiEventMatches);
     vi.mocked(rulesApi.listRuns).mockResolvedValue([{
       id: 11,
       ruleId: 7,
@@ -450,6 +436,7 @@ describe('BacktestPage', () => {
       status: 'completed',
       targetCount: 2,
       matchCount: 1,
+      eventCount: 3,
       startedAt: '2026-05-03T09:30:00',
       finishedAt: '2026-05-03T09:31:00',
       durationMs: 1000,
@@ -458,9 +445,49 @@ describe('BacktestPage', () => {
 
     expect(await screen.findByText('#11 放量观察')).toBeInTheDocument();
     expect(rulesApi.getRunMatches).toHaveBeenCalledWith(11);
+    expect(screen.getByText('命中记录 3')).toBeInTheDocument();
     expect(screen.getByRole('tab', { name: /运行结果/ })).toHaveAttribute('aria-selected', 'true');
     expect(screen.getByText('2026-05-01')).toBeInTheDocument();
+    expect(screen.getByText('2026-05-03')).toBeInTheDocument();
     expect(screen.getAllByText('300274.SZ').length).toBeGreaterThan(0);
+  });
+
+  it('clears stale result rows when selecting a running persisted run', async () => {
+    vi.mocked(rulesApi.listRuns).mockResolvedValue([
+      {
+        id: 12,
+        ruleId: 7,
+        ruleName: '放量观察',
+        status: 'running',
+        targetCount: 2,
+        matchCount: 0,
+        startedAt: '2026-05-04T09:30:00',
+        finishedAt: null,
+        durationMs: null,
+      },
+      {
+        id: 11,
+        ruleId: 7,
+        ruleName: '放量观察',
+        status: 'completed',
+        targetCount: 2,
+        matchCount: 1,
+        startedAt: '2026-05-03T09:30:00',
+        finishedAt: '2026-05-03T09:31:00',
+        durationMs: 1000,
+      },
+    ]);
+    render(<BacktestPage />);
+
+    expect(await screen.findByText('#11 放量观察')).toBeInTheDocument();
+    expect(screen.getByText('2026-05-01')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByText('#12 放量观察').closest('button')!);
+
+    expect(screen.getByRole('tab', { name: /执行日志/ })).toHaveAttribute('aria-selected', 'true');
+    expect(screen.getByRole('tab', { name: '运行结果' })).toBeInTheDocument();
+    expect(screen.getByText('#12 放量观察 仍在执行，暂未生成命中结果')).toBeInTheDocument();
+    expect(screen.queryByText('2026-05-01')).not.toBeInTheDocument();
   });
 
   it('deletes a persisted backtest run from history and clears the selected result', async () => {
@@ -515,7 +542,8 @@ describe('BacktestPage', () => {
     fireEvent.click(screen.getByRole('button', { name: '运行回测' }));
 
     await waitFor(() => {
-      expect(rulesApi.run).toHaveBeenCalledWith(7, {
+      expect(rulesApi.runBatch).toHaveBeenCalledWith({
+        ruleIds: [7],
         mode: 'history',
         target: {
           scope: 'watchlist',
@@ -528,8 +556,8 @@ describe('BacktestPage', () => {
   });
 
   it('shows running history, progress, and logs while a run is in flight', async () => {
-    const deferredRun = createDeferred<Awaited<ReturnType<typeof rulesApi.run>>>();
-    vi.mocked(rulesApi.run).mockReturnValueOnce(deferredRun.promise);
+    const deferredRun = createDeferred<Awaited<ReturnType<typeof rulesApi.runBatch>>>();
+    vi.mocked(rulesApi.runBatch).mockReturnValueOnce(deferredRun.promise);
     render(<BacktestPage />);
 
     await screen.findByText('回测执行历史');
@@ -562,8 +590,8 @@ describe('BacktestPage', () => {
   });
 
   it('keeps the active run visible after leaving and returning to the page', async () => {
-    const deferredRun = createDeferred<Awaited<ReturnType<typeof rulesApi.run>>>();
-    vi.mocked(rulesApi.run).mockReturnValueOnce(deferredRun.promise);
+    const deferredRun = createDeferred<Awaited<ReturnType<typeof rulesApi.runBatch>>>();
+    vi.mocked(rulesApi.runBatch).mockReturnValueOnce(deferredRun.promise);
     const view = render(<BacktestPage />);
 
     await screen.findByText('回测执行历史');
@@ -645,7 +673,8 @@ describe('BacktestPage', () => {
     fireEvent.click(screen.getByRole('button', { name: '运行回测' }));
 
     await waitFor(() => {
-      expect(rulesApi.run).toHaveBeenCalledWith(7, expect.objectContaining({
+      expect(rulesApi.runBatch).toHaveBeenCalledWith(expect.objectContaining({
+        ruleIds: [7],
         target: {
           scope: 'custom',
           stockCodes: ['603375.SH', '688521.SH'],

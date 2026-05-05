@@ -72,13 +72,20 @@ class RuleRunRequest(BaseModel):
     end_date: Optional[date] = Field(None, description="Optional backtest end date")
 
 
+class RuleBatchRunRequest(RuleRunRequest):
+    rule_ids: List[int] = Field(..., min_length=1, description="Rule IDs to run as one batch")
+
+
 class RuleRunHistoryItem(BaseModel):
     id: int
     rule_id: int
+    rule_ids: List[int] = Field(default_factory=list)
     rule_name: Optional[str] = None
+    rule_names: List[str] = Field(default_factory=list)
     status: str
     target_count: int = 0
     match_count: int = 0
+    event_count: int = 0
     error: Optional[str] = None
     started_at: Optional[str] = None
     finished_at: Optional[str] = None
@@ -124,6 +131,8 @@ class RuleMetricRegistryResponse(BaseModel):
 
 
 class RuleMatchItem(BaseModel):
+    run_id: Optional[int] = None
+    rule_id: Optional[int] = None
     stock_code: str
     stock_name: Optional[str] = None
     matched_dates: List[str] = Field(default_factory=list)
@@ -136,6 +145,8 @@ class RuleMatchItem(BaseModel):
 class RuleRunResponse(BaseModel):
     run_id: int
     rule_id: int
+    rule_ids: List[int] = Field(default_factory=list)
+    rule_names: List[str] = Field(default_factory=list)
     status: str
     target_count: int
     match_count: int

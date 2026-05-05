@@ -1,5 +1,9 @@
+import threading
+import time
+
 from src.rules.engine import evaluate_rule, evaluate_rule_history
 from src.rules.metrics import build_metric_frame, get_metric_registry
+from src.repositories.rule_repo import RuleRepository
 from src.services.rule_service import RuleService, RuleValidationError
 
 
@@ -127,6 +131,19 @@ def test_rule_engine_returns_matched_history_dates():
     events = evaluate_rule_history(definition, frame)
 
     assert [event["date"] for event in events] == ["2026-04-04", "2026-04-05"]
+
+
+def test_rule_repository_counts_persisted_match_event_rows():
+    event_count = RuleRepository._count_event_rows_from_snapshots([
+        '{"_matched_events":[{"date":"2026-04-04"},{"date":"2026-04-05"}]}',
+        '{"_matched_dates":["2026-04-03"]}',
+        '{"_matched_events":[],"_matched_dates":["2026-04-02"]}',
+        "{}",
+        None,
+        "{broken",
+    ])
+
+    assert event_count == 4
 
 
 def test_metric_frame_maps_chip_ratios_to_percent_values():
@@ -411,6 +428,15 @@ class _FakeRuleRepo:
         return len(kwargs["matches"]), 12
 
 
+class _FakeMultiRuleRepo(_FakeRuleRepo):
+    def __init__(self, rules):
+        self.rules = {rule["id"]: rule for rule in rules}
+        self.finished_matches = None
+
+    def get_rule(self, rule_id):
+        return self.rules.get(rule_id)
+
+
 class _FakeStockService:
     def get_history_data(self, stock_code, period="daily", days=30):
         return {
@@ -457,6 +483,40 @@ def _service_rule_for_run_mode():
     }
 
 
+def _service_rule_for_codes(codes):
+    rule = _service_rule_for_run_mode()
+    rule["definition"] = {
+        **rule["definition"],
+        "target": {"scope": "custom", "stock_codes": codes},
+    }
+    return rule
+
+
+class _PartiallyFailingStockService(_FakeStockService):
+    def get_history_data(self, stock_code, period="daily", days=30):
+        if stock_code == "000001":
+            raise RuntimeError("boom")
+        return super().get_history_data(stock_code, period=period, days=days)
+
+
+class _ConcurrentProbeStockService(_FakeStockService):
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._active_calls = 0
+        self.max_active_calls = 0
+
+    def get_history_data(self, stock_code, period="daily", days=30):
+        with self._lock:
+            self._active_calls += 1
+            self.max_active_calls = max(self.max_active_calls, self._active_calls)
+        try:
+            time.sleep(0.05)
+            return super().get_history_data(stock_code, period=period, days=days)
+        finally:
+            with self._lock:
+                self._active_calls -= 1
+
+
 def test_rule_service_run_modes_separate_latest_from_history():
     repo = _FakeRuleRepo(_service_rule_for_run_mode())
     service = RuleService(repo=repo, stock_service=_FakeStockService())
@@ -485,6 +545,62 @@ def test_rule_service_history_mode_respects_date_range():
     assert included["matches"][0]["matched_dates"] == ["2026-04-02"]
     assert excluded["event_count"] == 0
     assert excluded["matches"] == []
+
+
+def test_rule_service_run_rule_keeps_stock_order_with_worker_errors():
+    repo = _FakeRuleRepo(_service_rule_for_codes(["600519", "000001", "AAPL"]))
+    service = RuleService(repo=repo, stock_service=_PartiallyFailingStockService())
+
+    def use_two_workers(target_count):
+        return 2
+
+    service._resolve_run_workers = use_two_workers
+
+    result = service.run_rule(1, mode="history")
+
+    assert result["status"] == "partial"
+    assert [match["stock_code"] for match in result["matches"]] == ["600519", "AAPL"]
+    assert result["errors"] == ["000001:RuntimeError"]
+    assert [match["stock_code"] for match in repo.finished_matches] == ["600519", "AAPL"]
+
+
+def test_rule_service_run_rules_creates_one_run_with_rule_tagged_matches():
+    first_rule = _service_rule_for_codes(["600519"])
+    second_rule = _service_rule_for_codes(["AAPL"])
+    second_rule = {**second_rule, "id": 2, "name": "第二条规则"}
+    repo = _FakeMultiRuleRepo([first_rule, second_rule])
+    service = RuleService(repo=repo, stock_service=_FakeStockService())
+
+    def use_one_worker(target_count):
+        return 1
+
+    service._resolve_run_workers = use_one_worker
+
+    result = service.run_rules([1, 2], mode="history")
+
+    assert result["run_id"] == 101
+    assert result["rule_id"] == 1
+    assert result["rule_ids"] == [1, 2]
+    assert result["event_count"] == 2
+    assert [match["rule_id"] for match in result["matches"]] == [1, 2]
+    assert [match["rule_id"] for match in repo.finished_matches] == [1, 2]
+
+
+def test_rule_service_run_rules_executes_rules_concurrently_and_preserves_order():
+    first_rule = _service_rule_for_codes(["600519"])
+    second_rule = _service_rule_for_codes(["AAPL"])
+    second_rule = {**second_rule, "id": 2, "name": "第二条规则"}
+    repo = _FakeMultiRuleRepo([first_rule, second_rule])
+    stock_service = _ConcurrentProbeStockService()
+    service = RuleService(repo=repo, stock_service=stock_service)
+    service._resolve_run_workers = lambda target_count: 1
+    service._resolve_batch_rule_workers = lambda rule_count: 2
+
+    result = service.run_rules([1, 2], mode="history")
+
+    assert stock_service.max_active_calls >= 2
+    assert [match["rule_id"] for match in result["matches"]] == [1, 2]
+    assert [match["rule_id"] for match in repo.finished_matches] == [1, 2]
 
 
 def test_rule_service_rejects_cross_operators():

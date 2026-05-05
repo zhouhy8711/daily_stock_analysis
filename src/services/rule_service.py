@@ -4,13 +4,15 @@
 from __future__ import annotations
 
 import logging
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
 
 from src.config import get_config
-from src.repositories.rule_repo import RuleRepository
+from src.repositories.rule_repo import RuleRepository, encode_rule_batch_metadata
 from src.rules.engine import AGGREGATE_METHODS, COMPARE_OPERATORS, evaluate_rule_at_index, evaluate_rule_history
 from src.rules.metrics import METRIC_BY_KEY, build_metric_frame, get_metric_registry
 from src.services.stock_service import StockService
@@ -38,6 +40,7 @@ ALLOWED_OPERATORS = {
 DISABLED_OPERATORS = {"cross_up", "cross_down"}
 MAX_RULE_TARGET_CODES = 10000
 RUN_MODES = {"latest", "history"}
+DEFAULT_RULE_RUN_WORKERS = 3
 
 
 def _model_to_dict(value: Any) -> Dict[str, Any]:
@@ -180,35 +183,22 @@ class RuleService:
         start_date: Any = None,
         end_date: Any = None,
     ) -> Dict[str, Any]:
-        rule = self.repo.get_rule(rule_id)
-        if rule is None:
-            raise KeyError(f"rule not found: {rule_id}")
-
-        definition = rule.get("definition") or {}
-        if target_override is not None:
-            definition = {
-                **definition,
-                "target": target_override,
-            }
-        self.validate_definition(definition)
         run_mode = self._normalize_run_mode(mode)
         date_from, date_to = self._normalize_date_range(start_date, end_date)
-        stock_codes = self._resolve_target_codes(definition.get("target") or {})
+        rule, definition, stock_codes = self._prepare_rule_run(rule_id, target_override)
         run_id = self.repo.create_run(rule_id, len(stock_codes))
         started_at = datetime.now()
-        matches: List[Dict[str, Any]] = []
-        errors: List[str] = []
 
         try:
-            for code in stock_codes:
-                try:
-                    match = self._evaluate_stock(rule, definition, code, run_mode, date_from, date_to)
-                except Exception as exc:
-                    logger.warning("规则 %s 执行 %s 失败: %s", rule_id, code, exc)
-                    errors.append(f"{code}:{type(exc).__name__}")
-                    continue
-                if match:
-                    matches.append(match)
+            matches, errors = self._execute_rule_scan(
+                rule_id,
+                rule,
+                definition,
+                stock_codes,
+                run_mode,
+                date_from,
+                date_to,
+            )
 
             status = "completed" if not errors else "partial"
             match_count, duration_ms = self.repo.finish_run(
@@ -222,6 +212,8 @@ class RuleService:
             return {
                 "run_id": run_id,
                 "rule_id": rule_id,
+                "rule_ids": [rule_id],
+                "rule_names": [str(rule.get("name") or f"规则 {rule_id}")],
                 "status": status,
                 "target_count": len(stock_codes),
                 "match_count": match_count,
@@ -232,6 +224,7 @@ class RuleService:
                 "errors": errors,
             }
         except Exception as exc:
+            logger.error("规则 %s 执行失败: %s", rule_id, exc, exc_info=True)
             self.repo.finish_run(
                 run_id=run_id,
                 rule_id=rule_id,
@@ -241,6 +234,295 @@ class RuleService:
                 error=str(exc),
             )
             raise
+
+    def run_rules(
+        self,
+        rule_ids: List[int],
+        mode: str = "history",
+        target_override: Optional[Dict[str, Any]] = None,
+        start_date: Any = None,
+        end_date: Any = None,
+    ) -> Dict[str, Any]:
+        normalized_rule_ids = [int(rule_id) for rule_id in rule_ids if int(rule_id) > 0]
+        if not normalized_rule_ids:
+            raise RuleValidationError("至少选择一条规则")
+
+        run_mode = self._normalize_run_mode(mode)
+        date_from, date_to = self._normalize_date_range(start_date, end_date)
+        prepared = [
+            (rule_id, *self._prepare_rule_run(rule_id, target_override))
+            for rule_id in normalized_rule_ids
+        ]
+        primary_rule_id = prepared[0][0]
+        target_count = len(prepared[0][3])
+        run_id = self.repo.create_run(primary_rule_id, target_count)
+        started_at = datetime.now()
+        all_matches: List[Dict[str, Any]] = []
+        all_errors: List[str] = []
+        rule_names = [str(rule.get("name") or f"规则 {rule_id}") for rule_id, rule, _, _ in prepared]
+
+        try:
+            rule_worker_count = self._resolve_batch_rule_workers(len(prepared))
+            logger.info(
+                "批量规则回测开始: run_id=%s, rules=%s, target_count=%s, mode=%s, rule_workers=%s",
+                run_id,
+                normalized_rule_ids,
+                target_count,
+                run_mode,
+                rule_worker_count,
+            )
+
+            def execute_prepared_rule(
+                index: int,
+                rule_id: int,
+                rule: Dict[str, Any],
+                definition: Dict[str, Any],
+                stock_codes: List[str],
+            ) -> tuple[int, List[Dict[str, Any]], List[str]]:
+                logger.info(
+                    "批量规则回测子任务开始: run_id=%s, rule_id=%s, target_count=%s",
+                    run_id,
+                    rule_id,
+                    len(stock_codes),
+                )
+                matches, errors = self._execute_rule_scan(
+                    rule_id,
+                    rule,
+                    definition,
+                    stock_codes,
+                    run_mode,
+                    date_from,
+                    date_to,
+                )
+                for match in matches:
+                    match["rule_id"] = rule_id
+                    match["rule_name"] = rule.get("name")
+                tagged_errors = [f"#{rule_id}:{error}" for error in errors]
+                logger.info(
+                    "批量规则回测子任务完成: run_id=%s, rule_id=%s, matched_stocks=%s, matched_events=%s, errors=%s",
+                    run_id,
+                    rule_id,
+                    len(matches),
+                    self._count_match_events(matches),
+                    len(tagged_errors),
+                )
+                return index, matches, tagged_errors
+
+            rule_results: List[tuple[List[Dict[str, Any]], List[str]]] = [
+                ([], []) for _ in prepared
+            ]
+            with ThreadPoolExecutor(
+                max_workers=rule_worker_count,
+                thread_name_prefix=f"rule-batch-{run_id}",
+            ) as executor:
+                future_to_context = {
+                    executor.submit(
+                        execute_prepared_rule,
+                        index,
+                        rule_id,
+                        rule,
+                        definition,
+                        stock_codes,
+                    ): (index, rule_id)
+                    for index, (rule_id, rule, definition, stock_codes) in enumerate(prepared)
+                }
+                for future in as_completed(future_to_context):
+                    index, rule_id = future_to_context[future]
+                    try:
+                        result_index, matches, errors = future.result()
+                        rule_results[result_index] = (matches, errors)
+                    except Exception as exc:
+                        logger.error(
+                            "批量规则回测子任务失败: run_id=%s, rule_id=%s, error=%s",
+                            run_id,
+                            rule_id,
+                            exc,
+                            exc_info=True,
+                        )
+                        rule_results[index] = ([], [f"#{rule_id}:{type(exc).__name__}"])
+
+            for matches, errors in rule_results:
+                all_matches.extend(matches)
+                all_errors.extend(errors)
+
+            status = "completed" if not all_errors else "partial"
+            match_count, duration_ms = self.repo.finish_run(
+                run_id=run_id,
+                rule_id=primary_rule_id,
+                status=status,
+                started_at=started_at,
+                matches=all_matches,
+                error=encode_rule_batch_metadata(normalized_rule_ids, rule_names, all_errors),
+            )
+            return {
+                "run_id": run_id,
+                "rule_id": primary_rule_id,
+                "rule_ids": normalized_rule_ids,
+                "rule_names": rule_names,
+                "status": status,
+                "target_count": target_count,
+                "match_count": match_count,
+                "event_count": self._count_match_events(all_matches),
+                "mode": run_mode,
+                "duration_ms": duration_ms,
+                "matches": all_matches,
+                "errors": all_errors,
+            }
+        except Exception as exc:
+            logger.error("批量规则回测失败: %s", exc, exc_info=True)
+            self.repo.finish_run(
+                run_id=run_id,
+                rule_id=primary_rule_id,
+                status="failed",
+                started_at=started_at,
+                matches=[],
+                error=str(exc),
+            )
+            raise
+
+    def _prepare_rule_run(
+        self,
+        rule_id: int,
+        target_override: Optional[Dict[str, Any]],
+    ) -> tuple[Dict[str, Any], Dict[str, Any], List[str]]:
+        rule = self.repo.get_rule(rule_id)
+        if rule is None:
+            raise KeyError(f"rule not found: {rule_id}")
+
+        definition = rule.get("definition") or {}
+        if target_override is not None:
+            definition = {
+                **definition,
+                "target": target_override,
+            }
+        self.validate_definition(definition)
+        stock_codes = self._resolve_target_codes(definition.get("target") or {})
+        return rule, definition, stock_codes
+
+    def _execute_rule_scan(
+        self,
+        rule_id: int,
+        rule: Dict[str, Any],
+        definition: Dict[str, Any],
+        stock_codes: List[str],
+        run_mode: str,
+        date_from: Optional[date],
+        date_to: Optional[date],
+    ) -> tuple[List[Dict[str, Any]], List[str]]:
+        worker_count = self._resolve_run_workers(len(stock_codes))
+        logger.info(
+            "规则 %s 开始执行: mode=%s, target_count=%s, workers=%s, start_date=%s, end_date=%s",
+            rule_id,
+            run_mode,
+            len(stock_codes),
+            worker_count,
+            date_from,
+            date_to,
+        )
+
+        ordered_matches: List[Optional[Dict[str, Any]]] = [None] * len(stock_codes)
+        ordered_errors: List[Optional[str]] = [None] * len(stock_codes)
+
+        if stock_codes:
+            with ThreadPoolExecutor(
+                max_workers=worker_count,
+                thread_name_prefix=f"rule-{rule_id}",
+            ) as executor:
+                future_to_context = {
+                    executor.submit(
+                        self._evaluate_stock_for_run,
+                        rule_id,
+                        rule,
+                        definition,
+                        code,
+                        run_mode,
+                        date_from,
+                        date_to,
+                        index + 1,
+                        len(stock_codes),
+                    ): (index, code)
+                    for index, code in enumerate(stock_codes)
+                }
+
+                for future in as_completed(future_to_context):
+                    index, code = future_to_context[future]
+                    try:
+                        ordered_matches[index] = future.result()
+                    except Exception as exc:
+                        ordered_errors[index] = f"{code}:{type(exc).__name__}"
+
+        return (
+            [match for match in ordered_matches if match],
+            [error for error in ordered_errors if error],
+        )
+
+    @staticmethod
+    def _resolve_run_workers(target_count: int) -> int:
+        if target_count <= 0:
+            return 1
+        try:
+            configured_workers = int(
+                getattr(get_config(), "max_workers", DEFAULT_RULE_RUN_WORKERS)
+                or DEFAULT_RULE_RUN_WORKERS
+            )
+        except Exception:
+            configured_workers = DEFAULT_RULE_RUN_WORKERS
+        return max(1, min(configured_workers, target_count))
+
+    @staticmethod
+    def _resolve_batch_rule_workers(rule_count: int) -> int:
+        if rule_count <= 0:
+            return 1
+        try:
+            configured_workers = int(
+                getattr(get_config(), "max_workers", DEFAULT_RULE_RUN_WORKERS)
+                or DEFAULT_RULE_RUN_WORKERS
+            )
+        except Exception:
+            configured_workers = DEFAULT_RULE_RUN_WORKERS
+        return max(1, min(configured_workers, rule_count))
+
+    def _evaluate_stock_for_run(
+        self,
+        rule_id: int,
+        rule: Dict[str, Any],
+        definition: Dict[str, Any],
+        stock_code: str,
+        mode: str,
+        start_date: Optional[date],
+        end_date: Optional[date],
+        ordinal: int,
+        total: int,
+    ) -> Optional[Dict[str, Any]]:
+        started_at = time.monotonic()
+        logger.info("规则 %s 股票 %s 开始分析 (%s/%s)", rule_id, stock_code, ordinal, total)
+        try:
+            match = self._evaluate_stock(rule, definition, stock_code, mode, start_date, end_date)
+        except Exception as exc:
+            elapsed_ms = int((time.monotonic() - started_at) * 1000)
+            logger.warning(
+                "规则 %s 股票 %s 分析失败 (%s/%s)，耗时 %s ms: %s",
+                rule_id,
+                stock_code,
+                ordinal,
+                total,
+                elapsed_ms,
+                exc,
+            )
+            raise
+
+        elapsed_ms = int((time.monotonic() - started_at) * 1000)
+        matched_events = len(match.get("matched_events") or []) if match else 0
+        logger.info(
+            "规则 %s 股票 %s 分析结束 (%s/%s)，耗时 %s ms，命中交易日 %s 个",
+            rule_id,
+            stock_code,
+            ordinal,
+            total,
+            elapsed_ms,
+            matched_events,
+        )
+        return match
 
     @staticmethod
     def _normalize_run_mode(mode: str) -> str:

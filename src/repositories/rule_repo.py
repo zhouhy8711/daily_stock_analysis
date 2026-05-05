@@ -11,6 +11,8 @@ from sqlalchemy import delete, desc, func, select
 
 from src.storage import DatabaseManager, StockRule, StockRuleMatch, StockRuleRun
 
+RULE_BATCH_META_PREFIX = "__rule_batch_meta__:"
+
 
 def _json_dumps(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
@@ -23,6 +25,23 @@ def _json_loads(value: Optional[str], fallback: Any) -> Any:
         return json.loads(value)
     except Exception:
         return fallback
+
+
+def encode_rule_batch_metadata(rule_ids: List[int], rule_names: List[str], errors: List[str]) -> str:
+    return RULE_BATCH_META_PREFIX + _json_dumps({
+        "rule_ids": rule_ids,
+        "rule_names": rule_names,
+        "errors": errors,
+    })
+
+
+def _decode_rule_batch_metadata(error: Optional[str]) -> Tuple[Dict[str, Any], Optional[str]]:
+    if not error or not error.startswith(RULE_BATCH_META_PREFIX):
+        return {}, error
+    metadata = _json_loads(error[len(RULE_BATCH_META_PREFIX):], {})
+    errors = metadata.get("errors") if isinstance(metadata, dict) else []
+    public_error = "；".join(str(item) for item in errors if item) if isinstance(errors, list) else None
+    return metadata if isinstance(metadata, dict) else {}, public_error or None
 
 
 class RuleRepository:
@@ -77,18 +96,44 @@ class RuleRepository:
 
     @staticmethod
     def run_to_dict(row: StockRuleRun, rule_name: Optional[str] = None) -> Dict[str, Any]:
+        batch_metadata, public_error = _decode_rule_batch_metadata(row.error)
+        metadata_rule_ids = batch_metadata.get("rule_ids")
+        metadata_rule_names = batch_metadata.get("rule_names")
+        rule_ids = [int(rule_id) for rule_id in metadata_rule_ids] if isinstance(metadata_rule_ids, list) else [row.rule_id]
+        rule_names = [str(name) for name in metadata_rule_names] if isinstance(metadata_rule_names, list) else (
+            [rule_name] if rule_name else []
+        )
         return {
             "id": row.id,
             "rule_id": row.rule_id,
-            "rule_name": rule_name,
+            "rule_ids": rule_ids,
+            "rule_name": f"多规则回测（{len(rule_ids)} 条）" if len(rule_ids) > 1 else rule_name,
+            "rule_names": rule_names,
             "status": row.status,
             "target_count": int(row.target_count or 0),
             "match_count": int(row.match_count or 0),
-            "error": row.error,
+            "event_count": int(row.match_count or 0),
+            "error": public_error,
             "started_at": row.started_at.isoformat() if row.started_at else None,
             "finished_at": row.finished_at.isoformat() if row.finished_at else None,
             "duration_ms": row.duration_ms,
         }
+
+    @staticmethod
+    def _count_event_rows_from_snapshots(snapshot_json_values: List[Optional[str]]) -> int:
+        total = 0
+        for snapshot_json in snapshot_json_values:
+            snapshot = _json_loads(snapshot_json, {}) or {}
+            if not isinstance(snapshot, dict):
+                continue
+            matched_events = snapshot.get("_matched_events")
+            if isinstance(matched_events, list) and matched_events:
+                total += len(matched_events)
+                continue
+            matched_dates = snapshot.get("_matched_dates")
+            if isinstance(matched_dates, list):
+                total += len(matched_dates)
+        return total
 
     def list_runs(self, limit: int = 30) -> List[Dict[str, Any]]:
         with self.db.get_session() as session:
@@ -98,7 +143,29 @@ class RuleRepository:
                 .order_by(desc(StockRuleRun.started_at), desc(StockRuleRun.id))
                 .limit(limit)
             ).all()
-            return [self.run_to_dict(run, rule_name) for run, rule_name in rows]
+            items: List[Dict[str, Any]] = []
+            for run, rule_name in rows:
+                item = self.run_to_dict(run, rule_name)
+                snapshot_json_values = session.execute(
+                    select(StockRuleMatch.snapshot_json).where(StockRuleMatch.run_id == run.id)
+                ).scalars().all()
+                item["event_count"] = self._count_event_rows_from_snapshots(list(snapshot_json_values))
+                match_rules = session.execute(
+                    select(StockRuleMatch.rule_id, StockRule.name)
+                    .join(StockRule, StockRule.id == StockRuleMatch.rule_id)
+                    .where(StockRuleMatch.run_id == run.id)
+                    .distinct()
+                    .order_by(StockRuleMatch.rule_id.asc())
+                ).all()
+                if match_rules and len(item.get("rule_ids") or []) <= 1:
+                    rule_ids = [int(rule_id) for rule_id, _ in match_rules]
+                    rule_names = [str(name) for _, name in match_rules if name]
+                    item["rule_ids"] = rule_ids
+                    item["rule_names"] = rule_names
+                    if len(rule_ids) > 1:
+                        item["rule_name"] = f"多规则回测（{len(rule_ids)} 条）"
+                items.append(item)
+            return items
 
     def get_rule(self, rule_id: int) -> Optional[Dict[str, Any]]:
         with self.db.get_session() as session:
@@ -206,7 +273,7 @@ class RuleRepository:
                 session.add(
                     StockRuleMatch(
                         run_id=run_id,
-                        rule_id=rule_id,
+                        rule_id=int(match.get("rule_id") or rule_id),
                         stock_code=match["stock_code"],
                         stock_name=match.get("stock_name"),
                         matched_groups_json=_json_dumps(match.get("matched_groups") or []),

@@ -342,7 +342,7 @@ daily_stock_analysis/
 | `STOCK_LIST` | 自选股代码（逗号分隔） | - |
 | `ADMIN_AUTH_ENABLED` | Web 登录：设为 `true` 启用密码保护；首次访问在网页设置初始密码，可在「系统设置 > 修改密码」修改；忘记密码执行 `python -m src.auth reset_password` | `false` |
 | `TRUST_X_FORWARDED_FOR` | 单层可信反向代理部署时设为 `true`，取 `X-Forwarded-For` 最右值作为真实客户端 IP（用于登录限流等）；直连公网时保持 `false` 防伪造。多级代理/CDN 场景下限流 key 可能退化为边缘代理 IP，需额外评估 | `false` |
-| `MAX_WORKERS` | 并发线程数 | `3` |
+| `MAX_WORKERS` | 每日分析任务队列与 Web 规则历史回测共用的并发线程数 | `3` |
 | `MARKET_REVIEW_ENABLED` | 启用大盘复盘 | `true` |
 | `MARKET_REVIEW_REGION` | 大盘复盘市场区域：cn(A股)、us(美股)、both(两者)，us 适合仅关注美股的用户 | `cn` |
 | `TRADING_DAY_CHECK_ENABLED` | 交易日检查：默认 `true`，非交易日跳过执行；设为 `false` 或使用 `--force-run` 可强制执行（Issue #373） | `true` |
@@ -1084,6 +1084,8 @@ FastAPI 提供 RESTful API 服务，支持配置管理和触发分析。
 | `/api/v1/backtest/results` | GET | 查询回测结果（分页） |
 | `/api/v1/backtest/performance` | GET | 获取整体回测表现 |
 | `/api/v1/backtest/performance/{code}` | GET | 获取单股回测表现 |
+| `/api/v1/rules/{rule_id}/run` | POST | 运行单条规则历史扫描 |
+| `/api/v1/rules/run-batch` | POST | 将多条规则作为一次回测运行，历史中保存为单条记录，结果按规则分组 |
 | `/api/v1/agent/skill-output/{filename}` | GET | 查看自定义 Codex skill 后台任务生成的 Markdown 结果 |
 | `/api/v1/stocks/extract-from-image` | POST | 从图片提取股票代码（multipart，超时 60s） |
 | `/api/v1/stocks/parse-import` | POST | 解析 CSV/Excel/剪贴板（multipart file 或 JSON `{"text":"..."}`，文件≤2MB，文本≤100KB） |

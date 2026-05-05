@@ -104,6 +104,8 @@ export type RuleMetricItem = {
 };
 
 export type RuleMatchItem = {
+  runId?: number;
+  ruleId?: number;
   stockCode: string;
   stockName?: string | null;
   matchedDates: string[];
@@ -116,6 +118,8 @@ export type RuleMatchItem = {
 export type RuleRunResponse = {
   runId: number;
   ruleId: number;
+  ruleIds?: number[];
+  ruleNames?: string[];
   status: string;
   targetCount: number;
   matchCount: number;
@@ -136,13 +140,21 @@ export type RuleRunPayload = {
   endDate?: string;
 };
 
+export type RuleBatchRunPayload = RuleRunPayload & {
+  ruleIds: number[];
+};
+
 export type RuleRunHistoryItem = {
   id: number;
+  runIds?: number[];
   ruleId: number;
+  ruleIds?: number[];
   ruleName?: string | null;
+  ruleNames?: string[];
   status: string;
   targetCount: number;
   matchCount: number;
+  eventCount?: number;
   error?: string | null;
   startedAt?: string | null;
   finishedAt?: string | null;

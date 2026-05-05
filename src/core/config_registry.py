@@ -347,7 +347,7 @@ _FIELD_DEFINITIONS: Dict[str, Dict[str, Any]] = {
         "description": "Username for the licensed Tonghuashun iFinD Python client.",
         "category": "data_source",
         "data_type": "string",
-        "ui_control": "text",
+        "ui_control": "password",
         "is_sensitive": True,
         "is_required": False,
         "is_editable": True,
