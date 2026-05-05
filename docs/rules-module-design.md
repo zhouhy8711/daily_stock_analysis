@@ -127,6 +127,7 @@
 - 筹码峰-全部筹码：`profit_ratio`（收盘获利）、`trapped_ratio`（套牢盘）、`profit_trapped_spread`、`avg_cost`、`price_to_avg_cost_pct`、`cost_90_low`、`cost_90_high`、`price_range_90_mid`、`price_range_90_width`、`price_range_90_width_pct`、`chip_concentration_90`、`cost_70_low`、`cost_70_high`、`price_range_70_mid`、`price_range_70_width`、`price_range_70_width_pct`、`chip_concentration_70`、`chip_peak_price`、`chip_peak_percent`、`chip_peak_distance_pct`
 - 筹码峰-主力筹码：`main_profit_ratio`、`main_trapped_ratio`、`main_profit_trapped_spread`、`main_avg_cost`、`main_price_to_avg_cost_pct`、`main_cost_90_low`、`main_cost_90_high`、`main_price_range_90_mid`、`main_price_range_90_width`、`main_price_range_90_width_pct`、`main_chip_concentration_90`、`main_cost_70_low`、`main_cost_70_high`、`main_price_range_70_mid`、`main_price_range_70_width`、`main_price_range_70_width_pct`、`main_chip_concentration_70`、`main_chip_peak_price`、`main_chip_peak_percent`、`main_chip_peak_distance_pct`
 - 实时监控：`turnover_rate`、`main_net_volume_pct`、`main_force_net`、`net_super_large_order`、`net_large_order`、`net_medium_order`、`net_small_order`
+- 额外：`prev_5d_return_pct`（前5日累计涨幅，不含当前判断日）、`prev_20d_return_pct`（前20日累计涨幅，不含当前判断日）
 
 指标分析页点击加号会先把多个指标保存为一个规则草稿，已选指标的按钮会切换为减号，点击可直接从草稿移除。K 线标题栏中的股本、涨跌停、涨速、主力资金和委比等次级指标收纳在“更多”浮层中，浮层内仍保留同样的加号入口。右上角“已选 N”可打开浮窗编辑关系、取值日偏移和值类型等条件配置；跳转到规则页后会生成一条未保存规则，这些指标会放在同一个条件组里，因此默认是「且」关系，用户仍可在规则页继续调整比较关系和阈值后保存。
 

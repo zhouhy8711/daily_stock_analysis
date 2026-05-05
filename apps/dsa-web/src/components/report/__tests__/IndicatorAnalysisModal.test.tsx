@@ -24,6 +24,8 @@ const ruleMetricItems = [
   { key: 'current_price', label: '最新价', category: '核心行情', valueType: 'number', unit: '元', periods: ['daily'], description: '' },
   { key: 'volume_ratio', label: '量比', category: 'K线图', valueType: 'number', unit: '倍', periods: ['daily'], description: '' },
   { key: 'amplitude', label: '振幅', category: 'K线图', valueType: 'number', unit: '%', periods: ['daily'], description: '' },
+  { key: 'prev_5d_return_pct', label: '前5日累计涨幅', category: '额外', valueType: 'number', unit: '%', periods: ['daily'], description: '' },
+  { key: 'prev_20d_return_pct', label: '前20日累计涨幅', category: '额外', valueType: 'number', unit: '%', periods: ['daily'], description: '' },
   { key: 'profit_ratio', label: '收盘获利', category: '筹码峰-全部筹码', valueType: 'number', unit: '%', periods: ['daily'], description: '' },
 ];
 
@@ -335,6 +337,8 @@ describe('IndicatorAnalysisModal', () => {
     expect(within(latestMoreMetrics).getByText(/^主力净流入:/)).toBeInTheDocument();
     expect(within(latestPriceHeader).queryByText(/^换手:/)).not.toBeInTheDocument();
     expect(within(latestMoreMetrics).getByText(/^委比:/)).toBeInTheDocument();
+    expect(within(latestMoreMetrics).getByText(/^前5日累计涨幅:/)).toBeInTheDocument();
+    expect(within(latestMoreMetrics).getByText(/^前20日累计涨幅:/)).toBeInTheDocument();
     expect(within(latestPriceHeader).queryByText(/^总量:/)).not.toBeInTheDocument();
     expect(within(latestPriceHeader).queryByText(/^总金额:/)).not.toBeInTheDocument();
     fireEvent.click(within(latestPriceHeader).getByRole('button', { name: '更多K线指标' }));
@@ -406,8 +410,10 @@ describe('IndicatorAnalysisModal', () => {
 
     fireEvent.click(screen.getByRole('button', { name: '添加 最新价 到规则' }));
     fireEvent.click(screen.getByRole('button', { name: '添加 量比 到规则' }));
+    fireEvent.click(within(screen.getByTestId('indicator-price-header')).getByRole('button', { name: '更多K线指标' }));
+    fireEvent.click(screen.getByRole('button', { name: '添加 前5日累计涨幅 到规则' }));
 
-    expect(screen.getByText('已选 2')).toBeInTheDocument();
+    expect(screen.getByText('已选 3')).toBeInTheDocument();
     expect(screen.getByText(/多个指标会在规则页放入同一条件组/)).toBeInTheDocument();
 
     const rawDraft = localStorage.getItem(RULE_METRIC_DRAFT_STORAGE_KEY);
@@ -415,9 +421,10 @@ describe('IndicatorAnalysisModal', () => {
     const draft = JSON.parse(rawDraft ?? '{}') as { stockCode?: string; stockName?: string; items?: Array<{ key: string; value: number | null }> };
     expect(draft.stockCode).toBe('600519');
     expect(draft.stockName).toBe('贵州茅台');
-    expect(draft.items?.map((item) => item.key)).toEqual(['current_price', 'volume_ratio']);
+    expect(draft.items?.map((item) => item.key)).toEqual(['current_price', 'volume_ratio', 'prev_5d_return_pct']);
     expect(draft.items?.[0]?.value).toBe(132);
     expect(draft.items?.[1]?.value).toBe(1.2);
+    expect(typeof draft.items?.[2]?.value).toBe('number');
 
     unmount();
   });
@@ -790,6 +797,8 @@ describe('IndicatorAnalysisModal', () => {
     expect(within(morePopover).getByText(/^主力净量:/)).toBeInTheDocument();
     expect(within(morePopover).getByText(/^主力净流入:/)).toBeInTheDocument();
     expect(within(morePopover).getByText(/^委比:/)).toBeInTheDocument();
+    expect(within(morePopover).getByText(/^前5日累计涨幅:/)).toBeInTheDocument();
+    expect(within(morePopover).getByText(/^前20日累计涨幅:/)).toBeInTheDocument();
 
     fireEvent.click(moreButton);
     expect(screen.queryByRole('dialog', { name: '更多K线指标' })).not.toBeInTheDocument();

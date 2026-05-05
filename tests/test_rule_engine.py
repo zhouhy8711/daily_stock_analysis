@@ -175,6 +175,8 @@ def test_metric_registry_groups_indicator_page_metrics_by_chart_area():
     assert registry["current_price"]["category"] == "核心行情"
     assert registry["total_mv"]["category"] == "核心行情"
     assert registry["close"]["category"] == "K线图"
+    assert registry["prev_5d_return_pct"]["category"] == "额外"
+    assert registry["prev_20d_return_pct"]["category"] == "额外"
     assert registry["limit_up_price"]["category"] == "K线图"
     assert registry["volume_ma5"]["category"] == "成交量图"
     assert registry["after_hours_amount"]["category"] == "成交量图"
@@ -219,6 +221,40 @@ def test_metric_frame_calculates_indicator_page_metrics_for_rules():
     assert latest["amount_ma5"] == 19920
     assert latest["main_force_net"] > 0
     assert round(latest["net_super_large_order"], 6) == round(latest["main_force_net"] * 0.44, 6)
+
+
+def test_metric_frame_calculates_previous_window_cumulative_return_metrics():
+    history = [
+        {"date": "2026-04-01", "open": 10, "high": 10, "low": 10, "close": 10, "volume": 1000, "amount": 10000, "pct_chg": 0},
+        {"date": "2026-04-02", "open": 10, "high": 11, "low": 10, "close": 11, "volume": 1000, "amount": 11000, "pct_chg": 10},
+        {"date": "2026-04-03", "open": 11, "high": 12, "low": 11, "close": 12, "volume": 1000, "amount": 12000, "pct_chg": 9.090909},
+        {"date": "2026-04-04", "open": 12, "high": 13, "low": 12, "close": 13, "volume": 1000, "amount": 13000, "pct_chg": 8.333333},
+        {"date": "2026-04-05", "open": 13, "high": 14, "low": 13, "close": 14, "volume": 1000, "amount": 14000, "pct_chg": 7.692308},
+        {"date": "2026-04-06", "open": 14, "high": 15, "low": 14, "close": 15, "volume": 1000, "amount": 15000, "pct_chg": 7.142857},
+        {"date": "2026-04-07", "open": 15, "high": 30, "low": 15, "close": 30, "volume": 1000, "amount": 30000, "pct_chg": 100},
+    ]
+
+    frame = build_metric_frame(history)
+    latest = frame.iloc[-1]
+
+    assert round(latest["prev_5d_return_pct"], 6) == round((15 / 10 - 1) * 100, 6)
+
+    history_20 = [
+        {
+            "date": f"2026-05-{day + 1:02d}",
+            "open": close,
+            "high": close,
+            "low": close,
+            "close": close,
+            "volume": 1000,
+            "amount": close * 1000,
+        }
+        for day, close in enumerate([100 + step for step in range(21)] + [200])
+    ]
+    frame_20 = build_metric_frame(history_20)
+    latest_20 = frame_20.iloc[-1]
+
+    assert round(latest_20["prev_20d_return_pct"], 6) == round((120 / 100 - 1) * 100, 6)
 
 
 def test_metric_frame_maps_realtime_quote_metrics_for_rules():

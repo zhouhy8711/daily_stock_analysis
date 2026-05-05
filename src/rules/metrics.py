@@ -33,6 +33,20 @@ METRIC_DEFINITIONS: List[MetricDefinition] = [
     MetricDefinition("close", "收盘价", "K线图", unit="元"),
     MetricDefinition("prev_close", "昨收价", "K线图", unit="元"),
     MetricDefinition("pct_chg", "涨跌幅", "K线图", unit="%"),
+    MetricDefinition(
+        "prev_5d_return_pct",
+        "前5日累计涨幅",
+        "额外",
+        unit="%",
+        description="当前判断日前 5 个交易日的复利累计涨幅，不包含当前判断日",
+    ),
+    MetricDefinition(
+        "prev_20d_return_pct",
+        "前20日累计涨幅",
+        "额外",
+        unit="%",
+        description="当前判断日前 20 个交易日的复利累计涨幅，不包含当前判断日",
+    ),
     MetricDefinition("amplitude", "振幅", "K线图", unit="%"),
     MetricDefinition("limit_up_price", "涨幅限价", "K线图", unit="元"),
     MetricDefinition("limit_down_price", "跌幅限价", "K线图", unit="元"),
@@ -347,6 +361,16 @@ def build_metric_frame(
     computed_pct_chg = (df["change"] / df["prev_close"].replace(0, pd.NA)) * 100
     df["pct_chg"] = pd.to_numeric(df["pct_chg"], errors="coerce").fillna(computed_pct_chg)
     df["change_percent"] = pd.to_numeric(df["change_percent"], errors="coerce").fillna(df["pct_chg"])
+    daily_return_factor = 1 + (pd.to_numeric(df["pct_chg"], errors="coerce") / 100)
+    for window in (5, 20):
+        df[f"prev_{window}d_return_pct"] = (
+            daily_return_factor
+            .rolling(window=window, min_periods=window)
+            .apply(lambda values: values.prod(), raw=True)
+            .shift(1)
+            .sub(1)
+            .mul(100)
+        )
 
     if "amplitude" not in df.columns:
         df["amplitude"] = pd.NA

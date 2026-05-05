@@ -90,6 +90,8 @@ type ChartPoint = KLineData & {
   rsi6?: number;
   rsi12?: number;
   rsi24?: number;
+  prev5dReturnPct?: number;
+  prev20dReturnPct?: number;
 };
 
 type HistoryState = {
@@ -1189,6 +1191,29 @@ function relativeStrengthIndex(data: KLineData[], index: number, period: number)
   return 100 - (100 / (1 + rs));
 }
 
+function previousWindowCumulativeReturn(data: KLineData[], index: number, period: number): number | undefined {
+  if (index < period) {
+    return undefined;
+  }
+
+  const window = data.slice(index - period, index);
+  const factors = window.map((point) => (
+    isValidNumber(point.changePercent) ? 1 + (point.changePercent / 100) : undefined
+  ));
+  if (factors.every((value): value is number => isValidNumber(value))) {
+    const compounded = factors.reduce((product, value) => product * value, 1);
+    return (compounded - 1) * 100;
+  }
+
+  const previousIndex = index - period - 1;
+  const base = previousIndex >= 0 ? data[previousIndex]?.close : undefined;
+  const end = data[index - 1]?.close;
+  if (!base || !end) {
+    return undefined;
+  }
+  return ((end - base) / base) * 100;
+}
+
 function buildChartPoints(data: KLineData[]): ChartPoint[] {
   let ema12: number | undefined;
   let ema26: number | undefined;
@@ -1220,6 +1245,8 @@ function buildChartPoints(data: KLineData[]): ChartPoint[] {
       rsi6: relativeStrengthIndex(data, index, 6),
       rsi12: relativeStrengthIndex(data, index, 12),
       rsi24: relativeStrengthIndex(data, index, 24),
+      prev5dReturnPct: previousWindowCumulativeReturn(data, index, 5),
+      prev20dReturnPct: previousWindowCumulativeReturn(data, index, 20),
     };
   });
 }
@@ -2141,7 +2168,7 @@ const CoreQuoteMetrics: React.FC<{
   return (
     <section
       data-testid="indicator-core-metrics"
-      className="grid gap-3 border px-3 py-2 font-mono md:grid-cols-[9.5rem_minmax(0,1fr)]"
+      className="grid gap-3 border px-3 py-2 font-mono md:grid-cols-[13rem_minmax(0,1fr)]"
       style={{ borderColor: TERMINAL_COLORS.redGrid, backgroundColor: TERMINAL_COLORS.panel }}
       aria-label="核心行情指标"
     >
@@ -2311,6 +2338,12 @@ const ChartLegend: React.FC<{
             </MetricInline>
             <MetricInline metricKey="entrust_ratio" label="委比" value={entrustRatio} unit="%" date={point?.date} color={TERMINAL_COLORS.axisText} onAdd={onAddRuleMetric}>
               委比:{formatPct(entrustRatio)}
+            </MetricInline>
+            <MetricInline metricKey="prev_5d_return_pct" label="前5日累计涨幅" value={point?.prev5dReturnPct} unit="%" date={point?.date} color={TERMINAL_COLORS.axisText} onAdd={onAddRuleMetric}>
+              前5日累计涨幅:{formatPct(point?.prev5dReturnPct)}
+            </MetricInline>
+            <MetricInline metricKey="prev_20d_return_pct" label="前20日累计涨幅" value={point?.prev20dReturnPct} unit="%" date={point?.date} color={TERMINAL_COLORS.axisText} onAdd={onAddRuleMetric}>
+              前20日累计涨幅:{formatPct(point?.prev20dReturnPct)}
             </MetricInline>
           </span>
         ) : null}
