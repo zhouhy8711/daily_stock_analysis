@@ -27,6 +27,7 @@ import type {
   RuleValueExpression,
 } from '../types/rules';
 import { getRecentStartDate, getTodayInShanghai } from '../utils/format';
+import { consumeRuleMetricDraft, type RuleMetricDraft, type RuleMetricDraftItem } from '../utils/ruleMetricDraft';
 import { generateUUID } from '../utils/uuid';
 import {
   buildCurrentWatchlistItems,
@@ -131,6 +132,69 @@ function createDefinition(metric = 'close', stockCodes: string[] = []): RuleDefi
     lookbackDays: 120,
     target: { scope: 'watchlist', stockCodes },
     groups: [createGroup(metric)],
+  };
+}
+
+function roundDraftValue(value?: number | null): number {
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    return 0;
+  }
+  if (Math.abs(value) >= 1000) {
+    return Number(value.toFixed(2));
+  }
+  return Number(value.toFixed(4));
+}
+
+function defaultOperatorForDraftMetric(metricKey: string): RuleOperator {
+  if (
+    metricKey.includes('concentration')
+    || metricKey.includes('trapped')
+    || metricKey.includes('price_to_avg_cost')
+    || metricKey.includes('peak_distance')
+  ) {
+    return '<';
+  }
+  return '>';
+}
+
+function createConditionFromDraftMetric(item: RuleMetricDraftItem): RuleCondition {
+  const operator = item.operator ?? defaultOperatorForDraftMetric(item.key);
+  const right = item.right ?? createLiteral(roundDraftValue(item.value));
+  return {
+    id: `cond-${generateUUID()}`,
+    left: { metric: item.key, offset: item.offset ?? 0 },
+    operator,
+    right: canUseRightValue(operator) ? right : undefined,
+    compare: item.compare,
+    lookback: item.lookback,
+    minCount: item.minCount,
+  };
+}
+
+function createDefinitionFromDraft(
+  draft: RuleMetricDraft,
+  metrics: RuleMetricItem[],
+  fallbackStockCodes: string[],
+): RuleDefinition | null {
+  const metricKeys = new Set(metrics.map((metric) => metric.key));
+  const conditions = draft.items
+    .filter((item) => metricKeys.has(item.key))
+    .map((item) => createConditionFromDraftMetric(item));
+  if (conditions.length === 0) {
+    return null;
+  }
+  const stockCodes = draft.stockCode ? [draft.stockCode] : fallbackStockCodes;
+  return {
+    period: 'daily',
+    lookbackDays: 120,
+    target: {
+      scope: draft.stockCode ? 'custom' : 'watchlist',
+      stockCodes,
+    },
+    groups: [{
+      id: `group-${generateUUID()}`,
+      conditions,
+    }],
   };
 }
 
@@ -712,10 +776,23 @@ const RulesPage: React.FC = () => {
         history.items,
       );
       const nextWatchlistCodes = nextWatchlistItems.map((item) => item.code);
+      const metricDraft = consumeRuleMetricDraft();
+      const draftDefinition = metricDraft
+        ? createDefinitionFromDraft(metricDraft, metricItems, nextWatchlistCodes)
+        : null;
       setWatchlistItems(nextWatchlistItems);
       setMetrics(metricItems);
       setRules(ruleItems);
-      if (ruleItems.length > 0) {
+      if (draftDefinition) {
+        const draftLabels = metricDraft?.items.map((item) => item.label).join('、') ?? '';
+        const draftTargetText = metricDraft?.stockCode ? `；目标股票：${metricDraft.stockCode}` : '';
+        setSelectedRuleId(null);
+        setName(`${metricDraft?.stockName || metricDraft?.stockCode || '指标'}规则`);
+        setDescription(draftLabels ? `从指标分析加入：${draftLabels}${draftTargetText}` : draftTargetText.replace(/^；/, ''));
+        setIsActive(true);
+        setDefinition(draftDefinition);
+        setFeedback(`已从指标分析加入 ${draftDefinition.groups[0]?.conditions.length ?? 0} 个指标，已放入同一个条件组，组内按“且”关系判断${draftTargetText}。`);
+      } else if (ruleItems.length > 0) {
         const first = ruleItems[0];
         setSelectedRuleId(first.id);
         setName(first.name);
@@ -723,7 +800,7 @@ const RulesPage: React.FC = () => {
         setIsActive(first.isActive);
         setDefinition(hydrateDefinitionTarget(first.definition, nextWatchlistCodes, []));
       }
-      if (ruleItems.length === 0 && metricItems.length > 0) {
+      if (!draftDefinition && ruleItems.length === 0 && metricItems.length > 0) {
         setDefinition(createDefinition(metricItems[0].key, nextWatchlistCodes));
       }
     } catch (err) {

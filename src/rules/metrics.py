@@ -21,24 +21,35 @@ class MetricDefinition:
 
 
 METRIC_DEFINITIONS: List[MetricDefinition] = [
+    MetricDefinition("current_price", "最新价", "核心行情", unit="元"),
+    MetricDefinition("change", "涨跌额", "核心行情", unit="元"),
+    MetricDefinition("change_percent", "实时涨跌幅", "核心行情", unit="%"),
+    MetricDefinition("total_mv", "总市值", "核心行情", unit="元"),
+    MetricDefinition("circ_mv", "流通市值", "核心行情", unit="元"),
+    MetricDefinition("pe_ratio", "市盈TTM", "核心行情"),
     MetricDefinition("open", "开盘价", "K线图", unit="元"),
     MetricDefinition("high", "最高价", "K线图", unit="元"),
     MetricDefinition("low", "最低价", "K线图", unit="元"),
     MetricDefinition("close", "收盘价", "K线图", unit="元"),
     MetricDefinition("prev_close", "昨收价", "K线图", unit="元"),
-    MetricDefinition("change", "涨跌额", "K线图", unit="元"),
     MetricDefinition("pct_chg", "涨跌幅", "K线图", unit="%"),
-    MetricDefinition("change_percent", "实时涨跌幅", "K线图", unit="%"),
     MetricDefinition("amplitude", "振幅", "K线图", unit="%"),
-    MetricDefinition("current_price", "最新价", "K线图", unit="元"),
+    MetricDefinition("limit_up_price", "涨幅限价", "K线图", unit="元"),
+    MetricDefinition("limit_down_price", "跌幅限价", "K线图", unit="元"),
+    MetricDefinition("price_speed", "涨速", "K线图", unit="%"),
+    MetricDefinition("entrust_ratio", "委比", "K线图", unit="%"),
     MetricDefinition("ma5", "MA5", "K线图", unit="元"),
     MetricDefinition("ma10", "MA10", "K线图", unit="元"),
     MetricDefinition("ma20", "MA20", "K线图", unit="元"),
     MetricDefinition("ma30", "MA30", "K线图", unit="元"),
     MetricDefinition("ma60", "MA60", "K线图", unit="元"),
     MetricDefinition("volume_ratio", "量比", "K线图", unit="倍"),
+    MetricDefinition("total_shares", "总股本", "K线图", unit="股"),
+    MetricDefinition("float_shares", "流通股本", "K线图", unit="股"),
     MetricDefinition("volume", "成交量", "成交量图", unit="股"),
+    MetricDefinition("after_hours_volume", "盘后成交量", "成交量图", unit="股"),
     MetricDefinition("amount", "成交额", "成交量图", unit="元"),
+    MetricDefinition("after_hours_amount", "盘后成交额", "成交量图", unit="元"),
     MetricDefinition("volume_ma5", "MAVOL5", "成交量图", unit="股"),
     MetricDefinition("volume_ma10", "MAVOL10", "成交量图", unit="股"),
     MetricDefinition("volume_ma20", "MAVOL20", "成交量图", unit="股"),
@@ -93,7 +104,8 @@ METRIC_DEFINITIONS: List[MetricDefinition] = [
     MetricDefinition("main_chip_peak_percent", "主力筹码峰峰值占比", "筹码峰-主力筹码", unit="%"),
     MetricDefinition("main_chip_peak_distance_pct", "现价偏离主力筹码峰", "筹码峰-主力筹码", unit="%"),
     MetricDefinition("turnover_rate", "换手率", "实时监控", unit="%"),
-    MetricDefinition("main_force_net", "主力净额", "实时监控", unit="元", description="基于价量关系估算的主力净额"),
+    MetricDefinition("main_net_volume_pct", "主力净量", "实时监控", unit="%", description="主力净流入相对流通市值占比"),
+    MetricDefinition("main_force_net", "主力净流入", "实时监控", unit="元", description="基于价量关系估算的主力净流入"),
     MetricDefinition("net_super_large_order", "净特大单", "实时监控", unit="元", description="基于主力净额拆分的估算值"),
     MetricDefinition("net_large_order", "净大单", "实时监控", unit="元", description="基于主力净额拆分的估算值"),
     MetricDefinition("net_medium_order", "净中单", "实时监控", unit="元", description="基于主力净额拆分的估算值"),
@@ -290,6 +302,17 @@ def build_metric_frame(
         "amplitude",
         "prev_close",
         "pre_close",
+        "after_hours_volume",
+        "after_hours_amount",
+        "total_mv",
+        "circ_mv",
+        "pe_ratio",
+        "total_shares",
+        "float_shares",
+        "limit_up_price",
+        "limit_down_price",
+        "price_speed",
+        "entrust_ratio",
     )
     for col in numeric_columns:
         if col in df.columns:
@@ -363,9 +386,22 @@ def build_metric_frame(
             "change": "change",
             "change_percent": "change_percent",
             "prev_close": "prev_close",
+            "volume": "volume",
+            "amount": "amount",
+            "after_hours_volume": "after_hours_volume",
+            "after_hours_amount": "after_hours_amount",
             "turnover_rate": "turnover_rate",
             "volume_ratio": "volume_ratio",
             "amplitude": "amplitude",
+            "total_mv": "total_mv",
+            "circ_mv": "circ_mv",
+            "pe_ratio": "pe_ratio",
+            "total_shares": "total_shares",
+            "float_shares": "float_shares",
+            "limit_up_price": "limit_up_price",
+            "limit_down_price": "limit_down_price",
+            "price_speed": "price_speed",
+            "entrust_ratio": "entrust_ratio",
         }
         for metric_key, quote_key in quote_mapping.items():
             value = _to_float(quote.get(quote_key))
@@ -387,6 +423,11 @@ def build_metric_frame(
         + (flow_volume_ratio - 1) * 0.055
     ).clip(lower=-0.26, upper=0.26)
     df["main_force_net"] = amount_for_flow * flow_ratio
+    if "circ_mv" in df.columns:
+        circ_mv = pd.to_numeric(df["circ_mv"], errors="coerce").replace(0, pd.NA)
+        df["main_net_volume_pct"] = (df["main_force_net"] / circ_mv) * 100
+    else:
+        df["main_net_volume_pct"] = pd.NA
     df["net_super_large_order"] = df["main_force_net"] * 0.44
     df["net_large_order"] = df["main_force_net"] * 0.30
     df["net_medium_order"] = df["main_force_net"] * 0.18

@@ -1,15 +1,31 @@
 import { act, fireEvent, render, screen, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { rulesApi } from '../../../api/rules';
 import { stocksApi, type KLineData, type KLinePeriod, type StockQuote } from '../../../api/stocks';
-import { IndicatorAnalysisModal } from '../IndicatorAnalysisModal';
+import { RULE_METRIC_DRAFT_STORAGE_KEY } from '../../../utils/ruleMetricDraft';
+import { IndicatorAnalysisModal, IndicatorAnalysisView } from '../IndicatorAnalysisModal';
 
 vi.mock('../../../api/stocks', () => ({
   stocksApi: {
     getHistory: vi.fn(),
     getQuote: vi.fn(),
     getIndicatorMetrics: vi.fn(),
+    getRelatedNews: vi.fn(),
   },
 }));
+
+vi.mock('../../../api/rules', () => ({
+  rulesApi: {
+    getMetrics: vi.fn(),
+  },
+}));
+
+const ruleMetricItems = [
+  { key: 'current_price', label: '最新价', category: '核心行情', valueType: 'number', unit: '元', periods: ['daily'], description: '' },
+  { key: 'volume_ratio', label: '量比', category: 'K线图', valueType: 'number', unit: '倍', periods: ['daily'], description: '' },
+  { key: 'amplitude', label: '振幅', category: 'K线图', valueType: 'number', unit: '%', periods: ['daily'], description: '' },
+  { key: 'profit_ratio', label: '收盘获利', category: '筹码峰-全部筹码', valueType: 'number', unit: '%', periods: ['daily'], description: '' },
+];
 
 function makeHistory(period: KLinePeriod): KLineData[] {
   const length = period === 'daily' ? 24 : 90;
@@ -120,6 +136,8 @@ function expectIndicatorHeadersToShow(date: string) {
 
   expect(within(priceHeader).getByText(date)).toBeInTheDocument();
   expect(within(priceHeader).getByText(/^MA5:/)).toBeInTheDocument();
+  expect(within(priceHeader).getByRole('button', { name: '更多K线指标' })).toBeInTheDocument();
+  expect(within(priceHeader).queryByText(/^振幅:/)).not.toBeInTheDocument();
   expect(within(priceHeader).queryByText(/^收盘:/)).not.toBeInTheDocument();
   expect(within(priceHeader).queryByText(/^总市值:/)).not.toBeInTheDocument();
   expect(within(priceHeader).queryByText(/^总量:/)).not.toBeInTheDocument();
@@ -141,6 +159,8 @@ describe('IndicatorAnalysisModal', () => {
   beforeEach(() => {
     vi.useFakeTimers();
     vi.clearAllMocks();
+    localStorage.clear();
+    vi.mocked(rulesApi.getMetrics).mockResolvedValue(ruleMetricItems);
     vi.mocked(stocksApi.getHistory).mockImplementation(async (stockCode, _days, period = 'daily') => ({
       stockCode,
       stockName: '阿里巴巴',
@@ -193,9 +213,20 @@ describe('IndicatorAnalysisModal', () => {
       errors: [],
       updateTime: '2026-04-30T23:50:00',
     }));
+    vi.mocked(stocksApi.getRelatedNews).mockResolvedValue({
+      total: 1,
+      items: [
+        {
+          title: '平安银行发布最新经营动态',
+          snippet: '公司近期披露经营数据，市场关注息差和资产质量变化。',
+          url: 'https://example.com/news/pab',
+        },
+      ],
+    });
   });
 
   afterEach(() => {
+    localStorage.clear();
     vi.clearAllTimers();
     vi.useRealTimers();
   });
@@ -275,31 +306,38 @@ describe('IndicatorAnalysisModal', () => {
     expect(within(coreMetrics).getByText('132.00')).toBeInTheDocument();
     expect(within(coreMetrics).getByText('+0.20')).toBeInTheDocument();
     expect(within(coreMetrics).getByText('+0.15%')).toBeInTheDocument();
-    expect(within(coreMetrics).getByText('高')).toBeInTheDocument();
-    expect(within(coreMetrics).getByText('低')).toBeInTheDocument();
-    expect(within(coreMetrics).getByText('开')).toBeInTheDocument();
-    expect(within(coreMetrics).getByText('市值')).toBeInTheDocument();
-    expect(within(coreMetrics).getByText('流通')).toBeInTheDocument();
+    expect(within(coreMetrics).getByText('最高价')).toBeInTheDocument();
+    expect(within(coreMetrics).getByText('最低价')).toBeInTheDocument();
+    expect(within(coreMetrics).getByText('开盘价')).toBeInTheDocument();
+    expect(within(coreMetrics).getByText('总市值')).toBeInTheDocument();
+    expect(within(coreMetrics).getByText('流通市值')).toBeInTheDocument();
     expect(within(coreMetrics).getByText('市盈TTM')).toBeInTheDocument();
     expect(within(coreMetrics).getByText('量比')).toBeInTheDocument();
-    expect(within(coreMetrics).getByText('换')).toBeInTheDocument();
-    expect(within(coreMetrics).getByText('额')).toBeInTheDocument();
+    expect(within(coreMetrics).getByText('换手率')).toBeInTheDocument();
+    expect(within(coreMetrics).getByText('成交额')).toBeInTheDocument();
+    expect(within(coreMetrics).getByRole('button', { name: '添加 最高价 到规则' })).toBeInTheDocument();
+    expect(within(coreMetrics).getByRole('button', { name: '添加 换手率 到规则' })).toBeInTheDocument();
+    expect(within(coreMetrics).getByRole('button', { name: '添加 成交额 到规则' })).toBeInTheDocument();
     expect(within(coreMetrics).getByText('2640.00亿')).toBeInTheDocument();
     expect(within(coreMetrics).getByText('2112.00亿')).toBeInTheDocument();
     expect(within(coreMetrics).getByText('23.89')).toBeInTheDocument();
     const latestPriceHeader = screen.getByTestId('indicator-price-header');
     expect(within(latestPriceHeader).queryByText(/^流通市值:/)).not.toBeInTheDocument();
     expect(within(latestPriceHeader).queryByText(/^总市值:/)).not.toBeInTheDocument();
-    expect(within(latestPriceHeader).getByText(/^流通股本:/)).toBeInTheDocument();
-    expect(within(latestPriceHeader).getByText(/^总股本:/)).toBeInTheDocument();
-    expect(within(latestPriceHeader).getByText(/^涨幅限价:/)).toBeInTheDocument();
-    expect(within(latestPriceHeader).getByText(/^涨速:/)).toBeInTheDocument();
-    expect(within(latestPriceHeader).getByText(/^主力净量:/)).toBeInTheDocument();
-    expect(within(latestPriceHeader).getByText(/^主力净流入:/)).toBeInTheDocument();
+    expect(within(latestPriceHeader).queryByText(/^流通股本:/)).not.toBeInTheDocument();
+    fireEvent.click(within(latestPriceHeader).getByRole('button', { name: '更多K线指标' }));
+    const latestMoreMetrics = screen.getByRole('dialog', { name: '更多K线指标' });
+    expect(within(latestMoreMetrics).getByText(/^流通股本:/)).toBeInTheDocument();
+    expect(within(latestMoreMetrics).getByText(/^总股本:/)).toBeInTheDocument();
+    expect(within(latestMoreMetrics).getByText(/^涨幅限价:/)).toBeInTheDocument();
+    expect(within(latestMoreMetrics).getByText(/^涨速:/)).toBeInTheDocument();
+    expect(within(latestMoreMetrics).getByText(/^主力净量:/)).toBeInTheDocument();
+    expect(within(latestMoreMetrics).getByText(/^主力净流入:/)).toBeInTheDocument();
     expect(within(latestPriceHeader).queryByText(/^换手:/)).not.toBeInTheDocument();
-    expect(within(latestPriceHeader).getByText(/^委比:/)).toBeInTheDocument();
+    expect(within(latestMoreMetrics).getByText(/^委比:/)).toBeInTheDocument();
     expect(within(latestPriceHeader).queryByText(/^总量:/)).not.toBeInTheDocument();
     expect(within(latestPriceHeader).queryByText(/^总金额:/)).not.toBeInTheDocument();
+    fireEvent.click(within(latestPriceHeader).getByRole('button', { name: '更多K线指标' }));
     const latestVolumeHeader = screen.getByTestId('indicator-volume-header');
     expect(within(latestVolumeHeader).getByText(/^量:/)).toBeInTheDocument();
     expect(within(latestVolumeHeader).getByText('盘后:104')).toBeInTheDocument();
@@ -356,6 +394,61 @@ describe('IndicatorAnalysisModal', () => {
     expect(screen.getByRole('menu', { name: '图表缩放菜单' })).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: '放大' }));
     expect(screen.queryByRole('menu', { name: '图表缩放菜单' })).not.toBeInTheDocument();
+
+    unmount();
+  });
+
+  it('adds visible indicator metrics to a reusable rule draft', async () => {
+    const { unmount } = render(
+      <IndicatorAnalysisModal stockCode="600519" stockName="贵州茅台" onClose={vi.fn()} />,
+    );
+    await flushPromises();
+
+    fireEvent.click(screen.getByRole('button', { name: '添加 最新价 到规则' }));
+    fireEvent.click(screen.getByRole('button', { name: '添加 量比 到规则' }));
+
+    expect(screen.getByText('已选 2')).toBeInTheDocument();
+    expect(screen.getByText(/多个指标会在规则页放入同一条件组/)).toBeInTheDocument();
+
+    const rawDraft = localStorage.getItem(RULE_METRIC_DRAFT_STORAGE_KEY);
+    expect(rawDraft).not.toBeNull();
+    const draft = JSON.parse(rawDraft ?? '{}') as { stockCode?: string; stockName?: string; items?: Array<{ key: string; value: number | null }> };
+    expect(draft.stockCode).toBe('600519');
+    expect(draft.stockName).toBe('贵州茅台');
+    expect(draft.items?.map((item) => item.key)).toEqual(['current_price', 'volume_ratio']);
+    expect(draft.items?.[0]?.value).toBe(132);
+    expect(draft.items?.[1]?.value).toBe(1.2);
+
+    unmount();
+  });
+
+  it('toggles selected metrics and edits the reusable rule draft inline', async () => {
+    const { unmount } = render(
+      <IndicatorAnalysisModal stockCode="600519" stockName="贵州茅台" onClose={vi.fn()} />,
+    );
+    await flushPromises();
+
+    fireEvent.click(screen.getByRole('button', { name: '添加 最新价 到规则' }));
+    expect(screen.getByRole('button', { name: '移除 最新价 从规则' })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: '编辑已选规则条件' }));
+    const editor = screen.getByRole('dialog', { name: '已选规则条件编辑' });
+    expect(within(editor).getByText('规则条件草稿')).toBeInTheDocument();
+    expect(within(editor).getByText(/多个子条件按“且”关系判断/)).toBeInTheDocument();
+
+    fireEvent.change(within(editor).getByLabelText('关系'), { target: { value: '<=' } });
+    fireEvent.change(within(editor).getByLabelText('数值'), { target: { value: '130' } });
+
+    const editedDraft = JSON.parse(localStorage.getItem(RULE_METRIC_DRAFT_STORAGE_KEY) ?? '{}') as {
+      items?: Array<{ key: string; operator?: string; right?: { type?: string; value?: number } }>;
+    };
+    expect(editedDraft.items?.[0]?.key).toBe('current_price');
+    expect(editedDraft.items?.[0]?.operator).toBe('<=');
+    expect(editedDraft.items?.[0]?.right).toEqual({ type: 'literal', value: 130 });
+
+    fireEvent.click(screen.getByRole('button', { name: '移除 最新价 从规则' }));
+    expect(localStorage.getItem(RULE_METRIC_DRAFT_STORAGE_KEY)).toBeNull();
+    expect(screen.queryByText('已选 1')).not.toBeInTheDocument();
 
     unmount();
   });
@@ -431,6 +524,26 @@ describe('IndicatorAnalysisModal', () => {
     expect(historicalCoreMetrics.getByText('122.20')).toBeInTheDocument();
     expect(historicalCoreMetrics.getByText('+0.10')).toBeInTheDocument();
     expect(historicalCoreMetrics.getByText('+0.10%')).toBeInTheDocument();
+    const historicalPriceHeader = screen.getByTestId('indicator-price-header');
+    fireEvent.click(within(historicalPriceHeader).getByRole('button', { name: '更多K线指标' }));
+    const historicalPriceHeaderText = screen.getByRole('dialog', { name: '更多K线指标' }).textContent ?? '';
+    expect(historicalPriceHeaderText).toContain('流通股本:16.00亿股');
+    expect(historicalPriceHeaderText).toContain('总股本:20.00亿股');
+    expect(historicalPriceHeaderText).toMatch(/涨幅限价:\d/);
+    expect(historicalPriceHeaderText).toMatch(/跌幅限价:\d/);
+    expect(historicalPriceHeaderText).toContain('涨速:+0.10%');
+    expect(historicalPriceHeaderText).toMatch(/主力净量:[+-]?\d/);
+    expect(historicalPriceHeaderText).toMatch(/主力净流入:[+-]?\d/);
+    expect(historicalPriceHeaderText).toMatch(/委比:[+-]?\d/);
+    expect(historicalPriceHeaderText).not.toContain('流通股本:--');
+    expect(historicalPriceHeaderText).not.toContain('总股本:--');
+    expect(historicalPriceHeaderText).not.toContain('涨幅限价:--');
+    expect(historicalPriceHeaderText).not.toContain('跌幅限价:--');
+    expect(historicalPriceHeaderText).not.toContain('涨速:--');
+    expect(historicalPriceHeaderText).not.toContain('主力净量:--');
+    expect(historicalPriceHeaderText).not.toContain('主力净流入:--');
+    expect(historicalPriceHeaderText).not.toContain('委比:--');
+    fireEvent.click(within(historicalPriceHeader).getByRole('button', { name: '更多K线指标' }));
 
     fireEvent.mouseEnter(screen.getByTestId('indicator-volume-bar-2026-04-24'));
     expectIndicatorHeadersToShow('2026-04-24');
@@ -611,7 +724,7 @@ describe('IndicatorAnalysisModal', () => {
     unmount();
   });
 
-  it('pans and zooms the K-line window from in-chart controls around the selected candle', async () => {
+  it('pans and zooms the K-line window from the header control strip without covering the chart', async () => {
     const longHistory = makeDailyHistory(120);
     vi.mocked(stocksApi.getHistory).mockImplementation(async (stockCode, _days, period = 'daily') => ({
       stockCode,
@@ -620,7 +733,7 @@ describe('IndicatorAnalysisModal', () => {
       data: period === 'daily' ? longHistory : makeHistory(period),
     }));
 
-    const { unmount } = render(
+    const { unmount, container } = render(
       <IndicatorAnalysisModal stockCode="600519" stockName="贵州茅台" onClose={vi.fn()} />,
     );
     await flushPromises();
@@ -629,19 +742,102 @@ describe('IndicatorAnalysisModal', () => {
     fireEvent.mouseEnter(screen.getByTestId(`indicator-chart-bar-${selectedDate}`));
     expectIndicatorHeadersToShow(selectedDate);
 
-    fireEvent.click(screen.getByRole('button', { name: '放大选中K线日期' }));
-    expect(screen.getByText(/最近 55 个交易日/)).toBeInTheDocument();
+    const timeAxis = screen.getByTestId('indicator-chart-time-axis');
+    const chartShell = screen.getByRole('img', { name: 'K线图' }).parentElement as HTMLElement;
+    expect(within(chartShell).queryByRole('button', { name: '放大选中K线日期' })).not.toBeInTheDocument();
+    expect(within(timeAxis).getByRole('slider', { name: 'K线时间窗口' })).toBeInTheDocument();
+    expect(screen.queryByText(/最近 \d+ 个交易日/)).not.toBeInTheDocument();
+    expect(screen.getByTestId('indicator-kline-y-axis-zero')).toHaveTextContent('0.00');
+    expect(screen.getAllByTestId('indicator-kline-x-axis-label').length).toBeGreaterThan(1);
+
+    fireEvent.click(within(timeAxis).getByRole('button', { name: '放大选中K线日期' }));
+    expect(container.querySelectorAll('[data-testid^="indicator-chart-bar-"]')).toHaveLength(55);
     expectIndicatorHeadersToShow(selectedDate);
 
-    fireEvent.click(screen.getByRole('button', { name: '缩小选中K线日期' }));
-    expect(screen.getByText(/最近 80 个交易日/)).toBeInTheDocument();
+    fireEvent.click(within(timeAxis).getByRole('button', { name: '缩小选中K线日期' }));
+    expect(container.querySelectorAll('[data-testid^="indicator-chart-bar-"]')).toHaveLength(80);
     expectIndicatorHeadersToShow(selectedDate);
 
-    fireEvent.click(screen.getByRole('button', { name: '向左平移K线时间' }));
+    fireEvent.click(within(timeAxis).getByRole('button', { name: '向左平移K线时间' }));
     expect(screen.getByTestId(`indicator-chart-bar-${longHistory[0].date}`)).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole('button', { name: '向右平移K线时间' }));
+    fireEvent.click(within(timeAxis).getByRole('button', { name: '向右平移K线时间' }));
     expect(screen.getByTestId(`indicator-chart-bar-${longHistory.at(-1)?.date}`)).toBeInTheDocument();
+
+    unmount();
+  });
+
+  it('shows secondary K-line metrics in a transparent more popover', async () => {
+    const { unmount } = render(
+      <IndicatorAnalysisModal stockCode="600519" stockName="贵州茅台" onClose={vi.fn()} />,
+    );
+    await flushPromises();
+
+    const priceHeader = screen.getByTestId('indicator-price-header');
+    const moreButton = within(priceHeader).getByRole('button', { name: '更多K线指标' });
+
+    expect(within(priceHeader).queryByText(/^振幅:/)).not.toBeInTheDocument();
+    expect(screen.queryByRole('dialog', { name: '更多K线指标' })).not.toBeInTheDocument();
+
+    fireEvent.click(moreButton);
+    const morePopover = screen.getByRole('dialog', { name: '更多K线指标' });
+    expect(within(morePopover).getByText(/^振幅:/)).toBeInTheDocument();
+    expect(within(morePopover).getByText(/^流通股本:/)).toBeInTheDocument();
+    expect(within(morePopover).getByText(/^总股本:/)).toBeInTheDocument();
+    expect(within(morePopover).getByText(/^涨幅限价:/)).toBeInTheDocument();
+    expect(within(morePopover).getByText(/^跌幅限价:/)).toBeInTheDocument();
+    expect(within(morePopover).getByText(/^涨速:/)).toBeInTheDocument();
+    expect(within(morePopover).getByText(/^主力净量:/)).toBeInTheDocument();
+    expect(within(morePopover).getByText(/^主力净流入:/)).toBeInTheDocument();
+    expect(within(morePopover).getByText(/^委比:/)).toBeInTheDocument();
+
+    fireEvent.click(moreButton);
+    expect(screen.queryByRole('dialog', { name: '更多K线指标' })).not.toBeInTheDocument();
+
+    unmount();
+  });
+
+  it('maximizes each indicator chart and restores it with Escape', async () => {
+    const { unmount } = render(
+      <IndicatorAnalysisModal stockCode="600519" stockName="贵州茅台" onClose={vi.fn()} />,
+    );
+    await flushPromises();
+
+    fireEvent.click(screen.getByRole('button', { name: '最大化K线图' }));
+    expect(screen.getByRole('dialog', { name: 'K线图最大化' })).toBeInTheDocument();
+    expect(within(screen.getByRole('dialog', { name: 'K线图最大化' })).getByRole('img', { name: 'K线图' })).toBeInTheDocument();
+    fireEvent.keyDown(window, { key: 'Escape' });
+    expect(screen.queryByRole('dialog', { name: 'K线图最大化' })).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: '最大化成交量图' }));
+    expect(screen.getByRole('dialog', { name: '成交量图最大化' })).toBeInTheDocument();
+    expect(within(screen.getByRole('dialog', { name: '成交量图最大化' })).getByRole('img', { name: '成交量图' })).toBeInTheDocument();
+    fireEvent.keyDown(window, { key: 'Escape' });
+    expect(screen.queryByRole('dialog', { name: '成交量图最大化' })).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: '最大化MACD指标图' }));
+    expect(screen.getByRole('dialog', { name: 'MACD指标图最大化' })).toBeInTheDocument();
+    expect(within(screen.getByRole('dialog', { name: 'MACD指标图最大化' })).getByRole('img', { name: 'MACD指标图' })).toBeInTheDocument();
+    fireEvent.keyDown(window, { key: 'Escape' });
+    expect(screen.queryByRole('dialog', { name: 'MACD指标图最大化' })).not.toBeInTheDocument();
+
+    unmount();
+  });
+
+  it('loads related news on the indicator page and refreshes it on demand', async () => {
+    const { unmount } = render(
+      <IndicatorAnalysisView stockCode="600519" stockName="贵州茅台" onClose={vi.fn()} variant="page" />,
+    );
+    await flushPromises();
+
+    expect(screen.getByTestId('indicator-related-news')).toBeInTheDocument();
+    expect(screen.getByText('平安银行发布最新经营动态')).toBeInTheDocument();
+    expect(stocksApi.getRelatedNews).toHaveBeenCalledWith('600519', 8, false);
+
+    fireEvent.click(screen.getByRole('button', { name: '刷新相关资讯' }));
+    await flushPromises();
+
+    expect(stocksApi.getRelatedNews).toHaveBeenLastCalledWith('600519', 8, true);
 
     unmount();
   });

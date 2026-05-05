@@ -16,6 +16,7 @@ from typing import Optional
 
 from fastapi import APIRouter, File, HTTPException, Query, Request, UploadFile
 
+from api.v1.schemas.history import NewsIntelItem, NewsIntelResponse
 from api.v1.schemas.stocks import (
     ExtractFromImageResponse,
     ExtractItem,
@@ -319,6 +320,53 @@ def get_stock_quotes(payload: StockQuotesRequest) -> StockQuotesResponse:
             detail={
                 "error": "internal_error",
                 "message": f"批量获取实时行情失败: {str(e)}",
+            },
+        )
+
+
+@router.get(
+    "/{stock_code}/news",
+    response_model=NewsIntelResponse,
+    responses={
+        200: {"description": "股票相关新闻"},
+        500: {"description": "服务器错误", "model": ErrorResponse},
+    },
+    summary="获取股票相关新闻",
+    description="获取指定股票最近相关资讯；refresh=true 时会尝试刷新公开资讯源。",
+)
+def get_stock_news(
+    stock_code: str,
+    limit: int = Query(8, ge=1, le=20, description="返回数量限制"),
+    days: Optional[int] = Query(None, ge=1, le=30, description="最近天数；不传则使用新闻策略配置"),
+    refresh: bool = Query(False, description="是否主动刷新公开资讯源"),
+) -> NewsIntelResponse:
+    """
+    获取股票相关新闻。
+
+    默认读取本地已沉淀的新闻情报；刷新时触发 SearchService/PublicFinance
+    等公开资讯源，不调用 LLM 模型。
+    """
+    try:
+        service = StockService()
+        result = service.get_related_news(stock_code, limit=limit, days=days, refresh=refresh)
+        return NewsIntelResponse(
+            total=result.get("total", 0),
+            items=[
+                NewsIntelItem(
+                    title=item.get("title", ""),
+                    snippet=item.get("snippet", ""),
+                    url=item.get("url", ""),
+                )
+                for item in result.get("items", [])
+            ],
+        )
+    except Exception as e:
+        logger.error(f"获取股票相关新闻失败: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": "internal_error",
+                "message": f"获取股票相关新闻失败: {str(e)}",
             },
         )
 

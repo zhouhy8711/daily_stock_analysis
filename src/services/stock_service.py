@@ -478,6 +478,87 @@ class StockService:
             "update_time": datetime.now().isoformat(),
         }
 
+    def get_related_news(
+        self,
+        stock_code: str,
+        *,
+        limit: int = 8,
+        days: Optional[int] = None,
+        refresh: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        获取指标页右侧相关资讯。
+
+        默认读取已有分析流程沉淀到 news_intel 表里的资讯；用户点击刷新时，
+        触发一次公开财经/搜索通道拉取并写回本地库。该链路不调用 LLM。
+        """
+        from src.config import get_config
+        from src.storage import DatabaseManager
+
+        cfg = get_config()
+        effective_days = days
+        if effective_days is None:
+            try:
+                effective_days = cfg.get_effective_news_window_days()
+            except Exception:
+                effective_days = getattr(cfg, "news_max_age_days", 7)
+        effective_days = max(1, min(int(effective_days or 7), 30))
+        effective_limit = max(1, min(int(limit or 8), 20))
+
+        db = DatabaseManager.get_instance()
+
+        if refresh:
+            stock_name = stock_code
+            try:
+                from data_provider.base import DataFetcherManager
+
+                manager = DataFetcherManager()
+                stock_name = manager.get_stock_name(stock_code, allow_realtime=False) or stock_code
+            except Exception as e:
+                logger.debug(f"刷新相关资讯时获取 {stock_code} 股票名称失败: {e}")
+
+            try:
+                from src.search_service import get_search_service
+
+                response = get_search_service().search_stock_news(
+                    stock_code,
+                    stock_name,
+                    max_results=effective_limit,
+                )
+                if response.success and response.results:
+                    db.save_news_intel(
+                        code=stock_code,
+                        name=stock_name,
+                        dimension="latest_news",
+                        query=response.query,
+                        response=response,
+                        query_context={"query_source": "indicator_page"},
+                    )
+            except Exception as e:
+                logger.warning(f"刷新 {stock_code} 相关资讯失败: {e}", exc_info=True)
+
+        records = db.get_recent_news(code=stock_code, days=effective_days, limit=effective_limit)
+        items: List[Dict[str, str]] = []
+        for record in records:
+            title = str(getattr(record, "title", "") or "").strip()
+            url = str(getattr(record, "url", "") or "").strip()
+            if not title or not url:
+                continue
+            snippet = str(getattr(record, "snippet", "") or "").strip()
+            if len(snippet) > 200:
+                snippet = f"{snippet[:197]}..."
+            items.append({
+                "title": title,
+                "snippet": snippet,
+                "url": url,
+            })
+
+        return {
+            "total": len(items),
+            "items": items,
+            "update_time": datetime.now().isoformat(),
+        }
+
     @staticmethod
     def _format_kline_date(value: Any, period: str) -> str:
         if hasattr(value, "strftime"):

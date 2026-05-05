@@ -1,5 +1,5 @@
 import type React from 'react';
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Activity,
   ArrowLeft,
@@ -9,12 +9,18 @@ import {
   ChevronRight,
   Layers3,
   LineChart,
+  Maximize2,
   Minus,
+  Minimize2,
   Plus,
   Radio,
+  RefreshCw,
+  HelpCircle,
+  Trash2,
   Users,
   X,
 } from 'lucide-react';
+import { rulesApi } from '../../api/rules';
 import {
   stocksApi,
   type ChipDistributionMetrics,
@@ -24,7 +30,25 @@ import {
   type StockIndicatorMetrics,
   type StockQuote,
 } from '../../api/stocks';
-import { Badge, Button, EmptyState, InlineAlert } from '../common';
+import type {
+  RuleAggregateMethod,
+  RuleCompareOperator,
+  RuleCondition,
+  RuleMetricItem,
+  RuleOperator,
+  RuleValueExpression,
+} from '../../types/rules';
+import type { NewsIntelItem } from '../../types/analysis';
+import {
+  addRuleMetricDraftItem,
+  readRuleMetricDraft,
+  removeRuleMetricDraftItem,
+  updateRuleMetricDraftItem,
+  type RuleMetricDraft,
+  type RuleMetricDraftItem,
+  type RuleMetricDraftItemPatch,
+} from '../../utils/ruleMetricDraft';
+import { Badge, Button, EmptyState, InlineAlert, Tooltip } from '../common';
 import { DashboardStateBlock } from '../dashboard';
 
 type IndicatorAnalysisModalProps = {
@@ -65,6 +89,7 @@ type ChartPoint = KLineData & {
   macd?: number;
   rsi6?: number;
   rsi12?: number;
+  rsi24?: number;
 };
 
 type HistoryState = {
@@ -138,6 +163,15 @@ type MomentumIndicatorMode = 'macd' | 'rsi';
 type ChipPanelScope = 'all' | 'main';
 type ChipRangeLevel = '90' | '70';
 type SidePanelTab = 'chip' | 'flow';
+type MaximizedChart = 'kline' | 'volume' | 'momentum';
+type RuleMetricAddPayload = {
+  key: string;
+  label: string;
+  value?: number | null;
+  unit?: string | null;
+  date?: string | null;
+};
+type AddRuleMetricHandler = (metric: RuleMetricAddPayload) => void;
 
 const EMPTY_HISTORY: KLineData[] = [];
 const EMPTY_HOLDERS: MajorHolder[] = [];
@@ -205,6 +239,711 @@ const BASE_HOLDER_PROFILE: HolderScopeProfile = {
   momentumWeight: 0,
 };
 
+const ORDER_FLOW_METRIC_KEYS: Record<string, string> = {
+  净特大单: 'net_super_large_order',
+  净大单: 'net_large_order',
+  净中单: 'net_medium_order',
+  净小单: 'net_small_order',
+};
+
+const EMPTY_SELECTED_RULE_METRIC_KEYS = new Set<string>();
+const RuleMetricSelectionContext = createContext<ReadonlySet<string>>(EMPTY_SELECTED_RULE_METRIC_KEYS);
+const RULE_EDITOR_INPUT_CLASS =
+  'input-surface input-focus-glow h-10 w-full rounded-xl border bg-transparent px-3 text-sm transition-all focus:outline-none disabled:cursor-not-allowed disabled:opacity-60';
+const RULE_EDITOR_OFFSET_HELP = (
+  <span>
+    偏移按交易日计算：0 表示当前判断日，也就是最新交易日；1 表示前 1 个交易日；2 表示前 2 个交易日。
+  </span>
+);
+const RULE_OPERATOR_OPTIONS: Array<{ value: RuleOperator; label: string }> = [
+  { value: '>', label: '大于' },
+  { value: '>=', label: '大于等于' },
+  { value: '<', label: '小于' },
+  { value: '<=', label: '小于等于' },
+  { value: '=', label: '等于' },
+  { value: '!=', label: '不等于' },
+  { value: 'between', label: '介于' },
+  { value: 'not_between', label: '不介于' },
+  { value: 'consecutive', label: '连续满足' },
+  { value: 'frequency', label: '频次满足' },
+  { value: 'trend_up', label: '连续上升' },
+  { value: 'trend_down', label: '连续下降' },
+  { value: 'new_high', label: 'N 期新高' },
+  { value: 'new_low', label: 'N 期新低' },
+  { value: 'exists', label: '有值' },
+  { value: 'not_exists', label: '无值' },
+];
+const RULE_COMPARE_OPTIONS: Array<{ value: RuleCompareOperator; label: string }> = [
+  { value: '>', label: '>' },
+  { value: '>=', label: '>=' },
+  { value: '<', label: '<' },
+  { value: '<=', label: '<=' },
+  { value: '=', label: '=' },
+  { value: '!=', label: '!=' },
+];
+const RULE_AGGREGATE_OPTIONS: Array<{ value: RuleAggregateMethod; label: string }> = [
+  { value: 'max', label: '最大值' },
+  { value: 'min', label: '最小值' },
+  { value: 'avg', label: '平均值' },
+  { value: 'sum', label: '求和' },
+  { value: 'median', label: '中位数' },
+  { value: 'std', label: '标准差' },
+];
+
+type RuleMetricGroup = {
+  category: string;
+  items: RuleMetricItem[];
+};
+
+type RuleEditableValueType = Exclude<RuleValueExpression['type'], 'range'>;
+
+function createRuleLiteral(value = 0): RuleValueExpression {
+  return { type: 'literal', value };
+}
+
+function createRuleMetricValue(metric = 'close'): RuleValueExpression {
+  return { type: 'metric', metric, offset: 0 };
+}
+
+function createRuleAggregate(metric = 'close'): RuleValueExpression {
+  return { type: 'aggregate', metric, method: 'avg', window: 5, offset: 1 };
+}
+
+function createRuleRange(value = 10): RuleValueExpression {
+  return { type: 'range', min: createRuleLiteral(0), max: createRuleLiteral(value) };
+}
+
+function canUseRuleRightValue(operator: RuleOperator): boolean {
+  return !['trend_up', 'trend_down', 'new_high', 'new_low', 'exists', 'not_exists'].includes(operator);
+}
+
+function roundRuleDraftValue(value?: number | null): number {
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    return 0;
+  }
+  if (Math.abs(value) >= 1000) {
+    return Number(value.toFixed(2));
+  }
+  return Number(value.toFixed(4));
+}
+
+function defaultOperatorForRuleMetric(metricKey: string): RuleOperator {
+  if (
+    metricKey.includes('concentration')
+    || metricKey.includes('trapped')
+    || metricKey.includes('price_to_avg_cost')
+    || metricKey.includes('peak_distance')
+  ) {
+    return '<';
+  }
+  return '>';
+}
+
+function metricOptionLabel(metric: RuleMetricItem): string {
+  return `${metric.label} · ${metric.key}${metric.unit ? ` (${metric.unit})` : ''}`;
+}
+
+function metricLabel(metrics: RuleMetricItem[], key: string): string {
+  const metric = metrics.find((item) => item.key === key);
+  return metric ? metric.label : key;
+}
+
+function groupRuleMetricsByCategory(metrics: RuleMetricItem[]): RuleMetricGroup[] {
+  const groups: RuleMetricGroup[] = [];
+  const groupMap = new Map<string, RuleMetricGroup>();
+  metrics.forEach((metric) => {
+    const category = metric.category || '其他';
+    let group = groupMap.get(category);
+    if (!group) {
+      group = { category, items: [] };
+      groupMap.set(category, group);
+      groups.push(group);
+    }
+    group.items.push(metric);
+  });
+  return groups;
+}
+
+function valueSummary(metrics: RuleMetricItem[], value?: RuleValueExpression): string {
+  if (!value) return '无右侧值';
+  if (value.type === 'literal') return formatNumber(value.value);
+  if (value.type === 'metric') return metricLabel(metrics, value.metric);
+  if (value.type === 'range') {
+    return `${valueSummary(metrics, value.min)} 到 ${valueSummary(metrics, value.max)}`;
+  }
+  const method = RULE_AGGREGATE_OPTIONS.find((item) => item.value === value.method)?.label ?? value.method;
+  const multiplier = value.multiplier ? ` * ${formatNumber(value.multiplier)}` : '';
+  return `前 ${value.window} 期 ${metricLabel(metrics, value.metric)} ${method}${multiplier}`;
+}
+
+function conditionSummary(metrics: RuleMetricItem[], condition: RuleCondition): string {
+  const left = metricLabel(metrics, condition.left.metric);
+  if (condition.operator === 'consecutive') {
+    return `连续 ${condition.lookback ?? 1} 次满足 ${left} ${condition.compare ?? '>'} ${valueSummary(metrics, condition.right)}`;
+  }
+  if (condition.operator === 'frequency') {
+    return `近 ${condition.lookback ?? 1} 次至少 ${condition.minCount ?? 1} 次满足 ${left} ${condition.compare ?? '>'} ${valueSummary(metrics, condition.right)}`;
+  }
+  if (condition.operator === 'trend_up') return `${left} 连续上升 ${condition.lookback ?? 3} 期`;
+  if (condition.operator === 'trend_down') return `${left} 连续下降 ${condition.lookback ?? 3} 期`;
+  if (condition.operator === 'new_high') return `${left} 创 ${condition.lookback ?? 20} 期新高`;
+  if (condition.operator === 'new_low') return `${left} 创 ${condition.lookback ?? 20} 期新低`;
+  if (condition.operator === 'exists') return `${left} 有值`;
+  if (condition.operator === 'not_exists') return `${left} 无值`;
+  return `${left} ${condition.operator} ${valueSummary(metrics, condition.right)}`;
+}
+
+function draftItemToCondition(item: RuleMetricDraftItem): RuleCondition {
+  const operator = item.operator ?? defaultOperatorForRuleMetric(item.key);
+  const literalValue = roundRuleDraftValue(item.value);
+  const right = item.right
+    ?? (operator === 'between' || operator === 'not_between'
+      ? createRuleRange(literalValue)
+      : canUseRuleRightValue(operator)
+        ? createRuleLiteral(literalValue)
+        : undefined);
+  return {
+    id: item.id,
+    left: { metric: item.key, offset: item.offset ?? 0 },
+    operator,
+    right,
+    compare: item.compare ?? (operator === 'consecutive' || operator === 'frequency' ? '>' : undefined),
+    lookback: item.lookback ?? (
+      operator === 'consecutive' ? 3
+        : operator === 'frequency' ? 10
+          : operator === 'new_high' || operator === 'new_low' ? 20
+            : operator === 'trend_up' || operator === 'trend_down' ? 3
+              : undefined
+    ),
+    minCount: item.minCount ?? (operator === 'frequency' ? 6 : undefined),
+  };
+}
+
+function conditionToDraftPatch(
+  item: RuleMetricDraftItem,
+  condition: RuleCondition,
+  metrics: RuleMetricItem[],
+): RuleMetricDraftItemPatch {
+  const metric = metrics.find((candidate) => candidate.key === condition.left.metric);
+  const literalValue = condition.right?.type === 'literal' ? condition.right.value : item.value;
+  return {
+    key: condition.left.metric,
+    label: metric?.label ?? item.label,
+    unit: metric?.unit ?? item.unit,
+    value: literalValue,
+    operator: condition.operator,
+    offset: condition.left.offset ?? 0,
+    right: condition.right,
+    compare: condition.compare,
+    lookback: condition.lookback,
+    minCount: condition.minCount,
+  };
+}
+
+function getFallbackRuleMetrics(draft: RuleMetricDraft): RuleMetricItem[] {
+  return draft.items.map((item) => ({
+    key: item.key,
+    label: item.label,
+    category: '已选指标',
+    valueType: 'number',
+    unit: item.unit ?? null,
+    periods: ['daily'],
+    description: '',
+  }));
+}
+
+function RuleEditorSelectField<T extends string>({
+  label,
+  value,
+  options,
+  onChange,
+  className = '',
+}: {
+  label?: string;
+  value: T;
+  options: Array<{ value: T; label: string }>;
+  onChange: (value: T) => void;
+  className?: string;
+}) {
+  return (
+    <label className={`flex flex-col gap-1 text-xs text-muted-text ${className}`}>
+      {label ? <span>{label}</span> : null}
+      <select
+        value={value}
+        onChange={(event) => onChange(event.target.value as T)}
+        className={RULE_EDITOR_INPUT_CLASS}
+      >
+        {options.map((option) => (
+          <option key={option.value} value={option.value} className="bg-elevated text-foreground">
+            {option.label}
+          </option>
+        ))}
+      </select>
+    </label>
+  );
+}
+
+function RuleEditorMetricSelectField({
+  label,
+  value,
+  metrics,
+  onChange,
+}: {
+  label: string;
+  value: string;
+  metrics: RuleMetricItem[];
+  onChange: (value: string) => void;
+}) {
+  const groups = groupRuleMetricsByCategory(metrics);
+  const hasSelectedMetric = metrics.some((metric) => metric.key === value);
+
+  return (
+    <label className="flex flex-col gap-1 text-xs text-muted-text">
+      <span>{label}</span>
+      <select
+        value={value}
+        onChange={(event) => onChange(event.target.value)}
+        className={RULE_EDITOR_INPUT_CLASS}
+      >
+        {!hasSelectedMetric && value ? (
+          <option value={value} className="bg-elevated text-foreground">
+            {value}
+          </option>
+        ) : null}
+        {groups.map((group) => (
+          <optgroup key={group.category} label={group.category} className="bg-elevated text-foreground">
+            {group.items.map((metric) => (
+              <option key={metric.key} value={metric.key} className="bg-elevated text-foreground">
+                {metricOptionLabel(metric)}
+              </option>
+            ))}
+          </optgroup>
+        ))}
+      </select>
+    </label>
+  );
+}
+
+function RuleEditorFieldLabel({ label, help }: { label: string; help?: React.ReactNode }) {
+  return (
+    <span className="inline-flex items-center gap-1">
+      <span>{label}</span>
+      {help ? (
+        <Tooltip content={help} side="bottom" contentClassName="max-w-[22rem]">
+          <button
+            type="button"
+            className="inline-flex h-4 w-4 items-center justify-center rounded-full text-muted-text transition-colors hover:text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/45"
+            aria-label={`${label}说明`}
+          >
+            <HelpCircle className="h-3.5 w-3.5" />
+          </button>
+        </Tooltip>
+      ) : null}
+    </span>
+  );
+}
+
+function RuleEditorNumberField({
+  label,
+  value,
+  min,
+  onChange,
+  className = '',
+  help,
+}: {
+  label: string;
+  value: number | undefined;
+  min?: number;
+  onChange: (value: number) => void;
+  className?: string;
+  help?: React.ReactNode;
+}) {
+  return (
+    <label className={`flex flex-col gap-1 text-xs text-muted-text ${className}`}>
+      <RuleEditorFieldLabel label={label} help={help} />
+      <input
+        type="number"
+        min={min}
+        value={value ?? ''}
+        onChange={(event) => onChange(Number(event.target.value || 0))}
+        className={RULE_EDITOR_INPUT_CLASS}
+      />
+    </label>
+  );
+}
+
+function RuleEditorValueEditor({
+  value,
+  metrics,
+  onChange,
+}: {
+  value: RuleValueExpression;
+  metrics: RuleMetricItem[];
+  onChange: (value: RuleValueExpression) => void;
+}) {
+  const typeOptions: Array<{ value: RuleEditableValueType; label: string }> = [
+    { value: 'literal', label: '固定数值' },
+    { value: 'metric', label: '指标引用' },
+    { value: 'aggregate', label: '历史聚合' },
+  ];
+  const switchType = (type: RuleEditableValueType) => {
+    if (type === 'literal') onChange(createRuleLiteral());
+    if (type === 'metric') onChange(createRuleMetricValue(metrics[0]?.key ?? 'close'));
+    if (type === 'aggregate') onChange(createRuleAggregate(metrics[0]?.key ?? 'close'));
+  };
+
+  if (value.type === 'range') {
+    return (
+      <div className="grid gap-2 md:grid-cols-2">
+        <RuleEditorNumberField
+          label="下限"
+          value={value.min.type === 'literal' ? value.min.value : 0}
+          onChange={(next) => onChange({ ...value, min: createRuleLiteral(next) })}
+        />
+        <RuleEditorNumberField
+          label="上限"
+          value={value.max.type === 'literal' ? value.max.value : 0}
+          onChange={(next) => onChange({ ...value, max: createRuleLiteral(next) })}
+        />
+      </div>
+    );
+  }
+
+  return (
+    <div className="grid gap-2 lg:grid-cols-[9rem_minmax(10rem,1fr)_8rem_7rem]">
+      <RuleEditorSelectField
+        label="值类型"
+        value={value.type}
+        options={typeOptions}
+        onChange={switchType}
+      />
+      {value.type === 'literal' ? (
+        <RuleEditorNumberField
+          label="数值"
+          value={value.value}
+          onChange={(next) => onChange({ ...value, value: next })}
+          className="lg:col-span-3"
+        />
+      ) : null}
+      {value.type === 'metric' ? (
+        <>
+          <RuleEditorMetricSelectField
+            label="指标"
+            value={value.metric}
+            metrics={metrics}
+            onChange={(metric) => onChange({ ...value, metric })}
+          />
+          <RuleEditorNumberField
+            label="取值日偏移"
+            help={RULE_EDITOR_OFFSET_HELP}
+            min={0}
+            value={value.offset ?? 0}
+            onChange={(offset) => onChange({ ...value, offset })}
+          />
+          <RuleEditorNumberField
+            label="倍数"
+            value={value.multiplier ?? 1}
+            onChange={(multiplier) => onChange({ ...value, multiplier })}
+          />
+        </>
+      ) : null}
+      {value.type === 'aggregate' ? (
+        <>
+          <RuleEditorMetricSelectField
+            label="指标"
+            value={value.metric}
+            metrics={metrics}
+            onChange={(metric) => onChange({ ...value, metric })}
+          />
+          <RuleEditorSelectField
+            label="方法"
+            value={value.method}
+            options={RULE_AGGREGATE_OPTIONS}
+            onChange={(method) => onChange({ ...value, method })}
+          />
+          <div className="grid grid-cols-3 gap-2 lg:col-span-4">
+            <RuleEditorNumberField
+              label="窗口"
+              min={1}
+              value={value.window}
+              onChange={(window) => onChange({ ...value, window })}
+            />
+            <RuleEditorNumberField
+              label="取值日偏移"
+              help={RULE_EDITOR_OFFSET_HELP}
+              min={0}
+              value={value.offset ?? 1}
+              onChange={(offset) => onChange({ ...value, offset })}
+            />
+            <RuleEditorNumberField
+              label="倍数"
+              value={value.multiplier ?? 1}
+              onChange={(multiplier) => onChange({ ...value, multiplier })}
+            />
+          </div>
+        </>
+      ) : null}
+    </div>
+  );
+}
+
+function RuleMetricDraftConditionEditor({
+  item,
+  metrics,
+  onChange,
+  onRemove,
+}: {
+  item: RuleMetricDraftItem;
+  metrics: RuleMetricItem[];
+  onChange: (itemId: string, patch: RuleMetricDraftItemPatch) => void;
+  onRemove: (metricKey: string) => void;
+}) {
+  const condition = draftItemToCondition(item);
+  const commit = (nextCondition: RuleCondition) => {
+    onChange(item.id, conditionToDraftPatch(item, nextCondition, metrics));
+  };
+  const updateOperator = (operator: RuleOperator) => {
+    if (operator === 'between' || operator === 'not_between') {
+      commit({ ...condition, operator, right: createRuleRange(roundRuleDraftValue(item.value)) });
+      return;
+    }
+    if (!canUseRuleRightValue(operator)) {
+      commit({ ...condition, operator, right: undefined, compare: undefined, lookback: condition.lookback ?? 3 });
+      return;
+    }
+    if (operator === 'consecutive') {
+      commit({ ...condition, operator, compare: condition.compare ?? '>', right: condition.right ?? createRuleLiteral(roundRuleDraftValue(item.value)), lookback: 3 });
+      return;
+    }
+    if (operator === 'frequency') {
+      commit({ ...condition, operator, compare: condition.compare ?? '>', right: condition.right ?? createRuleLiteral(roundRuleDraftValue(item.value)), lookback: 10, minCount: 6 });
+      return;
+    }
+    commit({ ...condition, operator, right: condition.right && condition.right.type !== 'range' ? condition.right : createRuleLiteral(roundRuleDraftValue(item.value)) });
+  };
+
+  return (
+    <div className="rounded-xl border border-border/55 bg-elevated/35 p-3">
+      <div className="grid gap-2 xl:grid-cols-[minmax(9rem,1fr)_10rem_5rem_auto]">
+        <RuleEditorMetricSelectField
+          label="指标 key"
+          value={condition.left.metric}
+          metrics={metrics}
+          onChange={(metric) => commit({ ...condition, left: { ...condition.left, metric } })}
+        />
+        <RuleEditorSelectField
+          label="关系"
+          value={condition.operator}
+          options={RULE_OPERATOR_OPTIONS}
+          onChange={updateOperator}
+        />
+        <RuleEditorNumberField
+          label="取值日偏移"
+          help={RULE_EDITOR_OFFSET_HELP}
+          min={0}
+          value={condition.left.offset ?? 0}
+          onChange={(offset) => commit({ ...condition, left: { ...condition.left, offset } })}
+        />
+        <div className="flex items-end">
+          <Button variant="ghost" size="sm" onClick={() => onRemove(item.key)} aria-label={`删除 ${item.label} 子条件`}>
+            <Trash2 className="h-4 w-4" />
+          </Button>
+        </div>
+      </div>
+
+      {condition.operator === 'consecutive' || condition.operator === 'frequency' ? (
+        <div className="mt-3 grid gap-2 md:grid-cols-3">
+          <RuleEditorSelectField
+            label="内部比较"
+            value={condition.compare ?? '>'}
+            options={RULE_COMPARE_OPTIONS}
+            onChange={(compare) => commit({ ...condition, compare })}
+          />
+          <RuleEditorNumberField
+            label="观察周期"
+            min={1}
+            value={condition.lookback ?? 1}
+            onChange={(lookback) => commit({ ...condition, lookback })}
+          />
+          {condition.operator === 'frequency' ? (
+            <RuleEditorNumberField
+              label="至少次数"
+              min={1}
+              value={condition.minCount ?? 1}
+              onChange={(minCount) => commit({ ...condition, minCount })}
+            />
+          ) : null}
+        </div>
+      ) : null}
+
+      {condition.operator === 'trend_up' || condition.operator === 'trend_down' || condition.operator === 'new_high' || condition.operator === 'new_low' ? (
+        <div className="mt-3 max-w-xs">
+          <RuleEditorNumberField
+            label="观察周期"
+            min={1}
+            value={condition.lookback ?? (condition.operator.startsWith('new_') ? 20 : 3)}
+            onChange={(lookback) => commit({ ...condition, lookback })}
+          />
+        </div>
+      ) : null}
+
+      {canUseRuleRightValue(condition.operator) && condition.right ? (
+        <div className="mt-3">
+          <RuleEditorValueEditor
+            value={condition.right}
+            metrics={metrics}
+            onChange={(right) => commit({ ...condition, right })}
+          />
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+const RuleMetricDraftEditor: React.FC<{
+  draft: RuleMetricDraft;
+  metrics: RuleMetricItem[];
+  isMetricsLoading: boolean;
+  metricsError: string | null;
+  onChange: (itemId: string, patch: RuleMetricDraftItemPatch) => void;
+  onRemove: (metricKey: string) => void;
+  onClose: () => void;
+  onOpenRulesPage: () => void;
+}> = ({ draft, metrics, isMetricsLoading, metricsError, onChange, onRemove, onClose, onOpenRulesPage }) => {
+  const editorMetrics = metrics.length > 0 ? metrics : getFallbackRuleMetrics(draft);
+  const summary = draft.items
+    .map((item) => conditionSummary(editorMetrics, draftItemToCondition(item)))
+    .join(' 且 ');
+
+  return (
+    <div
+      className="fixed right-4 top-20 z-[95] flex max-h-[72vh] w-[min(92vw,58rem)] flex-col overflow-hidden rounded-2xl border border-border/70 bg-card/95 shadow-2xl backdrop-blur-xl md:right-8"
+      role="dialog"
+      aria-label="已选规则条件编辑"
+    >
+      <div className="flex shrink-0 items-start justify-between gap-3 border-b border-subtle px-4 py-3">
+        <div className="min-w-0">
+          <div className="flex flex-wrap items-center gap-2">
+            <h3 className="text-base font-semibold text-foreground">规则条件草稿</h3>
+            <Badge variant="info" size="sm">已选 {draft.items.length}</Badge>
+          </div>
+          <p className="mt-1 text-xs text-secondary-text">
+            当前草稿会在规则页生成同一个条件组，多个子条件按“且”关系判断。
+          </p>
+        </div>
+        <div className="flex shrink-0 items-center gap-2">
+          <Button variant="secondary" size="sm" onClick={onOpenRulesPage}>
+            <Plus className="h-4 w-4" />
+            去规则
+          </Button>
+          <Button variant="ghost" size="sm" onClick={onClose} aria-label="关闭规则条件草稿">
+            <X className="h-4 w-4" />
+          </Button>
+        </div>
+      </div>
+      <div className="min-h-0 flex-1 overflow-y-auto p-4">
+        {isMetricsLoading ? (
+          <div className="mb-3 rounded-xl border border-subtle bg-elevated/30 px-3 py-2 text-xs text-secondary-text">
+            正在加载规则指标列表...
+          </div>
+        ) : null}
+        {metricsError ? (
+          <div className="mb-3 rounded-xl border border-danger/35 bg-danger/10 px-3 py-2 text-xs text-danger">
+            {metricsError}
+          </div>
+        ) : null}
+        <div className="space-y-3">
+          {draft.items.map((item) => (
+            <RuleMetricDraftConditionEditor
+              key={item.id}
+              item={item}
+              metrics={editorMetrics}
+              onChange={onChange}
+              onRemove={onRemove}
+            />
+          ))}
+        </div>
+      </div>
+      <div className="shrink-0 border-t border-subtle p-4">
+        <div className="rounded-xl border border-border/55 bg-elevated/35 px-3 py-2 text-sm text-secondary-text">
+          {summary}
+        </div>
+      </div>
+    </div>
+  );
+};
+
+function readRuleMetricDraftForStock(stockCode: string): RuleMetricDraft | null {
+  const draft = readRuleMetricDraft();
+  if (!draft || draft.items.length === 0) {
+    return null;
+  }
+  if (draft.stockCode && draft.stockCode !== stockCode) {
+    return null;
+  }
+  return draft;
+}
+
+const RuleMetricAddButton: React.FC<{
+  metricKey: string;
+  label: string;
+  value?: number | null;
+  unit?: string | null;
+  date?: string | null;
+  onAdd?: AddRuleMetricHandler;
+}> = ({ metricKey, label, value, unit, date, onAdd }) => {
+  const selectedMetricKeys = useContext(RuleMetricSelectionContext);
+  const selected = selectedMetricKeys.has(metricKey);
+  if (!onAdd) {
+    return null;
+  }
+
+  return (
+    <Tooltip content={selected ? `移除「${label}」规则条件` : `添加「${label}」到规则条件`} side="bottom">
+      <button
+        type="button"
+        aria-label={selected ? `移除 ${label} 从规则` : `添加 ${label} 到规则`}
+        onClick={(event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          onAdd({ key: metricKey, label, value, unit, date });
+        }}
+        className="inline-flex h-4 w-4 shrink-0 items-center justify-center rounded-full border transition-colors hover:scale-105 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/45"
+        style={{
+          borderColor: selected ? TERMINAL_COLORS.cyan : TERMINAL_COLORS.redGrid,
+          color: selected ? TERMINAL_COLORS.orange : TERMINAL_COLORS.cyan,
+          backgroundColor: selected ? 'rgba(6, 182, 212, 0.14)' : TERMINAL_COLORS.panel,
+        }}
+      >
+        {selected ? <Minus className="h-3 w-3" /> : <Plus className="h-3 w-3" />}
+      </button>
+    </Tooltip>
+  );
+};
+
+const MetricInline: React.FC<{
+  metricKey: string;
+  label: string;
+  value?: number | null;
+  unit?: string | null;
+  date?: string | null;
+  color?: string;
+  onAdd?: AddRuleMetricHandler;
+  children: React.ReactNode;
+}> = ({ metricKey, label, value, unit, date, color, onAdd, children }) => (
+  <span className="inline-flex items-center gap-1" style={color ? { color } : undefined}>
+    <RuleMetricAddButton
+      metricKey={metricKey}
+      label={label}
+      value={value}
+      unit={unit}
+      date={date}
+      onAdd={onAdd}
+    />
+    <span>{children}</span>
+  </span>
+);
+
 function getPeriodMeta(period: KLinePeriod) {
   const option = KLINE_PERIOD_OPTIONS.find((item) => item.value === period) ?? KLINE_PERIOD_OPTIONS[0];
   const isDaily = option.value === 'daily';
@@ -231,26 +970,6 @@ function getMarketKind(stockCode: string): 'cn' | 'hk' | 'us' {
     return 'us';
   }
   return 'cn';
-}
-
-function getTimeMeta(stockCode: string) {
-  const market = getMarketKind(stockCode);
-  if (market === 'us') {
-    return {
-      klineLabel: '美东 ET',
-      quoteLabel: '北京时间',
-    };
-  }
-  if (market === 'hk') {
-    return {
-      klineLabel: '港股时间',
-      quoteLabel: '北京时间',
-    };
-  }
-  return {
-    klineLabel: '北京时间',
-    quoteLabel: '北京时间',
-  };
 }
 
 function createHistoryState(
@@ -368,6 +1087,13 @@ function formatRatioPct(value?: number | null, digits = 2): string {
   }
   const pctValue = Math.abs(value) <= 1 ? value * 100 : value;
   return `${pctValue.toFixed(digits)}%`;
+}
+
+function normalizeRatioPctValue(value?: number | null): number | null | undefined {
+  if (typeof value !== 'number' || Number.isNaN(value)) {
+    return value;
+  }
+  return Math.abs(value) <= 1 ? value * 100 : value;
 }
 
 function formatSignedRatioPct(value?: number | null, digits = 1): string {
@@ -493,6 +1219,7 @@ function buildChartPoints(data: KLineData[]): ChartPoint[] {
       macd: (dif - dea) * 2,
       rsi6: relativeStrengthIndex(data, index, 6),
       rsi12: relativeStrengthIndex(data, index, 12),
+      rsi24: relativeStrengthIndex(data, index, 24),
     };
   });
 }
@@ -515,6 +1242,16 @@ function getPointAmplitude(point: ChartPoint, previous?: ChartPoint): number | u
     return undefined;
   }
   return ((point.high - point.low) / base) * 100;
+}
+
+function getPointChangePct(point: ChartPoint, previous?: ChartPoint): number | undefined {
+  if (isValidNumber(point.changePercent)) {
+    return point.changePercent;
+  }
+  if (!previous?.close) {
+    return undefined;
+  }
+  return ((point.close - previous.close) / previous.close) * 100;
 }
 
 function getPointVolumeRatio(point: ChartPoint): number | undefined {
@@ -651,6 +1388,65 @@ function deriveAfterHoursAmount(afterHoursVolume?: number | null, price?: number
   }
   const amount = afterHoursVolume * 100 * price;
   return Number.isFinite(amount) && amount > 0 ? amount : undefined;
+}
+
+function inferLimitRatio(limitPrice?: number | null, prevClose?: number | null, direction: 1 | -1 = 1): number {
+  if (isValidNumber(limitPrice) && isValidNumber(prevClose) && prevClose > 0) {
+    const ratio = (limitPrice / prevClose) - 1;
+    if (Number.isFinite(ratio) && Math.sign(ratio) === direction) {
+      return ratio;
+    }
+  }
+  return direction * 0.1;
+}
+
+function resolvePointLimitPrice(
+  point: ChartPoint | null | undefined,
+  previous: ChartPoint | undefined,
+  quote: StockQuote | null,
+  showRealtimeMetrics: boolean,
+  direction: 1 | -1,
+): number | undefined {
+  const quoteLimit = direction > 0 ? quote?.limitUpPrice : quote?.limitDownPrice;
+  if (showRealtimeMetrics && isValidNumber(quoteLimit)) {
+    return quoteLimit;
+  }
+  const basePrice = previous?.close ?? point?.open ?? quote?.prevClose;
+  if (!isValidNumber(basePrice) || basePrice <= 0) {
+    return isValidNumber(quoteLimit) ? quoteLimit : undefined;
+  }
+  const ratio = inferLimitRatio(quoteLimit, quote?.prevClose, direction);
+  return Math.round(basePrice * (1 + ratio) * 100) / 100;
+}
+
+function estimatePointEntrustRatio(point?: ChartPoint | null): number | undefined {
+  if (!point || !isValidNumber(point.high) || !isValidNumber(point.low) || point.high <= point.low) {
+    return undefined;
+  }
+  const ratio = ((point.close - point.open) / (point.high - point.low)) * 100;
+  return clamp(ratio, -100, 100);
+}
+
+function estimatePointMainNetInflow(point?: ChartPoint | null, previous?: ChartPoint): number | undefined {
+  if (!point) {
+    return undefined;
+  }
+  const amount = point.amount ?? (isValidNumber(point.volume) ? point.close * point.volume * 100 : undefined);
+  if (!isValidNumber(amount)) {
+    return undefined;
+  }
+  const changePct = getPointChangePct(point, previous) ?? 0;
+  const amplitude = getPointAmplitude(point, previous) ?? 0;
+  const volumeRatio = getPointVolumeRatio(point) ?? 1;
+  const direction = changePct >= 0 ? 1 : -1;
+  const flowRatio = clamp(
+    (changePct / 100) * 0.9
+      + direction * (amplitude / 100) * 0.08
+      + (volumeRatio - 1) * 0.055,
+    -0.26,
+    0.26,
+  );
+  return amount * flowRatio;
 }
 
 function getMainNetInflow(
@@ -1289,7 +2085,10 @@ function buildTrendPath<T>(
 
 type CoreMetricItem = {
   label: string;
+  metricKey: string;
   value: string;
+  rawValue?: number | null;
+  unit?: string | null;
   tone?: 'up' | 'down' | 'neutral';
 };
 
@@ -1299,7 +2098,8 @@ const CoreQuoteMetrics: React.FC<{
   quote: StockQuote | null;
   referenceQuote: StockQuote | null;
   points: ChartPoint[];
-}> = ({ point, previous, quote, referenceQuote, points }) => {
+  onAddRuleMetric?: AddRuleMetricHandler;
+}> = ({ point, previous, quote, referenceQuote, points, onAddRuleMetric }) => {
   const close = quote?.currentPrice ?? point?.close;
   const previousClose = quote?.prevClose ?? previous?.close;
   const change = quote?.change
@@ -1317,15 +2117,15 @@ const CoreQuoteMetrics: React.FC<{
   const coreVolumeRatio = quote?.volumeRatio ?? (point ? getPointVolumeRatio(point) : undefined);
   const coreTurnoverRate = resolvePointTurnoverRate(point, referenceQuote, points, quote !== null);
   const coreRows: CoreMetricItem[] = [
-    { label: '高', value: formatNumber(quote?.high ?? point?.high), tone: 'up' },
-    { label: '市值', value: formatCompactNumber(totalMv) },
-    { label: '量比', value: formatNumber(coreVolumeRatio, 2), tone: isValidNumber(coreVolumeRatio) && coreVolumeRatio >= 1 ? 'up' : 'down' },
-    { label: '低', value: formatNumber(quote?.low ?? point?.low), tone: 'down' },
-    { label: '流通', value: formatCompactNumber(circMv) },
-    { label: '换', value: formatPlainPct(coreTurnoverRate) },
-    { label: '开', value: formatNumber(quote?.open ?? point?.open), tone: 'up' },
-    { label: '市盈TTM', value: formatNumber(peRatio, 2) },
-    { label: '额', value: formatCompactNumber(quote?.amount ?? point?.amount) },
+    { label: '最高价', metricKey: 'high', value: formatNumber(quote?.high ?? point?.high), rawValue: quote?.high ?? point?.high, unit: '元', tone: 'up' },
+    { label: '总市值', metricKey: 'total_mv', value: formatCompactNumber(totalMv), rawValue: totalMv, unit: '元' },
+    { label: '量比', metricKey: 'volume_ratio', value: formatNumber(coreVolumeRatio, 2), rawValue: coreVolumeRatio, unit: '倍', tone: isValidNumber(coreVolumeRatio) && coreVolumeRatio >= 1 ? 'up' : 'down' },
+    { label: '最低价', metricKey: 'low', value: formatNumber(quote?.low ?? point?.low), rawValue: quote?.low ?? point?.low, unit: '元', tone: 'down' },
+    { label: '流通市值', metricKey: 'circ_mv', value: formatCompactNumber(circMv), rawValue: circMv, unit: '元' },
+    { label: '换手率', metricKey: 'turnover_rate', value: formatPlainPct(coreTurnoverRate), rawValue: coreTurnoverRate, unit: '%' },
+    { label: '开盘价', metricKey: 'open', value: formatNumber(quote?.open ?? point?.open), rawValue: quote?.open ?? point?.open, unit: '元', tone: 'up' },
+    { label: '市盈TTM', metricKey: 'pe_ratio', value: formatNumber(peRatio, 2), rawValue: peRatio },
+    { label: '成交额', metricKey: 'amount', value: formatCompactNumber(quote?.amount ?? point?.amount), rawValue: quote?.amount ?? point?.amount, unit: '元' },
   ];
 
   const getMetricColor = (item: CoreMetricItem) => {
@@ -1346,22 +2146,57 @@ const CoreQuoteMetrics: React.FC<{
       aria-label="核心行情指标"
     >
       <div className="min-w-0">
-        <div
-          className="text-[2rem] font-bold leading-none tabular-nums md:text-[2.35rem]"
-          style={{ color: trendColor }}
+        <MetricInline
+          metricKey={quote ? 'current_price' : 'close'}
+          label={quote ? '最新价' : '收盘价'}
+          value={close}
+          unit="元"
+          date={point?.date}
+          onAdd={onAddRuleMetric}
+          color={trendColor}
         >
-          {formatNumber(close)}
-        </div>
+          <span className="text-[2rem] font-bold leading-none tabular-nums md:text-[2.35rem]">
+            {formatNumber(close)}
+          </span>
+        </MetricInline>
         <div className="mt-2 flex flex-wrap items-center gap-x-2 gap-y-1 text-[12px] font-semibold tabular-nums" style={{ color: trendColor }}>
-          <span>{formatSignedNumber(change)}</span>
-          <span>{formatPct(changePct)}</span>
+          <MetricInline
+            metricKey="change"
+            label="涨跌额"
+            value={change}
+            unit="元"
+            date={point?.date}
+            onAdd={onAddRuleMetric}
+          >
+            {formatSignedNumber(change)}
+          </MetricInline>
+          <MetricInline
+            metricKey={quote ? 'change_percent' : 'pct_chg'}
+            label={quote ? '实时涨跌幅' : '涨跌幅'}
+            value={changePct}
+            unit="%"
+            date={point?.date}
+            onAdd={onAddRuleMetric}
+          >
+            {formatPct(changePct)}
+          </MetricInline>
         </div>
       </div>
 
       <div className="grid min-w-0 grid-cols-3 gap-x-4 gap-y-1 text-[12px] md:text-[13px]">
         {coreRows.map((item) => (
-          <div key={item.label} className="grid min-w-0 grid-cols-[2.6rem_minmax(0,1fr)] items-baseline gap-1">
-            <span className="truncate" style={{ color: TERMINAL_COLORS.muted }}>{item.label}</span>
+          <div key={item.label} className="grid min-w-0 grid-cols-[5.5rem_minmax(0,1fr)] items-baseline gap-1">
+            <span className="inline-flex min-w-0 items-center gap-1 truncate" style={{ color: TERMINAL_COLORS.muted }}>
+              <RuleMetricAddButton
+                metricKey={item.metricKey}
+                label={item.label}
+                value={item.rawValue}
+                unit={item.unit}
+                date={point?.date}
+                onAdd={onAddRuleMetric}
+              />
+              <span className="truncate">{item.label}</span>
+            </span>
             <span className="truncate text-right font-semibold tabular-nums" style={{ color: getMetricColor(item) }}>{item.value}</span>
           </div>
         ))}
@@ -1378,16 +2213,35 @@ const ChartLegend: React.FC<{
   metrics: StockIndicatorMetrics | null;
   points: ChartPoint[];
   showRealtimeMetrics: boolean;
-}> = ({ point, previous, periodLabel, latestQuote, metrics, points, showRealtimeMetrics }) => {
+  onAddRuleMetric?: AddRuleMetricHandler;
+}> = ({ point, previous, periodLabel, latestQuote, metrics, points, showRealtimeMetrics, onAddRuleMetric }) => {
+  const [moreOpen, setMoreOpen] = useState(false);
   const totalMv = latestQuote?.totalMv;
   const circMv = latestQuote?.circMv;
   const totalShares = latestQuote?.totalShares ?? deriveShares(totalMv, latestQuote?.currentPrice);
   const floatShares = latestQuote?.floatShares ?? deriveShares(circMv, latestQuote?.currentPrice);
-  const mainNetInflow = showRealtimeMetrics ? getMainNetInflow(points, latestQuote, metrics) : undefined;
-  const mainNetVolumePct = showRealtimeMetrics ? getMainNetVolumePct(points, latestQuote, metrics) : undefined;
+  const selectedPrice = point?.close ?? latestQuote?.currentPrice;
+  const selectedCircMv = resolveQuoteMarketValue(circMv, floatShares, selectedPrice);
+  const mainNetInflow = showRealtimeMetrics
+    ? getMainNetInflow(points, latestQuote, metrics)
+    : estimatePointMainNetInflow(point, previous);
+  const actualMainNetVolumePct = showRealtimeMetrics ? metrics?.capitalFlow?.mainNetInflowRatio : undefined;
+  const mainNetVolumePct = isValidNumber(actualMainNetVolumePct)
+    ? actualMainNetVolumePct
+    : isValidNumber(mainNetInflow) && isValidNumber(selectedCircMv) && selectedCircMv > 0
+      ? (mainNetInflow / selectedCircMv) * 100
+      : getMainNetVolumePct(points, latestQuote, showRealtimeMetrics ? metrics : null);
+  const limitUpPrice = resolvePointLimitPrice(point, previous, latestQuote, showRealtimeMetrics, 1);
+  const limitDownPrice = resolvePointLimitPrice(point, previous, latestQuote, showRealtimeMetrics, -1);
+  const priceSpeed = showRealtimeMetrics && isValidNumber(latestQuote?.priceSpeed)
+    ? latestQuote.priceSpeed
+    : point ? getPointChangePct(point, previous) : undefined;
+  const entrustRatio = showRealtimeMetrics && isValidNumber(latestQuote?.entrustRatio)
+    ? latestQuote.entrustRatio
+    : estimatePointEntrustRatio(point);
 
   return (
-    <div data-testid="indicator-price-header" className="flex flex-wrap items-center gap-x-3 gap-y-1 font-mono text-[11px] leading-none">
+    <div data-testid="indicator-price-header" className="flex min-w-0 flex-1 flex-wrap items-center gap-x-2 gap-y-1 font-mono text-[11px] leading-none">
       <span style={{ color: TERMINAL_COLORS.text }}>{periodLabel}</span>
       <span className="inline-flex items-center gap-1" style={{ color: TERMINAL_COLORS.cyan }}>
         <i className="h-2 w-4 border" style={{ borderColor: TERMINAL_COLORS.cyan, backgroundColor: TERMINAL_COLORS.cyan }} />阳线
@@ -1399,20 +2253,68 @@ const ChartLegend: React.FC<{
       <span style={{ color: (point?.close ?? 0) >= (point?.open ?? 0) ? TERMINAL_COLORS.cyan : TERMINAL_COLORS.orange }}>
         {point ? (point.close >= point.open ? '阳线' : '阴线') : '--'}
       </span>
-      <span style={{ color: TERMINAL_COLORS.axisText }}>振幅:{formatPct(point ? getPointAmplitude(point, previous) : undefined)}</span>
-      <span style={{ color: TERMINAL_COLORS.axisText }}>流通股本:{formatCompactShares(floatShares)}</span>
-      <span style={{ color: TERMINAL_COLORS.axisText }}>总股本:{formatCompactShares(totalShares)}</span>
-      <span style={{ color: TERMINAL_COLORS.axisText }}>涨幅限价:{formatNumber(latestQuote?.limitUpPrice)}</span>
-      <span style={{ color: TERMINAL_COLORS.axisText }}>跌幅限价:{formatNumber(latestQuote?.limitDownPrice)}</span>
-      <span style={{ color: TERMINAL_COLORS.axisText }}>涨速:{formatPct(latestQuote?.priceSpeed)}</span>
-      <span style={{ color: TERMINAL_COLORS.axisText }}>主力净量:{formatPct(mainNetVolumePct)}</span>
-      <span style={{ color: TERMINAL_COLORS.axisText }}>主力净流入:{formatCompactNumber(mainNetInflow)}</span>
-      <span style={{ color: TERMINAL_COLORS.axisText }}>委比:{formatPct(latestQuote?.entrustRatio)}</span>
-      <span style={{ color: LINE_COLORS.ma5 }}>MA5:{formatNumber(point?.ma5)}</span>
-      <span style={{ color: LINE_COLORS.ma10 }}>MA10:{formatNumber(point?.ma10)}</span>
-      <span style={{ color: LINE_COLORS.ma20 }}>MA20:{formatNumber(point?.ma20)}</span>
-      <span style={{ color: LINE_COLORS.ma30 }}>MA30:{formatNumber(point?.ma30)}</span>
-      <span style={{ color: LINE_COLORS.ma60 }}>MA60:{formatNumber(point?.ma60)}</span>
+      <MetricInline metricKey="ma5" label="MA5" value={point?.ma5} unit="元" date={point?.date} color={LINE_COLORS.ma5} onAdd={onAddRuleMetric}>MA5:{formatNumber(point?.ma5)}</MetricInline>
+      <MetricInline metricKey="ma10" label="MA10" value={point?.ma10} unit="元" date={point?.date} color={LINE_COLORS.ma10} onAdd={onAddRuleMetric}>MA10:{formatNumber(point?.ma10)}</MetricInline>
+      <MetricInline metricKey="ma20" label="MA20" value={point?.ma20} unit="元" date={point?.date} color={LINE_COLORS.ma20} onAdd={onAddRuleMetric}>MA20:{formatNumber(point?.ma20)}</MetricInline>
+      <MetricInline metricKey="ma30" label="MA30" value={point?.ma30} unit="元" date={point?.date} color={LINE_COLORS.ma30} onAdd={onAddRuleMetric}>MA30:{formatNumber(point?.ma30)}</MetricInline>
+      <MetricInline metricKey="ma60" label="MA60" value={point?.ma60} unit="元" date={point?.date} color={LINE_COLORS.ma60} onAdd={onAddRuleMetric}>MA60:{formatNumber(point?.ma60)}</MetricInline>
+      <span className="relative ml-auto inline-flex shrink-0">
+        <button
+          type="button"
+          aria-label="更多K线指标"
+          aria-expanded={moreOpen}
+          onClick={() => setMoreOpen((open) => !open)}
+          className="inline-flex h-5 items-center gap-1 rounded border px-2 font-mono text-[11px] transition-colors hover:bg-white/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/45"
+          style={{
+            borderColor: moreOpen ? TERMINAL_COLORS.cyan : TERMINAL_COLORS.redGrid,
+            color: moreOpen ? TERMINAL_COLORS.cyan : TERMINAL_COLORS.axisText,
+            backgroundColor: moreOpen ? 'rgba(35, 210, 255, 0.12)' : 'rgba(8, 17, 29, 0.42)',
+          }}
+        >
+          更多
+          <ChevronDown className={`h-3 w-3 transition-transform ${moreOpen ? 'rotate-180' : ''}`} />
+        </button>
+        {moreOpen ? (
+          <span
+            role="dialog"
+            aria-label="更多K线指标"
+            className="absolute right-0 top-[calc(100%+6px)] z-30 grid w-[min(28rem,calc(100vw-3rem))] grid-cols-1 gap-x-3 gap-y-2 rounded-lg border p-3 text-left shadow-2xl backdrop-blur-md sm:grid-cols-2"
+            style={{
+              borderColor: TERMINAL_COLORS.redGrid,
+              backgroundColor: 'rgba(8, 17, 29, 0.76)',
+              boxShadow: '0 18px 42px rgba(0, 0, 0, 0.38)',
+            }}
+          >
+            <MetricInline metricKey="amplitude" label="振幅" value={point ? getPointAmplitude(point, previous) : undefined} unit="%" date={point?.date} color={TERMINAL_COLORS.axisText} onAdd={onAddRuleMetric}>
+              振幅:{formatPct(point ? getPointAmplitude(point, previous) : undefined)}
+            </MetricInline>
+            <MetricInline metricKey="float_shares" label="流通股本" value={floatShares} unit="股" date={point?.date} color={TERMINAL_COLORS.axisText} onAdd={onAddRuleMetric}>
+              流通股本:{formatCompactShares(floatShares)}
+            </MetricInline>
+            <MetricInline metricKey="total_shares" label="总股本" value={totalShares} unit="股" date={point?.date} color={TERMINAL_COLORS.axisText} onAdd={onAddRuleMetric}>
+              总股本:{formatCompactShares(totalShares)}
+            </MetricInline>
+            <MetricInline metricKey="limit_up_price" label="涨幅限价" value={limitUpPrice} unit="元" date={point?.date} color={TERMINAL_COLORS.axisText} onAdd={onAddRuleMetric}>
+              涨幅限价:{formatNumber(limitUpPrice)}
+            </MetricInline>
+            <MetricInline metricKey="limit_down_price" label="跌幅限价" value={limitDownPrice} unit="元" date={point?.date} color={TERMINAL_COLORS.axisText} onAdd={onAddRuleMetric}>
+              跌幅限价:{formatNumber(limitDownPrice)}
+            </MetricInline>
+            <MetricInline metricKey="price_speed" label="涨速" value={priceSpeed} unit="%" date={point?.date} color={TERMINAL_COLORS.axisText} onAdd={onAddRuleMetric}>
+              涨速:{formatPct(priceSpeed)}
+            </MetricInline>
+            <MetricInline metricKey="main_net_volume_pct" label="主力净量" value={mainNetVolumePct} unit="%" date={point?.date} color={TERMINAL_COLORS.axisText} onAdd={onAddRuleMetric}>
+              主力净量:{formatPct(mainNetVolumePct)}
+            </MetricInline>
+            <MetricInline metricKey="main_force_net" label="主力净流入" value={mainNetInflow} unit="元" date={point?.date} color={TERMINAL_COLORS.axisText} onAdd={onAddRuleMetric}>
+              主力净流入:{formatCompactNumber(mainNetInflow)}
+            </MetricInline>
+            <MetricInline metricKey="entrust_ratio" label="委比" value={entrustRatio} unit="%" date={point?.date} color={TERMINAL_COLORS.axisText} onAdd={onAddRuleMetric}>
+              委比:{formatPct(entrustRatio)}
+            </MetricInline>
+          </span>
+        ) : null}
+      </span>
     </div>
   );
 };
@@ -1441,6 +2343,28 @@ const TerminalTabs: React.FC<{
   </div>
 );
 
+const ChartMaximizeButton: React.FC<{
+  label: string;
+  isMaximized?: boolean;
+  onClick?: () => void;
+}> = ({ label, isMaximized = false, onClick }) => (
+  <Tooltip content={isMaximized ? `还原${label}` : `最大化${label}`} side="bottom">
+    <button
+      type="button"
+      aria-label={isMaximized ? `还原${label}` : `最大化${label}`}
+      onClick={onClick}
+      className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-lg border transition-colors hover:bg-white/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/45"
+      style={{
+        borderColor: TERMINAL_COLORS.redGrid,
+        color: TERMINAL_COLORS.cyan,
+        backgroundColor: TERMINAL_COLORS.panel2,
+      }}
+    >
+      {isMaximized ? <Minimize2 className="h-4 w-4" /> : <Maximize2 className="h-4 w-4" />}
+    </button>
+  </Tooltip>
+);
+
 const CandlestickChart: React.FC<{
   points: ChartPoint[];
   visible: ChartPoint[];
@@ -1458,16 +2382,16 @@ const CandlestickChart: React.FC<{
   onOpenChartMenu: (event: React.MouseEvent) => void;
   canZoomIn: boolean;
   canZoomOut: boolean;
+  onAddRuleMetric?: AddRuleMetricHandler;
   period: KLinePeriod;
   periodLabel: string;
-  recentLabel: string;
-  sampleUnit: string;
-  timeZoneLabel: string;
   selectedPeriod: KLinePeriod;
   onPeriodChange: (period: KLinePeriod) => void;
   highlightedDate?: string;
   quote: StockQuote | null;
   metrics: StockIndicatorMetrics | null;
+  isMaximized?: boolean;
+  onToggleMaximize?: () => void;
 }> = ({
   points,
   visible,
@@ -1485,23 +2409,25 @@ const CandlestickChart: React.FC<{
   onOpenChartMenu,
   canZoomIn,
   canZoomOut,
+  onAddRuleMetric,
   period,
   periodLabel,
-  recentLabel,
-  sampleUnit,
-  timeZoneLabel,
   selectedPeriod,
   onPeriodChange,
   highlightedDate,
   quote,
   metrics,
+  isMaximized = false,
+  onToggleMaximize,
 }) => {
   const width = 1320;
-  const axisWidth = 64;
+  const axisWidth = 76;
   const plotRight = width - axisWidth;
-  const priceTop = 18;
-  const priceHeight = 264;
-  const chartBottom = 306;
+  const priceTop = 22;
+  const priceHeight = isMaximized ? 560 : 390;
+  const zeroAxisY = priceTop + priceHeight + 20;
+  const xAxisLabelY = zeroAxisY + 24;
+  const chartBottom = xAxisLabelY + 16;
   const canPan = maxWindowStart > 0;
   const visibleFirst = visible[0];
   const visibleLast = visible.at(-1);
@@ -1545,8 +2471,6 @@ const CandlestickChart: React.FC<{
       : null;
   const activePrevious = hoveredPoint ? hoveredPrevious : activePointIndex === null ? undefined : points[activePointIndex - 1];
   const activeIsLatest = activePointIndex !== null && activePointIndex === points.length - 1;
-  const activeQuote = activeIsLatest ? quote : null;
-  const activeMetrics = activeIsLatest ? metrics : null;
   const latestCloseY = typeof visibleLast?.close === 'number' ? yForPrice(visibleLast.close) : null;
   const highlightedDateKey = normalizeDateKey(highlightedDate);
   const windowSliderMax = Math.max(maxWindowStart, 1);
@@ -1578,55 +2502,166 @@ const CandlestickChart: React.FC<{
       style={{ backgroundColor: TERMINAL_COLORS.bg }}
       onContextMenu={onOpenChartMenu}
     >
-      <div className="flex flex-wrap items-center justify-between gap-2 border-b px-2 py-1" style={{ borderColor: TERMINAL_COLORS.redGrid, backgroundColor: TERMINAL_COLORS.panel }}>
-        <div className="flex min-w-0 flex-wrap items-center gap-2">
-          <div
-            role="tablist"
-            aria-label="K线周期"
-            className="inline-flex items-center border font-mono text-[10px]"
-            style={{ borderColor: TERMINAL_COLORS.redGrid }}
-          >
-            {KLINE_PERIOD_OPTIONS.map((option) => {
-              const selected = selectedPeriod === option.value;
-              return (
-                <button
-                  key={option.value}
-                  type="button"
-                  role="tab"
-                  aria-selected={selected}
-                  onClick={() => onPeriodChange(option.value)}
-                  className="border-r px-2 py-1 last:border-r-0"
-                  style={{
-                    borderColor: TERMINAL_COLORS.redGrid,
-                    backgroundColor: selected ? TERMINAL_COLORS.cyan : TERMINAL_COLORS.panel,
-                    color: selected ? TERMINAL_COLORS.selectedText : TERMINAL_COLORS.muted,
-                  }}
-                >
-                  {option.label}
-                </button>
-              );
-            })}
+      <div className="border-b px-2 py-1" style={{ borderColor: TERMINAL_COLORS.redGrid, backgroundColor: TERMINAL_COLORS.panel }}>
+        <div className="grid items-start gap-2 lg:grid-cols-[max-content_minmax(20rem,34rem)] lg:justify-between">
+          <div className="min-w-0">
+            <div
+              role="tablist"
+              aria-label="K线周期"
+              className="inline-flex h-8 min-w-max items-stretch border font-mono text-[10px] leading-none"
+              style={{ borderColor: TERMINAL_COLORS.redGrid }}
+            >
+              {KLINE_PERIOD_OPTIONS.map((option) => {
+                const selected = selectedPeriod === option.value;
+                return (
+                  <button
+                    key={option.value}
+                    type="button"
+                    role="tab"
+                    aria-selected={selected}
+                    onClick={() => onPeriodChange(option.value)}
+                    className="inline-flex h-full items-center border-r px-3 last:border-r-0"
+                    style={{
+                      borderColor: TERMINAL_COLORS.redGrid,
+                      backgroundColor: selected ? TERMINAL_COLORS.cyan : TERMINAL_COLORS.panel,
+                      color: selected ? TERMINAL_COLORS.selectedText : TERMINAL_COLORS.muted,
+                    }}
+                  >
+                    {option.label}
+                  </button>
+                );
+              })}
+            </div>
           </div>
+          <div
+            data-testid="indicator-chart-time-axis"
+            className="flex h-8 min-w-0 items-stretch justify-self-start border font-mono text-[10px] leading-none lg:justify-self-end"
+            style={{ borderColor: TERMINAL_COLORS.redGrid, backgroundColor: TERMINAL_COLORS.bg }}
+          >
+          <button
+            type="button"
+            data-testid="indicator-chart-pan-left"
+            aria-label="向左平移K线时间"
+            title="向左平移K线时间"
+            disabled={!canPan || safeWindowStart === 0}
+            onClick={() => shiftWindow(-1)}
+            className="inline-flex h-full w-8 shrink-0 items-center justify-center border-r transition-colors hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-40"
+            style={{ borderColor: TERMINAL_COLORS.redGrid, color: TERMINAL_COLORS.text, backgroundColor: TERMINAL_COLORS.panel2 }}
+          >
+            <ChevronLeft className="h-4 w-4" />
+          </button>
+          <button
+            type="button"
+            data-testid="indicator-chart-zoom-out"
+            aria-label="缩小选中K线日期"
+            title="缩小选中K线日期"
+            disabled={!canZoomOut}
+            onClick={() => onTimelineZoomChange(-1)}
+            className="inline-flex h-full w-8 shrink-0 items-center justify-center border-r transition-colors hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-40"
+            style={{ borderColor: TERMINAL_COLORS.redGrid, color: TERMINAL_COLORS.cyan, backgroundColor: TERMINAL_COLORS.panel2 }}
+          >
+            <Minus className="h-4 w-4" />
+          </button>
+          <div className="flex min-w-[11rem] flex-1 items-center gap-2 px-2 sm:min-w-[17rem]">
+            <span className="hidden shrink-0 sm:inline" style={{ color: TERMINAL_COLORS.muted }}>时间窗口</span>
+            <div className="relative h-4 min-w-[4rem] flex-1" data-testid="indicator-window-slider-shell">
+              <div
+                data-testid="indicator-window-track"
+                className="pointer-events-none absolute left-0 right-0 top-1/2 h-1.5 -translate-y-1/2 overflow-hidden rounded-full"
+                style={{ backgroundColor: 'rgba(35, 210, 255, 0.22)' }}
+              >
+                <div
+                  className="h-full rounded-full"
+                  style={{ width: `${windowSliderProgress}%`, backgroundColor: TERMINAL_COLORS.cyan }}
+                />
+              </div>
+              <span
+                data-testid="indicator-window-thumb"
+                className="pointer-events-none absolute top-1/2 h-4 w-4 -translate-x-1/2 -translate-y-1/2 rounded-full"
+                style={{
+                  left: `${windowSliderProgress}%`,
+                  backgroundColor: TERMINAL_COLORS.cyan,
+                  boxShadow: `0 0 18px ${TERMINAL_COLORS.cyan}`,
+                }}
+              />
+              <input
+                type="range"
+                min={0}
+                max={windowSliderMax}
+                value={windowSliderValue}
+                disabled={!canPan}
+                aria-label="K线时间窗口"
+                onChange={(event) => {
+                  if (!canPan) {
+                    return;
+                  }
+                  onWindowStartChange(Number(event.currentTarget.value));
+                  onHoverPinnedChange(false);
+                  onHoverIndexChange(null);
+                }}
+                className="absolute inset-0 h-4 w-full cursor-grab opacity-0 disabled:cursor-not-allowed"
+                style={{ accentColor: TERMINAL_COLORS.cyan }}
+              />
+            </div>
+            <span className="hidden max-w-[10rem] shrink-0 truncate sm:inline" style={{ color: TERMINAL_COLORS.axisText }}>
+                {visibleFirst?.date ?? '--'} - {visibleLast?.date ?? '--'}
+              </span>
+          </div>
+          <button
+            type="button"
+            data-testid="indicator-chart-zoom-in"
+            aria-label="放大选中K线日期"
+            title="放大选中K线日期"
+            disabled={!canZoomIn}
+            onClick={() => onTimelineZoomChange(1)}
+            className="inline-flex h-full w-8 shrink-0 items-center justify-center border-l border-r transition-colors hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-40"
+            style={{ borderColor: TERMINAL_COLORS.redGrid, color: TERMINAL_COLORS.cyan, backgroundColor: TERMINAL_COLORS.panel2 }}
+          >
+            <Plus className="h-4 w-4" />
+          </button>
+          <button
+            type="button"
+            data-testid="indicator-chart-pan-right"
+            aria-label="向右平移K线时间"
+            title="向右平移K线时间"
+            disabled={!canPan || safeWindowStart === maxWindowStart}
+            onClick={() => shiftWindow(1)}
+            className="inline-flex h-full w-8 shrink-0 items-center justify-center border-r transition-colors hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-40"
+            style={{ borderColor: TERMINAL_COLORS.redGrid, color: TERMINAL_COLORS.text, backgroundColor: TERMINAL_COLORS.panel2 }}
+          >
+            <ChevronRight className="h-4 w-4" />
+          </button>
+          <button
+            type="button"
+            aria-label={isMaximized ? '还原K线图' : '最大化K线图'}
+            title={isMaximized ? '还原K线图' : '最大化K线图'}
+            onClick={onToggleMaximize}
+            className="inline-flex h-full w-8 shrink-0 items-center justify-center transition-colors hover:bg-white/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/45"
+            style={{ color: TERMINAL_COLORS.cyan, backgroundColor: TERMINAL_COLORS.panel2 }}
+          >
+            {isMaximized ? <Minimize2 className="h-4 w-4" /> : <Maximize2 className="h-4 w-4" />}
+          </button>
+          </div>
+        </div>
+        <div className="mt-1.5 flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1">
           <ChartLegend
             point={activePoint}
             previous={activePrevious}
             periodLabel={periodLabel}
-            latestQuote={activeQuote}
-            metrics={activeMetrics}
+            latestQuote={quote}
+            metrics={metrics}
             points={points}
             showRealtimeMetrics={activeIsLatest}
+            onAddRuleMetric={onAddRuleMetric}
           />
         </div>
-        <span className="font-mono text-[11px]" style={{ color: TERMINAL_COLORS.muted }}>
-          {recentLabel} {visible.length} {sampleUnit} · {periodLabel} · {timeZoneLabel}
-        </span>
       </div>
-      <div className="relative overflow-x-auto">
+      <div className="relative overflow-hidden">
         <svg
           viewBox={`0 0 ${width} ${chartBottom}`}
           role="img"
           aria-label="K线图"
-          className="h-[12.5rem] min-w-[46rem] w-full"
+          className="h-auto min-w-0 w-full"
           style={{ backgroundColor: TERMINAL_COLORS.bg }}
         >
           <rect x="0" y="0" width={width} height={chartBottom} fill={TERMINAL_COLORS.bg} />
@@ -1637,7 +2672,14 @@ const CandlestickChart: React.FC<{
             return (
               <g key={`grid-${line}`}>
                 <line x1="0" y1={y} x2={plotRight} y2={y} stroke={TERMINAL_COLORS.redGrid} strokeDasharray="2 5" strokeWidth="0.8" opacity="0.82" />
-                <text x={plotRight + 8} y={y + 4} fill={TERMINAL_COLORS.axisText} className="text-[11px] font-semibold tabular-nums">{formatNumber(value, 2)}</text>
+                <text
+                  x={plotRight + 8}
+                  y={line === 4 ? y - 4 : y + 4}
+                  fill={TERMINAL_COLORS.axisText}
+                  className="text-[11px] font-semibold tabular-nums"
+                >
+                  {formatNumber(value, 2)}
+                </text>
               </g>
             );
           })}
@@ -1655,6 +2697,23 @@ const CandlestickChart: React.FC<{
           ))}
           <line x1={plotRight} y1="0" x2={plotRight} y2={chartBottom} stroke={TERMINAL_COLORS.axis} strokeWidth="1.2" />
           <line x1="0" y1={priceTop + priceHeight} x2={plotRight} y2={priceTop + priceHeight} stroke={TERMINAL_COLORS.axis} strokeWidth="1" />
+          <path
+            d={`M${plotRight + 6} ${priceTop + priceHeight + 5} l10 6 l-10 6 l10 6`}
+            fill="none"
+            stroke={TERMINAL_COLORS.axisText}
+            strokeWidth="1"
+            opacity="0.7"
+          />
+          <line x1="0" y1={zeroAxisY} x2={plotRight} y2={zeroAxisY} stroke={TERMINAL_COLORS.axis} strokeWidth="1" opacity="0.9" />
+          <text
+            data-testid="indicator-kline-y-axis-zero"
+            x={plotRight + 8}
+            y={zeroAxisY + 4}
+            fill={TERMINAL_COLORS.axisText}
+            className="text-[11px] font-semibold tabular-nums"
+          >
+            0.00
+          </text>
           {latestCloseY !== null ? (
             <g>
               <line x1="0" y1={latestCloseY} x2={plotRight} y2={latestCloseY} stroke={TERMINAL_COLORS.white} strokeWidth="1.1" opacity="0.84" />
@@ -1705,7 +2764,14 @@ const CandlestickChart: React.FC<{
                   opacity={isUp ? 0.92 : 1}
                 />
                 {index % 12 === 0 || index === visible.length - 1 ? (
-                  <text x={x} y={chartBottom - 10} textAnchor="middle" fill={TERMINAL_COLORS.axisText} className="text-[10px]">
+                  <text
+                    data-testid="indicator-kline-x-axis-label"
+                    x={clamp(x, 28, plotRight - 28)}
+                    y={xAxisLabelY}
+                    textAnchor="middle"
+                    fill={TERMINAL_COLORS.axisText}
+                    className="text-[10px]"
+                  >
                     {formatAxisDate(point.date, period)}
                   </text>
                 ) : null}
@@ -1802,127 +2868,6 @@ const CandlestickChart: React.FC<{
             </>
           ) : null}
         </svg>
-        <div className="pointer-events-none absolute bottom-4 left-4 right-16 z-10 md:left-10 md:right-24">
-          <div className="mx-auto flex w-full max-w-[42rem] items-center justify-between gap-4">
-            <button
-              type="button"
-              data-testid="indicator-chart-pan-left"
-              aria-label="向左平移K线时间"
-              title="向左平移K线时间"
-              disabled={!canPan || safeWindowStart === 0}
-              onClick={() => shiftWindow(-1)}
-              className="pointer-events-auto inline-flex h-9 w-9 items-center justify-center rounded-full border bg-background/80 shadow-lg backdrop-blur transition-colors hover:bg-muted disabled:cursor-not-allowed disabled:opacity-35"
-              style={{ borderColor: TERMINAL_COLORS.redGrid, color: TERMINAL_COLORS.text }}
-            >
-              <ChevronLeft className="h-5 w-5" />
-            </button>
-            <button
-              type="button"
-              data-testid="indicator-chart-zoom-in"
-              aria-label="放大选中K线日期"
-              title="放大选中K线日期"
-              disabled={!canZoomIn}
-              onClick={() => onTimelineZoomChange(1)}
-              className="pointer-events-auto inline-flex h-9 w-9 items-center justify-center rounded-full border bg-background/80 shadow-lg backdrop-blur transition-colors hover:bg-muted disabled:cursor-not-allowed disabled:opacity-35"
-              style={{ borderColor: TERMINAL_COLORS.redGrid, color: TERMINAL_COLORS.text }}
-            >
-              <Plus className="h-5 w-5" />
-            </button>
-            <button
-              type="button"
-              data-testid="indicator-chart-zoom-out"
-              aria-label="缩小选中K线日期"
-              title="缩小选中K线日期"
-              disabled={!canZoomOut}
-              onClick={() => onTimelineZoomChange(-1)}
-              className="pointer-events-auto inline-flex h-9 w-9 items-center justify-center rounded-full border bg-background/80 shadow-lg backdrop-blur transition-colors hover:bg-muted disabled:cursor-not-allowed disabled:opacity-35"
-              style={{ borderColor: TERMINAL_COLORS.redGrid, color: TERMINAL_COLORS.text }}
-            >
-              <Minus className="h-5 w-5" />
-            </button>
-            <button
-              type="button"
-              data-testid="indicator-chart-pan-right"
-              aria-label="向右平移K线时间"
-              title="向右平移K线时间"
-              disabled={!canPan || safeWindowStart === maxWindowStart}
-              onClick={() => shiftWindow(1)}
-              className="pointer-events-auto inline-flex h-9 w-9 items-center justify-center rounded-full border bg-background/80 shadow-lg backdrop-blur transition-colors hover:bg-muted disabled:cursor-not-allowed disabled:opacity-35"
-              style={{ borderColor: TERMINAL_COLORS.redGrid, color: TERMINAL_COLORS.text }}
-            >
-              <ChevronRight className="h-5 w-5" />
-            </button>
-          </div>
-        </div>
-      </div>
-      <div className="flex flex-wrap items-center gap-3 border-t px-2 py-1" style={{ borderColor: TERMINAL_COLORS.redGrid, backgroundColor: TERMINAL_COLORS.panel }}>
-        <button
-          type="button"
-          aria-label="向前移动K线窗口"
-          disabled={!canPan || safeWindowStart === 0}
-          onClick={() => shiftWindow(-1)}
-          className="inline-flex h-6 w-6 items-center justify-center border transition-colors disabled:cursor-not-allowed disabled:opacity-40"
-          style={{ borderColor: TERMINAL_COLORS.redGrid, color: TERMINAL_COLORS.muted }}
-        >
-          <ChevronLeft className="h-4 w-4" />
-        </button>
-        <div className="min-w-[12rem] flex-1">
-          <div className="mb-1 flex items-center justify-between gap-2 font-mono text-[10px]" style={{ color: TERMINAL_COLORS.muted }}>
-            <span>时间窗口</span>
-            <span className="font-mono">
-              {visibleFirst?.date ?? '--'} - {visibleLast?.date ?? '--'}
-            </span>
-          </div>
-          <div className="relative h-4" data-testid="indicator-window-slider-shell">
-            <div
-              data-testid="indicator-window-track"
-              className="pointer-events-none absolute left-0 right-0 top-1/2 h-1.5 -translate-y-1/2 overflow-hidden rounded-full"
-              style={{ backgroundColor: 'rgba(35, 210, 255, 0.22)' }}
-            >
-              <div
-                className="h-full rounded-full"
-                style={{ width: `${windowSliderProgress}%`, backgroundColor: TERMINAL_COLORS.cyan }}
-              />
-            </div>
-            <span
-              data-testid="indicator-window-thumb"
-              className="pointer-events-none absolute top-1/2 h-4 w-4 -translate-x-1/2 -translate-y-1/2 rounded-full"
-              style={{
-                left: `${windowSliderProgress}%`,
-                backgroundColor: TERMINAL_COLORS.cyan,
-                boxShadow: `0 0 18px ${TERMINAL_COLORS.cyan}`,
-              }}
-            />
-            <input
-              type="range"
-              min={0}
-              max={windowSliderMax}
-              value={windowSliderValue}
-              disabled={!canPan}
-              aria-label="K线时间窗口"
-              onChange={(event) => {
-                if (!canPan) {
-                  return;
-                }
-                onWindowStartChange(Number(event.currentTarget.value));
-                onHoverPinnedChange(false);
-                onHoverIndexChange(null);
-              }}
-              className="absolute inset-0 h-4 w-full cursor-grab opacity-0 disabled:cursor-not-allowed"
-              style={{ accentColor: TERMINAL_COLORS.cyan }}
-            />
-          </div>
-        </div>
-        <button
-          type="button"
-          aria-label="向后移动K线窗口"
-          disabled={!canPan || safeWindowStart === maxWindowStart}
-          onClick={() => shiftWindow(1)}
-          className="inline-flex h-6 w-6 items-center justify-center border transition-colors disabled:cursor-not-allowed disabled:opacity-40"
-          style={{ borderColor: TERMINAL_COLORS.redGrid, color: TERMINAL_COLORS.muted }}
-        >
-          <ChevronRight className="h-4 w-4" />
-        </button>
       </div>
     </div>
   );
@@ -1941,6 +2886,9 @@ const VolumeActivityChart: React.FC<{
   onOpenChartMenu: (event: React.MouseEvent) => void;
   period: KLinePeriod;
   highlightedDate?: string;
+  onAddRuleMetric?: AddRuleMetricHandler;
+  isMaximized?: boolean;
+  onToggleMaximize?: () => void;
 }> = ({
   points,
   visible,
@@ -1954,6 +2902,9 @@ const VolumeActivityChart: React.FC<{
   onOpenChartMenu,
   period,
   highlightedDate,
+  onAddRuleMetric,
+  isMaximized = false,
+  onToggleMaximize,
 }) => {
   const [mode, setMode] = useState<VolumeIndicatorMode>('volume');
   const width = 1600;
@@ -2030,6 +2981,14 @@ const VolumeActivityChart: React.FC<{
   const headerMa5 = isAmountMode ? activePoint?.amountMa5 : activePoint?.volumeMa5;
   const headerMa10 = isAmountMode ? activePoint?.amountMa10 : activePoint?.volumeMa10;
   const headerTurnoverRate = resolvePointTurnoverRate(activePoint, quote, points, activeIsLatest);
+  const primaryMetricKey = isAmountMode ? 'amount' : 'volume';
+  const afterHoursMetricKey = isAmountMode ? 'after_hours_amount' : 'after_hours_volume';
+  const ma5MetricKey = isAmountMode ? 'amount_ma5' : 'volume_ma5';
+  const ma10MetricKey = isAmountMode ? 'amount_ma10' : 'volume_ma10';
+  const primaryLabel = isAmountMode ? '成交额' : '成交量';
+  const afterHoursLabel = isAmountMode ? '盘后成交额' : '盘后成交量';
+  const ma5Label = isAmountMode ? 'MAAMT5' : 'MAVOL5';
+  const ma10Label = isAmountMode ? 'MAAMT10' : 'MAVOL10';
   const highlightedDateKey = normalizeDateKey(highlightedDate);
   const setVisibleHoverIndex = (index: number) => {
     onHoverIndexChange(visibleStartIndex + index);
@@ -2047,21 +3006,34 @@ const VolumeActivityChart: React.FC<{
       style={{ backgroundColor: TERMINAL_COLORS.bg }}
       onContextMenu={onOpenChartMenu}
     >
-      <div data-testid="indicator-volume-header" className="flex flex-wrap items-center gap-3 border-b px-2 py-1 font-mono text-[11px]" style={{ borderColor: TERMINAL_COLORS.redGrid, backgroundColor: TERMINAL_COLORS.panel }}>
-        <span style={{ color: TERMINAL_COLORS.text }}>成交量相关指标</span>
-        <span style={{ color: TERMINAL_COLORS.yellow }}>{activePoint?.date ?? '--'}</span>
-        <span style={{ color: TERMINAL_COLORS.axisText }}>{headerPrimaryLabel}:{formatCompactNumber(headerPrimaryValue)}</span>
-        <span style={{ color: TERMINAL_COLORS.axisText }}>盘后:{formatCompactNumber(headerAfterHoursValue)}</span>
-        <span style={{ color: LINE_COLORS.ma10 }}>MA5:{formatCompactNumber(headerMa5)}</span>
-        <span style={{ color: LINE_COLORS.ma5 }}>10:{formatCompactNumber(headerMa10)}</span>
-        <span style={{ color: TERMINAL_COLORS.axisText }}>换手:{formatPlainPct(headerTurnoverRate)}</span>
+      <div data-testid="indicator-volume-header" className="flex items-center justify-between gap-2 border-b px-2 py-1 font-mono text-[11px]" style={{ borderColor: TERMINAL_COLORS.redGrid, backgroundColor: TERMINAL_COLORS.panel }}>
+        <div className="flex min-w-0 flex-wrap items-center gap-3">
+          <span style={{ color: TERMINAL_COLORS.text }}>成交量相关指标</span>
+          <span style={{ color: TERMINAL_COLORS.yellow }}>{activePoint?.date ?? '--'}</span>
+          <MetricInline metricKey={primaryMetricKey} label={primaryLabel} value={headerPrimaryValue} unit={isAmountMode ? '元' : '股'} date={activePoint?.date} color={TERMINAL_COLORS.axisText} onAdd={onAddRuleMetric}>
+            {headerPrimaryLabel}:{formatCompactNumber(headerPrimaryValue)}
+          </MetricInline>
+          <MetricInline metricKey={afterHoursMetricKey} label={afterHoursLabel} value={headerAfterHoursValue} unit={isAmountMode ? '元' : '股'} date={activePoint?.date} color={TERMINAL_COLORS.axisText} onAdd={onAddRuleMetric}>
+            盘后:{formatCompactNumber(headerAfterHoursValue)}
+          </MetricInline>
+          <MetricInline metricKey={ma5MetricKey} label={ma5Label} value={headerMa5} unit={isAmountMode ? '元' : '股'} date={activePoint?.date} color={LINE_COLORS.ma10} onAdd={onAddRuleMetric}>
+            MA5:{formatCompactNumber(headerMa5)}
+          </MetricInline>
+          <MetricInline metricKey={ma10MetricKey} label={ma10Label} value={headerMa10} unit={isAmountMode ? '元' : '股'} date={activePoint?.date} color={LINE_COLORS.ma5} onAdd={onAddRuleMetric}>
+            10:{formatCompactNumber(headerMa10)}
+          </MetricInline>
+          <MetricInline metricKey="turnover_rate" label="换手率" value={headerTurnoverRate} unit="%" date={activePoint?.date} color={TERMINAL_COLORS.axisText} onAdd={onAddRuleMetric}>
+            换手:{formatPlainPct(headerTurnoverRate)}
+          </MetricInline>
+        </div>
+        <ChartMaximizeButton label="成交量图" isMaximized={isMaximized} onClick={onToggleMaximize} />
       </div>
-      <div className="overflow-x-auto">
+      <div className="overflow-hidden">
         <svg
           viewBox={`0 0 ${width} ${bottom}`}
           role="img"
           aria-label="成交量图"
-          className="h-[5.25rem] min-w-[46rem] w-full"
+          className="h-auto min-w-0 w-full"
           style={{ backgroundColor: TERMINAL_COLORS.bg }}
         >
           <rect x="0" y="0" width={width} height={bottom} fill={TERMINAL_COLORS.bg} />
@@ -2210,6 +3182,9 @@ const MacdSignalChart: React.FC<{
   onOpenChartMenu: (event: React.MouseEvent) => void;
   period: KLinePeriod;
   highlightedDate?: string;
+  onAddRuleMetric?: AddRuleMetricHandler;
+  isMaximized?: boolean;
+  onToggleMaximize?: () => void;
 }> = ({
   points,
   visible,
@@ -2222,6 +3197,9 @@ const MacdSignalChart: React.FC<{
   onOpenChartMenu,
   period,
   highlightedDate,
+  onAddRuleMetric,
+  isMaximized = false,
+  onToggleMaximize,
 }) => {
   const [mode, setMode] = useState<MomentumIndicatorMode>('macd');
   const width = 1420;
@@ -2230,14 +3208,14 @@ const MacdSignalChart: React.FC<{
   const top = 18;
   const height = 96;
   const bottom = 132;
-  const hasRsi = points.some((point) => typeof point.rsi6 === 'number' || typeof point.rsi12 === 'number');
+  const hasRsi = points.some((point) => typeof point.rsi6 === 'number' || typeof point.rsi12 === 'number' || typeof point.rsi24 === 'number');
   const tabs = [
     { label: 'MACD', mode: 'macd' as const },
     ...(hasRsi ? [{ label: 'RSI', mode: 'rsi' as const }] : []),
   ];
   const activeMode = mode === 'rsi' && !hasRsi ? 'macd' : mode;
   const values = activeMode === 'rsi'
-    ? visible.flatMap((point) => [point.rsi6, point.rsi12]).filter((value): value is number => typeof value === 'number' && Number.isFinite(value))
+    ? visible.flatMap((point) => [point.rsi6, point.rsi12, point.rsi24]).filter((value): value is number => typeof value === 'number' && Number.isFinite(value))
     : visible.flatMap((point) => [point.dif, point.dea, point.macd])
     .filter((value): value is number => typeof value === 'number' && Number.isFinite(value));
   const maxAbs = activeMode === 'rsi' ? 100 : Math.max(...values.map((value) => Math.abs(value)), 0.01);
@@ -2255,6 +3233,7 @@ const MacdSignalChart: React.FC<{
   const deaPath = buildTrendPath(visible, plotRight, top, height, -maxAbs, maxAbs, (point) => point.dea);
   const rsi6Path = buildTrendPath(visible, plotRight, top, height, 0, 100, (point) => point.rsi6);
   const rsi12Path = buildTrendPath(visible, plotRight, top, height, 0, 100, (point) => point.rsi12);
+  const rsi24Path = buildTrendPath(visible, plotRight, top, height, 0, 100, (point) => point.rsi24);
   const labelStep = Math.max(Math.floor(visible.length / 7), 1);
   const latest = visible.at(-1);
   const hoveredVisibleIndex = hoveredIndex !== null && hoveredIndex >= visibleStartIndex && hoveredIndex < visibleStartIndex + visible.length
@@ -2280,28 +3259,32 @@ const MacdSignalChart: React.FC<{
       style={{ backgroundColor: TERMINAL_COLORS.bg }}
       onContextMenu={onOpenChartMenu}
     >
-      <div data-testid="indicator-momentum-header" className="flex flex-wrap items-center gap-3 border-b px-2 py-1 font-mono text-[11px]" style={{ borderColor: TERMINAL_COLORS.redGrid, backgroundColor: TERMINAL_COLORS.panel }}>
-        <span style={{ color: TERMINAL_COLORS.text }}>{activeMode === 'rsi' ? 'RSI指标' : 'MACD等指标'}</span>
-        <span style={{ color: TERMINAL_COLORS.yellow }}>{activePoint?.date ?? '--'}</span>
-        {activeMode === 'rsi' ? (
-          <>
-            <span style={{ color: TERMINAL_COLORS.green }}>RSI6:{formatNumber(activePoint?.rsi6)}</span>
-            <span style={{ color: TERMINAL_COLORS.blue }}>RSI12:{formatNumber(activePoint?.rsi12)}</span>
-          </>
-        ) : (
-          <>
-            <span style={{ color: TERMINAL_COLORS.yellow }}>DIF:{formatNumber(activePoint?.dif)}</span>
-            <span style={{ color: TERMINAL_COLORS.purple }}>DEA:{formatNumber(activePoint?.dea)}</span>
-            <span style={{ color: (activePoint?.macd ?? 0) >= 0 ? TERMINAL_COLORS.green : TERMINAL_COLORS.blue }}>MACD:{formatNumber(activePoint?.macd)}</span>
-          </>
-        )}
+      <div data-testid="indicator-momentum-header" className="flex items-center justify-between gap-2 border-b px-2 py-1 font-mono text-[11px]" style={{ borderColor: TERMINAL_COLORS.redGrid, backgroundColor: TERMINAL_COLORS.panel }}>
+        <div className="flex min-w-0 flex-wrap items-center gap-3">
+          <span style={{ color: TERMINAL_COLORS.text }}>{activeMode === 'rsi' ? 'RSI指标' : 'MACD等指标'}</span>
+          <span style={{ color: TERMINAL_COLORS.yellow }}>{activePoint?.date ?? '--'}</span>
+          {activeMode === 'rsi' ? (
+            <>
+              <MetricInline metricKey="rsi6" label="RSI6" value={activePoint?.rsi6} date={activePoint?.date} color={TERMINAL_COLORS.green} onAdd={onAddRuleMetric}>RSI6:{formatNumber(activePoint?.rsi6)}</MetricInline>
+              <MetricInline metricKey="rsi12" label="RSI12" value={activePoint?.rsi12} date={activePoint?.date} color={TERMINAL_COLORS.blue} onAdd={onAddRuleMetric}>RSI12:{formatNumber(activePoint?.rsi12)}</MetricInline>
+              <MetricInline metricKey="rsi24" label="RSI24" value={activePoint?.rsi24} date={activePoint?.date} color={TERMINAL_COLORS.purple} onAdd={onAddRuleMetric}>RSI24:{formatNumber(activePoint?.rsi24)}</MetricInline>
+            </>
+          ) : (
+            <>
+              <MetricInline metricKey="macd_dif" label="DIF" value={activePoint?.dif} date={activePoint?.date} color={TERMINAL_COLORS.yellow} onAdd={onAddRuleMetric}>DIF:{formatNumber(activePoint?.dif)}</MetricInline>
+              <MetricInline metricKey="macd_dea" label="DEA" value={activePoint?.dea} date={activePoint?.date} color={TERMINAL_COLORS.purple} onAdd={onAddRuleMetric}>DEA:{formatNumber(activePoint?.dea)}</MetricInline>
+              <MetricInline metricKey="macd" label="MACD" value={activePoint?.macd} date={activePoint?.date} color={(activePoint?.macd ?? 0) >= 0 ? TERMINAL_COLORS.green : TERMINAL_COLORS.blue} onAdd={onAddRuleMetric}>MACD:{formatNumber(activePoint?.macd)}</MetricInline>
+            </>
+          )}
+        </div>
+        <ChartMaximizeButton label="MACD指标图" isMaximized={isMaximized} onClick={onToggleMaximize} />
       </div>
-      <div className="overflow-x-auto">
+      <div className="overflow-hidden">
         <svg
           viewBox={`0 0 ${width} ${bottom}`}
           role="img"
           aria-label="MACD指标图"
-          className="h-[5rem] min-w-[46rem] w-full"
+          className="h-auto min-w-0 w-full"
           style={{ backgroundColor: TERMINAL_COLORS.bg }}
         >
           <rect x="0" y="0" width={width} height={bottom} fill={TERMINAL_COLORS.bg} />
@@ -2414,11 +3397,13 @@ const MacdSignalChart: React.FC<{
               <path d={deaPath} fill="none" stroke={TERMINAL_COLORS.purple} strokeWidth="2" pointerEvents="none" />
               <path d={rsi6Path} fill="none" stroke={TERMINAL_COLORS.green} strokeWidth="1.5" opacity="0.9" pointerEvents="none" />
               <path d={rsi12Path} fill="none" stroke={TERMINAL_COLORS.blue} strokeWidth="1.5" opacity="0.9" pointerEvents="none" />
+              <path d={rsi24Path} fill="none" stroke={TERMINAL_COLORS.purple} strokeWidth="1.3" opacity="0.72" pointerEvents="none" />
             </>
           ) : (
             <>
               <path d={rsi6Path} fill="none" stroke={TERMINAL_COLORS.green} strokeWidth="2" pointerEvents="none" />
               <path d={rsi12Path} fill="none" stroke={TERMINAL_COLORS.blue} strokeWidth="2" pointerEvents="none" />
+              <path d={rsi24Path} fill="none" stroke={TERMINAL_COLORS.purple} strokeWidth="1.7" pointerEvents="none" />
             </>
           )}
           {hoveredVisibleIndex !== null ? (
@@ -2444,7 +3429,8 @@ const ChipPeakPanel: React.FC<{
   chip: ChipDistributionMetrics | null;
   mainChip: ChipDistributionMetrics | null;
   requiresRealChipData: boolean;
-}> = ({ points, currentPoint, chip, mainChip, requiresRealChipData }) => {
+  onAddRuleMetric?: AddRuleMetricHandler;
+}> = ({ points, currentPoint, chip, mainChip, requiresRealChipData, onAddRuleMetric }) => {
   const [activeScope, setActiveScope] = useState<ChipPanelScope>('all');
   const [activeRange, setActiveRange] = useState<ChipRangeLevel>('90');
   const activeChip = activeScope === 'main' ? mainChip : chip;
@@ -2478,6 +3464,11 @@ const ChipPeakPanel: React.FC<{
   const profitRatio = activeChip?.profitRatio;
   const trappedRatio = typeof profitRatio === 'number' ? 1 - profitRatio : undefined;
   const concentration = getChipConcentration(activeChip, activeRange);
+  const metricPrefix = activeScope === 'main' ? 'main_' : '';
+  const scopeLabel = activeScope === 'main' ? '主力' : '';
+  const rangeLowMetricKey = `${metricPrefix}cost_${activeRange}_low`;
+  const rangeHighMetricKey = `${metricPrefix}cost_${activeRange}_high`;
+  const concentrationMetricKey = `${metricPrefix}chip_concentration_${activeRange}`;
 
   return (
     <aside
@@ -2607,15 +3598,45 @@ const ChipPeakPanel: React.FC<{
 
         <dl className="mt-2 grid grid-cols-2 gap-x-4 gap-y-2 font-mono text-[12px]">
           <div className="flex items-center justify-between gap-2">
-            <dt style={{ color: TERMINAL_COLORS.orange }}>收盘获利</dt>
+            <dt className="inline-flex items-center gap-1" style={{ color: TERMINAL_COLORS.orange }}>
+              <RuleMetricAddButton
+                metricKey={`${metricPrefix}profit_ratio`}
+                label={`${scopeLabel}收盘获利`}
+                value={normalizeRatioPctValue(profitRatio)}
+                unit="%"
+                date={activeChip?.date}
+                onAdd={onAddRuleMetric}
+              />
+              <span>收盘获利</span>
+            </dt>
             <dd className="font-semibold tabular-nums" style={{ color: TERMINAL_COLORS.orange }}>{formatRatioPct(profitRatio)}</dd>
           </div>
           <div className="flex items-center justify-between gap-2">
-            <dt style={{ color: TERMINAL_COLORS.chipBlue }}>套牢盘</dt>
+            <dt className="inline-flex items-center gap-1" style={{ color: TERMINAL_COLORS.chipBlue }}>
+              <RuleMetricAddButton
+                metricKey={`${metricPrefix}trapped_ratio`}
+                label={`${scopeLabel}套牢盘`}
+                value={normalizeRatioPctValue(trappedRatio)}
+                unit="%"
+                date={activeChip?.date}
+                onAdd={onAddRuleMetric}
+              />
+              <span>套牢盘</span>
+            </dt>
             <dd className="font-semibold tabular-nums" style={{ color: TERMINAL_COLORS.chipBlue }}>{formatRatioPct(trappedRatio)}</dd>
           </div>
           <div className="col-span-2 flex items-center justify-between gap-2">
-            <dt style={{ color: TERMINAL_COLORS.yellow }}>平均成本</dt>
+            <dt className="inline-flex items-center gap-1" style={{ color: TERMINAL_COLORS.yellow }}>
+              <RuleMetricAddButton
+                metricKey={`${metricPrefix}avg_cost`}
+                label={`${scopeLabel}平均成本`}
+                value={activeChip?.avgCost}
+                unit="元"
+                date={activeChip?.date}
+                onAdd={onAddRuleMetric}
+              />
+              <span>平均成本</span>
+            </dt>
             <dd className="font-semibold tabular-nums" style={{ color: TERMINAL_COLORS.yellow }}>{formatNumber(activeChip?.avgCost)}</dd>
           </div>
         </dl>
@@ -2655,11 +3676,39 @@ const ChipPeakPanel: React.FC<{
 
         <dl className="mt-2 space-y-1.5 font-mono text-[12px]">
           <div className="flex items-center justify-between gap-3">
-            <dt style={{ color: TERMINAL_COLORS.muted }}>价格区间</dt>
+            <dt className="inline-flex items-center gap-1" style={{ color: TERMINAL_COLORS.muted }}>
+              <RuleMetricAddButton
+                metricKey={rangeLowMetricKey}
+                label={`${scopeLabel}${activeRange}%筹码价格区间下限`}
+                value={activeRange === '90' ? activeChip?.cost90Low : activeChip?.cost70Low}
+                unit="元"
+                date={activeChip?.date}
+                onAdd={onAddRuleMetric}
+              />
+              <RuleMetricAddButton
+                metricKey={rangeHighMetricKey}
+                label={`${scopeLabel}${activeRange}%筹码价格区间上限`}
+                value={activeRange === '90' ? activeChip?.cost90High : activeChip?.cost70High}
+                unit="元"
+                date={activeChip?.date}
+                onAdd={onAddRuleMetric}
+              />
+              <span>价格区间</span>
+            </dt>
             <dd className="font-semibold tabular-nums" style={{ color: TERMINAL_COLORS.text }}>{formatChipRange(activeChip, activeRange)}</dd>
           </div>
           <div className="flex items-center justify-between gap-3">
-            <dt style={{ color: TERMINAL_COLORS.muted }}>集中度</dt>
+            <dt className="inline-flex items-center gap-1" style={{ color: TERMINAL_COLORS.muted }}>
+              <RuleMetricAddButton
+                metricKey={concentrationMetricKey}
+                label={`${scopeLabel}${activeRange}%筹码集中度`}
+                value={normalizeRatioPctValue(concentration)}
+                unit="%"
+                date={activeChip?.date}
+                onAdd={onAddRuleMetric}
+              />
+              <span>集中度</span>
+            </dt>
             <dd className="font-semibold tabular-nums" style={{ color: TERMINAL_COLORS.text }}>{formatRatioPct(concentration)}</dd>
           </div>
         </dl>
@@ -2671,7 +3720,8 @@ const ChipPeakPanel: React.FC<{
 const OrderFlowMonitor: React.FC<{
   points: ChartPoint[];
   quote: StockQuote | null;
-}> = ({ points, quote }) => {
+  onAddRuleMetric?: AddRuleMetricHandler;
+}> = ({ points, quote, onAddRuleMetric }) => {
   const flow = useMemo(() => buildOrderFlowMetrics(points, quote), [points, quote]);
   const netTone = getMetricTone(flow.netTotal);
 
@@ -2695,7 +3745,16 @@ const OrderFlowMonitor: React.FC<{
       </div>
 
       <div className={`mb-3 rounded-lg border border-subtle bg-background/50 px-3 py-2 ${getValueToneClass(netTone)}`}>
-        <div className="text-[11px] text-muted-text">主力净额</div>
+        <div className="inline-flex items-center gap-1 text-[11px] text-muted-text">
+          <RuleMetricAddButton
+            metricKey="main_force_net"
+            label="主力净流入"
+            value={flow.netTotal}
+            unit="元"
+            onAdd={onAddRuleMetric}
+          />
+          <span>主力净流入</span>
+        </div>
         <div className="mt-1 text-lg font-semibold tabular-nums">{formatCompactNumber(flow.netTotal)}</div>
       </div>
 
@@ -2703,7 +3762,16 @@ const OrderFlowMonitor: React.FC<{
         {flow.rows.map((row) => (
           <div key={row.label}>
             <div className="mb-1 flex items-center justify-between gap-2 text-xs">
-              <span className="text-secondary-text">{row.label}</span>
+              <span className="inline-flex items-center gap-1 text-secondary-text">
+                <RuleMetricAddButton
+                  metricKey={ORDER_FLOW_METRIC_KEYS[row.label] ?? row.label}
+                  label={row.label}
+                  value={row.value}
+                  unit="元"
+                  onAdd={onAddRuleMetric}
+                />
+                <span>{row.label}</span>
+              </span>
               <span className={`font-semibold tabular-nums ${getValueToneClass(row.tone)}`}>
                 {formatCompactNumber(row.value)}
               </span>
@@ -2733,6 +3801,7 @@ const IndicatorSidePanel: React.FC<{
   mainChip: ChipDistributionMetrics | null;
   requiresRealChipData: boolean;
   quote: StockQuote | null;
+  onAddRuleMetric?: AddRuleMetricHandler;
 }> = ({
   points,
   chipPoints,
@@ -2741,11 +3810,12 @@ const IndicatorSidePanel: React.FC<{
   mainChip,
   requiresRealChipData,
   quote,
+  onAddRuleMetric,
 }) => {
   const [activeTab, setActiveTab] = useState<SidePanelTab>('chip');
 
   return (
-    <div className="flex min-h-0 flex-col gap-2 xl:flex-1" data-testid="indicator-side-panel">
+    <div className="flex min-h-0 flex-col gap-2" data-testid="indicator-side-panel">
       <div
         role="tablist"
         aria-label="筹码与监控切换"
@@ -2787,12 +3857,113 @@ const IndicatorSidePanel: React.FC<{
             chip={chip}
             mainChip={mainChip}
             requiresRealChipData={requiresRealChipData}
+            onAddRuleMetric={onAddRuleMetric}
           />
         ) : (
-          <OrderFlowMonitor points={points} quote={quote} />
+          <OrderFlowMonitor points={points} quote={quote} onAddRuleMetric={onAddRuleMetric} />
         )}
       </div>
     </div>
+  );
+};
+
+const RelatedNewsPanel: React.FC<{
+  stockCode: string;
+}> = ({ stockCode }) => {
+  const [items, setItems] = useState<NewsIntelItem[]>([]);
+  const [isLoading, setIsLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const loadNews = useCallback(async (refresh = false) => {
+    if (!stockCode) {
+      return;
+    }
+    setIsLoading(true);
+    setError(null);
+    try {
+      const response = await stocksApi.getRelatedNews(stockCode, 8, refresh);
+      setItems(response.items || []);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '相关资讯加载失败');
+    } finally {
+      setIsLoading(false);
+    }
+  }, [stockCode]);
+
+  useEffect(() => {
+    setItems([]);
+    setError(null);
+    void loadNews(false);
+  }, [loadNews]);
+
+  return (
+    <aside
+      data-testid="indicator-related-news"
+      className="flex min-h-[18rem] flex-col overflow-hidden rounded-md border xl:flex-1"
+      style={{ borderColor: TERMINAL_COLORS.redGrid, backgroundColor: TERMINAL_COLORS.bg, boxShadow: TERMINAL_COLORS.shadow }}
+      aria-label="相关资讯"
+    >
+      <div className="flex items-center justify-between gap-2 border-b px-3 py-2" style={{ borderColor: TERMINAL_COLORS.redGrid, backgroundColor: TERMINAL_COLORS.panel }}>
+        <div className="min-w-0">
+          <h3 className="text-sm font-semibold" style={{ color: TERMINAL_COLORS.text }}>相关资讯</h3>
+        </div>
+        <button
+          type="button"
+          aria-label="刷新相关资讯"
+          title="刷新相关资讯"
+          disabled={isLoading}
+          onClick={() => void loadNews(true)}
+          className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded border transition-colors hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/45"
+          style={{ borderColor: TERMINAL_COLORS.redGrid, color: TERMINAL_COLORS.cyan, backgroundColor: TERMINAL_COLORS.panel2 }}
+        >
+          <RefreshCw className={`h-3.5 w-3.5 ${isLoading ? 'animate-spin' : ''}`} />
+        </button>
+      </div>
+
+      <div className="min-h-0 flex-1 overflow-y-auto px-3 py-2">
+        {isLoading && items.length === 0 ? (
+          <div className="flex h-full min-h-[10rem] items-center justify-center gap-2 font-mono text-xs" style={{ color: TERMINAL_COLORS.muted }}>
+            <span className="h-4 w-4 animate-spin rounded-full border-2 border-current border-t-transparent" aria-hidden="true" />
+            加载资讯中...
+          </div>
+        ) : error ? (
+          <div className="rounded border border-dashed px-3 py-4 text-xs leading-5" style={{ borderColor: TERMINAL_COLORS.redGrid, color: TERMINAL_COLORS.muted }}>
+            <div style={{ color: TERMINAL_COLORS.orange }}>相关资讯加载失败</div>
+            <div className="mt-1 break-words">{error}</div>
+          </div>
+        ) : items.length === 0 ? (
+          <div className="flex h-full min-h-[10rem] flex-col items-center justify-center rounded border border-dashed px-3 text-center text-xs leading-5" style={{ borderColor: TERMINAL_COLORS.redGrid, color: TERMINAL_COLORS.muted }}>
+            <span>暂无相关资讯</span>
+            <span className="mt-1">点击刷新可重新拉取公开资讯源。</span>
+          </div>
+        ) : (
+          <div className="space-y-2">
+            {items.map((item, index) => (
+              <article
+                key={`${item.url}-${index}`}
+                className="rounded border px-2.5 py-2 transition-colors hover:bg-white/5"
+                style={{ borderColor: TERMINAL_COLORS.redGridSoft, backgroundColor: 'rgba(8, 17, 29, 0.48)' }}
+              >
+                <a
+                  href={item.url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="block text-xs font-semibold leading-5 transition-colors hover:underline"
+                  style={{ color: TERMINAL_COLORS.text }}
+                >
+                  {item.title}
+                </a>
+                {item.snippet ? (
+                  <p className="mt-1 overflow-hidden text-[11px] leading-5 [display:-webkit-box] [-webkit-line-clamp:3] [-webkit-box-orient:vertical]" style={{ color: TERMINAL_COLORS.muted }}>
+                    {item.snippet}
+                  </p>
+                ) : null}
+              </article>
+            ))}
+          </div>
+        )}
+      </div>
+    </aside>
   );
 };
 
@@ -3172,6 +4343,7 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
   const [timelineZoom, setTimelineZoom] = useState(0);
   const [windowStart, setWindowStart] = useState(0);
   const [chartMenu, setChartMenu] = useState<ChartMenuState | null>(null);
+  const [maximizedChart, setMaximizedChart] = useState<MaximizedChart | null>(null);
   const [historyCache, setHistoryCache] = useState<HistoryCache>(() => ({
     daily: createHistoryState(stockCode, 'daily'),
   }));
@@ -3183,10 +4355,68 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
   const marketKind = useMemo(() => getMarketKind(stockCode), [stockCode]);
   const initialDateKey = normalizeDateKey(initialDate);
   const dailyHistoryDays = Math.max(1, Math.min(365, Math.round(initialHistoryDays ?? 120)));
+  const [ruleDraft, setRuleDraft] = useState<RuleMetricDraft | null>(() => readRuleMetricDraftForStock(stockCode));
+  const [isRuleDraftEditorOpen, setIsRuleDraftEditorOpen] = useState(false);
+  const [ruleMetrics, setRuleMetrics] = useState<RuleMetricItem[]>([]);
+  const [isRuleMetricsLoading, setIsRuleMetricsLoading] = useState(false);
+  const [ruleMetricsError, setRuleMetricsError] = useState<string | null>(null);
+  const [ruleDraftFeedback, setRuleDraftFeedback] = useState<string | null>(null);
+  const ruleDraftCount = ruleDraft?.items.length ?? 0;
+  const selectedRuleMetricKeys = useMemo(
+    () => (ruleDraft ? new Set(ruleDraft.items.map((item) => item.key)) : EMPTY_SELECTED_RULE_METRIC_KEYS),
+    [ruleDraft],
+  );
 
   const handlePeriodChange = useCallback((period: KLinePeriod) => {
     selectedRefreshTokenRef.current = null;
     setSelectedPeriod(period);
+  }, []);
+
+  const handleAddRuleMetric = useCallback((metric: RuleMetricAddPayload) => {
+    const currentDraft = readRuleMetricDraftForStock(stockCode);
+    const selected = currentDraft?.items.some((item) => item.key === metric.key) ?? false;
+    if (selected) {
+      const nextDraft = removeRuleMetricDraftItem(metric.key, stockCode);
+      const nextDraftForStock = nextDraft && (!nextDraft.stockCode || nextDraft.stockCode === stockCode) ? nextDraft : null;
+      setRuleDraft(nextDraftForStock);
+      if (!nextDraftForStock) {
+        setIsRuleDraftEditorOpen(false);
+      }
+      setRuleDraftFeedback(`已移除「${metric.label}」规则条件。`);
+      return;
+    }
+    const draft = addRuleMetricDraftItem({
+      ...metric,
+      stockCode,
+      stockName,
+    });
+    setRuleDraft(draft);
+    setRuleDraftFeedback(`已加入「${metric.label}」，多个指标会在规则页放入同一条件组并按“且”关系判断。`);
+  }, [stockCode, stockName]);
+
+  const handleRuleDraftItemChange = useCallback((itemId: string, patch: RuleMetricDraftItemPatch) => {
+    const nextDraft = updateRuleMetricDraftItem(itemId, patch);
+    const nextDraftForStock = nextDraft && (!nextDraft.stockCode || nextDraft.stockCode === stockCode) ? nextDraft : null;
+    setRuleDraft(nextDraftForStock);
+    if (!nextDraftForStock) {
+      setIsRuleDraftEditorOpen(false);
+    }
+    setRuleDraftFeedback('已更新规则条件草稿。');
+  }, [stockCode]);
+
+  const handleRuleDraftItemRemove = useCallback((metricKey: string) => {
+    const item = ruleDraft?.items.find((draftItem) => draftItem.key === metricKey);
+    const nextDraft = removeRuleMetricDraftItem(metricKey, stockCode);
+    const nextDraftForStock = nextDraft && (!nextDraft.stockCode || nextDraft.stockCode === stockCode) ? nextDraft : null;
+    setRuleDraft(nextDraftForStock);
+    if (!nextDraftForStock) {
+      setIsRuleDraftEditorOpen(false);
+    }
+    setRuleDraftFeedback(`已移除「${item?.label ?? metricKey}」规则条件。`);
+  }, [ruleDraft?.items, stockCode]);
+
+  const openRulesPage = useCallback(() => {
+    window.location.assign('/rules?from=indicators');
   }, []);
 
   useEffect(() => {
@@ -3198,6 +4428,10 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
     setTimelineZoom(0);
     setWindowStart(0);
     setChartMenu(null);
+    setMaximizedChart(null);
+    setRuleDraft(readRuleMetricDraftForStock(stockCode));
+    setIsRuleDraftEditorOpen(false);
+    setRuleDraftFeedback(null);
   }, [stockCode]);
 
   useEffect(() => {
@@ -3226,6 +4460,16 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
       if (event.key !== 'Escape') {
         return;
       }
+      if (maximizedChart) {
+        event.preventDefault();
+        setMaximizedChart(null);
+        return;
+      }
+      if (isRuleDraftEditorOpen) {
+        event.preventDefault();
+        setIsRuleDraftEditorOpen(false);
+        return;
+      }
       if (isHoverPinned) {
         event.preventDefault();
         setIsHoverPinned(false);
@@ -3239,7 +4483,35 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [isHoverPinned, onClose]);
+  }, [isHoverPinned, isRuleDraftEditorOpen, maximizedChart, onClose]);
+
+  useEffect(() => {
+    if (!isRuleDraftEditorOpen || ruleMetrics.length > 0) {
+      return undefined;
+    }
+    let ignore = false;
+    setIsRuleMetricsLoading(true);
+    setRuleMetricsError(null);
+    rulesApi.getMetrics()
+      .then((items) => {
+        if (!ignore) {
+          setRuleMetrics(items);
+        }
+      })
+      .catch((err: unknown) => {
+        if (!ignore) {
+          setRuleMetricsError(err instanceof Error ? err.message : '规则指标列表加载失败');
+        }
+      })
+      .finally(() => {
+        if (!ignore) {
+          setIsRuleMetricsLoading(false);
+        }
+      });
+    return () => {
+      ignore = true;
+    };
+  }, [isRuleDraftEditorOpen, ruleMetrics.length]);
 
   useEffect(() => {
     let ignore = false;
@@ -3559,7 +4831,6 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
     };
   }, [isLoading, selectedPeriod, stockCode]);
 
-  const timeMeta = useMemo(() => getTimeMeta(stockCode), [stockCode]);
   const points = useMemo(() => buildChartPoints(history), [history]);
   const visibleCount = useMemo(() => getVisiblePointCount(points.length, timelineZoom), [points.length, timelineZoom]);
   const maxWindowStart = Math.max(points.length - visibleCount, 0);
@@ -3687,6 +4958,79 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
     setChartMenu(null);
   };
 
+  const maximizedChartTitle = maximizedChart === 'kline'
+    ? 'K线图'
+    : maximizedChart === 'volume'
+      ? '成交量图'
+      : maximizedChart === 'momentum'
+        ? 'MACD指标图'
+        : '';
+  const maximizedChartNode = maximizedChart === 'kline' ? (
+    <CandlestickChart
+      points={points}
+      visible={visiblePoints}
+      visibleStartIndex={safeWindowStart}
+      visibleCount={visibleCount}
+      safeWindowStart={safeWindowStart}
+      maxWindowStart={maxWindowStart}
+      hoveredIndex={safeHoveredIndex}
+      isHoverPinned={isHoverPinned}
+      onHoverIndexChange={handleHoverIndexChange}
+      onHoverPinnedChange={setIsHoverPinned}
+      onStepHoverIndex={stepHoverIndex}
+      onWindowStartChange={handleWindowStartChange}
+      onTimelineZoomChange={adjustTimelineZoom}
+      onOpenChartMenu={openChartMenu}
+      canZoomIn={canZoomIn}
+      canZoomOut={canZoomOut}
+      onAddRuleMetric={handleAddRuleMetric}
+      period={effectivePeriod}
+      periodLabel={periodMeta.label}
+      selectedPeriod={selectedPeriod}
+      onPeriodChange={handlePeriodChange}
+      highlightedDate={initialDateKey ?? undefined}
+      quote={quote}
+      metrics={metrics}
+      isMaximized
+      onToggleMaximize={() => setMaximizedChart(null)}
+    />
+  ) : maximizedChart === 'volume' ? (
+    <VolumeActivityChart
+      points={points}
+      visible={visiblePoints}
+      visibleStartIndex={safeWindowStart}
+      hoveredIndex={safeHoveredIndex}
+      quote={quote}
+      isHoverPinned={isHoverPinned}
+      onHoverIndexChange={handleHoverIndexChange}
+      onHoverPinnedChange={setIsHoverPinned}
+      onStepHoverIndex={stepHoverIndex}
+      onOpenChartMenu={openChartMenu}
+      period={effectivePeriod}
+      highlightedDate={initialDateKey ?? undefined}
+      onAddRuleMetric={handleAddRuleMetric}
+      isMaximized
+      onToggleMaximize={() => setMaximizedChart(null)}
+    />
+  ) : maximizedChart === 'momentum' ? (
+    <MacdSignalChart
+      points={points}
+      visible={visiblePoints}
+      visibleStartIndex={safeWindowStart}
+      hoveredIndex={safeHoveredIndex}
+      isHoverPinned={isHoverPinned}
+      onHoverIndexChange={handleHoverIndexChange}
+      onHoverPinnedChange={setIsHoverPinned}
+      onStepHoverIndex={stepHoverIndex}
+      onOpenChartMenu={openChartMenu}
+      period={effectivePeriod}
+      highlightedDate={initialDateKey ?? undefined}
+      onAddRuleMetric={handleAddRuleMetric}
+      isMaximized
+      onToggleMaximize={() => setMaximizedChart(null)}
+    />
+  ) : null;
+
   return (
     <div
       data-testid={modal ? 'indicator-analysis-modal' : 'indicator-analysis-page'}
@@ -3697,6 +5041,7 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
       aria-modal={modal ? 'true' : undefined}
       aria-label="指标分析"
     >
+      <RuleMetricSelectionContext.Provider value={selectedRuleMetricKeys}>
       <div className={`glass-card flex min-h-0 w-full flex-col overflow-hidden shadow-2xl ${modal ? 'max-h-full max-w-7xl' : 'h-full'}`}>
         <div className="flex shrink-0 items-center justify-between gap-3 border-b border-subtle px-4 py-3">
           <div className="min-w-0">
@@ -3706,17 +5051,38 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
               {initialDateKey ? <Badge variant="danger" size="sm">命中日 {initialDateKey}</Badge> : null}
               <span className="truncate text-sm text-secondary-text">{stockName}</span>
             </div>
+            {ruleDraftFeedback ? (
+              <p className="mt-1 max-w-2xl truncate text-xs text-secondary-text">{ruleDraftFeedback}</p>
+            ) : null}
           </div>
-          {onClose ? (
-            <Button
-              variant="ghost"
-              size="sm"
-              onClick={onClose}
-              aria-label={modal ? '关闭指标分析浮窗' : '返回自选'}
-            >
-              {modal ? <X className="h-4 w-4" /> : <ArrowLeft className="h-4 w-4" />}
-            </Button>
-          ) : null}
+          <div className="flex shrink-0 items-center gap-2">
+            {ruleDraftCount > 0 ? (
+              <>
+                <button
+                  type="button"
+                  onClick={() => setIsRuleDraftEditorOpen((current) => !current)}
+                  className="rounded-full transition-transform hover:scale-105 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/45"
+                  aria-label="编辑已选规则条件"
+                >
+                  <Badge variant="info" size="sm">已选 {ruleDraftCount}</Badge>
+                </button>
+                <Button variant="secondary" size="sm" onClick={openRulesPage}>
+                  <Plus className="h-4 w-4" />
+                  去规则
+                </Button>
+              </>
+            ) : null}
+            {onClose ? (
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={onClose}
+                aria-label={modal ? '关闭指标分析浮窗' : '返回自选'}
+              >
+                {modal ? <X className="h-4 w-4" /> : <ArrowLeft className="h-4 w-4" />}
+              </Button>
+            ) : null}
+          </div>
         </div>
 
         <div className={modal ? 'min-h-0 flex-1 overflow-y-auto p-4 md:p-5' : 'min-h-0 flex-1 overflow-hidden p-3 md:p-4'}>
@@ -3741,6 +5107,7 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
                     quote={coreQuote}
                     referenceQuote={quote}
                     points={points}
+                    onAddRuleMetric={handleAddRuleMetric}
                   />
 
                   <section
@@ -3764,16 +5131,15 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
                       onOpenChartMenu={openChartMenu}
                       canZoomIn={canZoomIn}
                       canZoomOut={canZoomOut}
+                      onAddRuleMetric={handleAddRuleMetric}
                       period={effectivePeriod}
                       periodLabel={periodMeta.label}
-                      recentLabel={periodMeta.recentLabel}
-                      sampleUnit={periodMeta.sampleUnit}
-                      timeZoneLabel={timeMeta.klineLabel}
                       selectedPeriod={selectedPeriod}
                       onPeriodChange={handlePeriodChange}
                       highlightedDate={initialDateKey ?? undefined}
                       quote={quote}
                       metrics={metrics}
+                      onToggleMaximize={() => setMaximizedChart('kline')}
                     />
                   </section>
 
@@ -3794,6 +5160,8 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
                       onOpenChartMenu={openChartMenu}
                       period={effectivePeriod}
                       highlightedDate={initialDateKey ?? undefined}
+                      onAddRuleMetric={handleAddRuleMetric}
+                      onToggleMaximize={() => setMaximizedChart('volume')}
                     />
                   </section>
 
@@ -3813,6 +5181,8 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
                       onOpenChartMenu={openChartMenu}
                       period={effectivePeriod}
                       highlightedDate={initialDateKey ?? undefined}
+                      onAddRuleMetric={handleAddRuleMetric}
+                      onToggleMaximize={() => setMaximizedChart('momentum')}
                     />
                   </section>
                 </div>
@@ -3826,8 +5196,11 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
                     mainChip={mainChip}
                     requiresRealChipData={requiresRealChipData}
                     quote={quote}
+                    onAddRuleMetric={handleAddRuleMetric}
                   />
-                  {modal ? (
+                  {!modal ? (
+                    <RelatedNewsPanel stockCode={stockCode} />
+                  ) : (
                     <MarketStructureStrip
                       points={points}
                       quote={quote}
@@ -3836,7 +5209,7 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
                       estimatedChip={estimatedChip}
                       derivedVolumeRatio={volumeRatio}
                     />
-                  ) : null}
+                  )}
                 </div>
               </section>
             </div>
@@ -3888,6 +5261,47 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
           </button>
         </div>
       ) : null}
+      {maximizedChart && maximizedChartNode ? (
+        <div
+          className="fixed inset-0 z-[105] flex items-center justify-center bg-background/80 p-3 backdrop-blur-sm md:p-6"
+          role="dialog"
+          aria-modal="true"
+          aria-label={`${maximizedChartTitle}最大化`}
+        >
+          <div className="glass-card flex max-h-full w-full max-w-[calc(100vw-2rem)] flex-col overflow-hidden shadow-2xl md:max-w-[calc(100vw-4rem)]">
+            <div className="flex shrink-0 items-center justify-between gap-3 border-b border-subtle px-4 py-3">
+              <div className="min-w-0">
+                <h3 className="truncate text-base font-semibold text-foreground">{maximizedChartTitle}</h3>
+                <p className="mt-1 text-xs text-secondary-text">按 Esc 或右上角还原按钮返回原布局。</p>
+              </div>
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() => setMaximizedChart(null)}
+                aria-label={`还原${maximizedChartTitle}`}
+              >
+                <Minimize2 className="h-4 w-4" />
+              </Button>
+            </div>
+            <div className="min-h-0 flex-1 overflow-y-auto p-3">
+              {maximizedChartNode}
+            </div>
+          </div>
+        </div>
+      ) : null}
+      {isRuleDraftEditorOpen && ruleDraft ? (
+        <RuleMetricDraftEditor
+          draft={ruleDraft}
+          metrics={ruleMetrics}
+          isMetricsLoading={isRuleMetricsLoading}
+          metricsError={ruleMetricsError}
+          onChange={handleRuleDraftItemChange}
+          onRemove={handleRuleDraftItemRemove}
+          onClose={() => setIsRuleDraftEditorOpen(false)}
+          onOpenRulesPage={openRulesPage}
+        />
+      ) : null}
+      </RuleMetricSelectionContext.Provider>
     </div>
   );
 };

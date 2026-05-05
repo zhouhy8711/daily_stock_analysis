@@ -265,3 +265,73 @@ def test_history_endpoint_exposes_turnover_rate() -> None:
         response = get_stock_history("600519", period="daily", days=1)
 
     assert response.data[0].turnover_rate == 0.86
+
+
+def test_related_news_reads_recent_news_without_model_call() -> None:
+    long_snippet = "公司经营保持稳定，零售业务资产质量改善。" * 10
+    fake_db = SimpleNamespace(
+        get_recent_news=lambda code, days, limit: [
+            SimpleNamespace(
+                title="贵州茅台发布经营动态",
+                snippet=long_snippet,
+                url="https://example.com/news/maotai",
+            )
+        ],
+    )
+
+    with patch("src.storage.DatabaseManager.get_instance", return_value=fake_db):
+        result = StockService().get_related_news("600519", limit=3, days=7)
+
+    assert result["total"] == 1
+    assert result["items"][0]["title"] == "贵州茅台发布经营动态"
+    assert result["items"][0]["url"] == "https://example.com/news/maotai"
+    assert len(result["items"][0]["snippet"]) <= 200
+
+
+def test_related_news_refreshes_public_news_and_saves_to_db() -> None:
+    saved = {}
+
+    class FakeDb:
+        def save_news_intel(self, **kwargs):
+            saved.update(kwargs)
+            return 1
+
+        def get_recent_news(self, code, days, limit):
+            assert code == "600519"
+            return [
+                SimpleNamespace(
+                    title="刷新后的贵州茅台资讯",
+                    snippet="公开资讯源返回的最新消息。",
+                    url="https://example.com/news/refreshed",
+                )
+            ]
+
+    fake_search_response = SimpleNamespace(
+        success=True,
+        results=[
+            SimpleNamespace(
+                title="刷新后的贵州茅台资讯",
+                snippet="公开资讯源返回的最新消息。",
+                url="https://example.com/news/refreshed",
+                source="public",
+                published_date="2026-04-30",
+            )
+        ],
+        query="贵州茅台 600519 股票 最新消息",
+    )
+    fake_search_service = SimpleNamespace(
+        search_stock_news=lambda stock_code, stock_name, max_results: fake_search_response
+    )
+
+    with (
+        patch("src.storage.DatabaseManager.get_instance", return_value=FakeDb()),
+        patch("data_provider.base.DataFetcherManager", return_value=_FakeManager()),
+        patch("src.search_service.get_search_service", return_value=fake_search_service),
+    ):
+        result = StockService().get_related_news("600519", limit=3, days=7, refresh=True)
+
+    assert saved["code"] == "600519"
+    assert saved["name"] == "贵州茅台"
+    assert saved["dimension"] == "latest_news"
+    assert saved["query_context"]["query_source"] == "indicator_page"
+    assert result["items"][0]["title"] == "刷新后的贵州茅台资讯"

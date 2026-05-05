@@ -1,4 +1,5 @@
 import apiClient from './index';
+import type { NewsIntelItem, NewsIntelResponse } from '../types/analysis';
 
 export type ExtractItem = {
   code?: string | null;
@@ -347,6 +348,24 @@ export const stocksApi = {
       `/api/v1/stocks/${encodeURIComponent(stockCode)}/indicator-metrics`,
     );
     return normalizeIndicatorMetrics(response.data, stockCode);
+  },
+
+  async getRelatedNews(stockCode: string, limit = 8, refresh = false): Promise<NewsIntelResponse> {
+    const response = await apiClient.get<Record<string, unknown>>(
+      `/api/v1/stocks/${encodeURIComponent(stockCode)}/news`,
+      {
+        params: { limit, refresh },
+      },
+    );
+    const rawItems = Array.isArray(response.data.items) ? response.data.items : [];
+    return {
+      total: toNumber(response.data.total),
+      items: (rawItems as Array<Record<string, unknown>>).map((item): NewsIntelItem => ({
+        title: String(item.title ?? ''),
+        snippet: String(item.snippet ?? ''),
+        url: String(item.url ?? ''),
+      })).filter((item) => item.title && item.url),
+    };
   },
 
   async extractFromImage(file: File): Promise<ExtractFromImageResponse> {

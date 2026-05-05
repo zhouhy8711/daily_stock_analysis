@@ -172,12 +172,17 @@ def test_metric_frame_maps_chip_ratios_to_percent_values():
 def test_metric_registry_groups_indicator_page_metrics_by_chart_area():
     registry = {item["key"]: item for item in get_metric_registry()}
 
+    assert registry["current_price"]["category"] == "核心行情"
+    assert registry["total_mv"]["category"] == "核心行情"
     assert registry["close"]["category"] == "K线图"
+    assert registry["limit_up_price"]["category"] == "K线图"
     assert registry["volume_ma5"]["category"] == "成交量图"
+    assert registry["after_hours_amount"]["category"] == "成交量图"
     assert registry["macd_dif"]["category"] == "MACD图"
     assert registry["rsi24"]["category"] == "RSI图"
     assert registry["trapped_ratio"]["category"] == "筹码峰-全部筹码"
     assert registry["main_profit_ratio"]["category"] == "筹码峰-主力筹码"
+    assert registry["main_net_volume_pct"]["category"] == "实时监控"
     assert registry["main_force_net"]["category"] == "实时监控"
 
 
@@ -214,6 +219,43 @@ def test_metric_frame_calculates_indicator_page_metrics_for_rules():
     assert latest["amount_ma5"] == 19920
     assert latest["main_force_net"] > 0
     assert round(latest["net_super_large_order"], 6) == round(latest["main_force_net"] * 0.44, 6)
+
+
+def test_metric_frame_maps_realtime_quote_metrics_for_rules():
+    frame = build_metric_frame(
+        _history(),
+        quote={
+            "current_price": 14.5,
+            "change": 0.5,
+            "change_percent": 3.57,
+            "volume": 2600,
+            "amount": 37700,
+            "after_hours_volume": 120,
+            "after_hours_amount": 1740,
+            "total_mv": 1_450_000_000,
+            "circ_mv": 1_160_000_000,
+            "pe_ratio": 18.2,
+            "total_shares": 100_000_000,
+            "float_shares": 80_000_000,
+            "limit_up_price": 15.4,
+            "limit_down_price": 12.6,
+            "price_speed": 0.42,
+            "entrust_ratio": 11.5,
+        },
+    )
+    latest = frame.iloc[-1]
+
+    assert latest["current_price"] == 14.5
+    assert latest["total_mv"] == 1_450_000_000
+    assert latest["circ_mv"] == 1_160_000_000
+    assert latest["pe_ratio"] == 18.2
+    assert latest["after_hours_volume"] == 120
+    assert latest["after_hours_amount"] == 1740
+    assert latest["limit_up_price"] == 15.4
+    assert latest["limit_down_price"] == 12.6
+    assert latest["price_speed"] == 0.42
+    assert latest["entrust_ratio"] == 11.5
+    assert latest["main_net_volume_pct"] > 0
 
 
 def test_metric_frame_maps_chip_snapshots_by_date():

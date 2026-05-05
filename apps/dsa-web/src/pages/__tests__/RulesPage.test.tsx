@@ -4,6 +4,7 @@ import { historyApi } from '../../api/history';
 import { rulesApi } from '../../api/rules';
 import { systemConfigApi } from '../../api/systemConfig';
 import type { StockIndexItem } from '../../types/stockIndex';
+import { RULE_METRIC_DRAFT_STORAGE_KEY } from '../../utils/ruleMetricDraft';
 import RulesPage from '../RulesPage';
 
 const stockIndexHookState = vi.hoisted(() => ({
@@ -52,6 +53,7 @@ vi.mock('../../hooks/useStockIndex', () => ({
 describe('RulesPage', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    localStorage.clear();
     stockIndexHookState.current = {
       index: [
         {
@@ -153,5 +155,57 @@ describe('RulesPage', () => {
     expect(groupLabels).toEqual(['K线图', '成交量图', '筹码峰-全部筹码', '筹码峰-主力筹码']);
     expect(metricSelect.querySelector('option[value="volume_ma5"]')?.textContent).toContain('MAVOL5');
     expect(metricSelect.querySelector('option[value="profit_ratio"]')?.textContent).toContain('收盘获利');
+  });
+
+  it('creates an unsaved AND condition group from indicator-analysis draft metrics', async () => {
+    localStorage.setItem(RULE_METRIC_DRAFT_STORAGE_KEY, JSON.stringify({
+      version: 1,
+      stockCode: '600519',
+      stockName: '贵州茅台',
+      items: [
+        {
+          id: 'm1',
+          key: 'close',
+          label: '收盘价',
+          value: 12.34,
+          unit: '元',
+          date: '2026-04-30',
+          operator: '<=',
+          right: { type: 'literal', value: 11 },
+          addedAt: '2026-04-30T10:00:00',
+        },
+        { id: 'm2', key: 'volume_ma5', label: 'MAVOL5', value: 10000, unit: '股', date: '2026-04-30', addedAt: '2026-04-30T10:01:00' },
+      ],
+    }));
+
+    render(<RulesPage />);
+
+    expect(await screen.findByDisplayValue('贵州茅台规则')).toBeInTheDocument();
+    expect(screen.getByText(/已从指标分析加入 2 个指标/)).toBeInTheDocument();
+    expect(document.body.textContent).toContain('收盘价');
+    expect(document.body.textContent).toContain('MAVOL5');
+    expect(document.body.textContent).toContain('且');
+
+    fireEvent.click(screen.getByRole('button', { name: '保存' }));
+
+    await waitFor(() => {
+      expect(rulesApi.create).toHaveBeenCalledWith(expect.objectContaining({
+        definition: expect.objectContaining({
+          target: {
+            scope: 'custom',
+            stockCodes: ['600519'],
+          },
+          groups: [
+            expect.objectContaining({
+              conditions: [
+                expect.objectContaining({ left: { metric: 'close', offset: 0 }, operator: '<=', right: { type: 'literal', value: 11 } }),
+                expect.objectContaining({ left: { metric: 'volume_ma5', offset: 0 } }),
+              ],
+            }),
+          ],
+        }),
+      }));
+    });
+    expect(localStorage.getItem(RULE_METRIC_DRAFT_STORAGE_KEY)).toBeNull();
   });
 });
