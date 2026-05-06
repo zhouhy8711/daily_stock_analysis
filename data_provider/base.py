@@ -1326,7 +1326,13 @@ class DataFetcherManager:
             logger.error(f"[预取] 批量预取异常: {e}")
             return 0
     
-    def get_realtime_quote(self, stock_code: str, *, log_final_failure: bool = True):
+    def get_realtime_quote(
+        self,
+        stock_code: str,
+        *,
+        log_final_failure: bool = True,
+        freshness_seconds: Optional[int] = None,
+    ):
         """
         获取实时行情数据（自动故障切换）
         
@@ -1342,6 +1348,8 @@ class DataFetcherManager:
             stock_code: 股票代码
             log_final_failure: Whether to emit the final "all sources failed"
                 summary log when no realtime quote is available.
+            freshness_seconds: Optional cache freshness upper bound used by
+                all-market realtime quote providers.
             
         Returns:
             UnifiedRealtimeQuote 对象，所有数据源都失败则返回 None
@@ -1417,7 +1425,12 @@ class DataFetcherManager:
                     for fetcher in self._get_fetchers_snapshot():
                         if fetcher.name == "EfinanceFetcher":
                             if hasattr(fetcher, 'get_realtime_quote'):
-                                quote = self._call_fetcher_method(fetcher, 'get_realtime_quote', stock_code)
+                                quote = self._call_fetcher_method(
+                                    fetcher,
+                                    'get_realtime_quote',
+                                    stock_code,
+                                    freshness_seconds=freshness_seconds,
+                                )
                             break
                 
                 elif source == "akshare_em":
@@ -1425,7 +1438,13 @@ class DataFetcherManager:
                     for fetcher in self._get_fetchers_snapshot():
                         if fetcher.name == "AkshareFetcher":
                             if hasattr(fetcher, 'get_realtime_quote'):
-                                quote = self._call_fetcher_method(fetcher, 'get_realtime_quote', stock_code, source="em")
+                                quote = self._call_fetcher_method(
+                                    fetcher,
+                                    'get_realtime_quote',
+                                    stock_code,
+                                    source="em",
+                                    freshness_seconds=freshness_seconds,
+                                )
                             break
                 
                 elif source == "akshare_sina":

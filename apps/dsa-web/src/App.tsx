@@ -12,6 +12,7 @@ import IndicatorAnalysisPage from './pages/IndicatorAnalysisPage';
 import RulesPage from './pages/RulesPage';
 import { ApiErrorAlert, Shell } from './components/common';
 import { AuthProvider, useAuth } from './contexts/AuthContext';
+import { LiveMarketDataProvider } from './contexts/LiveMarketDataContext';
 import { useAgentChatStore } from './stores/agentChatStore';
 import './App.css';
 
@@ -61,19 +62,21 @@ const AppContent: React.FC = () => {
   }
 
   return (
-    <Routes>
-      <Route element={<Shell />}>
-        <Route path="/" element={<HomePage />} />
-        <Route path="/rules" element={<RulesPage />} />
-        <Route path="/chat" element={<ChatPage />} />
-        <Route path="/indicators/:stockCode" element={<IndicatorAnalysisPage />} />
-        <Route path="/portfolio" element={<PortfolioPage />} />
-        <Route path="/backtest" element={<BacktestPage />} />
-        <Route path="/settings" element={<SettingsPage />} />
-        <Route path="*" element={<NotFoundPage />} />
-      </Route>
-      <Route path="/login" element={<LoginPage />} />
-    </Routes>
+    <LiveMarketDataProvider>
+      <Routes>
+        <Route element={<Shell />}>
+          <Route path="/" element={<HomePage />} />
+          <Route path="/rules" element={<RulesPage />} />
+          <Route path="/chat" element={<ChatPage />} />
+          <Route path="/indicators/:stockCode" element={<IndicatorAnalysisPage />} />
+          <Route path="/portfolio" element={<PortfolioPage />} />
+          <Route path="/backtest" element={<BacktestPage />} />
+          <Route path="/settings" element={<SettingsPage />} />
+          <Route path="*" element={<NotFoundPage />} />
+        </Route>
+        <Route path="/login" element={<LoginPage />} />
+      </Routes>
+    </LiveMarketDataProvider>
   );
 };
 

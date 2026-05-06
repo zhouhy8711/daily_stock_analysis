@@ -8,6 +8,7 @@ import { historyApi } from '../../api/history';
 import { stocksApi } from '../../api/stocks';
 import { systemConfigApi } from '../../api/systemConfig';
 import { ShellSidebarActionProvider } from '../../components/layout/ShellSidebarActionContext';
+import { LiveMarketDataProvider } from '../../contexts/LiveMarketDataContext';
 import { useStockPoolStore } from '../../stores';
 import type { StockIndexItem } from '../../types/stockIndex';
 import { getReportText, normalizeReportLanguage } from '../../utils/reportLanguage';
@@ -319,6 +320,52 @@ describe('HomePage', () => {
       '查看 平安银行 报告',
       '查看 贵州茅台 报告',
     ]);
+  });
+
+  it('updates watchlist prices from the shared live quote store', async () => {
+    vi.mocked(systemConfigApi.getConfig).mockResolvedValue({
+      configVersion: 'v1',
+      maskToken: '******',
+      items: [{ key: 'STOCK_LIST', value: '600519', rawValueExists: true, isMasked: false }],
+    });
+    vi.mocked(historyApi.getList).mockResolvedValue({
+      total: 1,
+      page: 1,
+      limit: 20,
+      items: [{
+        ...historyItem,
+        currentPrice: 100,
+        changePct: -1.1,
+      }],
+    });
+    vi.mocked(stocksApi.getQuotes).mockResolvedValue({
+      items: [{
+        stockCode: '600519',
+        stockName: '贵州茅台',
+        currentPrice: 1688.5,
+        changePercent: 2.34,
+        updateTime: '2026-04-30T10:30:00',
+      }],
+      failedCodes: [],
+      updateTime: '2026-04-30T10:30:00',
+    });
+
+    render(
+      <MemoryRouter>
+        <LiveMarketDataProvider>
+          <HomePage />
+        </LiveMarketDataProvider>
+      </MemoryRouter>,
+    );
+
+    const watchlistTab = await screen.findByRole('button', { name: '自选' });
+    const board = watchlistTab.closest('section') as HTMLElement;
+
+    await waitFor(() => {
+      expect(stocksApi.getQuotes).toHaveBeenCalledWith(['600519'], 60);
+      expect(within(board).getByText('1688.50')).toBeInTheDocument();
+      expect(within(board).getByText('+2.34%')).toBeInTheDocument();
+    });
   });
 
   it('closes the report overlay when pressing Escape', async () => {

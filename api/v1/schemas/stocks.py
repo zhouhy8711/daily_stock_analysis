@@ -83,6 +83,7 @@ class StockQuotesRequest(BaseModel):
     """批量实时行情请求"""
 
     stock_codes: List[str] = Field(..., description="股票代码列表")
+    freshness_seconds: Optional[int] = Field(None, ge=0, le=3600, description="可接受的行情缓存新鲜度秒数")
 
 
 class StockQuotesResponse(BaseModel):
@@ -157,6 +158,21 @@ class StockHistoryResponse(BaseModel):
                 "data": []
             }
         }
+
+
+class StockIntradaySnapshotResponse(BaseModel):
+    """当日分钟走势快照响应"""
+
+    stock_code: str = Field(..., description="股票代码")
+    stock_name: Optional[str] = Field(None, description="股票名称")
+    market: Optional[str] = Field(None, description="市场: cn/hk/us")
+    trading_date: str = Field(..., description="快照对应交易日")
+    period: str = Field(..., description="分钟 K 线周期")
+    refresh_interval_seconds: int = Field(..., description="建议前端刷新周期")
+    update_time: str = Field(..., description="快照生成时间")
+    quote: Optional[StockQuote] = Field(None, description="实时行情")
+    data: List[KLineData] = Field(default_factory=list, description="当日分钟 K 线")
+    errors: List[str] = Field(default_factory=list, description="部分失败信息")
 
 
 class ChipDistributionPoint(BaseModel):

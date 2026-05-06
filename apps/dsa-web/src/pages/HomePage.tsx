@@ -11,6 +11,7 @@ import { StockAutocomplete } from '../components/StockAutocomplete';
 import { HistoryList } from '../components/history';
 import { ReportMarkdown, ReportSummary } from '../components/report';
 import { WatchlistBoard, type WatchlistItem } from '../components/watchlist';
+import { findLiveQuote, useLiveQuotes } from '../contexts/LiveMarketDataContext';
 import { useDashboardLifecycle, useHomeDashboardState } from '../hooks';
 import { useStockIndex } from '../hooks/useStockIndex';
 import type { StockIndexItem } from '../types/stockIndex';
@@ -139,6 +140,21 @@ const HomePage: React.FC = () => {
     return buildLatestHistoryByCode(historyItems);
   }, [historyItems]);
 
+  const watchlistLiveCodes = useMemo(() => {
+    if (watchlistCodes.length > 0) {
+      return watchlistCodes;
+    }
+    return historyItems.reduce<string[]>((codes, item) => {
+      const code = normalizeWatchlistCode(item.stockCode);
+      if (code && !codes.includes(code)) {
+        codes.push(code);
+      }
+      return codes;
+    }, []);
+  }, [historyItems, watchlistCodes]);
+
+  const { quotesByCode: liveQuotesByCode } = useLiveQuotes(watchlistLiveCodes);
+
   const watchlistLookupSet = useMemo(() => {
     const keys = new Set<string>();
     for (const code of watchlistCodes) {
@@ -185,13 +201,15 @@ const HomePage: React.FC = () => {
       const stockIndexItem = lookupKeys
         .map((key) => stockIndexByLookupKey.get(key))
         .find((item) => item !== undefined);
+      const liveQuote = findLiveQuote(liveQuotesByCode, code)
+        ?? findLiveQuote(liveQuotesByCode, history?.stockCode);
       return {
-        stockCode: history?.stockCode || code,
+        stockCode: liveQuote?.stockCode || history?.stockCode || code,
         watchlistCode: code,
-        stockName: history?.stockName || stockIndexItem?.nameZh,
+        stockName: history?.stockName || liveQuote?.stockName || stockIndexItem?.nameZh,
         recordId: history?.id,
-        currentPrice: history?.currentPrice,
-        changePct: history?.changePct,
+        currentPrice: liveQuote?.currentPrice ?? history?.currentPrice,
+        changePct: liveQuote?.changePercent ?? history?.changePct,
         sentimentScore: history?.sentimentScore,
         operationAdvice: history?.operationAdvice,
         createdAt: history?.createdAt,
@@ -200,7 +218,7 @@ const HomePage: React.FC = () => {
         industry: stockIndexItem?.industry,
       };
     });
-  }, [historyItems, latestHistoryByCode, stockIndexByLookupKey, watchlistCodes]);
+  }, [historyItems, latestHistoryByCode, liveQuotesByCode, stockIndexByLookupKey, watchlistCodes]);
 
   const allShareIndexItems = useMemo(
     () => stockIndex

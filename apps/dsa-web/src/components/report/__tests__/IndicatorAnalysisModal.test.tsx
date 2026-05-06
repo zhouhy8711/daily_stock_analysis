@@ -9,6 +9,7 @@ vi.mock('../../../api/stocks', () => ({
   stocksApi: {
     getHistory: vi.fn(),
     getQuote: vi.fn(),
+    getIntradaySnapshot: vi.fn(),
     getIndicatorMetrics: vi.fn(),
     getRelatedNews: vi.fn(),
   },
@@ -119,7 +120,7 @@ function makeQuote(stockCode: string, overrides: Partial<StockQuote> = {}): Stoc
     priceSpeed: 0.36,
     entrustRatio: 18.5,
     source: stockCode === 'BABA' ? 'yfinance' : 'efinance',
-    updateTime: '2026-04-30T23:50:00',
+    updateTime: '2026-04-24T15:00:00',
     ...overrides,
   };
 }
@@ -170,6 +171,18 @@ describe('IndicatorAnalysisModal', () => {
       data: makeHistory(period),
     }));
     vi.mocked(stocksApi.getQuote).mockImplementation(async (stockCode) => makeQuote(stockCode));
+    vi.mocked(stocksApi.getIntradaySnapshot).mockImplementation(async (stockCode, period = '1m') => ({
+      stockCode,
+      stockName: stockCode === 'BABA' ? '阿里巴巴' : '贵州茅台',
+      market: stockCode === 'BABA' ? 'us' : 'cn',
+      tradingDate: '2026-04-30',
+      period,
+      refreshIntervalSeconds: 60,
+      updateTime: '2026-04-30T10:30:00',
+      quote: makeQuote(stockCode, { currentPrice: 135, change: 3.2, changePercent: 2.43 }),
+      data: makeHistory('1m'),
+      errors: [],
+    }));
     vi.mocked(stocksApi.getIndicatorMetrics).mockImplementation(async (stockCode) => ({
       stockCode,
       stockName: stockCode === 'BABA' ? '阿里巴巴' : '贵州茅台',
@@ -233,7 +246,7 @@ describe('IndicatorAnalysisModal', () => {
     vi.useRealTimers();
   });
 
-  it('refreshes quote every 10 seconds and refreshes one-minute history only on 1m period', async () => {
+  it('refreshes quote every 60 seconds and refreshes one-minute history only on 1m period', async () => {
     const { unmount } = render(
       <IndicatorAnalysisModal stockCode="BABA" stockName="阿里巴巴" onClose={vi.fn()} />,
     );
@@ -241,15 +254,30 @@ describe('IndicatorAnalysisModal', () => {
 
     const dailyHistoryCallsBeforeRefresh = vi.mocked(stocksApi.getHistory).mock.calls.length;
     const dailyQuoteCallsBeforeRefresh = vi.mocked(stocksApi.getQuote).mock.calls.length;
+    vi.mocked(stocksApi.getQuote).mockResolvedValueOnce(makeQuote('BABA', {
+      currentPrice: 292,
+      change: 11.12,
+      changePercent: 3.96,
+      open: 260,
+      high: 292,
+      low: 260,
+      volume: 409100,
+      amount: 311000000,
+      turnoverRate: 0.2,
+      updateTime: '2026-05-06T09:37:00',
+    }));
 
     await act(async () => {
-      vi.advanceTimersByTime(10_000);
+      vi.advanceTimersByTime(60_000);
       await Promise.resolve();
       await Promise.resolve();
     });
 
     expect(stocksApi.getHistory).toHaveBeenCalledTimes(dailyHistoryCallsBeforeRefresh);
     expect(stocksApi.getQuote).toHaveBeenCalledTimes(dailyQuoteCallsBeforeRefresh + 1);
+    expectIndicatorHeadersToShow('2026-05-06');
+    expect(within(screen.getByTestId('indicator-core-metrics')).getAllByText('292.00').length).toBeGreaterThan(0);
+    expect(screen.getAllByTestId('indicator-kline-x-axis-label').map((item) => item.textContent)).toContain('05-06');
 
     fireEvent.click(screen.getByRole('tab', { name: '1分' }));
     await flushPromises();
@@ -259,7 +287,7 @@ describe('IndicatorAnalysisModal', () => {
     const metricsCallsBeforeRefresh = vi.mocked(stocksApi.getIndicatorMetrics).mock.calls.length;
 
     await act(async () => {
-      vi.advanceTimersByTime(10_000);
+      vi.advanceTimersByTime(60_000);
       await Promise.resolve();
       await Promise.resolve();
     });
@@ -273,15 +301,138 @@ describe('IndicatorAnalysisModal', () => {
     await flushPromises();
     const callsAfterFiveMinuteLoad = vi.mocked(stocksApi.getHistory).mock.calls.length;
     const quoteCallsAfterFiveMinuteLoad = vi.mocked(stocksApi.getQuote).mock.calls.length;
+    vi.mocked(stocksApi.getQuote).mockResolvedValue(makeQuote('BABA', {
+      currentPrice: 141.2,
+      updateTime: '2026-05-06T10:07:00',
+    }));
 
     await act(async () => {
-      vi.advanceTimersByTime(20_000);
+      vi.advanceTimersByTime(120_000);
       await Promise.resolve();
       await Promise.resolve();
     });
 
-    expect(stocksApi.getHistory).toHaveBeenCalledTimes(callsAfterFiveMinuteLoad);
+    expect(stocksApi.getHistory).toHaveBeenCalledTimes(callsAfterFiveMinuteLoad + 2);
+    expect(stocksApi.getHistory).toHaveBeenLastCalledWith('BABA', 3, '5m');
     expect(stocksApi.getQuote).toHaveBeenCalledTimes(quoteCallsAfterFiveMinuteLoad + 2);
+    expectIndicatorHeadersToShow('2026-05-06 10:05');
+    expect(within(screen.getByTestId('indicator-core-metrics')).getByText('141.20')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('tab', { name: '日K' }));
+    await flushPromises();
+    expect(within(screen.getByTestId('indicator-core-metrics')).getByText('141.20')).toBeInTheDocument();
+    unmount();
+  });
+
+  it('keeps core metrics consistent across periods when realtime quote is unavailable', async () => {
+    vi.mocked(stocksApi.getQuote).mockRejectedValue(new Error('quote unavailable'));
+
+    const { unmount } = render(
+      <IndicatorAnalysisModal stockCode="300274.SZ" stockName="阳光电源" onClose={vi.fn()} />,
+    );
+    await flushPromises();
+
+    const readCore = () => screen.getByTestId('indicator-core-metrics').textContent ?? '';
+    const dailyCore = readCore();
+
+    fireEvent.click(screen.getByRole('tab', { name: '1分' }));
+    await flushPromises();
+    expect(readCore()).toBe(dailyCore);
+
+    fireEvent.click(screen.getByRole('tab', { name: '5分' }));
+    await flushPromises();
+    expect(readCore()).toBe(dailyCore);
+
+    unmount();
+  });
+
+  it('shows the today trend tab after 60m and loads intraday snapshot data', async () => {
+    const { unmount } = render(
+      <IndicatorAnalysisModal stockCode="600519" stockName="贵州茅台" onClose={vi.fn()} />,
+    );
+    await flushPromises();
+
+    const tabs = within(screen.getByRole('tablist', { name: 'K线周期' }))
+      .getAllByRole('tab')
+      .map((tab) => tab.textContent);
+    expect(tabs).toEqual(['日K', '1分', '5分', '15分', '30分', '60分', '当日走势']);
+
+    fireEvent.click(screen.getByRole('tab', { name: '当日走势' }));
+    await flushPromises();
+
+    expect(stocksApi.getIntradaySnapshot).toHaveBeenCalledWith('600519', '1m');
+    expect(screen.getByRole('tab', { name: '当日走势' })).toHaveAttribute('aria-selected', 'true');
+    expectIndicatorHeadersToShow('2026-04-30 10:29');
+    expect(within(screen.getByTestId('indicator-core-metrics')).getByText('135.00')).toBeInTheDocument();
+
+    const callsBeforePoll = vi.mocked(stocksApi.getIntradaySnapshot).mock.calls.length;
+    await act(async () => {
+      vi.advanceTimersByTime(60_000);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(stocksApi.getIntradaySnapshot).toHaveBeenCalledTimes(callsBeforePoll + 1);
+
+    unmount();
+    const callsBeforeUnmountPoll = vi.mocked(stocksApi.getIntradaySnapshot).mock.calls.length;
+    await act(async () => {
+      vi.advanceTimersByTime(60_000);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(stocksApi.getIntradaySnapshot).toHaveBeenCalledTimes(callsBeforeUnmountPoll);
+  });
+
+  it('shows a dedicated today trend error instead of silently reusing the daily board', async () => {
+    vi.mocked(stocksApi.getIntradaySnapshot).mockRejectedValueOnce(new Error('连接上游服务超时'));
+
+    const { unmount } = render(
+      <IndicatorAnalysisModal stockCode="600519" stockName="贵州茅台" onClose={vi.fn()} />,
+    );
+    await flushPromises();
+
+    fireEvent.click(screen.getByRole('tab', { name: '当日走势' }));
+    await flushPromises();
+
+    expect(stocksApi.getIntradaySnapshot).toHaveBeenCalledWith('600519', '1m');
+    expect(screen.getByRole('tab', { name: '当日走势' })).toHaveAttribute('aria-selected', 'true');
+    expect(screen.getByText('当日走势暂无可用分钟线')).toBeInTheDocument();
+    expect(screen.getByText(/连接上游服务超时/)).toBeInTheDocument();
+    expect(screen.queryByText('指标数据加载失败')).not.toBeInTheDocument();
+    expect(screen.getByRole('img', { name: 'K线图' })).toBeInTheDocument();
+    expectIndicatorHeadersToShow('2026-04-24');
+
+    unmount();
+  });
+
+  it('shows a dedicated today trend empty state when the snapshot has no valid minute bars', async () => {
+    vi.mocked(stocksApi.getIntradaySnapshot).mockResolvedValueOnce({
+      stockCode: '600519',
+      stockName: '贵州茅台',
+      market: 'cn',
+      tradingDate: '2026-04-30',
+      period: '1m',
+      refreshIntervalSeconds: 60,
+      updateTime: '2026-04-30T09:26:00',
+      quote: makeQuote('600519'),
+      data: [],
+      errors: [],
+    });
+
+    const { unmount } = render(
+      <IndicatorAnalysisModal stockCode="600519" stockName="贵州茅台" onClose={vi.fn()} />,
+    );
+    await flushPromises();
+
+    fireEvent.click(screen.getByRole('tab', { name: '当日走势' }));
+    await flushPromises();
+
+    expect(screen.getByRole('tab', { name: '当日走势' })).toHaveAttribute('aria-selected', 'true');
+    expect(screen.getByText('当日走势暂无可用分钟线')).toBeInTheDocument();
+    expect(screen.getByText(/当日走势数据加载失败/)).toBeInTheDocument();
+    expect(screen.getByRole('img', { name: 'K线图' })).toBeInTheDocument();
+    expectIndicatorHeadersToShow('2026-04-24');
+
     unmount();
   });
 
@@ -295,7 +446,7 @@ describe('IndicatorAnalysisModal', () => {
     await flushPromises();
 
     expect(stocksApi.getHistory).toHaveBeenCalledWith(stockCode, 120, 'daily');
-    expect(stocksApi.getQuote).toHaveBeenCalledWith(stockCode);
+      expect(stocksApi.getQuote).toHaveBeenCalledWith(stockCode, 60);
     expect(stocksApi.getIndicatorMetrics).toHaveBeenCalledWith(stockCode);
 
     expect(screen.getByRole('tablist', { name: 'K线周期' })).toBeInTheDocument();
@@ -382,13 +533,8 @@ describe('IndicatorAnalysisModal', () => {
     expect(screen.queryByTestId('indicator-volume-tooltip')).not.toBeInTheDocument();
     expect(screen.queryByTestId('indicator-momentum-tooltip')).not.toBeInTheDocument();
     expectIndicatorHeadersToShow('2026-04-24');
-    if (stockCode === '600519') {
-      expect(within(screen.getByTestId('chip-peak-panel')).getByText('2026-04-24')).toBeInTheDocument();
-      expect(screen.getByRole('img', { name: '筹码峰分布图' })).toBeInTheDocument();
-    } else {
-      expect(within(screen.getByTestId('chip-peak-panel')).getByText('2026-04-30')).toBeInTheDocument();
-      expect(screen.getByRole('img', { name: '筹码峰分布图' })).toBeInTheDocument();
-    }
+    expect(within(screen.getByTestId('chip-peak-panel')).getByText('2026-04-24')).toBeInTheDocument();
+    expect(screen.getByRole('img', { name: '筹码峰分布图' })).toBeInTheDocument();
     fireEvent.mouseLeave(screen.getByTestId('indicator-chart-bar-2026-04-24'));
 
     fireEvent.mouseEnter(screen.getByTestId('indicator-volume-bar-2026-04-24'));
@@ -528,9 +674,9 @@ describe('IndicatorAnalysisModal', () => {
     fireEvent.mouseEnter(screen.getByTestId('indicator-chart-bar-2026-04-23'));
     expectIndicatorHeadersToShow('2026-04-23');
     const historicalCoreMetrics = within(screen.getByTestId('indicator-core-metrics'));
-    expect(historicalCoreMetrics.getByText('122.20')).toBeInTheDocument();
-    expect(historicalCoreMetrics.getByText('+0.10')).toBeInTheDocument();
-    expect(historicalCoreMetrics.getByText('+0.10%')).toBeInTheDocument();
+    expect(historicalCoreMetrics.getByText('132.00')).toBeInTheDocument();
+    expect(historicalCoreMetrics.getByText('+0.20')).toBeInTheDocument();
+    expect(historicalCoreMetrics.getByText('+0.15%')).toBeInTheDocument();
     const historicalPriceHeader = screen.getByTestId('indicator-price-header');
     fireEvent.click(within(historicalPriceHeader).getByRole('button', { name: '更多K线指标' }));
     const historicalPriceHeaderText = screen.getByRole('dialog', { name: '更多K线指标' }).textContent ?? '';
@@ -640,7 +786,7 @@ describe('IndicatorAnalysisModal', () => {
     fireEvent.mouseEnter(screen.getByTestId('indicator-chart-bar-2026-04-14'));
 
     expect(within(screen.getByTestId('indicator-volume-header')).getByText('换手:0.06%')).toBeInTheDocument();
-    expect(within(screen.getByTestId('indicator-core-metrics')).getByText('0.06%')).toBeInTheDocument();
+    expect(within(screen.getByTestId('indicator-core-metrics')).getByText('0.80%')).toBeInTheDocument();
 
     unmount();
   });

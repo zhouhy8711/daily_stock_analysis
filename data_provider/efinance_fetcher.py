@@ -146,6 +146,17 @@ _etf_realtime_cache: Dict[str, Any] = {
 }
 
 
+def _effective_realtime_ttl(cache: Dict[str, Any], freshness_seconds: Optional[int] = None) -> int:
+    ttl = int(cache.get('ttl') or 0)
+    if freshness_seconds is None:
+        return ttl
+    try:
+        freshness = max(0, int(freshness_seconds))
+    except (TypeError, ValueError):
+        return ttl
+    return min(ttl, freshness)
+
+
 def _is_etf_code(stock_code: str) -> bool:
     """
     判断代码是否为 ETF 基金
@@ -673,7 +684,11 @@ class EfinanceFetcher(BaseFetcher):
         
         return df
     
-    def get_realtime_quote(self, stock_code: str) -> Optional[UnifiedRealtimeQuote]:
+    def get_realtime_quote(
+        self,
+        stock_code: str,
+        freshness_seconds: Optional[int] = None,
+    ) -> Optional[UnifiedRealtimeQuote]:
         """
         获取实时行情数据
         
@@ -688,7 +703,7 @@ class EfinanceFetcher(BaseFetcher):
         """
         # ETF 需要单独请求 ETF 实时行情接口
         if _is_etf_code(stock_code):
-            return self._get_etf_realtime_quote(stock_code)
+            return self._get_etf_realtime_quote(stock_code, freshness_seconds=freshness_seconds)
 
         import efinance as ef
         circuit_breaker = get_realtime_circuit_breaker()
@@ -702,11 +717,12 @@ class EfinanceFetcher(BaseFetcher):
         try:
             # 检查缓存
             current_time = time.time()
+            cache_ttl = _effective_realtime_ttl(_realtime_cache, freshness_seconds)
             if (_realtime_cache['data'] is not None and 
-                current_time - _realtime_cache['timestamp'] < _realtime_cache['ttl']):
+                current_time - _realtime_cache['timestamp'] < cache_ttl):
                 df = _realtime_cache['data']
                 cache_age = int(current_time - _realtime_cache['timestamp'])
-                logger.debug(f"[缓存命中] 实时行情(efinance) - 缓存年龄 {cache_age}s/{_realtime_cache['ttl']}s")
+                logger.debug(f"[缓存命中] 实时行情(efinance) - 缓存年龄 {cache_age}s/{cache_ttl}s")
             else:
                 # 触发全量刷新
                 logger.info(f"[缓存未命中] 触发全量刷新 实时行情(efinance)")
@@ -796,7 +812,11 @@ class EfinanceFetcher(BaseFetcher):
             circuit_breaker.record_failure(source_key, str(e))
             return None
 
-    def get_realtime_quotes(self, stock_codes: List[str]) -> Dict[str, UnifiedRealtimeQuote]:
+    def get_realtime_quotes(
+        self,
+        stock_codes: List[str],
+        freshness_seconds: Optional[int] = None,
+    ) -> Dict[str, UnifiedRealtimeQuote]:
         """
         批量获取 A 股实时行情。
 
@@ -818,13 +838,14 @@ class EfinanceFetcher(BaseFetcher):
 
         try:
             current_time = time.time()
+            cache_ttl = _effective_realtime_ttl(_realtime_cache, freshness_seconds)
             if (
                 _realtime_cache['data'] is not None and
-                current_time - _realtime_cache['timestamp'] < _realtime_cache['ttl']
+                current_time - _realtime_cache['timestamp'] < cache_ttl
             ):
                 df = _realtime_cache['data']
                 cache_age = int(current_time - _realtime_cache['timestamp'])
-                logger.debug(f"[缓存命中] 批量实时行情(efinance) - 缓存年龄 {cache_age}s/{_realtime_cache['ttl']}s")
+                logger.debug(f"[缓存命中] 批量实时行情(efinance) - 缓存年龄 {cache_age}s/{cache_ttl}s")
             else:
                 self._set_random_user_agent()
                 self._enforce_rate_limit()
@@ -905,7 +926,11 @@ class EfinanceFetcher(BaseFetcher):
             circuit_breaker.record_failure(source_key, str(e))
             return {}
 
-    def _get_etf_realtime_quote(self, stock_code: str) -> Optional[UnifiedRealtimeQuote]:
+    def _get_etf_realtime_quote(
+        self,
+        stock_code: str,
+        freshness_seconds: Optional[int] = None,
+    ) -> Optional[UnifiedRealtimeQuote]:
         """
         获取 ETF 实时行情
 
@@ -921,13 +946,14 @@ class EfinanceFetcher(BaseFetcher):
 
         try:
             current_time = time.time()
+            cache_ttl = _effective_realtime_ttl(_etf_realtime_cache, freshness_seconds)
             if (
                 _etf_realtime_cache['data'] is not None and
-                current_time - _etf_realtime_cache['timestamp'] < _etf_realtime_cache['ttl']
+                current_time - _etf_realtime_cache['timestamp'] < cache_ttl
             ):
                 df = _etf_realtime_cache['data']
                 cache_age = int(current_time - _etf_realtime_cache['timestamp'])
-                logger.debug(f"[缓存命中] ETF实时行情(efinance) - 缓存年龄 {cache_age}s/{_etf_realtime_cache['ttl']}s")
+                logger.debug(f"[缓存命中] ETF实时行情(efinance) - 缓存年龄 {cache_age}s/{cache_ttl}s")
             else:
                 self._set_random_user_agent()
                 self._enforce_rate_limit()

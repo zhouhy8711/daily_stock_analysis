@@ -94,6 +94,15 @@ class RuleRepository:
                 items.append(item)
             return items
 
+    def list_active_rules(self) -> List[Dict[str, Any]]:
+        with self.db.get_session() as session:
+            rows = session.execute(
+                select(StockRule)
+                .where(StockRule.is_active.is_(True))
+                .order_by(desc(StockRule.updated_at), desc(StockRule.id))
+            ).scalars().all()
+            return [self.rule_to_dict(row) for row in rows]
+
     @staticmethod
     def run_to_dict(row: StockRuleRun, rule_name: Optional[str] = None) -> Dict[str, Any]:
         batch_metadata, public_error = _decode_rule_batch_metadata(row.error)
@@ -244,6 +253,34 @@ class RuleRepository:
             session.commit()
             session.refresh(row)
             return int(row.id)
+
+    def has_match_for_event(self, rule_id: int, stock_code: str, event_date: str) -> bool:
+        if not event_date:
+            return False
+        with self.db.get_session() as session:
+            rows = session.execute(
+                select(StockRuleMatch.snapshot_json)
+                .where(
+                    StockRuleMatch.rule_id == rule_id,
+                    StockRuleMatch.stock_code == stock_code,
+                )
+                .order_by(desc(StockRuleMatch.created_at), desc(StockRuleMatch.id))
+                .limit(50)
+            ).scalars().all()
+
+        for snapshot_json in rows:
+            snapshot = _json_loads(snapshot_json, {}) or {}
+            if not isinstance(snapshot, dict):
+                continue
+            matched_dates = snapshot.get("_matched_dates")
+            if isinstance(matched_dates, list) and event_date in {str(item) for item in matched_dates}:
+                return True
+            matched_events = snapshot.get("_matched_events")
+            if isinstance(matched_events, list):
+                for event in matched_events:
+                    if isinstance(event, dict) and str(event.get("date") or "") == event_date:
+                        return True
+        return False
 
     def finish_run(
         self,

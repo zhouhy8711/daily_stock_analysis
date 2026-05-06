@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import logging
+import re
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta
@@ -41,6 +43,7 @@ DISABLED_OPERATORS = {"cross_up", "cross_down"}
 MAX_RULE_TARGET_CODES = 10000
 RUN_MODES = {"latest", "history"}
 DEFAULT_RULE_RUN_WORKERS = 3
+_EVENT_RULE_TRIGGER_LOCK = threading.Lock()
 
 
 def _model_to_dict(value: Any) -> Dict[str, Any]:
@@ -67,6 +70,11 @@ class RuleService:
 
     def list_rules(self) -> List[Dict[str, Any]]:
         return self.repo.list_rules()
+
+    def list_active_rules(self) -> List[Dict[str, Any]]:
+        if hasattr(self.repo, "list_active_rules"):
+            return self.repo.list_active_rules()
+        return [rule for rule in self.repo.list_rules() if rule.get("is_active")]
 
     def get_rule(self, rule_id: int) -> Optional[Dict[str, Any]]:
         return self.repo.get_rule(rule_id)
@@ -380,6 +388,140 @@ class RuleService:
             )
             raise
 
+    def evaluate_active_rules_for_quote(
+        self,
+        stock_code: str,
+        quote: Dict[str, Any],
+        *,
+        send_notification: bool = True,
+    ) -> Dict[str, Any]:
+        return self.evaluate_active_rules_for_quotes(
+            {stock_code: quote},
+            send_notification=send_notification,
+        )
+
+    def evaluate_active_rules_for_quotes(
+        self,
+        quotes_by_code: Dict[str, Dict[str, Any]],
+        *,
+        send_notification: bool = True,
+    ) -> Dict[str, Any]:
+        if not quotes_by_code:
+            return {
+                "evaluated_rules": 0,
+                "target_count": 0,
+                "match_count": 0,
+                "event_count": 0,
+                "matches": [],
+                "errors": [],
+                "duplicate_count": 0,
+            }
+
+        active_rules = self.list_active_rules()
+        if not active_rules:
+            return {
+                "evaluated_rules": 0,
+                "target_count": len(quotes_by_code),
+                "match_count": 0,
+                "event_count": 0,
+                "matches": [],
+                "errors": [],
+                "duplicate_count": 0,
+            }
+
+        all_persisted_matches: List[Dict[str, Any]] = []
+        all_errors: List[str] = []
+        duplicate_count = 0
+        evaluated_rule_count = 0
+
+        with _EVENT_RULE_TRIGGER_LOCK:
+            for rule in active_rules:
+                rule_id = int(rule.get("id") or 0)
+                definition = rule.get("definition") or {}
+                try:
+                    self.validate_definition(definition)
+                except Exception as exc:
+                    all_errors.append(f"#{rule_id}:invalid_rule:{type(exc).__name__}")
+                    continue
+
+                target_codes = [
+                    stock_code
+                    for stock_code in quotes_by_code.keys()
+                    if self._rule_targets_stock(definition, stock_code)
+                ]
+                if not target_codes:
+                    continue
+
+                evaluated_rule_count += 1
+                rule_matches: List[Dict[str, Any]] = []
+                for stock_code in target_codes:
+                    try:
+                        match = self._evaluate_stock(
+                            rule,
+                            definition,
+                            stock_code,
+                            "latest",
+                            quote_override=quotes_by_code.get(stock_code),
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "实时规则事件计算失败 rule_id=%s stock_code=%s: %s",
+                            rule_id,
+                            stock_code,
+                            exc,
+                            exc_info=True,
+                        )
+                        all_errors.append(f"#{rule_id}:{stock_code}:{type(exc).__name__}")
+                        continue
+                    if not match:
+                        continue
+
+                    match["rule_id"] = rule_id
+                    match["rule_name"] = rule.get("name")
+                    event_date = self._latest_event_date(match)
+                    if self._has_persisted_event(rule_id, stock_code, event_date):
+                        duplicate_count += 1
+                        continue
+                    rule_matches.append(match)
+
+                if not rule_matches:
+                    continue
+
+                started_at = datetime.now()
+                run_id = self.repo.create_run(rule_id, len(target_codes))
+                match_count, duration_ms = self.repo.finish_run(
+                    run_id=run_id,
+                    rule_id=rule_id,
+                    status="completed",
+                    started_at=started_at,
+                    matches=rule_matches,
+                    error=None,
+                )
+                for match in rule_matches:
+                    match["run_id"] = run_id
+                logger.info(
+                    "实时规则事件已记录: run_id=%s rule_id=%s target_count=%s match_count=%s duration_ms=%s",
+                    run_id,
+                    rule_id,
+                    len(target_codes),
+                    match_count,
+                    duration_ms,
+                )
+                all_persisted_matches.extend(rule_matches)
+
+        if send_notification and all_persisted_matches:
+            self._send_event_rule_notification(all_persisted_matches)
+
+        return {
+            "evaluated_rules": evaluated_rule_count,
+            "target_count": len(quotes_by_code),
+            "match_count": len(all_persisted_matches),
+            "event_count": self._count_match_events(all_persisted_matches),
+            "matches": all_persisted_matches,
+            "errors": all_errors,
+            "duplicate_count": duplicate_count,
+        }
+
     def _prepare_rule_run(
         self,
         rule_id: int,
@@ -564,6 +706,7 @@ class RuleService:
         mode: str,
         start_date: Optional[date] = None,
         end_date: Optional[date] = None,
+        quote_override: Optional[Dict[str, Any]] = None,
     ) -> Optional[Dict[str, Any]]:
         lookback_days = self._resolve_history_fetch_days(definition, rule, start_date)
         history = self.stock_service.get_history_data(stock_code, period="daily", days=lookback_days)
@@ -571,8 +714,11 @@ class RuleService:
         if not history_rows:
             return None
 
-        quote = self.stock_service.get_realtime_quote(stock_code) if mode == "latest" else None
-        indicator_metrics = self._get_indicator_metrics(stock_code, history_rows, mode)
+        if mode == "latest":
+            quote = quote_override if quote_override is not None else self._get_realtime_quote_for_rule(stock_code)
+        else:
+            quote = None
+        indicator_metrics = self._get_indicator_metrics(stock_code, history_rows, mode, definition)
         metric_frame = build_metric_frame(history_rows, quote, indicator_metrics)
         if metric_frame.empty:
             return None
@@ -598,6 +744,100 @@ class RuleService:
             "snapshot": latest_event.get("snapshot") or {},
             "explanation": explanation,
         }
+
+    def _get_realtime_quote_for_rule(self, stock_code: str) -> Optional[Dict[str, Any]]:
+        try:
+            return self.stock_service.get_realtime_quote(stock_code, trigger_rules=False)
+        except TypeError:
+            return self.stock_service.get_realtime_quote(stock_code)
+
+    def _rule_targets_stock(self, definition: Dict[str, Any], stock_code: str) -> bool:
+        target = definition.get("target") or {}
+        scope = target.get("scope") or "watchlist"
+        stock_key = self._stock_match_key(stock_code)
+        explicit_codes = target.get("stock_codes") or []
+        if explicit_codes:
+            return stock_key in {self._stock_match_key(code) for code in explicit_codes}
+
+        if scope == "watchlist":
+            try:
+                config = get_config()
+                config.refresh_stock_list()
+                watchlist = config.stock_list
+            except Exception as exc:
+                logger.debug("实时规则读取 STOCK_LIST 失败: %s", exc)
+                watchlist = []
+            return stock_key in {self._stock_match_key(code) for code in watchlist}
+
+        if scope == "all_a_shares":
+            return bool(re.fullmatch(r"\d{6}", stock_key))
+
+        return False
+
+    @staticmethod
+    def _stock_match_key(stock_code: Any) -> str:
+        code = str(stock_code or "").strip().upper()
+        try:
+            from data_provider.base import normalize_stock_code
+
+            code = normalize_stock_code(code)
+        except Exception:
+            if "." in code:
+                code = code.split(".", 1)[0]
+            for prefix in ("SH", "SZ", "BJ"):
+                if code.startswith(prefix):
+                    code = code[len(prefix):]
+                    break
+        return code.upper()
+
+    @staticmethod
+    def _latest_event_date(match: Dict[str, Any]) -> str:
+        events = match.get("matched_events") or []
+        if events:
+            return str((events[-1] or {}).get("date") or "")
+        dates = match.get("matched_dates") or []
+        return str(dates[-1]) if dates else ""
+
+    def _has_persisted_event(self, rule_id: int, stock_code: str, event_date: str) -> bool:
+        if not event_date or not hasattr(self.repo, "has_match_for_event"):
+            return False
+        try:
+            return bool(self.repo.has_match_for_event(rule_id, stock_code, event_date))
+        except Exception as exc:
+            logger.debug("实时规则去重检查失败 rule_id=%s stock_code=%s: %s", rule_id, stock_code, exc)
+            return False
+
+    def _send_event_rule_notification(self, matches: List[Dict[str, Any]]) -> None:
+        try:
+            from src.notification import NotificationBuilder, NotificationService
+
+            lines = []
+            stock_codes = []
+            for match in matches[:20]:
+                stock_code = str(match.get("stock_code") or "")
+                if stock_code:
+                    stock_codes.append(stock_code)
+                rule_name = str(match.get("rule_name") or f"规则 {match.get('rule_id')}")
+                stock_name = str(match.get("stock_name") or stock_code)
+                event_date = self._latest_event_date(match)
+                explanation = str(match.get("explanation") or "")
+                lines.append(f"- {rule_name}: {stock_name}({stock_code}) {event_date}")
+                if explanation:
+                    lines.append(f"  {explanation}")
+            if len(matches) > 20:
+                lines.append(f"- 还有 {len(matches) - 20} 条命中已记录，可在规则运行历史中查看。")
+
+            content = "\n".join(lines)
+            alert_text = NotificationBuilder.build_simple_alert(
+                title=f"规则实时命中 {len(matches)} 条",
+                content=content,
+                alert_type="warning",
+            )
+            sent = NotificationService().send(alert_text, email_stock_codes=stock_codes)
+            if not sent:
+                logger.info("实时规则命中已记录，但未找到可用通知渠道")
+        except Exception as exc:
+            logger.warning("实时规则命中推送失败: %s", exc, exc_info=True)
 
     def _evaluate_latest_event(self, definition: Dict[str, Any], metric_frame: pd.DataFrame) -> List[Dict[str, Any]]:
         latest_index = len(metric_frame) - 1
@@ -666,12 +906,41 @@ class RuleService:
         stock_code: str,
         history_rows: List[Dict[str, Any]],
         mode: str,
+        definition: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
+        if not self._definition_uses_chip_metrics(definition or {}):
+            return {}
         if mode == "history":
             local_metrics = self._build_history_chip_metrics(stock_code, history_rows)
             if local_metrics.get("chip_distribution"):
                 return local_metrics
         return self.stock_service.get_indicator_metrics(stock_code)
+
+    def _definition_uses_chip_metrics(self, definition: Dict[str, Any]) -> bool:
+        for metric_key in self._iter_definition_metric_keys(definition):
+            metric = METRIC_BY_KEY.get(metric_key)
+            if metric and metric.category.startswith("筹码峰"):
+                return True
+        return False
+
+    def _iter_definition_metric_keys(self, definition: Dict[str, Any]):
+        def walk_expr(expr: Optional[Dict[str, Any]]):
+            if not isinstance(expr, dict):
+                return
+            metric = expr.get("metric")
+            if metric:
+                yield str(metric)
+            if expr.get("type") == "range" or "min" in expr or "max" in expr:
+                yield from walk_expr(expr.get("min"))
+                yield from walk_expr(expr.get("max"))
+
+        for group in definition.get("groups") or []:
+            for condition in (group.get("conditions") or []):
+                left = condition.get("left") or {}
+                metric = left.get("metric")
+                if metric:
+                    yield str(metric)
+                yield from walk_expr(condition.get("right"))
 
     def _build_history_chip_metrics(self, stock_code: str, history_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         if not history_rows:

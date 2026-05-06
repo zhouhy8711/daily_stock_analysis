@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+from datetime import datetime
 from typing import Any, Dict, Iterable, List, Optional
 
 import pandas as pd
@@ -189,6 +190,115 @@ def _normalize_date_key(value: Any) -> Optional[str]:
     return parsed.strftime("%Y-%m-%d")
 
 
+def _resolve_quote_date(quote: Dict[str, Any]) -> Optional[str]:
+    for key in ("quote_date", "trade_date", "date"):
+        date_key = _normalize_date_key(quote.get(key))
+        if date_key:
+            return date_key
+
+    stock_code = str(quote.get("stock_code") or quote.get("code") or "").strip()
+    try:
+        from src.core import trading_calendar
+
+        market = trading_calendar.get_market_for_stock(stock_code)
+        market_today = trading_calendar.get_market_now(market).date()
+        if trading_calendar.is_market_open(market, market_today):
+            return market_today.isoformat()
+        return trading_calendar.get_effective_trading_date(market).isoformat()
+    except Exception:
+        return datetime.now().date().isoformat()
+
+
+def _get_quote_number(quote: Dict[str, Any], *keys: str) -> Optional[float]:
+    for key in keys:
+        value = _to_float(quote.get(key))
+        if value is not None:
+            return value
+    return None
+
+
+def _merge_realtime_quote_row(df: pd.DataFrame, quote: Optional[Dict[str, Any]]) -> pd.DataFrame:
+    if not quote or df.empty:
+        return df
+
+    current_price = _get_quote_number(quote, "current_price", "price")
+    if current_price is None or current_price <= 0:
+        return df
+
+    df = df.copy()
+    quote_date = _resolve_quote_date(quote)
+    latest_index = int(df.index[-1])
+    if quote_date:
+        latest_date = _normalize_date_key(df.at[latest_index, "date"]) if "date" in df.columns else None
+        if latest_date and latest_date < quote_date:
+            new_row = df.iloc[[-1]].copy()
+            new_row.index = [latest_index + 1]
+            new_row.at[latest_index + 1, "date"] = quote_date
+            df = pd.concat([df, new_row], ignore_index=False)
+            latest_index = int(df.index[-1])
+        elif latest_date is None and "date" in df.columns:
+            df.at[latest_index, "date"] = quote_date
+
+    previous_close = _get_quote_number(quote, "prev_close", "pre_close")
+    if previous_close is None and len(df) > 1:
+        previous_close = _to_float(df.iloc[-2].get("close"))
+
+    open_price = _get_quote_number(quote, "open", "open_price")
+    high = _get_quote_number(quote, "high")
+    low = _get_quote_number(quote, "low")
+    if open_price is None:
+        open_price = current_price
+    if high is None:
+        high = max(value for value in (open_price, current_price) if value is not None)
+    if low is None:
+        low = min(value for value in (open_price, current_price) if value is not None)
+
+    change = _get_quote_number(quote, "change", "change_amount")
+    if change is None and previous_close and previous_close > 0:
+        change = current_price - previous_close
+
+    change_percent = _get_quote_number(quote, "change_percent", "change_pct", "pct_chg")
+    if change_percent is None and change is not None and previous_close and previous_close > 0:
+        change_percent = change / previous_close * 100
+
+    realtime_values = {
+        "open": open_price,
+        "high": high,
+        "low": low,
+        "close": current_price,
+        "current_price": current_price,
+        "prev_close": previous_close,
+        "change": change,
+        "pct_chg": change_percent,
+        "change_percent": change_percent,
+        "volume": _get_quote_number(quote, "volume"),
+        "amount": _get_quote_number(quote, "amount"),
+        "after_hours_volume": _get_quote_number(quote, "after_hours_volume"),
+        "after_hours_amount": _get_quote_number(quote, "after_hours_amount"),
+        "turnover_rate": _get_quote_number(quote, "turnover_rate"),
+        "volume_ratio": _get_quote_number(quote, "volume_ratio"),
+        "amplitude": _get_quote_number(quote, "amplitude"),
+        "total_mv": _get_quote_number(quote, "total_mv"),
+        "circ_mv": _get_quote_number(quote, "circ_mv"),
+        "pe_ratio": _get_quote_number(quote, "pe_ratio"),
+        "total_shares": _get_quote_number(quote, "total_shares"),
+        "float_shares": _get_quote_number(quote, "float_shares"),
+        "limit_up_price": _get_quote_number(quote, "limit_up_price"),
+        "limit_down_price": _get_quote_number(quote, "limit_down_price"),
+        "price_speed": _get_quote_number(quote, "price_speed"),
+        "entrust_ratio": _get_quote_number(quote, "entrust_ratio"),
+    }
+    for metric_key, value in realtime_values.items():
+        if value is None:
+            continue
+        if metric_key not in df.columns:
+            df[metric_key] = pd.NA
+        else:
+            df[metric_key] = pd.to_numeric(df[metric_key], errors="coerce").astype("float64")
+        df.at[latest_index, metric_key] = value
+    return df.reset_index(drop=True)
+
+
 def _range_values(low: Optional[float], high: Optional[float], prefix: str) -> Dict[str, Optional[float]]:
     mid = (low + high) / 2 if low is not None and high is not None else None
     width = high - low if low is not None and high is not None else None
@@ -300,6 +410,8 @@ def build_metric_frame(
     df = pd.DataFrame(list(history))
     if df.empty:
         return df
+
+    df = _merge_realtime_quote_row(df, quote)
 
     numeric_columns = (
         "open",

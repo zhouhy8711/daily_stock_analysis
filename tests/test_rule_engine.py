@@ -1,5 +1,6 @@
 import threading
 import time
+from datetime import datetime
 
 from src.rules.engine import evaluate_rule, evaluate_rule_history
 from src.rules.metrics import build_metric_frame, get_metric_registry
@@ -311,6 +312,37 @@ def test_metric_frame_maps_realtime_quote_metrics_for_rules():
     assert latest["main_net_volume_pct"] > 0
 
 
+def test_metric_frame_synthesizes_realtime_quote_as_current_daily_row(monkeypatch):
+    from src.core import trading_calendar
+
+    monkeypatch.setattr(trading_calendar, "get_market_now", lambda market: datetime(2026, 4, 6, 10, 0))
+    monkeypatch.setattr(trading_calendar, "is_market_open", lambda market, check_date: True)
+
+    frame = build_metric_frame(
+        _history(),
+        quote={
+            "stock_code": "600519",
+            "current_price": 16,
+            "open": 14,
+            "high": 17,
+            "low": 13,
+            "prev_close": 14,
+            "volume": 3200,
+            "amount": 51200,
+            "change_percent": 14.2857,
+        },
+    )
+    latest = frame.iloc[-1]
+
+    assert latest["date"] == "2026-04-06"
+    assert latest["open"] == 14
+    assert latest["high"] == 17
+    assert latest["low"] == 13
+    assert latest["close"] == 16
+    assert latest["current_price"] == 16
+    assert latest["pct_chg"] == 14.2857
+
+
 def test_metric_frame_maps_chip_snapshots_by_date():
     frame = build_metric_frame(
         _history(),
@@ -426,6 +458,23 @@ class _FakeRuleRepo:
     def finish_run(self, **kwargs):
         self.finished_matches = kwargs["matches"]
         return len(kwargs["matches"]), 12
+
+
+class _FakeEventRuleRepo(_FakeRuleRepo):
+    def __init__(self, rule, duplicate=False):
+        super().__init__(rule)
+        self.duplicate = duplicate
+        self.created_runs = []
+
+    def list_active_rules(self):
+        return [self.rule] if self.rule.get("is_active", True) else []
+
+    def create_run(self, rule_id, target_count):
+        self.created_runs.append((rule_id, target_count))
+        return 202
+
+    def has_match_for_event(self, rule_id, stock_code, event_date):
+        return self.duplicate
 
 
 class _FakeMultiRuleRepo(_FakeRuleRepo):
@@ -601,6 +650,60 @@ def test_rule_service_run_rules_executes_rules_concurrently_and_preserves_order(
     assert stock_service.max_active_calls >= 2
     assert [match["rule_id"] for match in result["matches"]] == [1, 2]
     assert [match["rule_id"] for match in repo.finished_matches] == [1, 2]
+
+
+def test_rule_service_event_trigger_records_active_rule_match():
+    repo = _FakeEventRuleRepo(_service_rule_for_run_mode())
+    service = RuleService(repo=repo, stock_service=_FakeStockService())
+
+    result = service.evaluate_active_rules_for_quote(
+        "600519",
+        {
+            "stock_code": "600519",
+            "stock_name": "测试股票",
+            "quote_date": "2026-04-04",
+            "current_price": 16,
+            "open": 10,
+            "high": 16,
+            "low": 10,
+            "prev_close": 10,
+            "volume": 5000,
+            "amount": 80000,
+            "change_percent": 60,
+        },
+        send_notification=False,
+    )
+
+    assert result["match_count"] == 1
+    assert result["event_count"] == 1
+    assert repo.created_runs == [(1, 1)]
+    assert repo.finished_matches[0]["run_id"] == 202
+    assert repo.finished_matches[0]["matched_dates"] == ["2026-04-04"]
+    assert repo.finished_matches[0]["snapshot"]["close"] == 16
+
+
+def test_rule_service_event_trigger_dedupes_same_rule_stock_date():
+    repo = _FakeEventRuleRepo(_service_rule_for_run_mode(), duplicate=True)
+    service = RuleService(repo=repo, stock_service=_FakeStockService())
+
+    result = service.evaluate_active_rules_for_quote(
+        "600519",
+        {
+            "stock_code": "600519",
+            "quote_date": "2026-04-04",
+            "current_price": 16,
+            "open": 10,
+            "high": 16,
+            "low": 10,
+            "prev_close": 10,
+        },
+        send_notification=False,
+    )
+
+    assert result["match_count"] == 0
+    assert result["duplicate_count"] == 1
+    assert repo.created_runs == []
+    assert repo.finished_matches is None
 
 
 def test_rule_service_rejects_cross_operators():

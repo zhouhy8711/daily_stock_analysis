@@ -71,6 +71,19 @@ export type StockQuotesResponse = {
   updateTime?: string | null;
 };
 
+export type StockIntradaySnapshotResponse = {
+  stockCode: string;
+  stockName?: string | null;
+  market?: string | null;
+  tradingDate: string;
+  period: KLinePeriod | string;
+  refreshIntervalSeconds: number;
+  updateTime: string;
+  quote?: StockQuote | null;
+  data: KLineData[];
+  errors: string[];
+};
+
 export type ChipDistributionPoint = {
   price: number;
   percent: number;
@@ -297,17 +310,23 @@ function normalizeIndicatorMetrics(item: Record<string, unknown>, stockCode: str
 }
 
 export const stocksApi = {
-  async getQuote(stockCode: string): Promise<StockQuote> {
+  async getQuote(stockCode: string, freshnessSeconds?: number): Promise<StockQuote> {
     const response = await apiClient.get<Record<string, unknown>>(
       `/api/v1/stocks/${encodeURIComponent(stockCode)}/quote`,
+      {
+        params: freshnessSeconds === undefined ? undefined : { freshness_seconds: freshnessSeconds },
+      },
     );
     return normalizeQuote(response.data, stockCode);
   },
 
-  async getQuotes(stockCodes: string[]): Promise<StockQuotesResponse> {
+  async getQuotes(stockCodes: string[], freshnessSeconds?: number): Promise<StockQuotesResponse> {
     const response = await apiClient.post<Record<string, unknown>>(
       '/api/v1/stocks/quotes',
-      { stock_codes: stockCodes },
+      {
+        stock_codes: stockCodes,
+        ...(freshnessSeconds === undefined ? {} : { freshness_seconds: freshnessSeconds }),
+      },
     );
     const rawItems = Array.isArray(response.data.items) ? response.data.items : [];
     const rawFailedCodes = response.data.failed_codes ?? response.data.failedCodes;
@@ -340,6 +359,35 @@ export const stocksApi = {
       stockName: data.stock_name,
       period: data.period ?? period,
       data: (data.data ?? []).map(normalizeKLine).filter((item) => item.date),
+    };
+  },
+
+  async getIntradaySnapshot(stockCode: string, period: KLinePeriod = '1m'): Promise<StockIntradaySnapshotResponse> {
+    const response = await apiClient.get<Record<string, unknown>>(
+      `/api/v1/stocks/${encodeURIComponent(stockCode)}/intraday-snapshot`,
+      {
+        params: { period },
+      },
+    );
+    const rawData = Array.isArray(response.data.data) ? response.data.data : [];
+    const rawQuote = response.data.quote;
+    const refreshIntervalSeconds = toNumber(
+      response.data.refresh_interval_seconds ?? response.data.refreshIntervalSeconds,
+      60,
+    );
+    return {
+      stockCode: String(response.data.stock_code ?? response.data.stockCode ?? stockCode),
+      stockName: toNullableString(response.data.stock_name ?? response.data.stockName),
+      market: toNullableString(response.data.market),
+      tradingDate: String(response.data.trading_date ?? response.data.tradingDate ?? ''),
+      period: String(response.data.period ?? period),
+      refreshIntervalSeconds,
+      updateTime: String(response.data.update_time ?? response.data.updateTime ?? ''),
+      quote: rawQuote && typeof rawQuote === 'object'
+        ? normalizeQuote(rawQuote as Record<string, unknown>, stockCode)
+        : null,
+      data: (rawData as Array<Record<string, unknown>>).map(normalizeKLine).filter((item) => item.date),
+      errors: Array.isArray(response.data.errors) ? response.data.errors.map(String) : [],
     };
   },
 

@@ -121,6 +121,17 @@ _etf_realtime_cache: Dict[str, Any] = {
 }
 
 
+def _effective_realtime_ttl(cache: Dict[str, Any], freshness_seconds: Optional[int] = None) -> int:
+    ttl = int(cache.get('ttl') or 0)
+    if freshness_seconds is None:
+        return ttl
+    try:
+        freshness = max(0, int(freshness_seconds))
+    except (TypeError, ValueError):
+        return ttl
+    return min(ttl, freshness)
+
+
 def _is_etf_code(stock_code: str) -> bool:
     """
     判断代码是否为 ETF 基金
@@ -1316,7 +1327,12 @@ class AkshareFetcher(BaseFetcher):
         
         return df
     
-    def get_realtime_quote(self, stock_code: str, source: str = "em") -> Optional[UnifiedRealtimeQuote]:
+    def get_realtime_quote(
+        self,
+        stock_code: str,
+        source: str = "em",
+        freshness_seconds: Optional[int] = None,
+    ) -> Optional[UnifiedRealtimeQuote]:
         """
         获取实时行情数据（支持多数据源）
 
@@ -1346,7 +1362,7 @@ class AkshareFetcher(BaseFetcher):
             if not circuit_breaker.is_available(source_key):
                 logger.info(f"[熔断] 数据源 {source_key} 处于熔断状态，跳过")
                 return None
-            return self._get_etf_realtime_quote(stock_code)
+            return self._get_etf_realtime_quote(stock_code, freshness_seconds=freshness_seconds)
         else:
             source_key = f"akshare_{source}"
             if not circuit_breaker.is_available(source_key):
@@ -1358,9 +1374,13 @@ class AkshareFetcher(BaseFetcher):
             elif source == "tencent":
                 return self._get_stock_realtime_quote_tencent(stock_code)
             else:
-                return self._get_stock_realtime_quote_em(stock_code)
+                return self._get_stock_realtime_quote_em(stock_code, freshness_seconds=freshness_seconds)
 
-    def get_realtime_quotes(self, stock_codes: List[str]) -> Dict[str, UnifiedRealtimeQuote]:
+    def get_realtime_quotes(
+        self,
+        stock_codes: List[str],
+        freshness_seconds: Optional[int] = None,
+    ) -> Dict[str, UnifiedRealtimeQuote]:
         """
         批量获取普通 A 股实时行情。
 
@@ -1479,7 +1499,11 @@ class AkshareFetcher(BaseFetcher):
             circuit_breaker.record_failure(source_key, str(e))
             return quotes
     
-    def _get_stock_realtime_quote_em(self, stock_code: str) -> Optional[UnifiedRealtimeQuote]:
+    def _get_stock_realtime_quote_em(
+        self,
+        stock_code: str,
+        freshness_seconds: Optional[int] = None,
+    ) -> Optional[UnifiedRealtimeQuote]:
         """
         获取普通 A 股实时行情数据（东方财富数据源）
         
@@ -1494,11 +1518,12 @@ class AkshareFetcher(BaseFetcher):
         try:
             # 检查缓存
             current_time = time.time()
+            cache_ttl = _effective_realtime_ttl(_realtime_cache, freshness_seconds)
             if (_realtime_cache['data'] is not None and 
-                current_time - _realtime_cache['timestamp'] < _realtime_cache['ttl']):
+                current_time - _realtime_cache['timestamp'] < cache_ttl):
                 df = _realtime_cache['data']
                 cache_age = int(current_time - _realtime_cache['timestamp'])
-                logger.debug(f"[缓存命中] A股实时行情(东财) - 缓存年龄 {cache_age}s/{_realtime_cache['ttl']}s")
+                logger.debug(f"[缓存命中] A股实时行情(东财) - 缓存年龄 {cache_age}s/{cache_ttl}s")
             else:
                 # 触发全量刷新
                 logger.info(f"[缓存未命中] 触发全量刷新 A股实时行情(东财)")
@@ -1893,7 +1918,11 @@ class AkshareFetcher(BaseFetcher):
             circuit_breaker.record_failure(source_key, failure_message)
             return None
     
-    def _get_etf_realtime_quote(self, stock_code: str) -> Optional[UnifiedRealtimeQuote]:
+    def _get_etf_realtime_quote(
+        self,
+        stock_code: str,
+        freshness_seconds: Optional[int] = None,
+    ) -> Optional[UnifiedRealtimeQuote]:
         """
         获取 ETF 基金实时行情数据
         
@@ -1913,10 +1942,12 @@ class AkshareFetcher(BaseFetcher):
         try:
             # 检查缓存
             current_time = time.time()
+            cache_ttl = _effective_realtime_ttl(_etf_realtime_cache, freshness_seconds)
             if (_etf_realtime_cache['data'] is not None and 
-                current_time - _etf_realtime_cache['timestamp'] < _etf_realtime_cache['ttl']):
+                current_time - _etf_realtime_cache['timestamp'] < cache_ttl):
                 df = _etf_realtime_cache['data']
-                logger.debug(f"[缓存命中] 使用缓存的ETF实时行情数据")
+                cache_age = int(current_time - _etf_realtime_cache['timestamp'])
+                logger.debug(f"[缓存命中] 使用缓存的ETF实时行情数据，缓存年龄 {cache_age}s/{cache_ttl}s")
             else:
                 last_error: Optional[Exception] = None
                 df = None

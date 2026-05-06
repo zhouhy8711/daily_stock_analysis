@@ -24,6 +24,7 @@ import { rulesApi } from '../../api/rules';
 import {
   stocksApi,
   type ChipDistributionMetrics,
+  type ChipDistributionPoint,
   type KLineData,
   type KLinePeriod,
   type MajorHolder,
@@ -39,6 +40,7 @@ import type {
   RuleValueExpression,
 } from '../../types/rules';
 import type { NewsIntelItem } from '../../types/analysis';
+import { useLiveQuote, useLiveMarketData } from '../../contexts/LiveMarketDataContext';
 import {
   addRuleMetricDraftItem,
   readRuleMetricDraft,
@@ -94,9 +96,11 @@ type ChartPoint = KLineData & {
   prev20dReturnPct?: number;
 };
 
+type IndicatorPeriod = KLinePeriod | 'today';
+
 type HistoryState = {
   stockCode: string;
-  period: KLinePeriod;
+  period: IndicatorPeriod;
   history: KLineData[];
   quote: StockQuote | null;
   metrics: StockIndicatorMetrics | null;
@@ -105,7 +109,14 @@ type HistoryState = {
   error: string | null;
 };
 
-type HistoryCache = Partial<Record<KLinePeriod, HistoryState>>;
+type HistoryCache = Partial<Record<IndicatorPeriod, HistoryState>>;
+
+type HistoryQuoteSource = {
+  point: KLineData;
+  previous?: KLineData;
+  period: IndicatorPeriod;
+  timestamp: number;
+};
 
 type StructureTrendPoint = {
   date: string;
@@ -178,19 +189,24 @@ type AddRuleMetricHandler = (metric: RuleMetricAddPayload) => void;
 const EMPTY_HISTORY: KLineData[] = [];
 const EMPTY_HOLDERS: MajorHolder[] = [];
 const ALL_HOLDERS_KEY = 'all';
-const KLINE_PERIOD_OPTIONS: Array<{ value: KLinePeriod; label: string; days: number }> = [
+const KLINE_PERIOD_OPTIONS: Array<{ value: IndicatorPeriod; label: string; days: number }> = [
   { value: 'daily', label: '日K', days: 120 },
   { value: '1m', label: '1分', days: 3 },
   { value: '5m', label: '5分', days: 3 },
   { value: '15m', label: '15分', days: 30 },
   { value: '30m', label: '30分', days: 30 },
   { value: '60m', label: '60分', days: 30 },
+  { value: 'today', label: '当日走势', days: 1 },
 ];
-const INTRADAY_PERIOD_OPTIONS = KLINE_PERIOD_OPTIONS.filter((option) => option.value !== 'daily');
+const INTRADAY_PERIOD_OPTIONS = KLINE_PERIOD_OPTIONS.filter(
+  (option): option is { value: KLinePeriod; label: string; days: number } => (
+    option.value !== 'daily' && option.value !== 'today'
+  ),
+);
 const MAX_VISIBLE_KLINE_POINTS = 80;
 const MIN_VISIBLE_KLINE_POINTS = 24;
 const MAX_EXPANDED_KLINE_POINTS = 160;
-const ONE_MINUTE_REFRESH_MS = 10_000;
+const DEFAULT_LIVE_REFRESH_MS = 60_000;
 const LINE_COLORS = {
   close: 'var(--indicator-line-close)',
   avgCost: 'var(--indicator-line-avg-cost)',
@@ -946,18 +962,22 @@ const MetricInline: React.FC<{
   </span>
 );
 
-function getPeriodMeta(period: KLinePeriod) {
+function getPeriodMeta(period: IndicatorPeriod) {
   const option = KLINE_PERIOD_OPTIONS.find((item) => item.value === period) ?? KLINE_PERIOD_OPTIONS[0];
   const isDaily = option.value === 'daily';
+  const isToday = option.value === 'today';
   return {
     ...option,
     isDaily,
+    isToday,
     sampleUnit: isDaily ? '个交易日' : '根K线',
     recentLabel: isDaily ? '最近' : '当前窗口',
     supportLabel: isDaily ? '近20日支撑' : '近20根支撑',
     resistanceLabel: isDaily ? '近20日压力' : '近20根压力',
     returnLabel: isDaily ? '5日 / 20日收益' : '5根 / 20根收益',
-    description: isDaily
+    description: isToday
+      ? '当前展示最近有效交易日的当日分钟走势，K线、成交量、MACD与核心行情会按配置周期静默刷新。'
+      : isDaily
       ? '当前展示基于历史日 K 计算的技术指标，可切换上方分钟周期查看分段 K 线。五档盘口和逐笔成交暂不在此图中展示。'
       : '当前展示分钟 K 线数据，按所选周期分段展示 OHLC、成交量、成交额与均线；可拖动下方时间窗口回看返回区间内的更早分钟数据。五档盘口和逐笔成交暂不在此图中展示。',
   };
@@ -976,7 +996,7 @@ function getMarketKind(stockCode: string): 'cn' | 'hk' | 'us' {
 
 function createHistoryState(
   stockCode: string,
-  period: KLinePeriod,
+  period: IndicatorPeriod,
   overrides: Partial<HistoryState> = {},
 ): HistoryState {
   return {
@@ -1010,6 +1030,366 @@ function getLatestHistoryDate(history: KLineData[]): string | null {
   return null;
 }
 
+function getQuoteDateOnly(quote?: StockQuote | null, fallback?: string | null): string | null {
+  return getKLineDateOnly(quote?.updateTime) ?? fallback ?? null;
+}
+
+function getQuoteTimestamp(quote?: StockQuote | null): number {
+  if (!quote?.updateTime) {
+    return 0;
+  }
+  const time = Date.parse(quote.updateTime);
+  return Number.isNaN(time) ? 0 : time;
+}
+
+function pickLatestQuote(quotes: Array<StockQuote | null | undefined>): StockQuote | null {
+  return quotes.reduce<StockQuote | null>((latest, candidate) => {
+    if (!candidate) {
+      return latest;
+    }
+    if (!latest) {
+      return candidate;
+    }
+    return getQuoteTimestamp(candidate) > getQuoteTimestamp(latest) ? candidate : latest;
+  }, null);
+}
+
+function getHistoryDateTimestamp(value?: string | null): number {
+  if (!value) {
+    return 0;
+  }
+  const normalized = value.includes(' ') ? value.replace(' ', 'T') : `${value}T15:00:00`;
+  const time = Date.parse(normalized);
+  return Number.isNaN(time) ? 0 : time;
+}
+
+function getHistoryQuotePriority(period: IndicatorPeriod): number {
+  switch (period) {
+    case 'today':
+      return 6;
+    case '1m':
+      return 5;
+    case '5m':
+      return 4;
+    case '15m':
+      return 3;
+    case '30m':
+      return 2;
+    case '60m':
+      return 1;
+    default:
+      return 0;
+  }
+}
+
+function pickLatestHistoryQuoteSource(cache: HistoryCache, stockCode: string): HistoryQuoteSource | null {
+  let selected: HistoryQuoteSource | null = null;
+  Object.values(cache).forEach((state) => {
+    if (!state || state.stockCode !== stockCode || state.history.length === 0) {
+      return;
+    }
+    const point = state.history.at(-1);
+    if (!point || !isValidNumber(point.close) || point.close <= 0) {
+      return;
+    }
+    const timestamp = getHistoryDateTimestamp(point.date);
+    const candidate: HistoryQuoteSource = {
+      point,
+      previous: state.history.length > 1 ? state.history[state.history.length - 2] : undefined,
+      period: state.period,
+      timestamp,
+    };
+    if (!selected) {
+      selected = candidate;
+      return;
+    }
+    if (candidate.timestamp > selected.timestamp) {
+      selected = candidate;
+      return;
+    }
+    if (
+      candidate.timestamp === selected.timestamp
+      && getHistoryQuotePriority(candidate.period) > getHistoryQuotePriority(selected.period)
+    ) {
+      selected = candidate;
+    }
+  });
+  return selected;
+}
+
+function buildQuoteFromHistorySource(
+  stockCode: string,
+  stockName: string | undefined,
+  source: HistoryQuoteSource | null,
+): StockQuote | null {
+  if (!source) {
+    return null;
+  }
+  const { point, previous } = source;
+  const previousClose = previous?.close;
+  const change = isValidNumber(previousClose) && previousClose !== 0
+    ? point.close - previousClose
+    : null;
+  const changePercent = isValidNumber(point.changePercent)
+    ? point.changePercent
+    : isValidNumber(previousClose) && previousClose !== 0
+      ? ((point.close - previousClose) / previousClose) * 100
+      : null;
+  return {
+    stockCode,
+    stockName,
+    currentPrice: point.close,
+    change,
+    changePercent,
+    open: point.open,
+    high: point.high,
+    low: point.low,
+    volume: point.volume,
+    amount: point.amount,
+    afterHoursVolume: point.afterHoursVolume,
+    turnoverRate: point.turnoverRate,
+    updateTime: point.date.includes(' ') ? point.date.replace(' ', 'T') : `${point.date}T15:00:00`,
+  };
+}
+
+function getDateTimeParts(value?: string | null): { date: string; hour?: number; minute?: number } | null {
+  if (!value) {
+    return null;
+  }
+  const match = value.match(/(\d{4}-\d{2}-\d{2})(?:[T\s]+(\d{2}):(\d{2}))?/);
+  if (!match?.[1]) {
+    return null;
+  }
+  const hour = match[2] ? Number(match[2]) : undefined;
+  const minute = match[3] ? Number(match[3]) : undefined;
+  return {
+    date: match[1],
+    hour: Number.isFinite(hour) ? hour : undefined,
+    minute: Number.isFinite(minute) ? minute : undefined,
+  };
+}
+
+function getIntradayPeriodMinutes(period: IndicatorPeriod): number | null {
+  switch (period) {
+    case '1m':
+      return 1;
+    case '5m':
+      return 5;
+    case '15m':
+      return 15;
+    case '30m':
+      return 30;
+    case '60m':
+      return 60;
+    default:
+      return null;
+  }
+}
+
+function getFiniteNumber(value?: number | null): number | null {
+  return isValidNumber(value) ? value : null;
+}
+
+function getPositiveFiniteNumber(value?: number | null): number | null {
+  return isValidNumber(value) && value > 0 ? value : null;
+}
+
+function isSameKLineData(left: KLineData, right: KLineData): boolean {
+  return left.date === right.date
+    && left.open === right.open
+    && left.high === right.high
+    && left.low === right.low
+    && left.close === right.close
+    && left.volume === right.volume
+    && left.afterHoursVolume === right.afterHoursVolume
+    && left.amount === right.amount
+    && left.changePercent === right.changePercent
+    && left.turnoverRate === right.turnoverRate;
+}
+
+function normalizeQuoteVolumeForHistory(history: KLineData[], rawVolume?: number | null): number | null {
+  const quoteVolume = getFiniteNumber(rawVolume);
+  if (!quoteVolume || quoteVolume <= 0) {
+    return quoteVolume;
+  }
+
+  const latestVolume = getFiniteNumber(history.at(-1)?.volume);
+  if (!latestVolume || latestVolume <= 0) {
+    return quoteVolume;
+  }
+
+  const ratio = quoteVolume / latestVolume;
+  if (ratio >= 50 && ratio <= 150) {
+    return quoteVolume / 100;
+  }
+  if (ratio >= 0.005 && ratio <= 0.015) {
+    return quoteVolume * 100;
+  }
+  return quoteVolume;
+}
+
+function mergeLiveQuoteIntoDailyHistory(history: KLineData[], quote?: StockQuote | null): KLineData[] {
+  const price = getPositiveFiniteNumber(quote?.currentPrice);
+  if (!price) {
+    return history;
+  }
+
+  const latest = history.at(-1);
+  const latestDate = getKLineDateOnly(latest?.date);
+  const quoteDate = getQuoteDateOnly(quote, latestDate);
+  if (!quoteDate) {
+    return history;
+  }
+
+  const existingIndex = history.findIndex((item) => getKLineDateOnly(item.date) === quoteDate);
+  if (existingIndex < 0 && latestDate && quoteDate < latestDate) {
+    return history;
+  }
+  const base = existingIndex >= 0 ? history[existingIndex] : latest;
+  const isSameDate = existingIndex >= 0 || latestDate === quoteDate;
+  const baseOpen = getPositiveFiniteNumber(quote?.open)
+    ?? (isSameDate ? getPositiveFiniteNumber(base?.open) : null)
+    ?? getPositiveFiniteNumber(quote?.prevClose)
+    ?? price;
+  const quoteHigh = getPositiveFiniteNumber(quote?.high);
+  const quoteLow = getPositiveFiniteNumber(quote?.low);
+  const baseHigh = isSameDate ? getPositiveFiniteNumber(base?.high) : null;
+  const baseLow = isSameDate ? getPositiveFiniteNumber(base?.low) : null;
+  const nextHigh = Math.max(baseHigh ?? quoteHigh ?? price, quoteHigh ?? price, price);
+  const nextLow = Math.min(baseLow ?? quoteLow ?? price, quoteLow ?? price, price);
+  const quoteVolume = normalizeQuoteVolumeForHistory(history, quote?.volume);
+  const nextPoint: KLineData = {
+    date: existingIndex >= 0 && base ? base.date : quoteDate,
+    open: baseOpen,
+    high: nextHigh,
+    low: nextLow,
+    close: price,
+    volume: quoteVolume ?? (isSameDate ? base?.volume : null),
+    afterHoursVolume: getFiniteNumber(quote?.afterHoursVolume) ?? (isSameDate ? base?.afterHoursVolume : null),
+    amount: getFiniteNumber(quote?.amount) ?? (isSameDate ? base?.amount : null),
+    changePercent: getFiniteNumber(quote?.changePercent) ?? (isSameDate ? base?.changePercent : null),
+    turnoverRate: getFiniteNumber(quote?.turnoverRate) ?? (isSameDate ? base?.turnoverRate : null),
+  };
+
+  if (existingIndex >= 0) {
+    const existing = history[existingIndex];
+    if (existing && isSameKLineData(existing, nextPoint)) {
+      return history;
+    }
+    return [
+      ...history.slice(0, existingIndex),
+      nextPoint,
+      ...history.slice(existingIndex + 1),
+    ];
+  }
+  if (!latest || !isSameDate) {
+    return [...history, nextPoint];
+  }
+  if (isSameKLineData(latest, nextPoint)) {
+    return history;
+  }
+  return [...history.slice(0, -1), nextPoint];
+}
+
+function getIntradayQuoteBucket(quote: StockQuote, period: IndicatorPeriod, fallbackDate?: string | null): string | null {
+  const minutes = getIntradayPeriodMinutes(period);
+  if (!minutes) {
+    return null;
+  }
+
+  const quoteParts = getDateTimeParts(quote.updateTime);
+  const fallbackParts = getDateTimeParts(fallbackDate);
+  const date = quoteParts?.date ?? fallbackParts?.date;
+  const hour = quoteParts?.hour ?? fallbackParts?.hour;
+  const minute = quoteParts?.minute ?? fallbackParts?.minute;
+  if (!date || !isValidNumber(hour) || !isValidNumber(minute)) {
+    return null;
+  }
+
+  const totalMinutes = hour * 60 + minute;
+  const bucketMinutes = Math.floor(totalMinutes / minutes) * minutes;
+  const bucketHour = Math.floor(bucketMinutes / 60);
+  const bucketMinute = bucketMinutes % 60;
+  return `${date} ${String(bucketHour).padStart(2, '0')}:${String(bucketMinute).padStart(2, '0')}`;
+}
+
+function mergeLiveQuoteIntoIntradayHistory(
+  history: KLineData[],
+  quote: StockQuote | null | undefined,
+  period: IndicatorPeriod,
+): KLineData[] {
+  if (!quote) {
+    return history;
+  }
+  const price = getPositiveFiniteNumber(quote.currentPrice);
+  if (!price) {
+    return history;
+  }
+
+  const latest = history.at(-1);
+  const bucketDate = getIntradayQuoteBucket(quote, period, latest?.date);
+  if (!bucketDate) {
+    return history;
+  }
+  const existingIndex = history.findIndex((item) => item.date === bucketDate);
+  if (existingIndex < 0 && latest?.date && bucketDate < latest.date) {
+    return history;
+  }
+  const base = existingIndex >= 0 ? history[existingIndex] : null;
+  const nextPoint: KLineData = {
+    date: bucketDate,
+    open: getPositiveFiniteNumber(base?.open) ?? price,
+    high: Math.max(getPositiveFiniteNumber(base?.high) ?? price, price),
+    low: Math.min(getPositiveFiniteNumber(base?.low) ?? price, price),
+    close: price,
+    volume: base?.volume ?? null,
+    afterHoursVolume: base?.afterHoursVolume ?? null,
+    amount: base?.amount ?? null,
+    changePercent: base?.changePercent ?? null,
+    turnoverRate: base?.turnoverRate ?? null,
+  };
+
+  if (existingIndex >= 0) {
+    if (base && isSameKLineData(base, nextPoint)) {
+      return history;
+    }
+    return [
+      ...history.slice(0, existingIndex),
+      nextPoint,
+      ...history.slice(existingIndex + 1),
+    ];
+  }
+  return [...history, nextPoint];
+}
+
+function mergeLiveQuoteIntoPeriodHistory(
+  history: KLineData[],
+  quote: StockQuote | null | undefined,
+  period: IndicatorPeriod,
+): KLineData[] {
+  if (period === 'daily') {
+    return mergeLiveQuoteIntoDailyHistory(history, quote);
+  }
+  if (period === 'today') {
+    return history;
+  }
+  return mergeLiveQuoteIntoIntradayHistory(history, quote, period);
+}
+
+function applyLiveQuoteToHistoryState(state: HistoryState, quote: StockQuote): HistoryState {
+  const nextHistory = mergeLiveQuoteIntoPeriodHistory(state.history, quote, state.period);
+
+  if (state.quote === quote && nextHistory === state.history) {
+    return state;
+  }
+
+  return {
+    ...state,
+    history: nextHistory,
+    quote,
+  };
+}
+
 function normalizeHistoryForPeriod(
   history: KLineData[],
   period: KLinePeriod,
@@ -1037,7 +1417,7 @@ function normalizeHistoryForPeriod(
   });
 }
 
-function formatAxisDate(value: string, period: KLinePeriod): string {
+function formatAxisDate(value: string, period: IndicatorPeriod): string {
   if (period === 'daily') {
     return value.slice(5);
   }
@@ -1558,6 +1938,41 @@ function pickChipSnapshot(chip: ChipDistributionMetrics | null, date?: string | 
     }).snapshot;
   }
   return snapshots.find((item) => item.dateKey <= dateKey)?.snapshot ?? snapshots[0]?.snapshot ?? chip;
+}
+
+function estimateChipProfitRatio(distribution: ChipDistributionPoint[], close?: number | null): number | null {
+  if (!isValidNumber(close) || close <= 0 || distribution.length === 0) {
+    return null;
+  }
+  const total = distribution.reduce((sum, item) => (
+    isValidNumber(item.percent) && item.percent > 0 ? sum + item.percent : sum
+  ), 0);
+  if (total <= 0) {
+    return null;
+  }
+  const profit = distribution.reduce((sum, item) => (
+    isValidNumber(item.percent) && item.percent > 0 && item.price <= close ? sum + item.percent : sum
+  ), 0);
+  return clamp(profit / total, 0, 1);
+}
+
+function projectChipSnapshotToPoint(
+  chip: ChipDistributionMetrics | null,
+  point?: ChartPoint | null,
+): ChipDistributionMetrics | null {
+  if (!chip || !point) {
+    return chip;
+  }
+  const pointDate = normalizeDateKey(point.date);
+  if (!pointDate) {
+    return chip;
+  }
+  const projectedProfitRatio = estimateChipProfitRatio(chip.distribution, point.close);
+  return {
+    ...chip,
+    date: pointDate,
+    profitRatio: projectedProfitRatio ?? chip.profitRatio,
+  };
 }
 
 function isChipForDate(chip: ChipDistributionMetrics | null, date?: string | null): boolean {
@@ -2141,8 +2556,8 @@ const CoreQuoteMetrics: React.FC<{
   const totalMv = resolveQuoteMarketValue(metricQuote?.totalMv, referenceQuote?.totalShares, metricPrice);
   const circMv = resolveQuoteMarketValue(metricQuote?.circMv, referenceQuote?.floatShares, metricPrice);
   const peRatio = resolvePeRatio(quote, referenceQuote, metricPrice);
-  const coreVolumeRatio = quote?.volumeRatio ?? (point ? getPointVolumeRatio(point) : undefined);
-  const coreTurnoverRate = resolvePointTurnoverRate(point, referenceQuote, points, quote !== null);
+  const coreVolumeRatio = quote ? quote.volumeRatio : point ? getPointVolumeRatio(point) : undefined;
+  const coreTurnoverRate = quote ? quote.turnoverRate : resolvePointTurnoverRate(point, referenceQuote, points);
   const coreRows: CoreMetricItem[] = [
     { label: '最高价', metricKey: 'high', value: formatNumber(quote?.high ?? point?.high), rawValue: quote?.high ?? point?.high, unit: '元', tone: 'up' },
     { label: '总市值', metricKey: 'total_mv', value: formatCompactNumber(totalMv), rawValue: totalMv, unit: '元' },
@@ -2416,10 +2831,10 @@ const CandlestickChart: React.FC<{
   canZoomIn: boolean;
   canZoomOut: boolean;
   onAddRuleMetric?: AddRuleMetricHandler;
-  period: KLinePeriod;
+  period: IndicatorPeriod;
   periodLabel: string;
-  selectedPeriod: KLinePeriod;
-  onPeriodChange: (period: KLinePeriod) => void;
+  selectedPeriod: IndicatorPeriod;
+  onPeriodChange: (period: IndicatorPeriod) => void;
   highlightedDate?: string;
   quote: StockQuote | null;
   metrics: StockIndicatorMetrics | null;
@@ -2917,7 +3332,7 @@ const VolumeActivityChart: React.FC<{
   onHoverPinnedChange: (value: boolean) => void;
   onStepHoverIndex: (direction: HoverStepDirection) => void;
   onOpenChartMenu: (event: React.MouseEvent) => void;
-  period: KLinePeriod;
+  period: IndicatorPeriod;
   highlightedDate?: string;
   onAddRuleMetric?: AddRuleMetricHandler;
   isMaximized?: boolean;
@@ -3213,7 +3628,7 @@ const MacdSignalChart: React.FC<{
   onHoverPinnedChange: (value: boolean) => void;
   onStepHoverIndex: (direction: HoverStepDirection) => void;
   onOpenChartMenu: (event: React.MouseEvent) => void;
-  period: KLinePeriod;
+  period: IndicatorPeriod;
   highlightedDate?: string;
   onAddRuleMetric?: AddRuleMetricHandler;
   isMaximized?: boolean;
@@ -4370,7 +4785,7 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
   onClose,
   variant = 'page',
 }) => {
-  const [selectedPeriod, setSelectedPeriod] = useState<KLinePeriod>('daily');
+  const [selectedPeriod, setSelectedPeriod] = useState<IndicatorPeriod>('daily');
   const [hoveredIndex, setHoveredIndex] = useState<number | null>(null);
   const [isHoverPinned, setIsHoverPinned] = useState(false);
   const [timelineZoom, setTimelineZoom] = useState(0);
@@ -4381,6 +4796,7 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
     daily: createHistoryState(stockCode, 'daily'),
   }));
   const oneMinuteRefreshInFlightRef = useRef(false);
+  const todaySnapshotInFlightRef = useRef(false);
   const dailyCutoffDateRef = useRef<string | null>(null);
   const selectedRefreshTokenRef = useRef<string | null>(null);
   const lastChartAnchorIndexRef = useRef<number | null>(null);
@@ -4399,8 +4815,14 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
     () => (ruleDraft ? new Set(ruleDraft.items.map((item) => item.key)) : EMPTY_SELECTED_RULE_METRIC_KEYS),
     [ruleDraft],
   );
+  const { quote: liveQuote, refreshIntervalSeconds } = useLiveQuote(stockCode);
+  const { upsertQuotes } = useLiveMarketData();
+  const liveRefreshMs = Math.max(
+    10_000,
+    (Number.isFinite(refreshIntervalSeconds) ? refreshIntervalSeconds : DEFAULT_LIVE_REFRESH_MS / 1000) * 1000,
+  );
 
-  const handlePeriodChange = useCallback((period: KLinePeriod) => {
+  const handlePeriodChange = useCallback((period: IndicatorPeriod) => {
     selectedRefreshTokenRef.current = null;
     setSelectedPeriod(period);
   }, []);
@@ -4546,59 +4968,62 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
     };
   }, [isRuleDraftEditorOpen, ruleMetrics.length]);
 
-  useEffect(() => {
-    let ignore = false;
-    dailyCutoffDateRef.current = null;
-    selectedRefreshTokenRef.current = null;
-    setHistoryCache({ daily: createHistoryState(stockCode, 'daily') });
+    useEffect(() => {
+      let ignore = false;
+      dailyCutoffDateRef.current = null;
+      selectedRefreshTokenRef.current = null;
+      setHistoryCache({ daily: createHistoryState(stockCode, 'daily') });
 
-    const loadInitialData = async () => {
-      const [historyResult, quoteResult, metricsResult] = await Promise.allSettled([
-        stocksApi.getHistory(stockCode, dailyHistoryDays, 'daily'),
-        stocksApi.getQuote(stockCode),
-        stocksApi.getIndicatorMetrics(stockCode),
-      ]);
+      const loadInitialData = async () => {
+        const [historyResult, quoteResult, metricsResult] = await Promise.allSettled([
+          stocksApi.getHistory(stockCode, dailyHistoryDays, 'daily'),
+          stocksApi.getQuote(stockCode, refreshIntervalSeconds),
+          stocksApi.getIndicatorMetrics(stockCode),
+        ]);
 
-      if (ignore) {
-        return;
-      }
+        if (ignore) {
+          return;
+        }
 
-      const historyResponse = historyResult.status === 'fulfilled' ? historyResult.value : null;
-      const quoteResponse = quoteResult.status === 'fulfilled' ? quoteResult.value : null;
-      const metricsResponse = metricsResult.status === 'fulfilled' ? metricsResult.value : null;
-      const dailyHistory = historyResponse?.data ?? [];
-      const dailyCutoffDate = getLatestHistoryDate(dailyHistory);
-      dailyCutoffDateRef.current = dailyCutoffDate;
-      const metricsError = metricsResult.status === 'rejected'
-        ? metricsResult.reason instanceof Error
-          ? metricsResult.reason.message
-          : '主力筹码数据加载失败'
-        : null;
+        const historyResponse = historyResult.status === 'fulfilled' ? historyResult.value : null;
+        const quoteResponse = quoteResult.status === 'fulfilled' ? quoteResult.value : null;
+        const metricsResponse = metricsResult.status === 'fulfilled' ? metricsResult.value : null;
+        if (quoteResponse) {
+          upsertQuotes([quoteResponse]);
+        }
+        const dailyHistory = historyResponse?.data ?? [];
+        const dailyCutoffDate = getLatestHistoryDate(dailyHistory);
+        dailyCutoffDateRef.current = dailyCutoffDate;
+        const metricsError = metricsResult.status === 'rejected'
+          ? metricsResult.reason instanceof Error
+            ? metricsResult.reason.message
+            : '主力筹码数据加载失败'
+          : null;
 
-      const dailyState = createHistoryState(stockCode, 'daily', {
-        history: dailyHistory,
-        quote: quoteResponse,
-        metrics: metricsResponse,
-        metricsError,
-        isLoading: false,
-        error: historyResult.status === 'rejected'
-          ? historyResult.reason instanceof Error
-            ? historyResult.reason.message
-            : '指标数据加载失败'
-          : null,
-      });
+        const dailyState = createHistoryState(stockCode, 'daily', {
+          history: mergeLiveQuoteIntoDailyHistory(dailyHistory, quoteResponse),
+          quote: quoteResponse,
+          metrics: metricsResponse,
+          metricsError,
+          isLoading: false,
+          error: historyResult.status === 'rejected'
+            ? historyResult.reason instanceof Error
+              ? historyResult.reason.message
+              : '指标数据加载失败'
+            : null,
+        });
 
-      setHistoryCache({ daily: dailyState });
+        setHistoryCache({ daily: dailyState });
 
-      INTRADAY_PERIOD_OPTIONS.forEach((option) => {
-        setHistoryCache((current) => ({
-          ...current,
-          [option.value]: createHistoryState(stockCode, option.value, {
-            quote: current.daily?.quote ?? quoteResponse,
-            metrics: current.daily?.metrics ?? metricsResponse,
-            metricsError: current.daily?.metricsError ?? metricsError,
-          }),
-        }));
+        INTRADAY_PERIOD_OPTIONS.forEach((option) => {
+          setHistoryCache((current) => ({
+            ...current,
+            [option.value]: createHistoryState(stockCode, option.value, {
+              quote: current.daily?.quote ?? quoteResponse,
+              metrics: current.daily?.metrics ?? metricsResponse,
+              metricsError: current.daily?.metricsError ?? metricsError,
+            }),
+          }));
 
         void stocksApi.getHistory(stockCode, option.days, option.value)
           .then((periodResponse) => {
@@ -4620,7 +5045,7 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
               return {
                 ...current,
                 [option.value]: createHistoryState(stockCode, option.value, {
-                  history: normalizedHistory,
+                  history: mergeLiveQuoteIntoPeriodHistory(normalizedHistory, currentDaily.quote, option.value),
                   quote: currentDaily.quote,
                   metrics: currentDaily.metrics,
                   metricsError: currentDaily.metricsError,
@@ -4664,14 +5089,16 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
       }
     });
 
-    return () => {
-      ignore = true;
-    };
-  }, [dailyHistoryDays, marketKind, stockCode]);
+      return () => {
+        ignore = true;
+      };
+    }, [dailyHistoryDays, marketKind, refreshIntervalSeconds, stockCode, upsertQuotes]);
 
   const selectedCachedState = historyCache[selectedPeriod];
   const dailyCachedState = historyCache.daily;
-  const displayState = selectedCachedState?.stockCode === stockCode && selectedCachedState.history.length > 0
+  const canUseSelectedState = selectedCachedState?.stockCode === stockCode
+    && (selectedPeriod !== 'today' || selectedCachedState.history.length > 0);
+  const displayState = canUseSelectedState
     ? selectedCachedState
     : dailyCachedState?.stockCode === stockCode && dailyCachedState.history.length > 0
       ? dailyCachedState
@@ -4680,19 +5107,56 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
         : dailyCachedState?.stockCode === stockCode
           ? dailyCachedState
           : Object.values(historyCache).find((state) => state?.stockCode === stockCode);
+  const todaySnapshotState = selectedPeriod === 'today' && selectedCachedState?.stockCode === stockCode
+    ? selectedCachedState
+    : null;
+  const todaySnapshotFallbackMessage = todaySnapshotState && displayState?.period !== 'today'
+    ? todaySnapshotState.isLoading
+      ? '正在获取当日分钟线，当前暂显示日 K 作为参考。'
+      : todaySnapshotState.error
+        ? `${todaySnapshotState.error}，当前暂显示日 K 作为参考。`
+        : null
+    : null;
   const effectivePeriod = displayState?.period ?? selectedPeriod;
   const periodMeta = getPeriodMeta(effectivePeriod);
   const isLoading = !displayState || (displayState.isLoading && displayState.history.length === 0);
   const error = displayState?.period === selectedPeriod ? displayState.error : null;
+  const isTodayDisplay = selectedPeriod === 'today' && displayState?.period === 'today';
   const history = displayState?.history ?? EMPTY_HISTORY;
-  const quote = displayState?.quote ?? dailyCachedState?.quote ?? null;
+  const cachedQuotes = Object.values(historyCache)
+    .filter((state): state is HistoryState => state?.stockCode === stockCode)
+    .map((state) => state.quote);
+  const historyQuoteSource = pickLatestHistoryQuoteSource(historyCache, stockCode);
+  const historyFallbackQuote = buildQuoteFromHistorySource(stockCode, stockName, historyQuoteSource);
+  const quote = pickLatestQuote([liveQuote, displayState?.quote, dailyCachedState?.quote, ...cachedQuotes])
+    ?? historyFallbackQuote;
   const metrics = displayState?.metrics ?? dailyCachedState?.metrics ?? null;
   const metricsError = displayState?.metricsError ?? dailyCachedState?.metricsError ?? null;
 
   useEffect(() => {
-    if (selectedPeriod === 'daily' || !selectedCachedState || selectedCachedState.isLoading) {
-      return undefined;
+    if (!liveQuote) {
+      return;
     }
+    setHistoryCache((current) => {
+      const next: HistoryCache = { ...current };
+      KLINE_PERIOD_OPTIONS.forEach((option) => {
+        const state = next[option.value];
+        if (state?.stockCode === stockCode) {
+          next[option.value] = applyLiveQuoteToHistoryState(state, liveQuote);
+        }
+      });
+      const nextDailyCutoffDate = getLatestHistoryDate(next.daily?.history ?? []);
+      if (nextDailyCutoffDate) {
+        dailyCutoffDateRef.current = nextDailyCutoffDate;
+      }
+      return next;
+    });
+  }, [liveQuote, stockCode]);
+
+    useEffect(() => {
+      if (selectedPeriod === 'daily' || selectedPeriod === 'today' || !selectedCachedState || selectedCachedState.isLoading) {
+        return undefined;
+      }
 
     const refreshToken = `${stockCode}:${selectedPeriod}`;
     if (selectedRefreshTokenRef.current === refreshToken) {
@@ -4723,7 +5187,7 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
             ...current,
             [selectedPeriod]: {
               ...currentState,
-              history: normalizedHistory,
+              history: mergeLiveQuoteIntoPeriodHistory(normalizedHistory, currentState.quote, selectedPeriod),
               isLoading: false,
               error: null,
             },
@@ -4750,14 +5214,105 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
         });
       });
 
-    return () => {
-      ignore = true;
-    };
-  }, [marketKind, selectedCachedState, selectedPeriod, stockCode]);
+      return () => {
+        ignore = true;
+      };
+    }, [marketKind, selectedCachedState, selectedPeriod, stockCode]);
 
-  useEffect(() => {
-    if (selectedPeriod !== '1m' || !selectedCachedState || selectedCachedState.isLoading) {
-      return undefined;
+    useEffect(() => {
+      if (selectedPeriod !== 'today') {
+        return undefined;
+      }
+
+      let ignore = false;
+      setHistoryCache((current) => {
+        const currentState = current.today;
+        if (currentState?.stockCode === stockCode && currentState.history.length > 0) {
+          return current;
+        }
+        return {
+          ...current,
+          today: createHistoryState(stockCode, 'today', {
+            quote: currentState?.quote ?? current.daily?.quote ?? null,
+            metrics: currentState?.metrics ?? current.daily?.metrics ?? null,
+            metricsError: currentState?.metricsError ?? current.daily?.metricsError ?? null,
+          }),
+        };
+      });
+
+      const refreshTodaySnapshot = async () => {
+        if (todaySnapshotInFlightRef.current) {
+          return;
+        }
+
+        todaySnapshotInFlightRef.current = true;
+        try {
+          const snapshot = await stocksApi.getIntradaySnapshot(stockCode, '1m');
+          if (ignore) {
+            return;
+          }
+          if (snapshot.quote) {
+            upsertQuotes([snapshot.quote]);
+          }
+          setHistoryCache((current) => {
+            const currentState = current.today;
+            const dailyState = current.daily;
+            if (currentState?.stockCode !== stockCode && dailyState?.stockCode !== stockCode) {
+              return current;
+            }
+            const snapshotError = snapshot.errors[0] ?? '当日走势数据加载失败';
+            const nextHistory = snapshot.data.length > 0 ? snapshot.data : currentState?.history ?? [];
+            return {
+              ...current,
+              today: createHistoryState(stockCode, 'today', {
+                history: nextHistory,
+                quote: snapshot.quote ?? currentState?.quote ?? dailyState?.quote ?? null,
+                metrics: currentState?.metrics ?? dailyState?.metrics ?? null,
+                metricsError: currentState?.metricsError ?? dailyState?.metricsError ?? null,
+                isLoading: false,
+                error: nextHistory.length > 0 ? null : snapshotError,
+              }),
+            };
+          });
+        } catch (err: unknown) {
+          if (!ignore) {
+            setHistoryCache((current) => {
+              const currentState = current.today;
+              if (currentState?.stockCode !== stockCode) {
+                return current;
+              }
+              return {
+                ...current,
+                today: {
+                  ...currentState,
+                  isLoading: false,
+                  error: currentState.history.length > 0
+                    ? null
+                    : err instanceof Error ? err.message : '当日走势数据加载失败',
+                },
+              };
+            });
+          }
+        } finally {
+          todaySnapshotInFlightRef.current = false;
+        }
+      };
+
+      void refreshTodaySnapshot();
+      const intervalId = window.setInterval(() => {
+        void refreshTodaySnapshot();
+      }, liveRefreshMs);
+
+      return () => {
+        ignore = true;
+        todaySnapshotInFlightRef.current = false;
+        window.clearInterval(intervalId);
+      };
+    }, [liveRefreshMs, selectedPeriod, stockCode, upsertQuotes]);
+
+    useEffect(() => {
+      if (selectedPeriod !== '1m' || !selectedCachedState || selectedCachedState.isLoading) {
+        return undefined;
     }
 
     let ignore = false;
@@ -4768,21 +5323,24 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
         return;
       }
 
-      oneMinuteRefreshInFlightRef.current = true;
-      try {
-        const [historyResult, quoteResult] = await Promise.allSettled([
-          stocksApi.getHistory(stockCode, oneMinuteMeta.days, '1m'),
-          stocksApi.getQuote(stockCode),
-        ]);
+        oneMinuteRefreshInFlightRef.current = true;
+        try {
+          const [historyResult, quoteResult] = await Promise.allSettled([
+            stocksApi.getHistory(stockCode, oneMinuteMeta.days, '1m'),
+            stocksApi.getQuote(stockCode, refreshIntervalSeconds),
+          ]);
 
-        if (ignore) {
-          return;
-        }
+          if (ignore) {
+            return;
+          }
+          if (quoteResult.status === 'fulfilled') {
+            upsertQuotes([quoteResult.value]);
+          }
 
-        setHistoryCache((current) => {
-          const currentState = current['1m'];
-          if (currentState?.stockCode !== stockCode) {
-            return current;
+          setHistoryCache((current) => {
+            const currentState = current['1m'];
+            if (currentState?.stockCode !== stockCode) {
+              return current;
           }
 
           const cutoffDate = getLatestHistoryDate(current.daily?.history ?? []) ?? dailyCutoffDateRef.current;
@@ -4792,6 +5350,7 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
           const nextQuote = quoteResult.status === 'fulfilled'
             ? quoteResult.value
             : currentState.quote;
+          const nextMergedHistory = mergeLiveQuoteIntoPeriodHistory(nextHistory, nextQuote, '1m');
           const historyError = historyResult.status === 'rejected'
             ? historyResult.reason instanceof Error
               ? historyResult.reason.message
@@ -4802,9 +5361,9 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
             ...current,
             '1m': {
               ...currentState,
-              history: nextHistory,
+              history: nextMergedHistory,
               quote: nextQuote,
-              error: nextHistory.length > 0 ? null : historyError,
+              error: nextMergedHistory.length > 0 ? null : historyError,
             },
           };
         });
@@ -4813,56 +5372,105 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
       }
     };
 
-    const intervalId = window.setInterval(() => {
-      void refreshOneMinuteData();
-    }, ONE_MINUTE_REFRESH_MS);
+      const intervalId = window.setInterval(() => {
+        void refreshOneMinuteData();
+      }, liveRefreshMs);
 
     return () => {
       ignore = true;
       oneMinuteRefreshInFlightRef.current = false;
       window.clearInterval(intervalId);
     };
-  }, [marketKind, selectedCachedState, selectedPeriod, stockCode]);
+    }, [
+      liveRefreshMs,
+      marketKind,
+      refreshIntervalSeconds,
+      selectedCachedState,
+      selectedPeriod,
+      stockCode,
+      upsertQuotes,
+    ]);
 
-  useEffect(() => {
-    if (isLoading || selectedPeriod === '1m') {
-      return undefined;
-    }
+    useEffect(() => {
+      if (isLoading || selectedPeriod === '1m' || selectedPeriod === 'today') {
+        return undefined;
+      }
 
-    let ignore = false;
-    const refreshQuote = async () => {
-      try {
-        const nextQuote = await stocksApi.getQuote(stockCode);
-        if (ignore) {
-          return;
-        }
-        setHistoryCache((current) => {
-          const next: HistoryCache = { ...current };
-          KLINE_PERIOD_OPTIONS.forEach((option) => {
-            const state = next[option.value];
-            if (state?.stockCode === stockCode) {
-              next[option.value] = {
-                ...state,
-                quote: nextQuote,
-              };
+      let ignore = false;
+      const selectedHistoryPeriod: KLinePeriod | null = selectedPeriod === 'daily' ? null : selectedPeriod;
+      const selectedHistoryMeta = selectedHistoryPeriod ? getPeriodMeta(selectedHistoryPeriod) : null;
+      const refreshQuote = async () => {
+        try {
+          const [quoteResult, historyResult] = await Promise.allSettled([
+            stocksApi.getQuote(stockCode, refreshIntervalSeconds),
+            selectedHistoryPeriod && selectedHistoryMeta
+              ? stocksApi.getHistory(stockCode, selectedHistoryMeta.days, selectedHistoryPeriod)
+              : Promise.resolve(null),
+          ]);
+          if (ignore) {
+            return;
+          }
+          const nextQuote = quoteResult.status === 'fulfilled' ? quoteResult.value : null;
+          if (nextQuote) {
+            upsertQuotes([nextQuote]);
+          }
+          setHistoryCache((current) => {
+            const next: HistoryCache = { ...current };
+            if (nextQuote) {
+              KLINE_PERIOD_OPTIONS.forEach((option) => {
+                const state = next[option.value];
+                if (state?.stockCode === stockCode) {
+                  next[option.value] = applyLiveQuoteToHistoryState(state, nextQuote);
+                }
+              });
             }
+            const nextDailyCutoffDate = getLatestHistoryDate(next.daily?.history ?? []);
+            if (nextDailyCutoffDate) {
+              dailyCutoffDateRef.current = nextDailyCutoffDate;
+            }
+            if (selectedHistoryPeriod && historyResult.status === 'fulfilled' && historyResult.value) {
+              const currentState = next[selectedHistoryPeriod];
+              if (currentState?.stockCode === stockCode) {
+                const cutoffDate = getLatestHistoryDate(next.daily?.history ?? []) ?? dailyCutoffDateRef.current;
+                const normalizedHistory = normalizeHistoryForPeriod(
+                  historyResult.value.data,
+                  selectedHistoryPeriod,
+                  marketKind,
+                  cutoffDate,
+                );
+                const quoteForMerge = nextQuote ?? currentState.quote;
+                next[selectedHistoryPeriod] = {
+                  ...currentState,
+                  history: mergeLiveQuoteIntoPeriodHistory(normalizedHistory, quoteForMerge, selectedHistoryPeriod),
+                  quote: quoteForMerge,
+                  error: null,
+                };
+              }
+            } else if (selectedHistoryPeriod && historyResult.status === 'rejected') {
+              const currentState = next[selectedHistoryPeriod];
+              if (currentState?.stockCode === stockCode && currentState.history.length === 0) {
+                next[selectedHistoryPeriod] = {
+                  ...currentState,
+                  error: historyResult.reason instanceof Error ? historyResult.reason.message : '指标数据刷新失败',
+                };
+              }
+            }
+            return next;
           });
-          return next;
-        });
       } catch {
         // Quote refresh is a soft realtime enhancement; keep the last usable quote.
       }
     };
 
-    const intervalId = window.setInterval(() => {
-      void refreshQuote();
-    }, ONE_MINUTE_REFRESH_MS);
+      const intervalId = window.setInterval(() => {
+        void refreshQuote();
+      }, liveRefreshMs);
 
-    return () => {
-      ignore = true;
-      window.clearInterval(intervalId);
-    };
-  }, [isLoading, selectedPeriod, stockCode]);
+      return () => {
+        ignore = true;
+        window.clearInterval(intervalId);
+      };
+    }, [isLoading, liveRefreshMs, marketKind, refreshIntervalSeconds, selectedPeriod, stockCode, upsertQuotes]);
 
   const points = useMemo(() => buildChartPoints(history), [history]);
   const visibleCount = useMemo(() => getVisiblePointCount(points.length, timelineZoom), [points.length, timelineZoom]);
@@ -4898,10 +5506,7 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
   }, [points.length]);
   const safeHoveredIndex = hoveredIndex !== null && hoveredIndex >= 0 && hoveredIndex < points.length ? hoveredIndex : null;
   const latest = points.at(-1);
-  const corePointIndex = safeHoveredIndex ?? (points.length > 0 ? points.length - 1 : null);
-  const corePoint = corePointIndex !== null ? points[corePointIndex] : latest;
-  const corePreviousPoint = corePointIndex !== null && corePointIndex > 0 ? points[corePointIndex - 1] : undefined;
-  const coreQuote = corePointIndex !== null && corePointIndex === points.length - 1 ? quote : null;
+  const latestPreviousPoint = points.length > 1 ? points[points.length - 2] : undefined;
   const displayVolume = quote?.volume ?? latest?.volume;
   const volumeRatio = displayVolume && latest?.volumeMa5 ? displayVolume / latest.volumeMa5 : undefined;
   const chipPoints = points;
@@ -4910,7 +5515,10 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
   const visibleAnchorPoint = visiblePoints.at(-1) ?? latest;
   const selectedPoint = safeHoveredIndex !== null ? points[safeHoveredIndex] : visibleAnchorPoint;
   const baseChip = metrics?.chipDistribution ?? null;
-  const chip = useMemo(() => pickChipSnapshot(baseChip, selectedPoint?.date), [baseChip, selectedPoint?.date]);
+  const chip = useMemo(() => {
+    const nearestChip = pickChipSnapshot(baseChip, selectedPoint?.date);
+    return projectChipSnapshotToPoint(nearestChip, selectedPoint);
+  }, [baseChip, selectedPoint]);
   const chipPoint = useMemo(
     () => (isChipForDate(chip, selectedPoint?.date) ? selectedPoint : findPointByDate(points, chip?.date) ?? selectedPoint ?? latest),
     [chip, latest, points, selectedPoint],
@@ -5120,24 +5728,41 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
 
         <div className={modal ? 'min-h-0 flex-1 overflow-y-auto p-4 md:p-5' : 'min-h-0 flex-1 overflow-hidden p-3 md:p-4'}>
           {isLoading ? (
-            <DashboardStateBlock loading title="加载指标数据中..." className="min-h-[24rem]" />
+            <DashboardStateBlock
+              loading
+              title={isTodayDisplay ? '加载当日走势中...' : '加载指标数据中...'}
+              className="min-h-[24rem]"
+            />
           ) : error ? (
-            <InlineAlert variant="danger" title="指标数据加载失败" message={error} />
+            <InlineAlert
+              variant="danger"
+              title={isTodayDisplay ? '当日走势加载失败' : '指标数据加载失败'}
+              message={error}
+            />
           ) : points.length === 0 ? (
             <EmptyState
-              title="暂无 K 线数据"
-              description="当前股票暂未返回历史行情，稍后刷新或更换股票再试。"
+              title={isTodayDisplay ? '暂无当日分钟线数据' : '暂无 K 线数据'}
+              description={isTodayDisplay
+                ? '当前交易日尚未形成有效分钟 K 线，可能尚未开盘或数据源暂未更新。'
+                : '当前股票暂未返回历史行情，稍后刷新或更换股票再试。'}
               className="min-h-[24rem]"
               icon={<BarChart3 className="h-5 w-5" />}
             />
           ) : (
             <div className="flex h-full min-h-0 flex-col gap-3">
+              {todaySnapshotFallbackMessage ? (
+                <InlineAlert
+                  variant={todaySnapshotState?.isLoading ? 'info' : 'warning'}
+                  title={todaySnapshotState?.isLoading ? '当日走势加载中' : '当日走势暂无可用分钟线'}
+                  message={todaySnapshotFallbackMessage}
+                />
+              ) : null}
               <section className="grid min-h-0 flex-1 gap-3 xl:grid-cols-[minmax(0,1fr)_20rem] xl:items-start">
                 <div className="grid min-w-0 content-start gap-2 xl:h-full xl:min-h-0">
                   <CoreQuoteMetrics
-                    point={corePoint}
-                    previous={corePreviousPoint}
-                    quote={coreQuote}
+                    point={latest}
+                    previous={latestPreviousPoint}
+                    quote={quote}
                     referenceQuote={quote}
                     points={points}
                     onAddRuleMetric={handleAddRuleMetric}

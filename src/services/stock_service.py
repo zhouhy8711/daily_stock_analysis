@@ -10,7 +10,8 @@
 """
 
 import logging
-from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
+from datetime import date, datetime
 import math
 import re
 from typing import Optional, Dict, Any, List
@@ -19,6 +20,9 @@ from src.core import trading_calendar
 from src.repositories.stock_repo import StockRepository
 
 logger = logging.getLogger(__name__)
+
+INTRADAY_SNAPSHOT_KLINE_TIMEOUT_SECONDS = 18
+INTRADAY_SNAPSHOT_QUOTE_TIMEOUT_SECONDS = 8
 
 
 def _to_optional_float(value: Any) -> Optional[float]:
@@ -182,7 +186,13 @@ class StockService:
         """初始化股票数据服务"""
         self.repo = StockRepository()
     
-    def get_realtime_quote(self, stock_code: str) -> Optional[Dict[str, Any]]:
+    def get_realtime_quote(
+        self,
+        stock_code: str,
+        *,
+        trigger_rules: bool = True,
+        freshness_seconds: Optional[int] = None,
+    ) -> Optional[Dict[str, Any]]:
         """
         获取股票实时行情
         
@@ -197,13 +207,16 @@ class StockService:
             from data_provider.base import DataFetcherManager
             
             manager = DataFetcherManager()
-            quote = manager.get_realtime_quote(stock_code)
+            quote = manager.get_realtime_quote(stock_code, freshness_seconds=freshness_seconds)
             
             if quote is None:
                 logger.warning(f"获取 {stock_code} 实时行情失败")
                 return None
-            
-            return _build_quote_payload(quote, stock_code)
+
+            payload = _build_quote_payload(quote, stock_code)
+            if trigger_rules:
+                self._trigger_rule_events_for_quotes({str(payload.get("stock_code") or stock_code): payload})
+            return payload
             
         except ImportError:
             logger.warning("DataFetcherManager 未找到，使用占位数据")
@@ -212,7 +225,13 @@ class StockService:
             logger.error(f"获取实时行情失败: {e}", exc_info=True)
             return None
 
-    def get_realtime_quotes(self, stock_codes: List[str]) -> Dict[str, Any]:
+    def get_realtime_quotes(
+        self,
+        stock_codes: List[str],
+        *,
+        trigger_rules: bool = True,
+        freshness_seconds: Optional[int] = None,
+    ) -> Dict[str, Any]:
         """
         批量获取股票实时行情。
 
@@ -243,7 +262,10 @@ class StockService:
 
             for fetcher in manager._get_fetchers_snapshot():
                 if fetcher.name == "EfinanceFetcher" and hasattr(fetcher, "get_realtime_quotes"):
-                    quote_by_code = fetcher.get_realtime_quotes(list(normalized_to_original.keys()))
+                    quote_by_code = fetcher.get_realtime_quotes(
+                        list(normalized_to_original.keys()),
+                        freshness_seconds=freshness_seconds,
+                    )
                     break
 
             missing_normalized_codes = [
@@ -254,7 +276,10 @@ class StockService:
             if missing_normalized_codes:
                 for fetcher in manager._get_fetchers_snapshot():
                     if fetcher.name == "AkshareFetcher" and hasattr(fetcher, "get_realtime_quotes"):
-                        fallback_quotes = fetcher.get_realtime_quotes(missing_normalized_codes)
+                        fallback_quotes = fetcher.get_realtime_quotes(
+                            missing_normalized_codes,
+                            freshness_seconds=freshness_seconds,
+                        )
                         quote_by_code.update(fallback_quotes)
                         break
 
@@ -265,7 +290,11 @@ class StockService:
             ]
             if len(normalized_codes) <= 20 and missing_codes:
                 for code in missing_codes:
-                    quote = manager.get_realtime_quote(code, log_final_failure=False)
+                    quote = manager.get_realtime_quote(
+                        code,
+                        log_final_failure=False,
+                        freshness_seconds=freshness_seconds,
+                    )
                     if quote is not None:
                         quote_by_code[normalize_stock_code(code)] = quote
 
@@ -285,11 +314,18 @@ class StockService:
                 for normalized, original in normalized_to_original.items()
                 if normalized not in found_codes
             ]
-            return {
+            result = {
                 "items": items,
                 "failed_codes": failed_codes,
                 "update_time": datetime.now().isoformat(),
             }
+            if trigger_rules and items:
+                self._trigger_rule_events_for_quotes({
+                    str(item.get("stock_code") or ""): item
+                    for item in items
+                    if item.get("stock_code")
+                })
+            return result
         except ImportError:
             logger.warning("DataFetcherManager 未找到，批量行情返回空数据")
             return {
@@ -304,6 +340,32 @@ class StockService:
                 "failed_codes": normalized_codes,
                 "update_time": datetime.now().isoformat(),
             }
+
+    def _trigger_rule_events_for_quotes(self, quotes_by_code: Dict[str, Dict[str, Any]]) -> None:
+        quotes = {
+            str(code or "").strip(): quote
+            for code, quote in quotes_by_code.items()
+            if code and quote and _to_optional_float(quote.get("current_price")) is not None
+        }
+        if not quotes:
+            return
+
+        try:
+            from src.services.rule_service import RuleService
+
+            result = RuleService(stock_service=self).evaluate_active_rules_for_quotes(
+                quotes,
+                send_notification=True,
+            )
+            if result.get("match_count"):
+                logger.info(
+                    "实时行情触发规则命中: target_count=%s match_count=%s event_count=%s",
+                    result.get("target_count"),
+                    result.get("match_count"),
+                    result.get("event_count"),
+                )
+        except Exception as exc:
+            logger.warning("实时行情触发规则计算失败，已忽略: %s", exc, exc_info=True)
 
     def get_indicator_metrics(self, stock_code: str) -> Dict[str, Any]:
         """
@@ -653,6 +715,133 @@ class StockService:
         except Exception as e:
             logger.error(f"获取历史数据失败: {e}", exc_info=True)
             return {"stock_code": stock_code, "period": period, "data": []}
+
+    @staticmethod
+    def _get_indicator_refresh_seconds() -> int:
+        try:
+            from src.config import get_config
+
+            value = int(getattr(get_config(), "indicator_intraday_refresh_seconds", 60) or 60)
+        except Exception:
+            value = 60
+        return max(10, min(value, 3600))
+
+    @staticmethod
+    def _resolve_intraday_trading_date(stock_code: str) -> tuple[Optional[str], date]:
+        market = trading_calendar.get_market_for_stock(stock_code)
+        if market:
+            market_today = trading_calendar.get_market_now(market).date()
+            if trading_calendar.is_market_open(market, market_today):
+                return market, market_today
+            return market, trading_calendar.get_effective_trading_date(market)
+        return market, datetime.now().date()
+
+    @staticmethod
+    def _run_intraday_snapshot_task(task, timeout_seconds: float, task_name: str) -> Any:
+        executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="intraday-snapshot")
+        future = executor.submit(task)
+        try:
+            return future.result(timeout=timeout_seconds)
+        except FuturesTimeoutError as exc:
+            future.cancel()
+            raise TimeoutError(f"{task_name} timeout after {timeout_seconds:g}s") from exc
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
+
+    def get_intraday_snapshot(self, stock_code: str, period: str = "1m") -> Dict[str, Any]:
+        """
+        获取当日分钟走势快照。
+
+        该接口面向 Web 实时展示，分钟 K 不落库；行情和 K 线任一路径失败时
+        返回可用的另一部分数据，并在 errors 中携带失败原因。
+        """
+        from data_provider.base import DataFetcherManager, normalize_kline_period
+
+        normalized_period = normalize_kline_period(period)
+        if normalized_period == "daily":
+            raise ValueError("当日走势仅支持分钟 K 线周期")
+
+        refresh_seconds = self._get_indicator_refresh_seconds()
+        market, trading_date = self._resolve_intraday_trading_date(stock_code)
+        trading_date_str = trading_date.isoformat()
+        errors: List[str] = []
+        data: List[Dict[str, Any]] = []
+        stock_name: Optional[str] = None
+        quote: Optional[Dict[str, Any]] = None
+
+        manager = DataFetcherManager()
+
+        try:
+            df, _source = self._run_intraday_snapshot_task(
+                lambda: manager.get_intraday_data(
+                    stock_code,
+                    period=normalized_period,
+                    start_date=trading_date_str,
+                    end_date=trading_date_str,
+                    days=1,
+                ),
+                INTRADAY_SNAPSHOT_KLINE_TIMEOUT_SECONDS,
+                "分钟K线",
+            )
+            if df is not None and not df.empty:
+                try:
+                    import pandas as pd
+
+                    if "date" in df.columns:
+                        dates = pd.to_datetime(df["date"], errors="coerce").dt.date
+                        df = df[dates == trading_date].copy()
+                    if not df.empty and "close" in df.columns:
+                        closes = pd.to_numeric(df["close"], errors="coerce")
+                        df = df[closes > 0].copy()
+                except Exception as filter_error:
+                    logger.debug("当日分钟K过滤失败，使用原始返回: %s", filter_error)
+                if df.empty:
+                    errors.append("当日分钟K线暂无有效数据，可能尚未开盘或数据源暂未更新")
+                else:
+                    data = self._build_kline_payload(df, normalized_period)
+            else:
+                errors.append("分钟K线数据为空")
+        except Exception as exc:
+            logger.warning("获取 %s 当日分钟K失败: %s", stock_code, exc)
+            errors.append(f"分钟K线获取失败: {exc}")
+
+        try:
+            quote = self._run_intraday_snapshot_task(
+                lambda: self.get_realtime_quote(
+                    stock_code,
+                    trigger_rules=False,
+                    freshness_seconds=refresh_seconds,
+                ),
+                INTRADAY_SNAPSHOT_QUOTE_TIMEOUT_SECONDS,
+                "实时行情",
+            )
+        except Exception as exc:
+            logger.warning("获取 %s 实时行情失败: %s", stock_code, exc)
+            errors.append(f"实时行情获取失败: {exc}")
+
+        if quote is None:
+            errors.append("实时行情不可用")
+        else:
+            stock_name = quote.get("stock_name")
+
+        if not stock_name:
+            try:
+                stock_name = manager.get_stock_name(stock_code, allow_realtime=False)
+            except Exception as exc:
+                logger.debug("当日走势股票名称获取失败: %s", exc)
+
+        return {
+            "stock_code": stock_code,
+            "stock_name": stock_name,
+            "market": market,
+            "trading_date": trading_date_str,
+            "period": normalized_period,
+            "refresh_interval_seconds": refresh_seconds,
+            "update_time": datetime.now().isoformat(),
+            "quote": quote,
+            "data": data,
+            "errors": errors,
+        }
     
     def _get_placeholder_quote(self, stock_code: str) -> Dict[str, Any]:
         """

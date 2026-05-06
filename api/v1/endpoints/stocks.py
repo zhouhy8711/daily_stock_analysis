@@ -23,6 +23,7 @@ from api.v1.schemas.stocks import (
     KLineData,
     StockIndicatorMetricsResponse,
     StockHistoryResponse,
+    StockIntradaySnapshotResponse,
     StockQuote,
     StockQuotesRequest,
     StockQuotesResponse,
@@ -48,6 +49,38 @@ router = APIRouter()
 ALLOWED_MIME_STR = ", ".join(ALLOWED_MIME)
 KLINE_PERIOD_PATTERN = "^(daily|1m|5m|15m|30m|60m)$"
 MAX_BATCH_QUOTE_CODES = 6000
+
+
+def _to_stock_quote(item: dict, fallback_code: str = "") -> StockQuote:
+    return StockQuote(
+        stock_code=item.get("stock_code", fallback_code),
+        stock_name=item.get("stock_name"),
+        current_price=item.get("current_price", 0.0),
+        change=item.get("change"),
+        change_percent=item.get("change_percent"),
+        open=item.get("open"),
+        high=item.get("high"),
+        low=item.get("low"),
+        prev_close=item.get("prev_close"),
+        volume=item.get("volume"),
+        amount=item.get("amount"),
+        after_hours_volume=item.get("after_hours_volume"),
+        after_hours_amount=item.get("after_hours_amount"),
+        volume_ratio=item.get("volume_ratio"),
+        turnover_rate=item.get("turnover_rate"),
+        amplitude=item.get("amplitude"),
+        pe_ratio=item.get("pe_ratio"),
+        total_mv=item.get("total_mv"),
+        circ_mv=item.get("circ_mv"),
+        total_shares=item.get("total_shares"),
+        float_shares=item.get("float_shares"),
+        limit_up_price=item.get("limit_up_price"),
+        limit_down_price=item.get("limit_down_price"),
+        price_speed=item.get("price_speed"),
+        entrust_ratio=item.get("entrust_ratio"),
+        source=item.get("source"),
+        update_time=item.get("update_time"),
+    )
 
 
 @router.post(
@@ -274,38 +307,13 @@ def get_stock_quotes(payload: StockQuotesRequest) -> StockQuotesResponse:
 
     try:
         service = StockService()
-        result = service.get_realtime_quotes(stock_codes)
+        result = service.get_realtime_quotes(
+            stock_codes,
+            freshness_seconds=payload.freshness_seconds,
+        )
         return StockQuotesResponse(
             items=[
-                StockQuote(
-                    stock_code=item.get("stock_code", ""),
-                    stock_name=item.get("stock_name"),
-                    current_price=item.get("current_price", 0.0),
-                    change=item.get("change"),
-                    change_percent=item.get("change_percent"),
-                    open=item.get("open"),
-                    high=item.get("high"),
-                    low=item.get("low"),
-                    prev_close=item.get("prev_close"),
-                    volume=item.get("volume"),
-                    amount=item.get("amount"),
-                    after_hours_volume=item.get("after_hours_volume"),
-                    after_hours_amount=item.get("after_hours_amount"),
-                    volume_ratio=item.get("volume_ratio"),
-                    turnover_rate=item.get("turnover_rate"),
-                    amplitude=item.get("amplitude"),
-                    pe_ratio=item.get("pe_ratio"),
-                    total_mv=item.get("total_mv"),
-                    circ_mv=item.get("circ_mv"),
-                    total_shares=item.get("total_shares"),
-                    float_shares=item.get("float_shares"),
-                    limit_up_price=item.get("limit_up_price"),
-                    limit_down_price=item.get("limit_down_price"),
-                    price_speed=item.get("price_speed"),
-                    entrust_ratio=item.get("entrust_ratio"),
-                    source=item.get("source"),
-                    update_time=item.get("update_time"),
-                )
+                _to_stock_quote(item)
                 for item in result.get("items", [])
             ],
             failed_codes=result.get("failed_codes", []),
@@ -372,6 +380,65 @@ def get_stock_news(
 
 
 @router.get(
+    "/{stock_code}/intraday-snapshot",
+    response_model=StockIntradaySnapshotResponse,
+    responses={
+        200: {"description": "当日分钟走势快照"},
+        422: {"description": "不支持的周期参数", "model": ErrorResponse},
+        500: {"description": "服务器错误", "model": ErrorResponse},
+    },
+    summary="获取当日走势快照",
+    description="获取指定股票当日分钟 K 线、实时行情和建议刷新周期。"
+)
+def get_stock_intraday_snapshot(
+    stock_code: str,
+    period: str = Query("1m", description="分钟 K 线周期: 1m/5m/15m/30m/60m", pattern="^(1m|5m|15m|30m|60m)$"),
+) -> StockIntradaySnapshotResponse:
+    try:
+        service = StockService()
+        result = service.get_intraday_snapshot(stock_code, period=period)
+        quote = result.get("quote")
+        data = [
+            KLineData(
+                date=item.get("date"),
+                open=item.get("open"),
+                high=item.get("high"),
+                low=item.get("low"),
+                close=item.get("close"),
+                volume=item.get("volume"),
+                after_hours_volume=item.get("after_hours_volume"),
+                amount=item.get("amount"),
+                change_percent=item.get("change_percent"),
+                turnover_rate=item.get("turnover_rate"),
+            )
+            for item in result.get("data", [])
+        ]
+        return StockIntradaySnapshotResponse(
+            stock_code=result.get("stock_code", stock_code),
+            stock_name=result.get("stock_name"),
+            market=result.get("market"),
+            trading_date=result.get("trading_date"),
+            period=result.get("period", period),
+            refresh_interval_seconds=result.get("refresh_interval_seconds", 60),
+            update_time=result.get("update_time"),
+            quote=_to_stock_quote(quote, stock_code) if isinstance(quote, dict) else None,
+            data=data,
+            errors=result.get("errors", []),
+        )
+    except ValueError as e:
+        raise HTTPException(
+            status_code=422,
+            detail={"error": "unsupported_period", "message": str(e)},
+        )
+    except Exception as e:
+        logger.error(f"获取当日走势快照失败: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail={"error": "internal_error", "message": f"获取当日走势快照失败: {str(e)}"},
+        )
+
+
+@router.get(
     "/{stock_code}/quote",
     response_model=StockQuote,
     responses={
@@ -382,7 +449,10 @@ def get_stock_news(
     summary="获取股票实时行情",
     description="获取指定股票的最新行情数据"
 )
-def get_stock_quote(stock_code: str) -> StockQuote:
+def get_stock_quote(
+    stock_code: str,
+    freshness_seconds: Optional[int] = Query(None, ge=0, le=3600, description="可接受的行情缓存新鲜度秒数"),
+) -> StockQuote:
     """
     获取股票实时行情
     
@@ -401,7 +471,7 @@ def get_stock_quote(stock_code: str) -> StockQuote:
         service = StockService()
         
         # 使用 def 而非 async def，FastAPI 自动在线程池中执行
-        result = service.get_realtime_quote(stock_code)
+        result = service.get_realtime_quote(stock_code, freshness_seconds=freshness_seconds)
         
         if result is None:
             raise HTTPException(
@@ -412,35 +482,7 @@ def get_stock_quote(stock_code: str) -> StockQuote:
                 }
             )
         
-        return StockQuote(
-            stock_code=result.get("stock_code", stock_code),
-            stock_name=result.get("stock_name"),
-            current_price=result.get("current_price", 0.0),
-            change=result.get("change"),
-            change_percent=result.get("change_percent"),
-            open=result.get("open"),
-            high=result.get("high"),
-            low=result.get("low"),
-            prev_close=result.get("prev_close"),
-            volume=result.get("volume"),
-            amount=result.get("amount"),
-            after_hours_volume=result.get("after_hours_volume"),
-            after_hours_amount=result.get("after_hours_amount"),
-            volume_ratio=result.get("volume_ratio"),
-            turnover_rate=result.get("turnover_rate"),
-            amplitude=result.get("amplitude"),
-            pe_ratio=result.get("pe_ratio"),
-            total_mv=result.get("total_mv"),
-            circ_mv=result.get("circ_mv"),
-            total_shares=result.get("total_shares"),
-            float_shares=result.get("float_shares"),
-            limit_up_price=result.get("limit_up_price"),
-            limit_down_price=result.get("limit_down_price"),
-            price_speed=result.get("price_speed"),
-            entrust_ratio=result.get("entrust_ratio"),
-            source=result.get("source"),
-            update_time=result.get("update_time")
-        )
+        return _to_stock_quote(result, stock_code)
         
     except HTTPException:
         raise

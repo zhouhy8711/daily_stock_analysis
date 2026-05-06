@@ -16,6 +16,16 @@ export const getWatchlistLookupKeys = (stockCode: string): string[] => {
   if (base) {
     keys.add(base);
   }
+  const cnSuffixMatch = code.match(/^(\d{6})\.(SH|SZ|BJ)$/);
+  if (cnSuffixMatch?.[1] && cnSuffixMatch[2]) {
+    keys.add(cnSuffixMatch[1]);
+    keys.add(`${cnSuffixMatch[2]}${cnSuffixMatch[1]}`);
+  }
+  const cnPrefixMatch = code.match(/^(SH|SZ|BJ)(\d{6})$/);
+  if (cnPrefixMatch?.[1] && cnPrefixMatch[2]) {
+    keys.add(cnPrefixMatch[2]);
+    keys.add(`${cnPrefixMatch[2]}.${cnPrefixMatch[1]}`);
+  }
   if (code.startsWith('HK') && code.length > 2) {
     keys.add(code.slice(2));
   }

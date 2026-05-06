@@ -1,4 +1,5 @@
 from datetime import date, datetime
+import time
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -133,6 +134,75 @@ class _FakeHistoryManager:
         return "贵州茅台"
 
 
+class _FakeIntradaySnapshotManager:
+    def __init__(self, quote_available=True):
+        self.quote = _FakeManager().quote if quote_available else None
+        self.last_intraday_kwargs = {}
+        self.last_realtime_kwargs = {}
+
+    def get_intraday_data(self, stock_code, period="1m", days=1, **kwargs):
+        assert stock_code == "600519"
+        self.last_intraday_kwargs = {"period": period, "days": days, **kwargs}
+        return pd.DataFrame(
+            {
+                "date": pd.to_datetime([
+                    "2026-04-29 14:59",
+                    "2026-04-30 09:30",
+                    "2026-04-30 09:31",
+                ]),
+                "open": [120.0, 122.0, 123.0],
+                "high": [121.0, 124.0, 124.5],
+                "low": [119.0, 121.5, 122.5],
+                "close": [120.5, 123.5, 124.0],
+                "volume": [9000, 10000, 11000],
+                "amount": [1_084_500, 1_235_000, 1_364_000],
+                "pct_chg": [0.1, 0.2, 0.3],
+                "turnover_rate": [0.1, 0.2, 0.3],
+            }
+        ), "EfinanceFetcher"
+
+    def get_realtime_quote(self, stock_code, **kwargs):
+        assert stock_code == "600519"
+        self.last_realtime_kwargs = kwargs
+        return self.quote
+
+    def get_stock_name(self, stock_code, allow_realtime=True):
+        assert stock_code == "600519"
+        assert allow_realtime is False
+        return "贵州茅台"
+
+
+class _SlowIntradaySnapshotManager(_FakeIntradaySnapshotManager):
+    def get_intraday_data(self, *args, **kwargs):
+        time.sleep(0.05)
+        return super().get_intraday_data(*args, **kwargs)
+
+
+class _SlowQuoteSnapshotManager(_FakeIntradaySnapshotManager):
+    def get_realtime_quote(self, *args, **kwargs):
+        time.sleep(0.05)
+        return super().get_realtime_quote(*args, **kwargs)
+
+
+class _InvalidOpeningMinuteSnapshotManager(_FakeIntradaySnapshotManager):
+    def get_intraday_data(self, stock_code, period="1m", days=1, **kwargs):
+        assert stock_code == "600519"
+        self.last_intraday_kwargs = {"period": period, "days": days, **kwargs}
+        return pd.DataFrame(
+            {
+                "date": pd.to_datetime(["2026-04-30 09:31"]),
+                "open": [122.0],
+                "high": [122.0],
+                "low": [122.0],
+                "close": [0.0],
+                "volume": [10000],
+                "amount": [1_220_000],
+                "pct_chg": [0.0],
+                "turnover_rate": [0.1],
+            }
+        ), "EfinanceFetcher"
+
+
 def test_realtime_quote_exposes_volume_turnover_and_source_fields() -> None:
     manager = _FakeManager()
 
@@ -239,6 +309,119 @@ def test_history_data_anchors_cn_intraday_to_previous_session_when_market_closed
 
     assert result["period"] == "5m"
     assert manager.last_intraday_kwargs["end_date"] == "2026-04-30"
+
+
+def test_intraday_snapshot_returns_quote_minute_kline_and_refresh_interval() -> None:
+    manager = _FakeIntradaySnapshotManager()
+
+    with (
+        patch("data_provider.base.DataFetcherManager", return_value=manager),
+        patch("src.config.get_config", return_value=SimpleNamespace(indicator_intraday_refresh_seconds=60)),
+        patch("src.services.stock_service.trading_calendar.get_market_for_stock", return_value="cn"),
+        patch("src.services.stock_service.trading_calendar.get_market_now", return_value=datetime(2026, 4, 30, 10, 0)),
+        patch("src.services.stock_service.trading_calendar.is_market_open", return_value=True),
+    ):
+        result = StockService().get_intraday_snapshot("600519", period="1m")
+
+    assert result["stock_code"] == "600519"
+    assert result["stock_name"] == "贵州茅台"
+    assert result["market"] == "cn"
+    assert result["trading_date"] == "2026-04-30"
+    assert result["period"] == "1m"
+    assert result["refresh_interval_seconds"] == 60
+    assert result["quote"]["current_price"] == 123.45
+    assert [item["date"] for item in result["data"]] == ["2026-04-30 09:30", "2026-04-30 09:31"]
+    assert result["data"][0]["turnover_rate"] == 0.2
+    assert result["errors"] == []
+    assert manager.last_intraday_kwargs["start_date"] == "2026-04-30"
+    assert manager.last_intraday_kwargs["end_date"] == "2026-04-30"
+    assert manager.last_realtime_kwargs["freshness_seconds"] == 60
+
+
+def test_intraday_snapshot_returns_partial_data_when_quote_fails() -> None:
+    manager = _FakeIntradaySnapshotManager(quote_available=False)
+
+    with (
+        patch("data_provider.base.DataFetcherManager", return_value=manager),
+        patch("src.config.get_config", return_value=SimpleNamespace(indicator_intraday_refresh_seconds=60)),
+        patch("src.services.stock_service.trading_calendar.get_market_for_stock", return_value="cn"),
+        patch("src.services.stock_service.trading_calendar.get_market_now", return_value=datetime(2026, 4, 30, 10, 0)),
+        patch("src.services.stock_service.trading_calendar.is_market_open", return_value=True),
+    ):
+        result = StockService().get_intraday_snapshot("600519", period="1m")
+
+    assert result["quote"] is None
+    assert len(result["data"]) == 2
+    assert "实时行情不可用" in result["errors"]
+    assert result["stock_name"] == "贵州茅台"
+
+
+def test_intraday_snapshot_returns_quote_when_minute_kline_times_out() -> None:
+    manager = _SlowIntradaySnapshotManager()
+
+    with (
+        patch("data_provider.base.DataFetcherManager", return_value=manager),
+        patch("src.config.get_config", return_value=SimpleNamespace(indicator_intraday_refresh_seconds=60)),
+        patch("src.services.stock_service.INTRADAY_SNAPSHOT_KLINE_TIMEOUT_SECONDS", 0.01),
+        patch("src.services.stock_service.trading_calendar.get_market_for_stock", return_value="cn"),
+        patch("src.services.stock_service.trading_calendar.get_market_now", return_value=datetime(2026, 4, 30, 10, 0)),
+        patch("src.services.stock_service.trading_calendar.is_market_open", return_value=True),
+    ):
+        result = StockService().get_intraday_snapshot("600519", period="1m")
+
+    assert result["quote"]["current_price"] == 123.45
+    assert result["data"] == []
+    assert any("分钟K线获取失败" in error and "timeout" in error for error in result["errors"])
+
+
+def test_intraday_snapshot_returns_minute_kline_when_quote_times_out() -> None:
+    manager = _SlowQuoteSnapshotManager()
+
+    with (
+        patch("data_provider.base.DataFetcherManager", return_value=manager),
+        patch("src.config.get_config", return_value=SimpleNamespace(indicator_intraday_refresh_seconds=60)),
+        patch("src.services.stock_service.INTRADAY_SNAPSHOT_QUOTE_TIMEOUT_SECONDS", 0.01),
+        patch("src.services.stock_service.trading_calendar.get_market_for_stock", return_value="cn"),
+        patch("src.services.stock_service.trading_calendar.get_market_now", return_value=datetime(2026, 4, 30, 10, 0)),
+        patch("src.services.stock_service.trading_calendar.is_market_open", return_value=True),
+    ):
+        result = StockService().get_intraday_snapshot("600519", period="1m")
+
+    assert result["quote"] is None
+    assert len(result["data"]) == 2
+    assert "实时行情不可用" in result["errors"]
+    assert any("实时行情获取失败" in error and "timeout" in error for error in result["errors"])
+
+
+def test_intraday_snapshot_filters_invalid_opening_minute_bar() -> None:
+    manager = _InvalidOpeningMinuteSnapshotManager()
+
+    with (
+        patch("data_provider.base.DataFetcherManager", return_value=manager),
+        patch("src.config.get_config", return_value=SimpleNamespace(indicator_intraday_refresh_seconds=60)),
+        patch("src.services.stock_service.trading_calendar.get_market_for_stock", return_value="cn"),
+        patch("src.services.stock_service.trading_calendar.get_market_now", return_value=datetime(2026, 4, 30, 9, 26)),
+        patch("src.services.stock_service.trading_calendar.is_market_open", return_value=True),
+    ):
+        result = StockService().get_intraday_snapshot("600519", period="1m")
+
+    assert result["quote"]["current_price"] == 123.45
+    assert result["data"] == []
+    assert any("暂无有效数据" in error for error in result["errors"])
+
+
+def test_realtime_cache_freshness_seconds_caps_efinance_and_akshare_ttl() -> None:
+    from data_provider.akshare_fetcher import _effective_realtime_ttl as akshare_ttl
+    from data_provider.efinance_fetcher import _effective_realtime_ttl as efinance_ttl
+
+    cache = {"ttl": 600}
+
+    assert efinance_ttl(cache, None) == 600
+    assert akshare_ttl(cache, None) == 600
+    assert efinance_ttl(cache, 60) == 60
+    assert akshare_ttl(cache, 60) == 60
+    assert efinance_ttl(cache, 1200) == 600
+    assert akshare_ttl(cache, 1200) == 600
 
 
 def test_history_endpoint_exposes_turnover_rate() -> None:
