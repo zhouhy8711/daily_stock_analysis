@@ -17,7 +17,7 @@ import {
 } from '../components/settings';
 import { WEB_BUILD_INFO } from '../utils/constants';
 import { getCategoryDescriptionZh } from '../utils/systemConfigI18n';
-import type { SystemConfigCategory } from '../types/systemConfig';
+import type { RealtimeCacheStatsResponse, SystemConfigCategory } from '../types/systemConfig';
 
 type DesktopWindow = Window & {
   dsaDesktop?: {
@@ -41,6 +41,13 @@ function formatDesktopEnvFilename() {
   return `dsa-desktop-env_${date}_${time}.env`;
 }
 
+function formatMemoryMb(value?: number | null) {
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    return '-- MB';
+  }
+  return `${value.toFixed(2)} MB`;
+}
+
 const SettingsPage: React.FC = () => {
   const { passwordChangeable } = useAuth();
   const [desktopActionError, setDesktopActionError] = useState<ParsedApiError | null>(null);
@@ -48,6 +55,8 @@ const SettingsPage: React.FC = () => {
   const [isExportingEnv, setIsExportingEnv] = useState(false);
   const [isImportingEnv, setIsImportingEnv] = useState(false);
   const [showImportConfirm, setShowImportConfirm] = useState(false);
+  const [realtimeCacheStats, setRealtimeCacheStats] = useState<RealtimeCacheStatsResponse | null>(null);
+  const [isRealtimeCacheStatsLoading, setIsRealtimeCacheStatsLoading] = useState(false);
   const desktopImportRef = useRef<HTMLInputElement | null>(null);
   const isDesktopRuntime = typeof window !== 'undefined' && Boolean((window as DesktopWindow).dsaDesktop);
   const desktopAppVersion = getDesktopAppVersion();
@@ -157,6 +166,49 @@ const SettingsPage: React.FC = () => {
         ? rawActiveItems.filter((item) => !AGENT_HIDDEN_KEYS.has(item.key))
       : rawActiveItems;
   const desktopActionDisabled = isLoading || isSaving || isExportingEnv || isImportingEnv;
+
+  useEffect(() => {
+    if (activeCategory !== 'system') {
+      return undefined;
+    }
+
+    let cancelled = false;
+    setIsRealtimeCacheStatsLoading(true);
+    systemConfigApi.getRealtimeCacheStats()
+      .then((stats) => {
+        if (!cancelled) {
+          setRealtimeCacheStats(stats);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setRealtimeCacheStats(null);
+        }
+      })
+      .finally(() => {
+        if (!cancelled) {
+          setIsRealtimeCacheStatsLoading(false);
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [activeCategory, configVersion]);
+
+  const realtimeCacheMemoryBadge = (
+    <div
+      className="inline-flex items-center gap-2 rounded-full border border-primary/25 bg-primary/10 px-3 py-1 text-[11px] font-medium text-primary"
+      aria-label="实时行情缓存内存"
+    >
+      <span className="text-secondary-text">缓存内存</span>
+      <span className="font-mono text-foreground">
+        {isRealtimeCacheStatsLoading && realtimeCacheStats === null
+          ? '读取中'
+          : formatMemoryMb(realtimeCacheStats?.totalMemoryMb)}
+      </span>
+    </div>
+  );
 
   const downloadDesktopEnv = async () => {
     setDesktopActionError(null);
@@ -450,6 +502,7 @@ const SettingsPage: React.FC = () => {
                     disabled={isSaving}
                     onChange={setDraftValue}
                     issues={issueByKey[item.key] || []}
+                    trailingContent={item.key === 'REALTIME_CACHE_TTL' ? realtimeCacheMemoryBadge : undefined}
                   />
                 ))}
               </SettingsSectionCard>

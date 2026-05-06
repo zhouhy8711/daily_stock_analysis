@@ -58,6 +58,19 @@ class SystemConfigServiceTestCase(unittest.TestCase):
         self.assertFalse(items["GEMINI_API_KEY"]["is_masked"])
         self.assertTrue(items["GEMINI_API_KEY"]["raw_value_exists"])
 
+    def test_get_config_exposes_realtime_cache_ttl_in_system_settings(self) -> None:
+        payload = self.service.get_config(include_schema=True)
+        items = {item["key"]: item for item in payload["items"]}
+
+        realtime_cache_ttl = items["REALTIME_CACHE_TTL"]
+
+        self.assertEqual(realtime_cache_ttl["value"], "30")
+        self.assertEqual(realtime_cache_ttl["schema"]["category"], "system")
+        self.assertEqual(realtime_cache_ttl["schema"]["data_type"], "integer")
+        self.assertEqual(realtime_cache_ttl["schema"]["ui_control"], "number")
+        self.assertTrue(realtime_cache_ttl["schema"]["is_editable"])
+        self.assertEqual(realtime_cache_ttl["schema"]["validation"]["min"], 0)
+
     def test_export_desktop_env_returns_raw_text(self) -> None:
         self.env_path.write_text(
             "# Desktop config\nSTOCK_LIST=600519,000001\n\nGEMINI_API_KEY=secret-key-value\n",

@@ -29,6 +29,12 @@ import {
 } from '../utils/watchlist';
 
 const ALL_SHARE_QUOTE_BATCH_SIZE = 6000;
+const FRONTEND_QUOTE_CACHE_TTL_MS = 30_000;
+
+type CachedQuote = {
+  quote: StockQuote;
+  expiresAt: number;
+};
 
 function removeEquivalentWatchlistCodes(codes: string[], targets: string[]): string[] {
   const targetKeys = new Set(targets.flatMap(getWatchlistLookupKeys));
@@ -56,8 +62,10 @@ const HomePage: React.FC = () => {
   const [reportHistoryStockCode, setReportHistoryStockCode] = useState<string | null>(null);
   const [shouldLoadAllShareQuotes, setShouldLoadAllShareQuotes] = useState(false);
   const [isLoadingAllShareQuotes, setIsLoadingAllShareQuotes] = useState(false);
-  const [allShareQuotesByCode, setAllShareQuotesByCode] = useState<Record<string, StockQuote>>({});
+  const [quotesByCode, setQuotesByCode] = useState<Record<string, StockQuote>>({});
   const allShareQuoteRequestIdRef = useRef(0);
+  const watchlistQuoteRequestIdRef = useRef(0);
+  const quoteCacheRef = useRef<Record<string, CachedQuote>>({});
   const {
     index: stockIndex,
     loading: isLoadingStockIndex,
@@ -165,8 +173,77 @@ const HomePage: React.FC = () => {
     return map;
   }, [stockIndex]);
 
-  const watchlistItems = useMemo<WatchlistItem[]>(() => {
-    const sourceCodes = watchlistCodes.length > 0
+  const getFreshCachedQuote = useCallback((code: string, now = Date.now()): StockQuote | undefined => {
+    return getWatchlistLookupKeys(code)
+      .map((key) => quoteCacheRef.current[key])
+      .find((entry) => entry !== undefined && entry.expiresAt > now)
+      ?.quote;
+  }, []);
+
+  const rememberQuotes = useCallback((quotes: StockQuote[]) => {
+    if (quotes.length === 0) {
+      return;
+    }
+
+    const expiresAt = Date.now() + FRONTEND_QUOTE_CACHE_TTL_MS;
+    const nextQuotes: Record<string, StockQuote> = {};
+
+    quotes.forEach((quote) => {
+      if (!quote.stockCode) {
+        return;
+      }
+
+      const normalizedCode = normalizeWatchlistCode(quote.stockCode);
+      if (!normalizedCode) {
+        return;
+      }
+
+      const cachedQuote = { quote, expiresAt };
+      const lookupKeys = new Set([
+        normalizedCode,
+        ...getWatchlistLookupKeys(normalizedCode),
+        ...getWatchlistLookupKeys(quote.stockCode),
+      ]);
+      lookupKeys.forEach((key) => {
+        quoteCacheRef.current[key] = cachedQuote;
+      });
+      nextQuotes[normalizedCode] = quote;
+    });
+
+    if (Object.keys(nextQuotes).length > 0) {
+      setQuotesByCode((current) => ({ ...current, ...nextQuotes }));
+    }
+  }, []);
+
+  const seedFreshQuotes = useCallback((codes: string[]): string[] => {
+    const now = Date.now();
+    const cachedQuotes: Record<string, StockQuote> = {};
+    const missingCodes: string[] = [];
+
+    codes.forEach((code) => {
+      const normalizedCode = normalizeWatchlistCode(code);
+      if (!normalizedCode) {
+        return;
+      }
+
+      const quote = getFreshCachedQuote(normalizedCode, now);
+      if (quote) {
+        cachedQuotes[normalizeWatchlistCode(quote.stockCode) || normalizedCode] = quote;
+        return;
+      }
+
+      missingCodes.push(normalizedCode);
+    });
+
+    if (Object.keys(cachedQuotes).length > 0) {
+      setQuotesByCode((current) => ({ ...current, ...cachedQuotes }));
+    }
+
+    return missingCodes;
+  }, [getFreshCachedQuote]);
+
+  const watchlistSourceCodes = useMemo(() => {
+    return watchlistCodes.length > 0
       ? watchlistCodes
       : historyItems.reduce<string[]>((codes, item) => {
         const code = normalizeWatchlistCode(item.stockCode);
@@ -175,8 +252,20 @@ const HomePage: React.FC = () => {
         }
         return codes;
       }, []);
+  }, [historyItems, watchlistCodes]);
 
-    return sourceCodes.map((code) => {
+  const quoteByKey = useMemo(() => {
+    const map = new Map<string, StockQuote>();
+    for (const quote of Object.values(quotesByCode)) {
+      for (const key of getWatchlistLookupKeys(quote.stockCode)) {
+        map.set(key, quote);
+      }
+    }
+    return map;
+  }, [quotesByCode]);
+
+  const watchlistItems = useMemo<WatchlistItem[]>(() => {
+    return watchlistSourceCodes.map((code) => {
       const history = getWatchlistLookupKeys(code)
         .map((key) => latestHistoryByCode.get(key))
         .find((item) => item !== undefined);
@@ -185,13 +274,16 @@ const HomePage: React.FC = () => {
       const stockIndexItem = lookupKeys
         .map((key) => stockIndexByLookupKey.get(key))
         .find((item) => item !== undefined);
+      const quote = lookupKeys
+        .map((key) => quoteByKey.get(key))
+        .find((quoteItem) => quoteItem !== undefined);
       return {
         stockCode: history?.stockCode || code,
         watchlistCode: code,
-        stockName: history?.stockName || stockIndexItem?.nameZh,
+        stockName: history?.stockName || quote?.stockName || stockIndexItem?.nameZh,
         recordId: history?.id,
-        currentPrice: history?.currentPrice,
-        changePct: history?.changePct,
+        currentPrice: quote?.currentPrice ?? history?.currentPrice,
+        changePct: quote?.changePercent ?? history?.changePct ?? undefined,
         sentimentScore: history?.sentimentScore,
         operationAdvice: history?.operationAdvice,
         createdAt: history?.createdAt,
@@ -200,7 +292,7 @@ const HomePage: React.FC = () => {
         industry: stockIndexItem?.industry,
       };
     });
-  }, [historyItems, latestHistoryByCode, stockIndexByLookupKey, watchlistCodes]);
+  }, [latestHistoryByCode, quoteByKey, stockIndexByLookupKey, watchlistCodes.length, watchlistSourceCodes]);
 
   const allShareIndexItems = useMemo(
     () => stockIndex
@@ -208,16 +300,6 @@ const HomePage: React.FC = () => {
       .sort(compareStockIndexById),
     [stockIndex],
   );
-
-  const allShareQuoteByKey = useMemo(() => {
-    const map = new Map<string, StockQuote>();
-    for (const quote of Object.values(allShareQuotesByCode)) {
-      for (const key of getWatchlistLookupKeys(quote.stockCode)) {
-        map.set(key, quote);
-      }
-    }
-    return map;
-  }, [allShareQuotesByCode]);
 
   const allShareItems = useMemo<WatchlistItem[]>(() => {
     const normalizedSearch = normalizeQuery(query);
@@ -230,7 +312,7 @@ const HomePage: React.FC = () => {
           .map((key) => latestHistoryByCode.get(key))
           .find((historyItem) => historyItem !== undefined);
         const quote = lookupKeys
-          .map((key) => allShareQuoteByKey.get(key))
+          .map((key) => quoteByKey.get(key))
           .find((quoteItem) => quoteItem !== undefined);
         const isInWatchlist = lookupKeys.some((key) => watchlistLookupSet.has(key));
 
@@ -249,9 +331,44 @@ const HomePage: React.FC = () => {
           industry: item.industry,
         };
       });
-  }, [allShareIndexItems, allShareQuoteByKey, latestHistoryByCode, query, watchlistLookupSet]);
+  }, [allShareIndexItems, latestHistoryByCode, query, quoteByKey, watchlistLookupSet]);
 
-  const loadAllShareQuotes = useCallback(async () => {
+  const loadWatchlistQuotes = useCallback(async (forceRefresh = false) => {
+    if (watchlistSourceCodes.length === 0) {
+      return;
+    }
+
+    const requestId = watchlistQuoteRequestIdRef.current + 1;
+    watchlistQuoteRequestIdRef.current = requestId;
+
+    const codes = Array.from(new Set(
+      watchlistSourceCodes
+        .map((code) => normalizeWatchlistCode(code))
+        .filter((code): code is string => Boolean(code)),
+    ));
+    const missingCodes = forceRefresh ? codes : seedFreshQuotes(codes);
+
+    if (missingCodes.length === 0) {
+      return;
+    }
+
+    try {
+      const response = await stocksApi.getQuotes(missingCodes);
+      if (watchlistQuoteRequestIdRef.current !== requestId) {
+        return;
+      }
+
+      rememberQuotes(response.items);
+    } catch (error) {
+      setWatchlistError(error instanceof Error ? error.message : '自选行情加载失败');
+    }
+  }, [rememberQuotes, seedFreshQuotes, watchlistSourceCodes]);
+
+  useEffect(() => {
+    void loadWatchlistQuotes();
+  }, [loadWatchlistQuotes]);
+
+  const loadAllShareQuotes = useCallback(async (forceRefresh = false) => {
     if (allShareIndexItems.length === 0) {
       return;
     }
@@ -259,30 +376,26 @@ const HomePage: React.FC = () => {
     const requestId = allShareQuoteRequestIdRef.current + 1;
     allShareQuoteRequestIdRef.current = requestId;
     setIsLoadingAllShareQuotes(true);
-    setAllShareQuotesByCode({});
 
     try {
       const codes = allShareIndexItems.map((item) => item.displayCode || item.canonicalCode);
-      for (let index = 0; index < codes.length; index += ALL_SHARE_QUOTE_BATCH_SIZE) {
+      const missingCodes = forceRefresh ? codes : seedFreshQuotes(codes);
+      if (missingCodes.length === 0) {
+        return;
+      }
+
+      for (let index = 0; index < missingCodes.length; index += ALL_SHARE_QUOTE_BATCH_SIZE) {
         if (allShareQuoteRequestIdRef.current !== requestId) {
           return;
         }
 
-        const batchCodes = codes.slice(index, index + ALL_SHARE_QUOTE_BATCH_SIZE);
+        const batchCodes = missingCodes.slice(index, index + ALL_SHARE_QUOTE_BATCH_SIZE);
         const response = await stocksApi.getQuotes(batchCodes);
         if (allShareQuoteRequestIdRef.current !== requestId) {
           return;
         }
 
-        setAllShareQuotesByCode((current) => {
-          const next = { ...current };
-          response.items.forEach((quote) => {
-            if (quote.stockCode) {
-              next[normalizeWatchlistCode(quote.stockCode)] = quote;
-            }
-          });
-          return next;
-        });
+        rememberQuotes(response.items);
       }
     } catch (error) {
       setWatchlistError(error instanceof Error ? error.message : 'A股行情加载失败');
@@ -291,7 +404,7 @@ const HomePage: React.FC = () => {
         setIsLoadingAllShareQuotes(false);
       }
     }
-  }, [allShareIndexItems]);
+  }, [allShareIndexItems, rememberQuotes, seedFreshQuotes]);
 
   useEffect(() => {
     if (!shouldLoadAllShareQuotes || allShareIndexItems.length === 0) {
@@ -817,9 +930,10 @@ const HomePage: React.FC = () => {
               reanalyzeDisabled={selectedWatchlistTargets.length === 0}
               onRefresh={() => {
                 void loadWatchlist();
+                void loadWatchlistQuotes(true);
                 void refreshHistory(true);
                 if (shouldLoadAllShareQuotes) {
-                  void loadAllShareQuotes();
+                  void loadAllShareQuotes(true);
                 }
               }}
               onReanalyzeSelected={handleReanalyzeWatchlist}

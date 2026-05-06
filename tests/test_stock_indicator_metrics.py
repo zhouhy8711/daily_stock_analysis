@@ -3,10 +3,23 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import pandas as pd
+import pytest
 
 from api.v1.endpoints.stocks import get_stock_history
 from data_provider.realtime_types import RealtimeSource
-from src.services.stock_service import StockService
+from src.services.stock_service import (
+    StockService,
+    _clear_realtime_quote_cache,
+    _realtime_quote_cache_size,
+    get_realtime_quote_cache_stats,
+)
+
+
+@pytest.fixture(autouse=True)
+def clear_realtime_quote_cache():
+    _clear_realtime_quote_cache()
+    yield
+    _clear_realtime_quote_cache()
 
 
 class _FakeManager:
@@ -133,6 +146,81 @@ class _FakeHistoryManager:
         return "贵州茅台"
 
 
+def _make_quote(code: str, name: str = "测试股票", price: float = 10.0):
+    return SimpleNamespace(
+        code=code,
+        name=name,
+        price=price,
+        change_amount=0.1,
+        change_pct=1.0,
+        open_price=price - 0.1,
+        high=price + 0.2,
+        low=price - 0.2,
+        pre_close=price - 0.1,
+        volume=1000,
+        amount=price * 1000,
+        after_hours_volume=None,
+        after_hours_amount=None,
+        volume_ratio=None,
+        turnover_rate=None,
+        amplitude=None,
+        pe_ratio=None,
+        total_mv=None,
+        circ_mv=None,
+        total_shares=None,
+        float_shares=None,
+        price_speed=None,
+        limit_up_price=None,
+        limit_down_price=None,
+        entrust_ratio=None,
+        source=RealtimeSource.EFINANCE,
+    )
+
+
+class _CountingRealtimeManager:
+    def __init__(self):
+        self.calls = 0
+        self.quote = _make_quote("600519", "贵州茅台", 123.45)
+
+    def get_realtime_quote(self, stock_code, **_kwargs):
+        self.calls += 1
+        return self.quote
+
+
+class _BatchQuoteFetcher:
+    name = "EfinanceFetcher"
+
+    def __init__(self):
+        self.requested_batches = []
+
+    def get_realtime_quotes(self, stock_codes):
+        self.requested_batches.append(list(stock_codes))
+        return {
+            code: _make_quote(code, "平安银行" if code == "000001" else "测试股票", 11.23)
+            for code in stock_codes
+        }
+
+
+class _EmptyBatchQuoteFetcher:
+    name = "AkshareFetcher"
+
+    def get_realtime_quotes(self, stock_codes):
+        return {}
+
+
+class _BatchRealtimeManager:
+    def __init__(self, fetcher):
+        self.fetcher = fetcher
+        self.direct_calls = []
+
+    def get_realtime_quote(self, stock_code, **_kwargs):
+        self.direct_calls.append(stock_code)
+        return _make_quote("600519", "贵州茅台", 1688.5)
+
+    def _get_fetchers_snapshot(self):
+        return [self.fetcher, _EmptyBatchQuoteFetcher()]
+
+
 def test_realtime_quote_exposes_volume_turnover_and_source_fields() -> None:
     manager = _FakeManager()
 
@@ -155,6 +243,123 @@ def test_realtime_quote_exposes_volume_turnover_and_source_fields() -> None:
     assert result["after_hours_volume"] == 104
     assert result["after_hours_amount"] == 1_429_064
     assert result["source"] == "efinance"
+
+
+def test_realtime_quote_uses_cache_within_time_bucket() -> None:
+    manager = _CountingRealtimeManager()
+
+    with (
+        patch("src.services.stock_service.get_config", return_value=SimpleNamespace(realtime_cache_ttl=30)),
+        patch("src.services.stock_service.time.time", return_value=1000),
+        patch("data_provider.base.DataFetcherManager", return_value=manager),
+    ):
+        first = StockService().get_realtime_quote("600519")
+        second = StockService().get_realtime_quote("600519")
+
+    assert first == second
+    assert manager.calls == 1
+
+
+def test_realtime_quote_refreshes_after_bucket_changes() -> None:
+    manager = _CountingRealtimeManager()
+
+    with (
+        patch("src.services.stock_service.get_config", return_value=SimpleNamespace(realtime_cache_ttl=30)),
+        patch("src.services.stock_service.time.time", side_effect=[1000, 1000, 1031, 1031]),
+        patch("data_provider.base.DataFetcherManager", return_value=manager),
+    ):
+        StockService().get_realtime_quote("600519")
+        StockService().get_realtime_quote("600519")
+
+    assert manager.calls == 2
+
+
+def test_realtime_quote_clears_old_bucket() -> None:
+    manager = _CountingRealtimeManager()
+
+    with (
+        patch("src.services.stock_service.get_config", return_value=SimpleNamespace(realtime_cache_ttl=30)),
+        patch("src.services.stock_service.time.time", side_effect=[1000, 1000]),
+        patch("data_provider.base.DataFetcherManager", return_value=manager),
+    ):
+        StockService().get_realtime_quote("600519")
+
+    assert _realtime_quote_cache_size() == 1
+
+    with (
+        patch("src.services.stock_service.get_config", return_value=SimpleNamespace(realtime_cache_ttl=30)),
+        patch("src.services.stock_service.time.time", side_effect=[1031, 1031]),
+        patch("data_provider.base.DataFetcherManager", return_value=manager),
+    ):
+        StockService().get_realtime_quote("600519")
+
+    assert manager.calls == 2
+    assert _realtime_quote_cache_size() == 1
+
+
+def test_realtime_quote_cache_disabled_when_ttl_zero() -> None:
+    manager = _CountingRealtimeManager()
+
+    with (
+        patch("src.services.stock_service.get_config", return_value=SimpleNamespace(realtime_cache_ttl=0)),
+        patch("src.services.stock_service.time.time", return_value=1000),
+        patch("data_provider.base.DataFetcherManager", return_value=manager),
+    ):
+        StockService().get_realtime_quote("600519")
+        StockService().get_realtime_quote("600519")
+
+    assert manager.calls == 2
+    assert _realtime_quote_cache_size() == 0
+
+
+def test_realtime_quote_cache_stats_reports_memory_usage() -> None:
+    manager = _CountingRealtimeManager()
+
+    with (
+        patch("src.services.stock_service.get_config", return_value=SimpleNamespace(realtime_cache_ttl=30)),
+        patch("src.services.stock_service.time.time", return_value=1000),
+        patch("data_provider.base.DataFetcherManager", return_value=manager),
+    ):
+        StockService().get_realtime_quote("600519")
+        stats = get_realtime_quote_cache_stats()
+
+    assert stats["quote_cache_items"] == 1
+    assert stats["bucket_start"] == 990
+    assert stats["quote_cache_memory_bytes"] > 0
+    assert stats["total_memory_bytes"] >= stats["quote_cache_memory_bytes"]
+    assert isinstance(stats["total_memory_mb"], float)
+
+
+def test_batch_realtime_quotes_fetches_only_missing_codes() -> None:
+    fetcher = _BatchQuoteFetcher()
+    manager = _BatchRealtimeManager(fetcher)
+
+    with (
+        patch("src.services.stock_service.get_config", return_value=SimpleNamespace(realtime_cache_ttl=30)),
+        patch("src.services.stock_service.time.time", return_value=1000),
+        patch("data_provider.base.DataFetcherManager", return_value=manager),
+    ):
+        StockService().get_realtime_quote("600519")
+        result = StockService().get_realtime_quotes(["600519", "000001"])
+
+    assert fetcher.requested_batches == [["000001"]]
+    assert {item["stock_code"] for item in result["items"]} == {"600519", "000001"}
+    assert result["failed_codes"] == []
+
+
+def test_data_provider_realtime_cache_ttl_reads_config() -> None:
+    from data_provider.akshare_fetcher import (
+        _realtime_cache as akshare_cache,
+        _refresh_realtime_cache_ttl as refresh_akshare_ttl,
+    )
+    from data_provider.efinance_fetcher import (
+        _realtime_cache as efinance_cache,
+        _refresh_realtime_cache_ttl as refresh_efinance_ttl,
+    )
+
+    with patch("src.config.get_config", return_value=SimpleNamespace(realtime_cache_ttl=17)):
+        assert refresh_efinance_ttl(efinance_cache) == 17
+        assert refresh_akshare_ttl(akshare_cache) == 17
 
 
 def test_realtime_quote_derives_after_hours_volume_from_amount_and_price() -> None:

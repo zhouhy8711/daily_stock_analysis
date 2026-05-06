@@ -6,6 +6,7 @@ import SettingsPage from '../SettingsPage';
 
 const {
   exportDesktopEnv,
+  getRealtimeCacheStats,
   importDesktopEnv,
   load,
   clearToast,
@@ -21,6 +22,7 @@ const {
   webBuildInfoMock,
 } = vi.hoisted(() => ({
   exportDesktopEnv: vi.fn(),
+  getRealtimeCacheStats: vi.fn(),
   importDesktopEnv: vi.fn(),
   load: vi.fn(),
   clearToast: vi.fn(),
@@ -52,6 +54,7 @@ vi.mock('../../hooks', () => ({
 vi.mock('../../api/systemConfig', () => ({
   systemConfigApi: {
     exportDesktopEnv: (...args: unknown[]) => exportDesktopEnv(...args),
+    getRealtimeCacheStats: (...args: unknown[]) => getRealtimeCacheStats(...args),
     importDesktopEnv: (...args: unknown[]) => importDesktopEnv(...args),
   },
 }));
@@ -111,7 +114,18 @@ vi.mock('../../components/settings', () => ({
       ))}
     </nav>
   ),
-  SettingsField: ({ item }: { item: { key: string } }) => <div>{item.key}</div>,
+  SettingsField: ({
+    item,
+    trailingContent,
+  }: {
+    item: { key: string };
+    trailingContent?: React.ReactNode;
+  }) => (
+    <div>
+      {item.key}
+      {trailingContent}
+    </div>
+  ),
   SettingsLoading: () => <div>loading</div>,
   SettingsSectionCard: ({
     title,
@@ -186,6 +200,24 @@ function buildSystemConfigState(overrides: ConfigOverride = {}) {
             options: [],
             validation: {},
             displayOrder: 1,
+          },
+        },
+        {
+          key: 'REALTIME_CACHE_TTL',
+          value: '30',
+          rawValueExists: true,
+          isMasked: false,
+          schema: {
+            key: 'REALTIME_CACHE_TTL',
+            category: 'system',
+            dataType: 'integer',
+            uiControl: 'number',
+            isSensitive: false,
+            isRequired: false,
+            isEditable: true,
+            options: [],
+            validation: {},
+            displayOrder: 2,
           },
         },
       ],
@@ -292,6 +324,17 @@ describe('SettingsPage', () => {
       configVersion: 'v1',
       updatedAt: '2026-03-21T00:00:00Z',
     });
+    getRealtimeCacheStats.mockResolvedValue({
+      totalMemoryBytes: 1310720,
+      totalMemoryMb: 1.25,
+      quoteCacheItems: 42,
+      quoteCacheMemoryBytes: 524288,
+      quoteCacheMemoryMb: 0.5,
+      providerCacheMemoryBytes: 786432,
+      providerCacheMemoryMb: 0.75,
+      bucketStart: 1800,
+      providerBreakdown: [],
+    });
     importDesktopEnv.mockResolvedValue({
       success: true,
       configVersion: 'v2',
@@ -320,6 +363,15 @@ describe('SettingsPage', () => {
     expect(screen.getByText('认证与登录保护')).toBeInTheDocument();
     expect(screen.getByText('修改密码')).toBeInTheDocument();
     expect(load).toHaveBeenCalled();
+  });
+
+  it('shows realtime cache memory next to the cache ttl setting', async () => {
+    render(<SettingsPage />);
+
+    expect(await screen.findByText('REALTIME_CACHE_TTL')).toBeInTheDocument();
+    await waitFor(() => expect(getRealtimeCacheStats).toHaveBeenCalledTimes(1));
+    expect(screen.getByLabelText('实时行情缓存内存')).toHaveTextContent('缓存内存');
+    expect(screen.getByLabelText('实时行情缓存内存')).toHaveTextContent('1.25 MB');
   });
 
   it('renders web build info in system settings', async () => {

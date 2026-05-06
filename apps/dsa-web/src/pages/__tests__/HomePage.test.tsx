@@ -128,6 +128,16 @@ const renderHomePageWithSidebarAction = () => render(
   </MemoryRouter>,
 );
 
+function createDeferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((promiseResolve, promiseReject) => {
+    resolve = promiseResolve;
+    reject = promiseReject;
+  });
+  return { promise, resolve, reject };
+}
+
 describe('HomePage', () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -503,6 +513,63 @@ describe('HomePage', () => {
     expect(screen.getByText('在设置里维护 STOCK_LIST，或先完成一次分析后这里会展示最近关注的股票。')).toBeInTheDocument();
   });
 
+  it('fills watchlist prices from realtime quotes when history has no price', async () => {
+    stockIndexHookState.current = {
+      index: [
+        {
+          canonicalCode: '600519.SH',
+          displayCode: '600519',
+          nameZh: '贵州茅台',
+          market: 'CN',
+          assetType: 'stock',
+          active: true,
+          popularity: 100,
+          industry: '白酒',
+        },
+      ],
+      loading: false,
+      error: null,
+      fallback: false,
+      loaded: true,
+    };
+    vi.mocked(systemConfigApi.getConfig).mockResolvedValue({
+      configVersion: 'v1',
+      maskToken: '******',
+      items: [{ key: 'STOCK_LIST', value: '600519', rawValueExists: true, isMasked: false }],
+    });
+    vi.mocked(historyApi.getList).mockResolvedValue({
+      total: 0,
+      page: 1,
+      limit: 20,
+      items: [],
+    });
+    vi.mocked(stocksApi.getQuotes).mockResolvedValue({
+      items: [{
+        stockCode: '600519',
+        stockName: '贵州茅台',
+        currentPrice: 1688.5,
+        changePercent: -1.25,
+        updateTime: '2026-04-25T15:00:00',
+      }],
+      failedCodes: [],
+      updateTime: '2026-04-25T15:00:00',
+    });
+
+    render(
+      <MemoryRouter>
+        <HomePage />
+      </MemoryRouter>,
+    );
+
+    expect(await screen.findByRole('button', { name: '查看 贵州茅台 报告' })).toBeInTheDocument();
+    await waitFor(() => {
+      expect(stocksApi.getQuotes).toHaveBeenCalledWith(['600519']);
+    });
+    expect(await screen.findByText('1688.50')).toBeInTheDocument();
+    expect(screen.getByText('-1.25%')).toBeInTheDocument();
+    expect(analysisApi.analyzeAsync).not.toHaveBeenCalled();
+  });
+
   it('shows all A-share stocks sorted by id, filters with the home search, and adds to watchlist', async () => {
     stockIndexHookState.current = {
       index: [
@@ -665,6 +732,137 @@ describe('HomePage', () => {
         originalQuery: '600519.SH',
       }));
     });
+  });
+
+  it('reuses cached all-share quotes when returning to the all-share tab', async () => {
+    stockIndexHookState.current = {
+      index: [
+        {
+          canonicalCode: '600519.SH',
+          displayCode: '600519',
+          nameZh: '贵州茅台',
+          market: 'CN',
+          assetType: 'stock',
+          active: true,
+          popularity: 100,
+        },
+        {
+          canonicalCode: '000001.SZ',
+          displayCode: '000001',
+          nameZh: '平安银行',
+          market: 'CN',
+          assetType: 'stock',
+          active: true,
+          popularity: 90,
+        },
+      ],
+      loading: false,
+      error: null,
+      fallback: false,
+      loaded: true,
+    };
+    vi.mocked(historyApi.getList).mockResolvedValue({
+      total: 0,
+      page: 1,
+      limit: 20,
+      items: [],
+    });
+    vi.mocked(stocksApi.getQuotes).mockImplementation(async (stockCodes: string[]) => ({
+      items: stockCodes.map((code) => ({
+        stockCode: code,
+        stockName: code === '000001' ? '平安银行' : '贵州茅台',
+        currentPrice: code === '000001' ? 11.23 : 1688.5,
+        changePercent: code === '000001' ? 0.42 : -1.25,
+        updateTime: '2026-04-25T15:00:00',
+      })),
+      failedCodes: [],
+      updateTime: '2026-04-25T15:00:00',
+    }));
+
+    render(
+      <MemoryRouter>
+        <HomePage />
+      </MemoryRouter>,
+    );
+
+    const allShareTab = await screen.findByRole('button', { name: 'A股所有' });
+    fireEvent.click(allShareTab);
+    expect(await screen.findByText('1688.50')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: '自选' }));
+    fireEvent.click(screen.getByRole('button', { name: 'A股所有' }));
+
+    await waitFor(() => {
+      expect(stocksApi.getQuotes).toHaveBeenCalledTimes(1);
+    });
+    expect(screen.getByText('1688.50')).toBeInTheDocument();
+  });
+
+  it('keeps old all-share prices visible while refresh fetches new quotes', async () => {
+    stockIndexHookState.current = {
+      index: [
+        {
+          canonicalCode: '000001.SZ',
+          displayCode: '000001',
+          nameZh: '平安银行',
+          market: 'CN',
+          assetType: 'stock',
+          active: true,
+          popularity: 90,
+        },
+      ],
+      loading: false,
+      error: null,
+      fallback: false,
+      loaded: true,
+    };
+    vi.mocked(historyApi.getList).mockResolvedValue({
+      total: 0,
+      page: 1,
+      limit: 20,
+      items: [],
+    });
+    const refreshQuotes = createDeferred<Awaited<ReturnType<typeof stocksApi.getQuotes>>>();
+    vi.mocked(stocksApi.getQuotes)
+      .mockResolvedValueOnce({
+        items: [{
+          stockCode: '000001',
+          stockName: '平安银行',
+          currentPrice: 11.23,
+          changePercent: 0.42,
+          updateTime: '2026-04-25T15:00:00',
+        }],
+        failedCodes: [],
+        updateTime: '2026-04-25T15:00:00',
+      })
+      .mockImplementationOnce(() => refreshQuotes.promise);
+
+    render(
+      <MemoryRouter>
+        <HomePage />
+      </MemoryRouter>,
+    );
+
+    fireEvent.click(await screen.findByRole('button', { name: 'A股所有' }));
+    expect(await screen.findByText('11.230')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: '刷新监控股票' }));
+
+    expect(screen.getByText('11.230')).toBeInTheDocument();
+    refreshQuotes.resolve({
+      items: [{
+        stockCode: '000001',
+        stockName: '平安银行',
+        currentPrice: 12.34,
+        changePercent: 1.25,
+        updateTime: '2026-04-25T15:01:00',
+      }],
+      failedCodes: [],
+      updateTime: '2026-04-25T15:01:00',
+    });
+
+    expect(await screen.findByText('12.340')).toBeInTheDocument();
+    expect(screen.queryByText('11.230')).not.toBeInTheDocument();
   });
 
   it('adds an autocomplete selection to the watchlist without starting analysis', async () => {

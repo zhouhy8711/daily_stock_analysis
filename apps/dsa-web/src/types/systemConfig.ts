@@ -175,3 +175,21 @@ export interface SystemConfigConflictResponse {
   message: string;
   currentConfigVersion: string;
 }
+
+export interface RealtimeCacheProviderStats {
+  name: string;
+  memoryBytes: number;
+  memoryMb: number;
+}
+
+export interface RealtimeCacheStatsResponse {
+  totalMemoryBytes: number;
+  totalMemoryMb: number;
+  quoteCacheItems: number;
+  quoteCacheMemoryBytes: number;
+  quoteCacheMemoryMb: number;
+  providerCacheMemoryBytes: number;
+  providerCacheMemoryMb: number;
+  bucketStart?: number | null;
+  providerBreakdown: RealtimeCacheProviderStats[];
+}

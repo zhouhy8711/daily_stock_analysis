@@ -50,6 +50,24 @@ class ConfigEnvCompatibilityTestCase(unittest.TestCase):
             config.realtime_source_priority,
             "tencent,akshare_sina,efinance,akshare_em",
         )
+        self.assertEqual(config.realtime_cache_ttl, 30)
+
+    @patch("src.config.setup_env")
+    @patch.object(Config, "_parse_litellm_yaml", return_value=[])
+    def test_realtime_cache_ttl_reads_env(
+        self, _mock_parse_litellm_yaml, _mock_setup_env
+    ):
+        with patch.dict(
+            os.environ,
+            {
+                "STOCK_LIST": "600519",
+                "REALTIME_CACHE_TTL": "45",
+            },
+            clear=True,
+        ):
+            config = Config._load_from_env()
+
+        self.assertEqual(config.realtime_cache_ttl, 45)
 
     @patch("src.config.setup_env")
     @patch.object(Config, "_parse_litellm_yaml", return_value=[])

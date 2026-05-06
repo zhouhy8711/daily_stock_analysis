@@ -6,6 +6,7 @@ import type {
   DiscoverLLMChannelModelsResponse,
   ExportSystemConfigResponse,
   ImportSystemConfigRequest,
+  RealtimeCacheStatsResponse,
   SystemConfigConflictResponse,
   SystemConfigResponse,
   SystemConfigSchemaResponse,
@@ -122,6 +123,11 @@ export const systemConfigApi = {
   async getSchema(): Promise<SystemConfigSchemaResponse> {
     const response = await apiClient.get<Record<string, unknown>>('/api/v1/system/config/schema');
     return toCamelCase<SystemConfigSchemaResponse>(response.data);
+  },
+
+  async getRealtimeCacheStats(): Promise<RealtimeCacheStatsResponse> {
+    const response = await apiClient.get<Record<string, unknown>>('/api/v1/system/config/realtime-cache/stats');
+    return toCamelCase<RealtimeCacheStatsResponse>(response.data);
   },
 
   async validate(payload: ValidateSystemConfigRequest): Promise<ValidateSystemConfigResponse> {

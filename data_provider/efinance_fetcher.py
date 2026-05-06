@@ -130,20 +130,31 @@ USER_AGENTS = [
 ]
 
 
-# 缓存实时行情数据（避免重复请求）
-# TTL 设为 10 分钟 (600秒)：批量分析场景下避免重复拉取
+# 缓存实时行情数据（避免重复请求），TTL 由 REALTIME_CACHE_TTL 控制
 _realtime_cache: Dict[str, Any] = {
     'data': None,
     'timestamp': 0,
-    'ttl': 600  # 10分钟缓存有效期
+    'ttl': 30
 }
 
 # ETF 实时行情缓存（与股票分开缓存）
 _etf_realtime_cache: Dict[str, Any] = {
     'data': None,
     'timestamp': 0,
-    'ttl': 600  # 10分钟缓存有效期
+    'ttl': 30
 }
+
+
+def _refresh_realtime_cache_ttl(cache: Dict[str, Any]) -> int:
+    try:
+        from src.config import get_config
+
+        ttl = int(getattr(get_config(), "realtime_cache_ttl", 30) or 0)
+    except Exception:
+        ttl = int(cache.get("ttl", 30) or 0)
+    ttl = max(0, ttl)
+    cache["ttl"] = ttl
+    return ttl
 
 
 def _is_etf_code(stock_code: str) -> bool:
@@ -702,11 +713,13 @@ class EfinanceFetcher(BaseFetcher):
         try:
             # 检查缓存
             current_time = time.time()
+            cache_ttl = _refresh_realtime_cache_ttl(_realtime_cache)
             if (_realtime_cache['data'] is not None and 
-                current_time - _realtime_cache['timestamp'] < _realtime_cache['ttl']):
+                cache_ttl > 0 and
+                current_time - _realtime_cache['timestamp'] < cache_ttl):
                 df = _realtime_cache['data']
                 cache_age = int(current_time - _realtime_cache['timestamp'])
-                logger.debug(f"[缓存命中] 实时行情(efinance) - 缓存年龄 {cache_age}s/{_realtime_cache['ttl']}s")
+                logger.debug(f"[缓存命中] 实时行情(efinance) - 缓存年龄 {cache_age}s/{cache_ttl}s")
             else:
                 # 触发全量刷新
                 logger.info(f"[缓存未命中] 触发全量刷新 实时行情(efinance)")
@@ -728,7 +741,7 @@ class EfinanceFetcher(BaseFetcher):
                 # 更新缓存
                 _realtime_cache['data'] = df
                 _realtime_cache['timestamp'] = current_time
-                logger.info(f"[缓存更新] 实时行情(efinance) 缓存已刷新，TTL={_realtime_cache['ttl']}s")
+                logger.info(f"[缓存更新] 实时行情(efinance) 缓存已刷新，TTL={cache_ttl}s")
             
             # 查找指定股票
             # efinance 返回的列名可能是 '股票代码' 或 'code'
@@ -818,13 +831,15 @@ class EfinanceFetcher(BaseFetcher):
 
         try:
             current_time = time.time()
+            cache_ttl = _refresh_realtime_cache_ttl(_realtime_cache)
             if (
                 _realtime_cache['data'] is not None and
-                current_time - _realtime_cache['timestamp'] < _realtime_cache['ttl']
+                cache_ttl > 0 and
+                current_time - _realtime_cache['timestamp'] < cache_ttl
             ):
                 df = _realtime_cache['data']
                 cache_age = int(current_time - _realtime_cache['timestamp'])
-                logger.debug(f"[缓存命中] 批量实时行情(efinance) - 缓存年龄 {cache_age}s/{_realtime_cache['ttl']}s")
+                logger.debug(f"[缓存命中] 批量实时行情(efinance) - 缓存年龄 {cache_age}s/{cache_ttl}s")
             else:
                 self._set_random_user_agent()
                 self._enforce_rate_limit()
@@ -921,13 +936,15 @@ class EfinanceFetcher(BaseFetcher):
 
         try:
             current_time = time.time()
+            cache_ttl = _refresh_realtime_cache_ttl(_etf_realtime_cache)
             if (
                 _etf_realtime_cache['data'] is not None and
-                current_time - _etf_realtime_cache['timestamp'] < _etf_realtime_cache['ttl']
+                cache_ttl > 0 and
+                current_time - _etf_realtime_cache['timestamp'] < cache_ttl
             ):
                 df = _etf_realtime_cache['data']
                 cache_age = int(current_time - _etf_realtime_cache['timestamp'])
-                logger.debug(f"[缓存命中] ETF实时行情(efinance) - 缓存年龄 {cache_age}s/{_etf_realtime_cache['ttl']}s")
+                logger.debug(f"[缓存命中] ETF实时行情(efinance) - 缓存年龄 {cache_age}s/{cache_ttl}s")
             else:
                 self._set_random_user_agent()
                 self._enforce_rate_limit()
@@ -1095,9 +1112,11 @@ class EfinanceFetcher(BaseFetcher):
             self._enforce_rate_limit()
 
             current_time = time.time()
+            cache_ttl = _refresh_realtime_cache_ttl(_realtime_cache)
             if (
                 _realtime_cache['data'] is not None and
-                current_time - _realtime_cache['timestamp'] < _realtime_cache['ttl']
+                cache_ttl > 0 and
+                current_time - _realtime_cache['timestamp'] < cache_ttl
             ):
                 df = _realtime_cache['data']
             else:

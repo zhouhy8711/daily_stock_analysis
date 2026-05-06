@@ -10,15 +10,168 @@
 """
 
 import logging
-from datetime import datetime
+from copy import deepcopy
+from datetime import datetime, timedelta
 import math
 import re
-from typing import Optional, Dict, Any, List
+import sys
+from threading import RLock
+import time
+from typing import Optional, Dict, Any, List, Tuple
 
 from src.core import trading_calendar
+from src.config import get_config
 from src.repositories.stock_repo import StockRepository
 
 logger = logging.getLogger(__name__)
+
+
+_REALTIME_QUOTE_CACHE_LOCK = RLock()
+_REALTIME_QUOTE_CACHE_BUCKET: Optional[int] = None
+_REALTIME_QUOTE_CACHE: Dict[str, Dict[str, Any]] = {}
+
+
+def _get_realtime_cache_ttl() -> int:
+    try:
+        ttl = int(getattr(get_config(), "realtime_cache_ttl", 30) or 0)
+    except Exception:
+        ttl = 30
+    return max(0, ttl)
+
+
+def _get_realtime_cache_bucket(now: Optional[float] = None, ttl: Optional[int] = None) -> Optional[int]:
+    effective_ttl = _get_realtime_cache_ttl() if ttl is None else max(0, int(ttl))
+    if effective_ttl <= 0:
+        return None
+    current_time = time.time() if now is None else now
+    return int(current_time // effective_ttl) * effective_ttl
+
+
+def _clear_realtime_quote_cache() -> None:
+    global _REALTIME_QUOTE_CACHE_BUCKET
+    with _REALTIME_QUOTE_CACHE_LOCK:
+        _REALTIME_QUOTE_CACHE.clear()
+        _REALTIME_QUOTE_CACHE_BUCKET = None
+
+
+def _realtime_quote_cache_size() -> int:
+    with _REALTIME_QUOTE_CACHE_LOCK:
+        return len(_REALTIME_QUOTE_CACHE)
+
+
+def _deep_getsizeof(value: Any, seen: Optional[set[int]] = None) -> int:
+    seen = seen or set()
+    object_id = id(value)
+    if object_id in seen:
+        return 0
+    seen.add(object_id)
+
+    if value is None:
+        return 0
+
+    memory_usage = getattr(value, "memory_usage", None)
+    if callable(memory_usage):
+        try:
+            usage = memory_usage(deep=True)
+            if hasattr(usage, "sum"):
+                return int(usage.sum()) + sys.getsizeof(value)
+            return int(usage) + sys.getsizeof(value)
+        except Exception:
+            pass
+
+    size = sys.getsizeof(value)
+    if isinstance(value, dict):
+        size += sum(_deep_getsizeof(key, seen) + _deep_getsizeof(item, seen) for key, item in value.items())
+    elif isinstance(value, (list, tuple, set, frozenset)):
+        size += sum(_deep_getsizeof(item, seen) for item in value)
+    return int(size)
+
+
+def _estimate_realtime_quote_cache_bytes() -> int:
+    with _REALTIME_QUOTE_CACHE_LOCK:
+        if not _REALTIME_QUOTE_CACHE:
+            return 0
+        snapshot = deepcopy(_REALTIME_QUOTE_CACHE)
+    return _deep_getsizeof(snapshot)
+
+
+def _provider_cache_memory_bytes(cache: Dict[str, Any]) -> int:
+    data = cache.get("data")
+    if data is None:
+        return 0
+    return _deep_getsizeof(data)
+
+
+def get_realtime_quote_cache_stats() -> Dict[str, Any]:
+    """Return lightweight memory stats for in-process realtime quote caches."""
+    quote_cache_bytes = _estimate_realtime_quote_cache_bytes()
+    provider_cache_bytes = 0
+
+    provider_caches: List[Tuple[str, Dict[str, Any]]] = []
+    for module_name in ("data_provider.efinance_fetcher", "data_provider.akshare_fetcher"):
+        try:
+            module = __import__(module_name, fromlist=["_realtime_cache", "_etf_realtime_cache"])
+            provider_caches.extend([
+                (f"{module_name}._realtime_cache", getattr(module, "_realtime_cache", {})),
+                (f"{module_name}._etf_realtime_cache", getattr(module, "_etf_realtime_cache", {})),
+            ])
+        except Exception:
+            continue
+
+    provider_breakdown: List[Dict[str, Any]] = []
+    for name, cache in provider_caches:
+        if not isinstance(cache, dict):
+            continue
+        cache_bytes = _provider_cache_memory_bytes(cache)
+        provider_cache_bytes += cache_bytes
+        provider_breakdown.append({
+            "name": name,
+            "memory_bytes": cache_bytes,
+            "memory_mb": round(cache_bytes / 1024 / 1024, 4),
+        })
+
+    total_bytes = quote_cache_bytes + provider_cache_bytes
+    with _REALTIME_QUOTE_CACHE_LOCK:
+        bucket_start = _REALTIME_QUOTE_CACHE_BUCKET
+        quote_cache_items = len(_REALTIME_QUOTE_CACHE)
+
+    return {
+        "total_memory_bytes": total_bytes,
+        "total_memory_mb": round(total_bytes / 1024 / 1024, 4),
+        "quote_cache_items": quote_cache_items,
+        "quote_cache_memory_bytes": quote_cache_bytes,
+        "quote_cache_memory_mb": round(quote_cache_bytes / 1024 / 1024, 4),
+        "provider_cache_memory_bytes": provider_cache_bytes,
+        "provider_cache_memory_mb": round(provider_cache_bytes / 1024 / 1024, 4),
+        "bucket_start": bucket_start,
+        "provider_breakdown": provider_breakdown,
+    }
+
+
+def _get_cached_quote_payload(normalized_code: str) -> Optional[Dict[str, Any]]:
+    bucket = _get_realtime_cache_bucket()
+    if bucket is None:
+        return None
+    global _REALTIME_QUOTE_CACHE_BUCKET
+    with _REALTIME_QUOTE_CACHE_LOCK:
+        if _REALTIME_QUOTE_CACHE_BUCKET != bucket:
+            _REALTIME_QUOTE_CACHE.clear()
+            _REALTIME_QUOTE_CACHE_BUCKET = bucket
+            return None
+        payload = _REALTIME_QUOTE_CACHE.get(normalized_code)
+        return deepcopy(payload) if payload is not None else None
+
+
+def _cache_quote_payload(normalized_code: str, payload: Dict[str, Any]) -> None:
+    bucket = _get_realtime_cache_bucket()
+    if bucket is None:
+        return
+    global _REALTIME_QUOTE_CACHE_BUCKET
+    with _REALTIME_QUOTE_CACHE_LOCK:
+        if _REALTIME_QUOTE_CACHE_BUCKET != bucket:
+            _REALTIME_QUOTE_CACHE.clear()
+            _REALTIME_QUOTE_CACHE_BUCKET = bucket
+        _REALTIME_QUOTE_CACHE[normalized_code] = deepcopy(payload)
 
 
 def _to_optional_float(value: Any) -> Optional[float]:
@@ -194,7 +347,12 @@ class StockService:
         """
         try:
             # 调用数据获取器获取实时行情
-            from data_provider.base import DataFetcherManager
+            from data_provider.base import DataFetcherManager, normalize_stock_code
+
+            normalized_code = normalize_stock_code(stock_code)
+            cached_payload = _get_cached_quote_payload(normalized_code)
+            if cached_payload is not None:
+                return cached_payload
             
             manager = DataFetcherManager()
             quote = manager.get_realtime_quote(stock_code)
@@ -203,7 +361,9 @@ class StockService:
                 logger.warning(f"获取 {stock_code} 实时行情失败")
                 return None
             
-            return _build_quote_payload(quote, stock_code)
+            payload = _build_quote_payload(quote, stock_code)
+            _cache_quote_payload(normalized_code, payload)
+            return payload
             
         except ImportError:
             logger.warning("DataFetcherManager 未找到，使用占位数据")
@@ -234,24 +394,33 @@ class StockService:
         try:
             from data_provider.base import DataFetcherManager, normalize_stock_code
 
-            manager = DataFetcherManager()
             items: List[Dict[str, Any]] = []
+            cached_by_code: Dict[str, Dict[str, Any]] = {}
             quote_by_code: Dict[str, Any] = {}
             normalized_to_original = {
                 normalize_stock_code(code): code for code in normalized_codes
             }
+            missing_for_fetch: List[str] = []
+            for normalized in normalized_to_original.keys():
+                cached_payload = _get_cached_quote_payload(normalized)
+                if cached_payload is None:
+                    missing_for_fetch.append(normalized)
+                else:
+                    cached_by_code[normalized] = cached_payload
 
-            for fetcher in manager._get_fetchers_snapshot():
-                if fetcher.name == "EfinanceFetcher" and hasattr(fetcher, "get_realtime_quotes"):
-                    quote_by_code = fetcher.get_realtime_quotes(list(normalized_to_original.keys()))
-                    break
+            manager = DataFetcherManager() if missing_for_fetch else None
+            if missing_for_fetch and manager is not None:
+                for fetcher in manager._get_fetchers_snapshot():
+                    if fetcher.name == "EfinanceFetcher" and hasattr(fetcher, "get_realtime_quotes"):
+                        quote_by_code = fetcher.get_realtime_quotes(missing_for_fetch)
+                        break
 
             missing_normalized_codes = [
                 normalized
-                for normalized in normalized_to_original.keys()
+                for normalized in missing_for_fetch
                 if normalized not in quote_by_code
             ]
-            if missing_normalized_codes:
+            if missing_normalized_codes and manager is not None:
                 for fetcher in manager._get_fetchers_snapshot():
                     if fetcher.name == "AkshareFetcher" and hasattr(fetcher, "get_realtime_quotes"):
                         fallback_quotes = fetcher.get_realtime_quotes(missing_normalized_codes)
@@ -261,20 +430,27 @@ class StockService:
             missing_codes = [
                 original
                 for normalized, original in normalized_to_original.items()
-                if normalized not in quote_by_code
+                if normalized not in cached_by_code and normalized not in quote_by_code
             ]
-            if len(normalized_codes) <= 20 and missing_codes:
+            if len(normalized_codes) <= 20 and missing_codes and manager is not None:
                 for code in missing_codes:
                     quote = manager.get_realtime_quote(code, log_final_failure=False)
                     if quote is not None:
                         quote_by_code[normalize_stock_code(code)] = quote
 
             for normalized, original in normalized_to_original.items():
+                cached_payload = cached_by_code.get(normalized)
+                if cached_payload is not None:
+                    items.append(cached_payload)
+                    continue
+
                 quote = quote_by_code.get(normalized)
                 if quote is None:
                     continue
 
-                items.append(_build_quote_payload(quote, original))
+                payload = _build_quote_payload(quote, original)
+                _cache_quote_payload(normalized, payload)
+                items.append(payload)
 
             found_codes = {
                 normalize_stock_code(str(item.get("stock_code") or ""))
@@ -583,6 +759,45 @@ class StockService:
                 "turnover_rate": _to_optional_float(row.get("turnover_rate")),
             })
         return data
+
+    def _load_daily_history_from_db(self, stock_code: str, days: int):
+        from data_provider.base import normalize_stock_code
+        import pandas as pd
+
+        requested_days = max(1, int(days or 1))
+        end_date = datetime.now().date()
+        start_date = end_date - timedelta(days=int(requested_days * 1.8) + 10)
+        required_rows = min(requested_days, max(5, int(requested_days * 0.3)))
+        candidates = list(dict.fromkeys([stock_code, normalize_stock_code(stock_code)]))
+
+        for candidate in candidates:
+            bars = self.repo.get_range(candidate, start_date, end_date)
+            if len(bars) < required_rows:
+                continue
+            selected_bars = bars[-requested_days:]
+            df = pd.DataFrame([bar.to_dict() for bar in selected_bars])
+            if not df.empty:
+                return df, "db_cache"
+
+        return None
+
+    @staticmethod
+    def _get_local_stock_name(stock_code: str) -> Optional[str]:
+        try:
+            from data_provider.base import (
+                STOCK_NAME_MAP,
+                get_index_stock_name,
+                is_meaningful_stock_name,
+                normalize_stock_code,
+            )
+        except Exception:
+            return None
+
+        normalized_code = normalize_stock_code(stock_code)
+        for name in (STOCK_NAME_MAP.get(normalized_code), get_index_stock_name(normalized_code)):
+            if is_meaningful_stock_name(name, normalized_code):
+                return name
+        return None
     
     def get_history_data(
         self,
@@ -609,11 +824,23 @@ class StockService:
             from data_provider.base import DataFetcherManager, normalize_kline_period
 
             normalized_period = normalize_kline_period(period)
-            
-            manager = DataFetcherManager()
+            manager = None
+            stock_name = None
             if normalized_period == "daily":
-                df, source = manager.get_daily_data(stock_code, days=days)
+                cached_history = self._load_daily_history_from_db(stock_code, days)
+                if cached_history is not None:
+                    df, source = cached_history
+                    stock_name = self._get_local_stock_name(stock_code)
+                else:
+                    manager = DataFetcherManager()
+                    df, source = manager.get_daily_data(stock_code, days=days)
+                    if df is not None and not df.empty:
+                        try:
+                            self.repo.save_dataframe(df, stock_code, source)
+                        except Exception as save_error:
+                            logger.debug("保存 %s 日线缓存失败: %s", stock_code, save_error)
             else:
+                manager = DataFetcherManager()
                 intraday_kwargs: Dict[str, Any] = {
                     "period": normalized_period,
                     "days": max(1, min(int(days or 1), 30)),
@@ -635,7 +862,8 @@ class StockService:
                 return {"stock_code": stock_code, "period": normalized_period, "data": []}
             
             # 获取股票名称
-            stock_name = manager.get_stock_name(stock_code)
+            if stock_name is None and manager is not None:
+                stock_name = manager.get_stock_name(stock_code)
             
             # 转换为响应格式
             data = self._build_kline_payload(df, normalized_period)

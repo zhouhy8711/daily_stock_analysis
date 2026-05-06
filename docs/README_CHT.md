@@ -156,6 +156,7 @@
 | `LONGBRIDGE_ENABLE_OVERNIGHT` | 是否開啟夜盤行情 `true` / `false`，預設 `false` | 可選 |
 | `LONGBRIDGE_PUSH_CANDLESTICK_MODE` | K 線推送模式：`realtime` 或 `confirmed`（預設 `realtime`） | 可選 |
 | `LONGBRIDGE_PRINT_QUOTE_PACKAGES` | 連線時是否列印行情包（未設定時預設 `false`；設為 `1`/`true`/`yes` 開啟） | 可選 |
+| `REALTIME_CACHE_TTL` | 即時行情短快取秒數，預設 `30`；`0` 表示停用進程內即時行情快取 | 可選 |
 | `AGENT_MODE` | 啟用 Agent 策略問股模式（內部統一命名為 skill，`true`/`false`，預設 `false`） | 可選 |
 | `AGENT_LITELLM_MODEL` | Agent 專用主模型（可選）；留空時繼承主模型，無 provider 前綴時按 `openai/<model>` 解析 | 可選 |
 | `AGENT_MAX_STEPS` | Agent 最大推理步數上限（預設 `10`）；保持預設時各子 Agent 依自身預設步數運行；主動調高到高於預設值時，所有子 Agent 統一採用該值；若設定值低於某子 Agent 的預設步數，則仍按該值作為上限進行限制 | 可選 |

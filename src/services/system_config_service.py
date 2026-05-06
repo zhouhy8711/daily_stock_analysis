@@ -103,6 +103,15 @@ class SystemConfigService:
             return value
         return alias_map.get(value.strip().lower(), value)
 
+    @staticmethod
+    def _get_runtime_default_display_value(key: str) -> str:
+        if key.upper() != "REALTIME_CACHE_TTL":
+            return ""
+        try:
+            return str(Config.get_instance().realtime_cache_ttl)
+        except Exception:
+            return "30"
+
     @classmethod
     def _build_display_config_map(cls, raw_config_map: Dict[str, str]) -> Dict[str, str]:
         raw_upper = {key.upper(): value for key, value in raw_config_map.items()}
@@ -171,10 +180,11 @@ class SystemConfigService:
         items: List[Dict[str, Any]] = []
         for key in all_keys:
             raw_value = config_map.get(key, "")
+            display_value = raw_value or self._get_runtime_default_display_value(key)
             field_schema = schema_by_key[key]
             item: Dict[str, Any] = {
                 "key": key,
-                "value": raw_value,
+                "value": display_value,
                 "raw_value_exists": bool(raw_value),
                 "is_masked": False,
             }

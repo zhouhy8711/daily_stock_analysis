@@ -15,6 +15,7 @@ from api.v1.schemas.system_config import (
     DiscoverLLMChannelModelsResponse,
     ExportSystemConfigResponse,
     ImportSystemConfigRequest,
+    RealtimeCacheStatsResponse,
     SystemConfigConflictResponse,
     SystemConfigResponse,
     SystemConfigSchemaResponse,
@@ -26,6 +27,7 @@ from api.v1.schemas.system_config import (
     ValidateSystemConfigRequest,
     ValidateSystemConfigResponse,
 )
+from src.services.stock_service import get_realtime_quote_cache_stats
 from src.services.system_config_service import (
     ConfigConflictError,
     ConfigImportError,
@@ -76,6 +78,32 @@ def get_system_config(
             detail={
                 "error": "internal_error",
                 "message": "Failed to load system configuration",
+            },
+        )
+
+
+@router.get(
+    "/config/realtime-cache/stats",
+    response_model=RealtimeCacheStatsResponse,
+    responses={
+        200: {"description": "Realtime cache stats loaded"},
+        401: {"description": "Unauthorized", "model": ErrorResponse},
+        500: {"description": "Internal server error", "model": ErrorResponse},
+    },
+    summary="Get realtime quote cache stats",
+    description="Read current in-process realtime quote cache memory usage.",
+)
+def get_realtime_cache_stats() -> RealtimeCacheStatsResponse:
+    """Return runtime memory stats for realtime quote caches."""
+    try:
+        return RealtimeCacheStatsResponse.model_validate(get_realtime_quote_cache_stats())
+    except Exception as exc:
+        logger.error("Failed to load realtime cache stats: %s", exc, exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": "internal_error",
+                "message": "Failed to load realtime cache stats",
             },
         )
 

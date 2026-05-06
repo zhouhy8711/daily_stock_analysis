@@ -43,6 +43,7 @@ interface SettingsFieldProps {
   disabled?: boolean;
   onChange: (key: string, value: string) => void;
   issues?: ConfigValidationIssue[];
+  trailingContent?: React.ReactNode;
 }
 
 function renderFieldControl(
@@ -194,6 +195,7 @@ export const SettingsField: React.FC<SettingsFieldProps> = ({
   disabled = false,
   onChange,
   issues = [],
+  trailingContent,
 }) => {
   const schema = item.schema;
   const isMultiValue = isMultiValueField(item);
@@ -224,6 +226,11 @@ export const SettingsField: React.FC<SettingsFieldProps> = ({
           <Badge variant="default" size="sm">
             只读
           </Badge>
+        ) : null}
+        {trailingContent ? (
+          <div className="ml-auto flex items-center">
+            {trailingContent}
+          </div>
         ) : null}
       </div>
 

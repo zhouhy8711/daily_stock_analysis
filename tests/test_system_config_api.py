@@ -63,6 +63,33 @@ class SystemConfigApiTestCase(unittest.TestCase):
         self.assertEqual(item_map["GEMINI_API_KEY"]["value"], "secret-key-value")
         self.assertFalse(item_map["GEMINI_API_KEY"]["is_masked"])
 
+    def test_get_realtime_cache_stats_returns_memory_payload(self) -> None:
+        with patch(
+            "api.v1.endpoints.system_config.get_realtime_quote_cache_stats",
+            return_value={
+                "total_memory_bytes": 1310720,
+                "total_memory_mb": 1.25,
+                "quote_cache_items": 42,
+                "quote_cache_memory_bytes": 524288,
+                "quote_cache_memory_mb": 0.5,
+                "provider_cache_memory_bytes": 786432,
+                "provider_cache_memory_mb": 0.75,
+                "bucket_start": 1800,
+                "provider_breakdown": [
+                    {
+                        "name": "data_provider.efinance_fetcher._realtime_cache",
+                        "memory_bytes": 786432,
+                        "memory_mb": 0.75,
+                    }
+                ],
+            },
+        ):
+            payload = system_config.get_realtime_cache_stats().model_dump()
+
+        self.assertEqual(payload["total_memory_mb"], 1.25)
+        self.assertEqual(payload["quote_cache_items"], 42)
+        self.assertEqual(payload["provider_breakdown"][0]["memory_mb"], 0.75)
+
     def test_put_config_updates_secret_and_plain_field(self) -> None:
         current = system_config.get_system_config(include_schema=False, service=self.service).model_dump()
         payload = system_config.update_system_config(

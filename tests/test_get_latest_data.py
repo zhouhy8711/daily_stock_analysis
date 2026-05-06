@@ -14,11 +14,59 @@ import os
 import tempfile
 import unittest
 from datetime import date, timedelta
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import pandas as pd
 
 from src.config import Config
+from src.services.stock_service import StockService
 from src.storage import DatabaseManager, StockDaily
+
+
+class _FakeDailyHistoryManager:
+    def __init__(self, df: pd.DataFrame):
+        self.df = df
+        self.daily_calls = 0
+
+    def get_daily_data(self, stock_code: str, days: int = 30):
+        self.daily_calls += 1
+        return self.df, "FakeDailyFetcher"
+
+    def get_stock_name(self, stock_code: str):
+        return "贵州茅台"
+
+
+class _FakeRealtimeQuoteManager:
+    def get_realtime_quote(self, stock_code: str):
+        return SimpleNamespace(
+            code=stock_code,
+            name="贵州茅台",
+            price=123.45,
+            change_amount=1.2,
+            change_pct=0.98,
+            open_price=122.0,
+            high=125.0,
+            low=121.0,
+            pre_close=122.25,
+            volume=1000000,
+            amount=123450000,
+            after_hours_volume=None,
+            after_hours_amount=None,
+            volume_ratio=None,
+            turnover_rate=None,
+            amplitude=None,
+            pe_ratio=None,
+            total_mv=None,
+            circ_mv=None,
+            total_shares=None,
+            float_shares=None,
+            price_speed=None,
+            limit_up_price=None,
+            limit_down_price=None,
+            entrust_ratio=None,
+            source="test",
+        )
 
 
 class GetLatestDataTestCase(unittest.TestCase):
@@ -179,6 +227,50 @@ class GetLatestDataTestCase(unittest.TestCase):
         self.assertAlmostEqual(by_date[base_date].volume_ratio or 0.0, 1.8, places=6)
         self.assertEqual(by_date[base_date].data_source, "batch-2")
         self.assertAlmostEqual(by_date[base_date + timedelta(days=2)].close, 122.0, places=6)
+
+    def test_history_data_uses_existing_daily_db_without_external_fetch(self) -> None:
+        self._insert_stock_data("600519", days_ago=0, close=1688.5)
+
+        with patch("data_provider.base.DataFetcherManager", side_effect=AssertionError("external fetch should not run")):
+            result = StockService().get_history_data("600519", period="daily", days=1)
+
+        self.assertEqual(result["period"], "daily")
+        self.assertEqual(result["stock_name"], "贵州茅台")
+        self.assertEqual(len(result["data"]), 1)
+        self.assertAlmostEqual(result["data"][0]["close"], 1688.5, places=6)
+
+    def test_history_data_fetches_and_upserts_when_daily_db_is_missing(self) -> None:
+        target_date = date.today()
+        fetched_df = pd.DataFrame([{
+            "date": target_date,
+            "open": 120.0,
+            "high": 125.0,
+            "low": 119.0,
+            "close": 123.45,
+            "volume": 1000000,
+            "amount": 123450000,
+            "pct_chg": 0.98,
+        }])
+        manager = _FakeDailyHistoryManager(fetched_df)
+
+        with patch("data_provider.base.DataFetcherManager", return_value=manager):
+            result = StockService().get_history_data("600519", period="daily", days=1)
+
+        self.assertEqual(manager.daily_calls, 1)
+        self.assertEqual(result["stock_name"], "贵州茅台")
+        self.assertEqual(result["data"][0]["date"], target_date.isoformat())
+
+        rows = self.db.get_data_range("600519", target_date, target_date)
+        self.assertEqual(len(rows), 1)
+        self.assertAlmostEqual(rows[0].close, 123.45, places=6)
+        self.assertEqual(rows[0].data_source, "FakeDailyFetcher")
+
+    def test_realtime_quote_does_not_write_daily_history_cache(self) -> None:
+        with patch("data_provider.base.DataFetcherManager", return_value=_FakeRealtimeQuoteManager()):
+            result = StockService().get_realtime_quote("600519")
+
+        self.assertIsNotNone(result)
+        self.assertEqual(self.db.get_latest_data("600519", days=5), [])
 
 
 if __name__ == "__main__":

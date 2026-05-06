@@ -198,3 +198,25 @@ class SystemConfigConflictResponse(BaseModel):
     error: str
     message: str
     current_config_version: str
+
+
+class RealtimeCacheProviderStats(BaseModel):
+    """Memory stats for one realtime provider cache."""
+
+    name: str
+    memory_bytes: int
+    memory_mb: float
+
+
+class RealtimeCacheStatsResponse(BaseModel):
+    """Runtime memory stats for realtime quote caches."""
+
+    total_memory_bytes: int
+    total_memory_mb: float
+    quote_cache_items: int
+    quote_cache_memory_bytes: int
+    quote_cache_memory_mb: float
+    provider_cache_memory_bytes: int
+    provider_cache_memory_mb: float
+    bucket_start: Optional[int] = None
+    provider_breakdown: List[RealtimeCacheProviderStats] = Field(default_factory=list)
