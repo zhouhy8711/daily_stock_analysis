@@ -157,6 +157,15 @@ function expectIndicatorHeadersToShow(date: string) {
   expect(within(momentumHeader).getByText(/^DIF:/)).toBeInTheDocument();
 }
 
+function expectCoreMetricsToShow(point: KLineData) {
+  const coreMetrics = screen.getByTestId('indicator-core-metrics');
+
+  expect(within(coreMetrics).getByText(point.close.toFixed(2))).toBeInTheDocument();
+  expect(within(coreMetrics).getByText(point.high.toFixed(2))).toBeInTheDocument();
+  expect(within(coreMetrics).getByText(point.low.toFixed(2))).toBeInTheDocument();
+  expect(within(coreMetrics).getByText(point.open.toFixed(2))).toBeInTheDocument();
+}
+
 describe('IndicatorAnalysisModal', () => {
   beforeEach(() => {
     vi.useFakeTimers();
@@ -393,6 +402,11 @@ describe('IndicatorAnalysisModal', () => {
 
     fireEvent.mouseEnter(screen.getByTestId('indicator-volume-bar-2026-04-24'));
     expectIndicatorHeadersToShow('2026-04-24');
+
+    fireEvent.mouseEnter(screen.getByTestId('indicator-chart-bar-2026-04-14'));
+    expectIndicatorHeadersToShow('2026-04-14');
+    expectCoreMetricsToShow(makeHistory('daily')[13]);
+    expect(within(screen.getByTestId('indicator-core-metrics')).queryByText('132.00')).not.toBeInTheDocument();
 
     fireEvent.contextMenu(screen.getByRole('img', { name: '成交量图' }), { clientX: 80, clientY: 120 });
     expect(screen.getByRole('menu', { name: '图表缩放菜单' })).toBeInTheDocument();
@@ -727,6 +741,8 @@ describe('IndicatorAnalysisModal', () => {
 
     expect(within(screen.getByTestId('chip-peak-panel')).getByText(windowSnapshotDate)).toBeInTheDocument();
     expect(within(screen.getByTestId('chip-peak-panel')).queryByText('2026-04-30')).not.toBeInTheDocument();
+    expectCoreMetricsToShow(longHistory[89]);
+    expect(within(screen.getByTestId('indicator-core-metrics')).queryByText('132.00')).not.toBeInTheDocument();
 
     unmount();
   });

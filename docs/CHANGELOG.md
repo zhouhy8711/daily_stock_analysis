@@ -71,6 +71,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [改进] Web 指标分析页 K 线标题栏移除窗口摘要文案，优化“更多”浮层入口位置，并将顶部核心行情的规则加号提示改为最高价、最低价、开盘价、换手率和成交额等完整指标名
 - [修复] Web 指标分析页 K 线主图重新预留横轴时间与右侧纵轴空间，纵轴从 0 开始，避免在常见浏览器分辨率下坐标轴被裁切或看不清
 - [新功能] Web 指标分析页右侧新增“相关资讯”面板，复用公开财经/搜索资讯源并支持刷新，不依赖 LLM 模型生成
+- [修复] Web 指标分析顶部核心行情指标重新跟随 K 线悬停日期和时间窗口末端日期，避免拖动窗口时仍停留在最新实时行情
 <!-- 每条独立一行追加到本段末尾，无需分类标题，合并时冲突最小 -->
 - [修复] Pipeline Agent 5 个 K 线工具（get_daily_history / analyze_trend / calculate_ma / get_volume_analysis / analyze_pattern）改为 DB-first 加载，消除同一只股票 9x5=45 次重复 HTTP 请求 (Fixes #1066)
 - [修复] Pipeline Agent 执行前按需预热 240 天 K 线历史到 DB，正常情况下 K 线工具调用无需重复网络请求

@@ -4869,6 +4869,12 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
   const maxWindowStart = Math.max(points.length - visibleCount, 0);
   const safeWindowStart = clamp(windowStart, 0, maxWindowStart);
   const visiblePoints = points.slice(safeWindowStart, safeWindowStart + visibleCount);
+  const visibleAnchorIndex = visiblePoints.length > 0
+    ? safeWindowStart + visiblePoints.length - 1
+    : points.length > 0
+      ? points.length - 1
+      : null;
+  const visibleAnchorPoint = visibleAnchorIndex !== null ? points[visibleAnchorIndex] : undefined;
   const handleHoverIndexChange = useCallback((index: number | null) => {
     if (index !== null) {
       lastChartAnchorIndexRef.current = index;
@@ -4898,7 +4904,7 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
   }, [points.length]);
   const safeHoveredIndex = hoveredIndex !== null && hoveredIndex >= 0 && hoveredIndex < points.length ? hoveredIndex : null;
   const latest = points.at(-1);
-  const corePointIndex = safeHoveredIndex ?? (points.length > 0 ? points.length - 1 : null);
+  const corePointIndex = safeHoveredIndex ?? visibleAnchorIndex;
   const corePoint = corePointIndex !== null ? points[corePointIndex] : latest;
   const corePreviousPoint = corePointIndex !== null && corePointIndex > 0 ? points[corePointIndex - 1] : undefined;
   const coreQuote = corePointIndex !== null && corePointIndex === points.length - 1 ? quote : null;
@@ -4907,7 +4913,6 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
   const chipPoints = points;
   const requiresRealChipData = marketKind === 'cn';
   const estimatedChip: ChipDistributionMetrics | null = null;
-  const visibleAnchorPoint = visiblePoints.at(-1) ?? latest;
   const selectedPoint = safeHoveredIndex !== null ? points[safeHoveredIndex] : visibleAnchorPoint;
   const baseChip = metrics?.chipDistribution ?? null;
   const chip = useMemo(() => pickChipSnapshot(baseChip, selectedPoint?.date), [baseChip, selectedPoint?.date]);
