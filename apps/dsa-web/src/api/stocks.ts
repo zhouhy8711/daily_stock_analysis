@@ -26,15 +26,23 @@ export type KLineData = {
   amount?: number | null;
   changePercent?: number | null;
   turnoverRate?: number | null;
+  dataSource?: string | null;
+  snapshotId?: string | null;
+  snapshotTime?: string | null;
 };
 
 export type KLinePeriod = 'daily' | '1m' | '5m' | '15m' | '30m' | '60m';
+export type StockDataPolicy = 'default' | 'cache_only' | 'snapshot_only';
 
 export type StockHistoryResponse = {
   stockCode: string;
   stockName?: string | null;
   period: KLinePeriod | string;
   data: KLineData[];
+  dataSource?: string | null;
+  snapshotId?: string | null;
+  snapshotTime?: string | null;
+  snapshotAgeSeconds?: number | null;
 };
 
 export type StockQuote = {
@@ -65,12 +73,18 @@ export type StockQuote = {
   entrustRatio?: number | null;
   source?: string | null;
   updateTime?: string | null;
+  snapshotId?: string | null;
+  snapshotTime?: string | null;
+  quoteTime?: string | null;
 };
 
 export type StockQuotesResponse = {
   items: StockQuote[];
   failedCodes: string[];
   updateTime?: string | null;
+  snapshotId?: string | null;
+  snapshotTime?: string | null;
+  snapshotAgeSeconds?: number | null;
 };
 
 export type ChipDistributionPoint = {
@@ -163,6 +177,9 @@ function normalizeKLine(item: Record<string, unknown>): KLineData {
     amount: toNullableNumber(item.amount),
     changePercent: toNullableNumber(item.change_percent ?? item.changePercent),
     turnoverRate: toNullableNumber(item.turnover_rate ?? item.turnoverRate),
+    dataSource: toNullableString(item.data_source ?? item.dataSource),
+    snapshotId: toNullableString(item.snapshot_id ?? item.snapshotId),
+    snapshotTime: toNullableString(item.snapshot_time ?? item.snapshotTime),
   };
 }
 
@@ -199,6 +216,9 @@ function normalizeQuote(item: Record<string, unknown>, stockCode: string): Stock
     updateTime: typeof (item.update_time ?? item.updateTime) === 'string'
       ? String(item.update_time ?? item.updateTime)
       : null,
+    snapshotId: toNullableString(item.snapshot_id ?? item.snapshotId),
+    snapshotTime: toNullableString(item.snapshot_time ?? item.snapshotTime),
+    quoteTime: toNullableString(item.quote_time ?? item.quoteTime),
   };
 }
 
@@ -299,17 +319,19 @@ function normalizeIndicatorMetrics(item: Record<string, unknown>, stockCode: str
 }
 
 export const stocksApi = {
-  async getQuote(stockCode: string): Promise<StockQuote> {
+  async getQuote(stockCode: string, dataPolicy: StockDataPolicy = 'default'): Promise<StockQuote> {
     const response = await apiClient.get<Record<string, unknown>>(
       `/api/v1/stocks/${encodeURIComponent(stockCode)}/quote`,
+      { params: { data_policy: dataPolicy } },
     );
     return normalizeQuote(response.data, stockCode);
   },
 
-  async getQuotes(stockCodes: string[]): Promise<StockQuotesResponse> {
+  async getQuotes(stockCodes: string[], dataPolicy: StockDataPolicy = 'default'): Promise<StockQuotesResponse> {
     const response = await apiClient.post<Record<string, unknown>>(
       '/api/v1/stocks/quotes',
       { stock_codes: stockCodes },
+      { params: { data_policy: dataPolicy } },
     );
     const rawItems = Array.isArray(response.data.items) ? response.data.items : [];
     const rawFailedCodes = response.data.failed_codes ?? response.data.failedCodes;
@@ -321,14 +343,22 @@ export const stocksApi = {
         ? rawFailedCodes.map(String)
         : [],
       updateTime: toNullableString(response.data.update_time ?? response.data.updateTime),
+      snapshotId: toNullableString(response.data.snapshot_id ?? response.data.snapshotId),
+      snapshotTime: toNullableString(response.data.snapshot_time ?? response.data.snapshotTime),
+      snapshotAgeSeconds: toNullableNumber(response.data.snapshot_age_seconds ?? response.data.snapshotAgeSeconds),
     };
   },
 
-  async getHistory(stockCode: string, days = 120, period: KLinePeriod = 'daily'): Promise<StockHistoryResponse> {
+  async getHistory(
+    stockCode: string,
+    days = 120,
+    period: KLinePeriod = 'daily',
+    dataPolicy: StockDataPolicy = 'default',
+  ): Promise<StockHistoryResponse> {
     const response = await apiClient.get<Record<string, unknown>>(
       `/api/v1/stocks/${encodeURIComponent(stockCode)}/history`,
       {
-        params: { days, period },
+        params: { days, period, data_policy: dataPolicy },
         timeout: STOCK_HISTORY_TIMEOUT_MS,
       },
     );
@@ -337,12 +367,20 @@ export const stocksApi = {
       stock_name?: string | null;
       period?: string;
       data?: Array<Record<string, unknown>>;
+      data_source?: string | null;
+      snapshot_id?: string | null;
+      snapshot_time?: string | null;
+      snapshot_age_seconds?: number | null;
     };
     return {
       stockCode: data.stock_code ?? stockCode,
       stockName: data.stock_name,
       period: data.period ?? period,
       data: (data.data ?? []).map(normalizeKLine).filter((item) => item.date),
+      dataSource: toNullableString(data.data_source ?? (data as Record<string, unknown>).dataSource),
+      snapshotId: toNullableString(data.snapshot_id ?? (data as Record<string, unknown>).snapshotId),
+      snapshotTime: toNullableString(data.snapshot_time ?? (data as Record<string, unknown>).snapshotTime),
+      snapshotAgeSeconds: toNullableNumber(data.snapshot_age_seconds ?? (data as Record<string, unknown>).snapshotAgeSeconds),
     };
   },
 

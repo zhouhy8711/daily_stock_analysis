@@ -11,9 +11,12 @@ import pytest
 
 from api.v1.endpoints.stocks import get_stock_history
 from data_provider.realtime_types import RealtimeSource
+from src.repositories.stock_repo import StockRepository
+from src.storage import DatabaseManager
 from src.services.stock_service import (
     StockService,
     _clear_realtime_quote_cache,
+    _replace_realtime_quote_snapshot,
     _realtime_quote_cache_size,
     get_realtime_quote_cache_stats,
 )
@@ -244,6 +247,36 @@ class _BatchRealtimeManager:
         return [self.fetcher, _EmptyBatchQuoteFetcher()]
 
 
+class _IntradayBackfillManager:
+    def __init__(self):
+        self.intraday_calls = []
+
+    def get_intraday_data(self, stock_code, period="1m", days=1, **kwargs):
+        self.intraday_calls.append({
+            "stock_code": stock_code,
+            "period": period,
+            "days": days,
+            **kwargs,
+        })
+        assert period == "1m"
+        return pd.DataFrame(
+            {
+                "date": pd.to_datetime(["2026-05-07 09:30", "2026-05-07 09:31"]),
+                "open": [10.0, 10.2],
+                "high": [10.3, 10.4],
+                "low": [9.9, 10.1],
+                "close": [10.2, 10.35],
+                "volume": [1000, 1200],
+                "amount": [10200, 12420],
+                "pct_chg": [0.1, 0.2],
+                "turnover_rate": [0.01, 0.02],
+            }
+        ), "EfinanceFetcher"
+
+    def get_stock_name(self, stock_code):
+        return "测试股票"
+
+
 def test_realtime_quote_exposes_volume_turnover_and_source_fields() -> None:
     manager = _FakeManager()
 
@@ -335,6 +368,30 @@ def test_realtime_quote_cache_disabled_when_ttl_zero() -> None:
     assert _realtime_quote_cache_size() == 0
 
 
+def test_realtime_quote_snapshot_only_does_not_call_remote() -> None:
+    manager = _CountingRealtimeManager()
+    _replace_realtime_quote_snapshot(
+        requested_codes=["600519"],
+        items=[{
+            "stock_code": "600519",
+            "stock_name": "贵州茅台",
+            "current_price": 1688.5,
+            "source": "efinance",
+        }],
+        failed_codes=[],
+        snapshot_time=datetime(2026, 5, 7, 10, 30, 0),
+    )
+
+    with patch("data_provider.base.DataFetcherManager", return_value=manager):
+        hit = StockService().get_realtime_quote("600519", data_policy="snapshot_only")
+        miss = StockService().get_realtime_quote("000001", data_policy="snapshot_only")
+
+    assert hit is not None
+    assert hit["snapshot_id"] == "20260507103000"
+    assert miss is None
+    assert manager.calls == 0
+
+
 def test_realtime_quote_cache_stats_reports_memory_usage() -> None:
     manager = _CountingRealtimeManager()
 
@@ -351,6 +408,96 @@ def test_realtime_quote_cache_stats_reports_memory_usage() -> None:
     assert stats["quote_cache_memory_bytes"] > 0
     assert stats["total_memory_bytes"] >= stats["quote_cache_memory_bytes"]
     assert isinstance(stats["total_memory_mb"], float)
+
+
+def test_intraday_history_cache_only_reads_hot_table_without_remote_fetch() -> None:
+    DatabaseManager.reset_instance()
+    db = DatabaseManager(db_url="sqlite:///:memory:")
+    service = StockService()
+    service.repo = StockRepository(db)
+    snapshot_time = datetime.now().replace(hour=10, minute=31, second=0, microsecond=0)
+    db.save_intraday_quote_samples(
+        [
+            {
+                "stock_code": "600519",
+                "stock_name": "贵州茅台",
+                "current_price": 12.3,
+                "volume": 1000,
+                "amount": 12300,
+                "source": "snapshot",
+            }
+        ],
+        snapshot_id=snapshot_time.strftime("%Y%m%d%H%M%S"),
+        snapshot_time=snapshot_time,
+    )
+
+    with patch("data_provider.base.DataFetcherManager", side_effect=AssertionError("remote fetch forbidden")):
+        result = service.get_history_data("600519", period="1m", days=1, data_policy="cache_only")
+
+    assert result["data_source"] == "intraday_hot_table"
+    assert len(result["data"]) == 1
+    assert result["data"][0]["close"] == 12.3
+    assert result["data"][0]["data_source"] == "snapshot"
+    DatabaseManager.reset_instance()
+
+
+def test_intraday_history_cache_only_ignores_after_hours_quote_samples() -> None:
+    DatabaseManager.reset_instance()
+    db = DatabaseManager(db_url="sqlite:///:memory:")
+    service = StockService()
+    service.repo = StockRepository(db)
+    snapshot_time = datetime.now().replace(hour=15, minute=52, second=0, microsecond=0)
+    db.save_intraday_quote_samples(
+        [
+            {
+                "stock_code": "600519",
+                "current_price": 12.3,
+                "volume": 1000,
+                "amount": 12300,
+                "source": "snapshot",
+            }
+        ],
+        snapshot_id=snapshot_time.strftime("%Y%m%d%H%M%S"),
+        snapshot_time=snapshot_time,
+    )
+
+    with patch("data_provider.base.DataFetcherManager", side_effect=AssertionError("remote fetch forbidden")):
+        result = service.get_history_data("600519.SH", period="1m", days=1, data_policy="cache_only")
+
+    assert result["data_source"] == "intraday_hot_table_miss"
+    assert result["data"] == []
+    DatabaseManager.reset_instance()
+
+
+def test_intraday_history_default_backfills_hot_table_from_remote_without_daily_fallback() -> None:
+    DatabaseManager.reset_instance()
+    db = DatabaseManager(db_url="sqlite:///:memory:")
+    service = StockService()
+    service.repo = StockRepository(db)
+    manager = _IntradayBackfillManager()
+
+    with (
+        patch("data_provider.base.DataFetcherManager", return_value=manager),
+        patch.object(StockService, "_resolve_intraday_cache_target_date", return_value=date(2026, 5, 7)),
+        patch.object(service, "get_realtime_quote", return_value=None),
+    ):
+        result = service.get_history_data("600519.SH", period="1m", days=1, data_policy="default")
+
+    assert manager.intraday_calls == [{"stock_code": "600519.SH", "period": "1m", "days": 1}]
+    assert result["data_source"] == "intraday_hot_table"
+    assert len(result["data"]) == 2
+    assert result["data"][0]["date"] == "2026-05-07 09:30"
+    assert result["data"][0]["data_source"] == "EfinanceFetcher"
+
+    with (
+        patch("data_provider.base.DataFetcherManager", side_effect=AssertionError("remote fetch forbidden")),
+        patch.object(StockService, "_resolve_intraday_cache_target_date", return_value=date(2026, 5, 7)),
+    ):
+        cached = service.get_history_data("600519.SH", period="1m", days=1, data_policy="cache_only")
+
+    assert cached["data_source"] == "intraday_hot_table"
+    assert len(cached["data"]) == 2
+    DatabaseManager.reset_instance()
 
 
 def test_batch_realtime_quotes_fetches_only_missing_codes() -> None:
@@ -393,7 +540,7 @@ def test_warm_all_a_share_realtime_quotes_fills_missing_current_bucket() -> None
     assert second["fetched_count"] == 0
 
 
-def test_data_provider_realtime_cache_ttl_reads_config() -> None:
+def test_data_provider_realtime_cache_seconds_reads_config() -> None:
     from data_provider.akshare_fetcher import (
         _realtime_cache as akshare_cache,
         _refresh_realtime_cache_ttl as refresh_akshare_ttl,
@@ -403,7 +550,7 @@ def test_data_provider_realtime_cache_ttl_reads_config() -> None:
         _refresh_realtime_cache_ttl as refresh_efinance_ttl,
     )
 
-    with patch("src.config.get_config", return_value=SimpleNamespace(realtime_cache_ttl=17)):
+    with patch("src.config.get_config", return_value=SimpleNamespace(realtime_quote_cache_seconds=17, realtime_cache_ttl=99)):
         assert refresh_efinance_ttl(efinance_cache) == 17
         assert refresh_akshare_ttl(akshare_cache) == 17
 
@@ -536,9 +683,13 @@ def test_indicator_metrics_maps_chip_distribution_and_major_holders() -> None:
 
 def test_history_data_supports_intraday_period() -> None:
     manager = _FakeHistoryManager()
+    DatabaseManager.reset_instance()
+    db = DatabaseManager(db_url="sqlite:///:memory:")
+    service = StockService()
+    service.repo = StockRepository(db)
 
     with patch("data_provider.base.DataFetcherManager", return_value=manager):
-        result = StockService().get_history_data("600519", period="5m", days=1)
+        result = service.get_history_data("600519", period="5m", days=1)
 
     assert result["period"] == "5m"
     assert result["stock_name"] == "贵州茅台"
@@ -546,10 +697,15 @@ def test_history_data_supports_intraday_period() -> None:
     assert result["data"][0]["open"] == 1408.0
     assert result["data"][0]["turnover_rate"] == 0.38
     assert result["data"][1]["change_percent"] == -0.11
+    DatabaseManager.reset_instance()
 
 
 def test_history_data_anchors_cn_intraday_to_previous_session_when_market_closed() -> None:
     manager = _FakeHistoryManager()
+    DatabaseManager.reset_instance()
+    db = DatabaseManager(db_url="sqlite:///:memory:")
+    service = StockService()
+    service.repo = StockRepository(db)
 
     with (
         patch("data_provider.base.DataFetcherManager", return_value=manager),
@@ -558,14 +714,19 @@ def test_history_data_anchors_cn_intraday_to_previous_session_when_market_closed
         patch("src.services.stock_service.trading_calendar.is_market_open", return_value=False),
         patch("src.services.stock_service.trading_calendar.get_effective_trading_date", return_value=date(2026, 4, 30)),
     ):
-        result = StockService().get_history_data("600519", period="5m", days=1)
+        result = service.get_history_data("600519", period="5m", days=1)
 
     assert result["period"] == "5m"
     assert manager.last_intraday_kwargs["end_date"] == "2026-04-30"
+    DatabaseManager.reset_instance()
 
 
 def test_history_data_syncs_intraday_tail_with_realtime_quote() -> None:
     manager = _FakeRealtimeIntradayHistoryManager()
+    DatabaseManager.reset_instance()
+    db = DatabaseManager(db_url="sqlite:///:memory:")
+    service = StockService()
+    service.repo = StockRepository(db)
 
     with (
         patch("data_provider.base.DataFetcherManager", return_value=manager),
@@ -574,13 +735,14 @@ def test_history_data_syncs_intraday_tail_with_realtime_quote() -> None:
             return_value=date(2026, 4, 30),
         ),
     ):
-        result = StockService().get_history_data("600519", period="5m", days=1)
+        result = service.get_history_data("600519", period="5m", days=1)
 
     assert result["period"] == "5m"
     assert result["data"][-1]["date"] == "2026-04-30 09:40"
     assert result["data"][-1]["close"] == 1411.23
     assert result["data"][-1]["high"] == 1411.23
     assert result["data"][-1]["low"] == 1406.0
+    DatabaseManager.reset_instance()
 
 
 def test_history_endpoint_exposes_turnover_rate() -> None:
@@ -598,6 +760,9 @@ def test_history_endpoint_exposes_turnover_rate() -> None:
                 "amount": 123450000,
                 "change_percent": 0.98,
                 "turnover_rate": 0.86,
+                "data_source": float("nan"),
+                "snapshot_id": float("nan"),
+                "snapshot_time": float("nan"),
             }
         ],
     }
@@ -607,6 +772,9 @@ def test_history_endpoint_exposes_turnover_rate() -> None:
         response = get_stock_history("600519", period="daily", days=1)
 
     assert response.data[0].turnover_rate == 0.86
+    assert response.data[0].data_source is None
+    assert response.data[0].snapshot_id is None
+    assert response.data[0].snapshot_time is None
 
 
 def test_related_news_reads_recent_news_without_model_call() -> None:

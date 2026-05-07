@@ -257,7 +257,7 @@ describe('BacktestPage', () => {
     };
     vi.mocked(rulesApi.getMetrics).mockResolvedValue([
       { key: 'close', label: '收盘价', category: 'K线图', valueType: 'number', unit: '元', periods: ['daily'] },
-      { key: 'volume', label: '成交量', category: '成交量图', valueType: 'number', unit: '股', periods: ['daily'] },
+      { key: 'volume', label: '成交量', category: '成交量图', valueType: 'number', unit: '手', periods: ['daily'] },
       { key: 'chip_concentration_90', label: '90%筹码集中度', category: '筹码峰', valueType: 'number', unit: '%', periods: ['daily'] },
       { key: 'profit_ratio', label: '收盘获利', category: '筹码峰', valueType: 'number', unit: '%', periods: ['daily'] },
     ]);
@@ -377,6 +377,8 @@ describe('BacktestPage', () => {
     expect(screen.getByRole('columnheader', { name: '收盘获利 阈值' })).toBeInTheDocument();
     expect(screen.getByText('8.94%')).toBeInTheDocument();
     expect(screen.getByText('91.2%')).toBeInTheDocument();
+    expect(screen.getByText('12.35万')).toBeInTheDocument();
+    expect(screen.getByText('10万')).toBeInTheDocument();
     expect(screen.getAllByText(/成交量/).length).toBeGreaterThan(0);
   });
 
@@ -396,6 +398,7 @@ describe('BacktestPage', () => {
       expect(rulesApi.runBatch).toHaveBeenCalledWith({
         ruleIds: [7],
         mode: 'latest',
+        dataPolicy: 'snapshot_only',
         target: {
           scope: 'watchlist',
           stockCodes: ['300274.SZ', '688521.SH'],
@@ -632,7 +635,7 @@ describe('BacktestPage', () => {
     expect(await screen.findByRole('dialog', { name: '指标分析' })).toBeInTheDocument();
     expect(screen.getByText('命中日 2026-05-01')).toBeInTheDocument();
     expect(screen.getByTestId('indicator-hit-highlight-2026-05-01')).toBeInTheDocument();
-    expect(stocksApi.getHistory).toHaveBeenCalledWith('300274.SZ', expect.any(Number), 'daily');
+    expect(stocksApi.getHistory).toHaveBeenCalledWith('300274.SZ', expect.any(Number), 'daily', 'cache_only');
   });
 
   it('runs selected rule with the current stock target override', async () => {

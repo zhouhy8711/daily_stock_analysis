@@ -256,7 +256,10 @@ async def parse_import(request: Request) -> ExtractFromImageResponse:
     summary="批量获取股票实时行情",
     description="批量获取指定股票的最新价和涨跌幅等实时行情数据。单次最多 6000 只。",
 )
-def get_stock_quotes(payload: StockQuotesRequest) -> StockQuotesResponse:
+def get_stock_quotes(
+    payload: StockQuotesRequest,
+    data_policy: str = Query("default", description="数据策略: default/cache_only/snapshot_only"),
+) -> StockQuotesResponse:
     stock_codes = list(dict.fromkeys(code.strip() for code in payload.stock_codes if code and code.strip()))
     if not stock_codes:
         raise HTTPException(
@@ -274,7 +277,7 @@ def get_stock_quotes(payload: StockQuotesRequest) -> StockQuotesResponse:
 
     try:
         service = StockService()
-        result = service.get_realtime_quotes(stock_codes)
+        result = service.get_realtime_quotes(stock_codes, data_policy=data_policy)
         return StockQuotesResponse(
             items=[
                 StockQuote(
@@ -305,11 +308,17 @@ def get_stock_quotes(payload: StockQuotesRequest) -> StockQuotesResponse:
                     entrust_ratio=item.get("entrust_ratio"),
                     source=item.get("source"),
                     update_time=item.get("update_time"),
+                    snapshot_id=item.get("snapshot_id"),
+                    snapshot_time=item.get("snapshot_time"),
+                    quote_time=item.get("quote_time"),
                 )
                 for item in result.get("items", [])
             ],
             failed_codes=result.get("failed_codes", []),
             update_time=result.get("update_time"),
+            snapshot_id=result.get("snapshot_id"),
+            snapshot_time=result.get("snapshot_time"),
+            snapshot_age_seconds=result.get("snapshot_age_seconds"),
         )
     except HTTPException:
         raise
@@ -382,7 +391,10 @@ def get_stock_news(
     summary="获取股票实时行情",
     description="获取指定股票的最新行情数据"
 )
-def get_stock_quote(stock_code: str) -> StockQuote:
+def get_stock_quote(
+    stock_code: str,
+    data_policy: str = Query("default", description="数据策略: default/cache_only/snapshot_only"),
+) -> StockQuote:
     """
     获取股票实时行情
     
@@ -401,7 +413,7 @@ def get_stock_quote(stock_code: str) -> StockQuote:
         service = StockService()
         
         # 使用 def 而非 async def，FastAPI 自动在线程池中执行
-        result = service.get_realtime_quote(stock_code)
+        result = service.get_realtime_quote(stock_code, data_policy=data_policy)
         
         if result is None:
             raise HTTPException(
@@ -439,7 +451,10 @@ def get_stock_quote(stock_code: str) -> StockQuote:
             price_speed=result.get("price_speed"),
             entrust_ratio=result.get("entrust_ratio"),
             source=result.get("source"),
-            update_time=result.get("update_time")
+            update_time=result.get("update_time"),
+            snapshot_id=result.get("snapshot_id"),
+            snapshot_time=result.get("snapshot_time"),
+            quote_time=result.get("quote_time"),
         )
         
     except HTTPException:
@@ -501,7 +516,8 @@ def get_stock_indicator_metrics(stock_code: str) -> StockIndicatorMetricsRespons
 def get_stock_history(
     stock_code: str,
     period: str = Query("daily", description="K 线周期: daily/1m/5m/15m/30m/60m", pattern=KLINE_PERIOD_PATTERN),
-    days: int = Query(30, ge=1, le=365, description="获取天数")
+    days: int = Query(30, ge=1, le=365, description="获取天数"),
+    data_policy: str = Query("default", description="数据策略: default/cache_only/snapshot_only"),
 ) -> StockHistoryResponse:
     """
     获取股票历史行情
@@ -523,7 +539,8 @@ def get_stock_history(
         result = service.get_history_data(
             stock_code=stock_code,
             period=period,
-            days=days
+            days=days,
+            data_policy=data_policy,
         )
         
         # 转换为响应模型
@@ -544,6 +561,9 @@ def get_stock_history(
                 amount=item.get("amount"),
                 change_percent=item.get("change_percent"),
                 turnover_rate=item.get("turnover_rate"),
+                data_source=item.get("data_source"),
+                snapshot_id=item.get("snapshot_id"),
+                snapshot_time=item.get("snapshot_time"),
             )
             for item in result.get("data", [])
         ]
@@ -552,7 +572,11 @@ def get_stock_history(
             stock_code=stock_code,
             stock_name=result.get("stock_name"),
             period=result.get("period", period),
-            data=data
+            data=data,
+            data_source=result.get("data_source"),
+            snapshot_id=result.get("snapshot_id"),
+            snapshot_time=result.get("snapshot_time"),
+            snapshot_age_seconds=result.get("snapshot_age_seconds"),
         )
     
     except ValueError as e:

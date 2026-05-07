@@ -1634,9 +1634,9 @@ _FIELD_DEFINITIONS: Dict[str, Dict[str, Any]] = {
         "validation": {},
         "display_order": 12,
     },
-    "REALTIME_CACHE_TTL": {
-        "title": "Realtime Quote Cache TTL",
-        "description": "Short in-process realtime quote cache TTL in seconds. Set 0 to disable realtime quote cache hits.",
+    "REALTIME_QUOTE_CACHE_SECONDS": {
+        "title": "Realtime Quote Cache Seconds",
+        "description": "Short in-process realtime quote snapshot/cache reuse window in seconds. Set 0 to disable realtime quote cache hits.",
         "category": "system",
         "data_type": "integer",
         "ui_control": "number",

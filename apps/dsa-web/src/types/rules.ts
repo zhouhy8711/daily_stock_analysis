@@ -1,6 +1,7 @@
 export type RuleTargetScope = 'watchlist' | 'all_a_shares' | 'custom';
 export type RulePeriod = 'daily';
 export type RuleRunMode = 'latest' | 'history';
+export type RuleDataPolicy = 'default' | 'snapshot_only';
 export type RuleAggregateMethod = 'max' | 'min' | 'avg' | 'sum' | 'median' | 'std';
 export type RuleOperator =
   | '>'
@@ -128,10 +129,16 @@ export type RuleRunResponse = {
   durationMs: number;
   matches: RuleMatchItem[];
   errors: string[];
+  snapshotId?: string | null;
+  snapshotTime?: string | null;
+  snapshotAgeSeconds?: number | null;
+  quoteHitCount?: number;
+  quoteMissCount?: number;
 };
 
 export type RuleRunPayload = {
   mode?: RuleRunMode;
+  dataPolicy?: RuleDataPolicy;
   target?: {
     scope: RuleTargetScope;
     stockCodes: string[];

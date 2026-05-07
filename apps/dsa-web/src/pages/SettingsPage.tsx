@@ -502,7 +502,7 @@ const SettingsPage: React.FC = () => {
                     disabled={isSaving}
                     onChange={setDraftValue}
                     issues={issueByKey[item.key] || []}
-                    trailingContent={item.key === 'REALTIME_CACHE_TTL' ? realtimeCacheMemoryBadge : undefined}
+                    trailingContent={item.key === 'REALTIME_QUOTE_CACHE_SECONDS' ? realtimeCacheMemoryBadge : undefined}
                   />
                 ))}
               </SettingsSectionCard>

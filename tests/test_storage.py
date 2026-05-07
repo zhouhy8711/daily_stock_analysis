@@ -4,7 +4,7 @@ import sys
 import os
 import tempfile
 import threading
-from datetime import date
+from datetime import date, datetime
 from unittest.mock import patch
 
 import pandas as pd
@@ -97,6 +97,65 @@ class TestStorage(unittest.TestCase):
         )
 
         self.assertEqual({item["session_id"] for item in sessions}, {"feishu_u1", "feishu_u1:ask_600519"})
+
+        DatabaseManager.reset_instance()
+
+    def test_intraday_minute_hot_table_upserts_and_archives_to_daily(self):
+        DatabaseManager.reset_instance()
+        db = DatabaseManager(db_url="sqlite:///:memory:")
+        snapshot_time = datetime(2026, 5, 7, 10, 30, 12)
+
+        first = db.save_intraday_quote_samples(
+            [
+                {
+                    "stock_code": "600519",
+                    "current_price": 10.0,
+                    "volume": 1000,
+                    "amount": 10000,
+                    "turnover_rate": 0.5,
+                    "change_percent": 1.0,
+                    "source": "snapshot",
+                }
+            ],
+            snapshot_id="20260507103012",
+            snapshot_time=snapshot_time,
+        )
+        second = db.save_intraday_quote_samples(
+            [
+                {
+                    "stock_code": "600519",
+                    "current_price": 12.0,
+                    "volume": 1300,
+                    "amount": 15000,
+                    "turnover_rate": 0.8,
+                    "change_percent": 2.0,
+                    "source": "snapshot",
+                }
+            ],
+            snapshot_id="20260507103030",
+            snapshot_time=snapshot_time.replace(second=30),
+        )
+
+        minute_df = db.get_intraday_minute_data("600519", trade_date=snapshot_time.date())
+
+        self.assertEqual(first["saved_count"], 1)
+        self.assertEqual(second["saved_count"], 1)
+        self.assertEqual(len(minute_df), 1)
+        row = minute_df.iloc[0]
+        self.assertEqual(row["open"], 10.0)
+        self.assertEqual(row["high"], 12.0)
+        self.assertEqual(row["low"], 10.0)
+        self.assertEqual(row["close"], 12.0)
+        self.assertEqual(row["snapshot_id"], "20260507103030")
+
+        archived = db.archive_intraday_minutes_to_daily(trade_date=snapshot_time.date(), codes=["600519"])
+        daily_rows = db.get_latest_data("600519", days=1)
+
+        self.assertEqual(archived, 1)
+        self.assertEqual(len(daily_rows), 1)
+        self.assertEqual(daily_rows[0].open, 10.0)
+        self.assertEqual(daily_rows[0].close, 12.0)
+        self.assertEqual(daily_rows[0].data_source, "intraday_hot_table")
 
         DatabaseManager.reset_instance()
 

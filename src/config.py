@@ -716,7 +716,8 @@ class Config:
     # - efinance/akshare_em: 东财全量接口，数据最全但容易被封
     # - tushare: Tushare Pro，需要2000积分，数据全面（付费用户可优先使用）
     realtime_source_priority: str = "tencent,akshare_sina,efinance,akshare_em"
-    # 实时行情缓存时间（秒）
+    # 实时行情按需短缓存时间（秒）。REALTIME_CACHE_TTL 为旧环境变量别名。
+    realtime_quote_cache_seconds: int = 30
     realtime_cache_ttl: int = 30
     # 熔断器冷却时间（秒）
     circuit_breaker_cooldown: int = 300
@@ -1451,7 +1452,8 @@ class Config:
             # - efinance/akshare_em: 东财全量接口，数据最全但容易被封
             # - tushare: Tushare Pro，需要2000积分，数据全面
             realtime_source_priority=cls._resolve_realtime_source_priority(),
-            realtime_cache_ttl=parse_env_int(os.getenv('REALTIME_CACHE_TTL'), 30, field_name='REALTIME_CACHE_TTL', minimum=0),
+            realtime_quote_cache_seconds=cls._resolve_realtime_quote_cache_seconds(),
+            realtime_cache_ttl=cls._resolve_realtime_quote_cache_seconds(),
             circuit_breaker_cooldown=parse_env_int(os.getenv('CIRCUIT_BREAKER_COOLDOWN'), 300, field_name='CIRCUIT_BREAKER_COOLDOWN', minimum=0),
             enable_fundamental_pipeline=os.getenv('ENABLE_FUNDAMENTAL_PIPELINE', 'true').lower() == 'true',
             fundamental_stage_timeout_seconds=parse_env_float(
@@ -1974,6 +1976,16 @@ class Config:
             return resolved
 
         return default_priority
+
+    @staticmethod
+    def _resolve_realtime_quote_cache_seconds() -> int:
+        """Resolve realtime quote short-cache seconds with legacy env compatibility."""
+        value = os.getenv('REALTIME_QUOTE_CACHE_SECONDS')
+        field_name = 'REALTIME_QUOTE_CACHE_SECONDS'
+        if value is None:
+            value = os.getenv('REALTIME_CACHE_TTL')
+            field_name = 'REALTIME_CACHE_TTL'
+        return parse_env_int(value, 30, field_name=field_name, minimum=0)
 
     @classmethod
     def reset_instance(cls) -> None:

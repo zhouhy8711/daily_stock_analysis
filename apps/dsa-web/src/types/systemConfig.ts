@@ -191,5 +191,12 @@ export interface RealtimeCacheStatsResponse {
   providerCacheMemoryBytes: number;
   providerCacheMemoryMb: number;
   bucketStart?: number | null;
+  snapshotId?: string | null;
+  snapshotTime?: string | null;
+  snapshotAgeSeconds?: number | null;
+  quoteSnapshotItems?: number;
+  snapshotRequestedCount?: number;
+  snapshotHitCount?: number;
+  snapshotMissCount?: number;
   providerBreakdown: RealtimeCacheProviderStats[];
 }

@@ -103,7 +103,7 @@ USER_AGENTS = [
 ]
 
 
-# 缓存实时行情数据（避免重复请求），TTL 由 REALTIME_CACHE_TTL 控制
+# 缓存实时行情数据（避免重复请求），复用窗口由 REALTIME_QUOTE_CACHE_SECONDS 控制
 _realtime_cache: Dict[str, Any] = {
     'data': None,
     'timestamp': 0,
@@ -124,7 +124,15 @@ def _refresh_realtime_cache_ttl(cache: Dict[str, Any]) -> int:
     try:
         from src.config import get_config
 
-        ttl = int(getattr(get_config(), "realtime_cache_ttl", 30) or 0)
+        config = get_config()
+        ttl = int(
+            getattr(
+                config,
+                "realtime_quote_cache_seconds",
+                getattr(config, "realtime_cache_ttl", 30),
+            )
+            or 0
+        )
     except Exception:
         ttl = int(cache.get("ttl", 30) or 0)
     ttl = max(0, ttl)
@@ -736,7 +744,7 @@ class AkshareFetcher(BaseFetcher):
                 continue
 
             open_price = previous_price if previous_price is not None else close
-            volume = max(cumulative_volume - previous_volume, 0.0)
+            volume = max(cumulative_volume - previous_volume, 0.0) / 100
             amount = max(cumulative_amount - previous_amount, 0.0)
             high = max(open_price, close)
             low = min(open_price, close)
@@ -1454,8 +1462,9 @@ class AkshareFetcher(BaseFetcher):
                     if code not in requested_code_set:
                         continue
 
-                    volume_lot = safe_int(fields[6]) if len(fields) > 6 else None
+                    volume_shares = safe_int(fields[6]) if len(fields) > 6 else None
                     amount = safe_float(fields[37]) if len(fields) > 37 else None
+                    after_hours_volume_shares = safe_float(fields[59]) if len(fields) > 59 else None
                     after_hours_amount_wan = safe_float(fields[58]) if len(fields) > 58 else None
                     circ_mv = safe_float(fields[44]) if len(fields) > 44 else None
                     total_mv = safe_float(fields[45]) if len(fields) > 45 else None
@@ -1466,9 +1475,9 @@ class AkshareFetcher(BaseFetcher):
                         price=safe_float(fields[3]),
                         change_pct=safe_float(fields[32]) if len(fields) > 32 else None,
                         change_amount=safe_float(fields[31]) if len(fields) > 31 else None,
-                        volume=volume_lot * 100 if volume_lot is not None else None,
+                        volume=volume_shares / 100 if volume_shares is not None else None,
                         amount=amount * 10000 if amount is not None else None,
-                        after_hours_volume=safe_float(fields[59]) if len(fields) > 59 else None,
+                        after_hours_volume=after_hours_volume_shares / 100 if after_hours_volume_shares is not None else None,
                         after_hours_amount=after_hours_amount_wan * 10000 if after_hours_amount_wan is not None else None,
                         open_price=safe_float(fields[5]) if len(fields) > 5 else None,
                         high=safe_float(fields[33]) if len(fields) > 33 else None,
@@ -1710,9 +1719,11 @@ class AkshareFetcher(BaseFetcher):
             # 新浪数据字段顺序：
             # 0:名称 1:今开 2:昨收 3:最新价 4:最高 5:最低 6:买一价 7:卖一价
             # 8:成交量(股) 9:成交额(元) ... 30:日期 31:时间
-            # 使用 realtime_types.py 中的统一转换函数
+            # 使用 realtime_types.py 中的统一转换函数。统一 quote.volume 为「手」，
+            # 与东财 / 腾讯 / 本地日线 K 的 volume 口径保持一致。
             price = safe_float(fields[3])
             pre_close = safe_float(fields[2])
+            volume_shares = safe_int(fields[8])
             change_pct = None
             change_amount = None
             if price and pre_close and pre_close > 0:
@@ -1726,7 +1737,7 @@ class AkshareFetcher(BaseFetcher):
                 price=price,
                 change_pct=change_pct,
                 change_amount=change_amount,
-                volume=safe_int(fields[8]),  # 成交量（股）
+                volume=volume_shares / 100 if volume_shares is not None else None,
                 amount=safe_float(fields[9]),  # 成交额（元）
                 open_price=safe_float(fields[1]),
                 high=safe_float(fields[4]),
@@ -1858,13 +1869,16 @@ class AkshareFetcher(BaseFetcher):
             circuit_breaker.record_success(source_key)
             
             # 腾讯数据字段顺序（完整）：
-            # 1:名称 2:代码 3:最新价 4:昨收 5:今开 6:成交量(手) 7:外盘 8:内盘
+            # 1:名称 2:代码 3:最新价 4:昨收 5:今开 6:成交量(股) 7:外盘 8:内盘
             # 9-28:买卖五档 30:时间戳 31:涨跌额 32:涨跌幅(%) 33:最高 34:最低 35:收盘/成交量/成交额
-            # 36:成交量(手) 37:成交额(万) 38:换手率(%) 39:市盈率 43:振幅(%)
+            # 36:成交量(股) 37:成交额(万) 38:换手率(%) 39:市盈率 43:振幅(%)
             # 44:流通市值(亿) 45:总市值(亿) 46:市净率 47:涨停价 48:跌停价 49:量比
-            # 58:盘后定价成交额(万) 59:盘后定价成交量(手)
-            # 使用 realtime_types.py 中的统一转换函数
+            # 58:盘后定价成交额(万) 59:盘后定价成交量(股)
+            # 使用 realtime_types.py 中的统一转换函数。统一 quote.volume 为「手」，
+            # 与东财 / efinance / 本地日线 K 的 volume 口径保持一致。
+            volume_shares = safe_int(fields[6]) if len(fields) > 6 else None
             amount_wan = safe_float(fields[37]) if len(fields) > 37 else None
+            after_hours_volume_shares = safe_float(fields[59]) if len(fields) > 59 else None
             after_hours_amount_wan = safe_float(fields[58]) if len(fields) > 58 else None
             quote = UnifiedRealtimeQuote(
                 code=stock_code,
@@ -1873,9 +1887,9 @@ class AkshareFetcher(BaseFetcher):
                 price=safe_float(fields[3]),
                 change_pct=safe_float(fields[32]),
                 change_amount=safe_float(fields[31]) if len(fields) > 31 else None,
-                volume=safe_int(fields[6]) * 100 if fields[6] else None,  # 腾讯返回的是手，转为股
+                volume=volume_shares / 100 if volume_shares is not None else None,
                 amount=amount_wan * 10000 if amount_wan is not None else None,
-                after_hours_volume=safe_float(fields[59]) if len(fields) > 59 else None,
+                after_hours_volume=after_hours_volume_shares / 100 if after_hours_volume_shares is not None else None,
                 after_hours_amount=after_hours_amount_wan * 10000 if after_hours_amount_wan is not None else None,
                 open_price=safe_float(fields[5]),
                 high=safe_float(fields[33]) if len(fields) > 33 else None,  # 修正：字段 33 是最高价

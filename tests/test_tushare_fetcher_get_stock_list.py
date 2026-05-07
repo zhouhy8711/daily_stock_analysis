@@ -196,7 +196,7 @@ class TestTushareFetcherFetchRawData(unittest.TestCase):
 
 
 class TestTushareFetcherNormalizeData(unittest.TestCase):
-    """TushareFetcher._normalize_data: A-share vol/amount scaling vs HK passthrough."""
+    """TushareFetcher._normalize_data: A-share amount scaling vs volume lot passthrough."""
 
     @staticmethod
     def _make_fetcher() -> TushareFetcher:
@@ -221,10 +221,10 @@ class TestTushareFetcherNormalizeData(unittest.TestCase):
             }
         )
 
-    def test_normalize_data_a_share_multiplies_volume_and_amount(self) -> None:
+    def test_normalize_data_a_share_keeps_volume_lots_and_scales_amount(self) -> None:
         fetcher = self._make_fetcher()
         out = fetcher._normalize_data(self._sample_daily_frame(), "600519")
-        self.assertEqual(out.iloc[0]["volume"], 10000.0)
+        self.assertEqual(out.iloc[0]["volume"], 100.0)
         self.assertEqual(out.iloc[0]["amount"], 50000.0)
         self.assertEqual(out.iloc[0]["code"], "600519")
 
@@ -241,10 +241,10 @@ class TestTushareFetcherNormalizeData(unittest.TestCase):
         self.assertEqual(out.iloc[0]["volume"], 100.0)
         self.assertEqual(out.iloc[0]["amount"], 50.0)
 
-    def test_normalize_data_etf_scales_like_a_share(self) -> None:
+    def test_normalize_data_etf_keeps_volume_lots_and_scales_amount(self) -> None:
         fetcher = self._make_fetcher()
         out = fetcher._normalize_data(self._sample_daily_frame(), "510050")
-        self.assertEqual(out.iloc[0]["volume"], 10000.0)
+        self.assertEqual(out.iloc[0]["volume"], 100.0)
         self.assertEqual(out.iloc[0]["amount"], 50000.0)
 
 
@@ -274,4 +274,3 @@ class TestTushareFetcherChipDistribution(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

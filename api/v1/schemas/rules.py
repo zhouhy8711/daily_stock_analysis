@@ -70,6 +70,7 @@ class RuleRunRequest(BaseModel):
     target: Optional[RuleTarget] = Field(None, description="Optional runtime target override")
     start_date: Optional[date] = Field(None, description="Optional backtest start date")
     end_date: Optional[date] = Field(None, description="Optional backtest end date")
+    data_policy: str = Field("default", description="default/snapshot_only")
 
 
 class RuleBatchRunRequest(RuleRunRequest):
@@ -155,6 +156,11 @@ class RuleRunResponse(BaseModel):
     duration_ms: int = 0
     matches: List[RuleMatchItem] = Field(default_factory=list)
     errors: List[str] = Field(default_factory=list)
+    snapshot_id: Optional[str] = None
+    snapshot_time: Optional[str] = None
+    snapshot_age_seconds: Optional[int] = None
+    quote_hit_count: int = 0
+    quote_miss_count: int = 0
 
 
 class RuleRunMatchListResponse(BaseModel):

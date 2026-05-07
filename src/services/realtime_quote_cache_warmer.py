@@ -48,8 +48,16 @@ class RealtimeQuoteCacheWarmer:
             return False, "PREFETCH_REALTIME_QUOTES=false"
         if not getattr(config, "enable_realtime_quote", True):
             return False, "ENABLE_REALTIME_QUOTE=false"
-        if int(getattr(config, "realtime_cache_ttl", 30) or 0) <= 0:
-            return False, "REALTIME_CACHE_TTL=0"
+        quote_cache_seconds = int(
+            getattr(
+                config,
+                "realtime_quote_cache_seconds",
+                getattr(config, "realtime_cache_ttl", 30),
+            )
+            or 0
+        )
+        if quote_cache_seconds <= 0:
+            return False, "REALTIME_QUOTE_CACHE_SECONDS=0"
         return True, "enabled"
 
     def start(self, *, skip_pytest: bool = True) -> bool:
@@ -147,7 +155,7 @@ class RealtimeQuoteCacheWarmer:
             return
 
         while not self._stop_event.is_set():
-            self.run_once(reason="background")
+            self.run_once(force_refresh=True, reason="background")
             if self._stop_event.wait(self._interval_seconds):
                 return
 

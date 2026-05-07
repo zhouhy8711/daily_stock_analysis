@@ -28,6 +28,7 @@ import {
   type KLineData,
   type KLinePeriod,
   type MajorHolder,
+  type StockHistoryResponse,
   type StockIndicatorMetrics,
   type StockQuote,
 } from '../../api/stocks';
@@ -101,6 +102,9 @@ type HistoryState = {
   period: ChartPeriod;
   history: KLineData[];
   quote: StockQuote | null;
+  dataSource?: string | null;
+  snapshotId?: string | null;
+  snapshotTime?: string | null;
   metrics: StockIndicatorMetrics | null;
   metricsError: string | null;
   isLoading: boolean;
@@ -970,12 +974,62 @@ function getPeriodMeta(period: ChartPeriod) {
     supportLabel: isDaily ? '近20日支撑' : isTimeshare ? '日内支撑' : '近20根支撑',
     resistanceLabel: isDaily ? '近20日压力' : isTimeshare ? '日内压力' : '近20根压力',
     returnLabel: isDaily ? '5日 / 20日收益' : isTimeshare ? '日内波动' : '5根 / 20根收益',
-    description: isDaily
+  description: isDaily
       ? '当前展示基于历史日 K 计算的技术指标，可切换上方分钟周期查看分段 K 线。五档盘口和逐笔成交暂不在此图中展示。'
       : isTimeshare
         ? '当前展示最新交易日 09:30-15:00 的 1 分钟分时波动，自动过滤其他日期和盘前盘后分钟数据。'
       : '当前展示分钟 K 线数据，按所选周期分段展示 OHLC、成交量、成交额与均线；可拖动下方时间窗口回看返回区间内的更早分钟数据。五档盘口和逐笔成交暂不在此图中展示。',
   };
+}
+
+function getEmptyHistoryCopy(period: ChartPeriod, dataSource?: string | null): { title: string; description: string } {
+  if (period === 'timeshare') {
+    return {
+      title: '暂无分时数据',
+      description: dataSource === 'intraday_hot_table_miss'
+        ? '当天分钟热表暂无 09:30-15:00 的 1 分钟采样数据，等待后台预热写入后刷新。'
+        : '当前未拿到当天 09:30-15:00 的 1 分钟分时数据，等待后台缓存更新后刷新。',
+    };
+  }
+
+  if (period !== 'daily') {
+    return {
+      title: '暂无分钟 K 数据',
+      description: dataSource === 'intraday_hot_table_miss'
+        ? '分钟热表暂无当前周期数据，页面不会回退展示日 K，避免把多日曲线误认为分时。'
+        : '当前周期暂未返回分钟 K 数据，稍后刷新或切换其他周期查看。',
+    };
+  }
+
+  return {
+    title: '暂无 K 线数据',
+    description: '当前股票暂未返回历史行情，稍后刷新或更换股票再试。',
+  };
+}
+
+function shouldWarmIntradayHistory(period: ChartPeriod, response: StockHistoryResponse): boolean {
+  return period !== 'daily'
+    && response.data.length === 0
+    && response.dataSource === 'intraday_hot_table_miss';
+}
+
+function shouldWarmDailyHistory(period: ChartPeriod, response: StockHistoryResponse): boolean {
+  return period === 'daily'
+    && response.data.length === 0
+    && response.dataSource === 'daily_cache_miss';
+}
+
+async function getHistoryWithCacheWarm(
+  stockCode: string,
+  days: number,
+  requestPeriod: KLinePeriod,
+  chartPeriod: ChartPeriod,
+): Promise<StockHistoryResponse> {
+  const cached = await stocksApi.getHistory(stockCode, days, requestPeriod, 'cache_only');
+  if (!shouldWarmDailyHistory(chartPeriod, cached) && !shouldWarmIntradayHistory(chartPeriod, cached)) {
+    return cached;
+  }
+  return stocksApi.getHistory(stockCode, days, requestPeriod, 'default');
 }
 
 function getMarketKind(stockCode: string): 'cn' | 'hk' | 'us' {
@@ -1116,6 +1170,8 @@ function syncPointWithRealtimeQuote(
       amount: quote.amount ?? point.amount,
       changePercent,
       turnoverRate: quote.turnoverRate ?? point.turnoverRate,
+      snapshotId: quote.snapshotId ?? point.snapshotId,
+      snapshotTime: quote.snapshotTime ?? point.snapshotTime,
     };
   }
 
@@ -1125,6 +1181,8 @@ function syncPointWithRealtimeQuote(
     high: Math.max(point.high ?? price, open, price),
     low: Math.min(point.low ?? price, open, price),
     close: price,
+    snapshotId: quote.snapshotId ?? point.snapshotId,
+    snapshotTime: quote.snapshotTime ?? point.snapshotTime,
   };
 }
 
@@ -1572,12 +1630,13 @@ function inferVolumeShareMultiplier(points: ChartPoint[], quote: StockQuote | nu
     if (ratio >= 50 && ratio <= 150) {
       return 100;
     }
-    if (ratio >= 0.5 && ratio <= 1.5) {
+    if (ratio >= 0.005 && ratio <= 0.015) {
       return 1;
     }
   }
 
-  return undefined;
+  // KLineData.volume is normalized to lots; convert to shares before dividing by float shares.
+  return 100;
 }
 
 function resolvePointTurnoverRate(
@@ -2230,8 +2289,10 @@ function buildOrderFlowMetrics(
         tone: getMetricTone(value, (amount ?? 0) * 0.002),
       };
     }),
-    sourceLabel: quote?.source ? `实时行情 · ${quote.source}` : '价量估算',
-    updatedAt: quote?.updateTime,
+    sourceLabel: quote?.source
+      ? `缓存行情 · ${quote.source}${quote.snapshotTime ? ` · 快照 ${formatDateTime(quote.snapshotTime)}` : ''}`
+      : '价量估算',
+    updatedAt: quote?.quoteTime ?? quote?.snapshotTime ?? quote?.updateTime,
     netTotal,
   };
 }
@@ -2637,6 +2698,39 @@ const ChartMaximizeButton: React.FC<{
   </Tooltip>
 );
 
+const KLinePeriodTabs: React.FC<{
+  selectedPeriod: ChartPeriod;
+  onPeriodChange: (period: ChartPeriod) => void;
+}> = ({ selectedPeriod, onPeriodChange }) => (
+  <div
+    role="tablist"
+    aria-label="K线周期"
+    className="inline-flex h-8 min-w-max items-stretch border font-mono text-[10px] leading-none"
+    style={{ borderColor: TERMINAL_COLORS.redGrid }}
+  >
+    {KLINE_PERIOD_OPTIONS.map((option) => {
+      const selected = selectedPeriod === option.value;
+      return (
+        <button
+          key={option.value}
+          type="button"
+          role="tab"
+          aria-selected={selected}
+          onClick={() => onPeriodChange(option.value)}
+          className="inline-flex h-full items-center border-r px-3 last:border-r-0"
+          style={{
+            borderColor: TERMINAL_COLORS.redGrid,
+            backgroundColor: selected ? TERMINAL_COLORS.cyan : TERMINAL_COLORS.panel,
+            color: selected ? TERMINAL_COLORS.selectedText : TERMINAL_COLORS.muted,
+          }}
+        >
+          {option.label}
+        </button>
+      );
+    })}
+  </div>
+);
+
 const CandlestickChart: React.FC<{
   points: ChartPoint[];
   visible: ChartPoint[];
@@ -2757,6 +2851,8 @@ const CandlestickChart: React.FC<{
   const windowSliderProgress = canPan
     ? (safeWindowStart / windowSliderMax) * 100
     : 100;
+  const latestDataSource = visibleLast?.dataSource ?? points.at(-1)?.dataSource ?? null;
+  const latestSnapshotTime = quote?.snapshotTime ?? visibleLast?.snapshotTime ?? points.at(-1)?.snapshotTime ?? null;
 
   const shiftWindow = (direction: -1 | 1) => {
     onWindowStartChange(clamp(safeWindowStart + direction * visibleCount, 0, maxWindowStart));
@@ -2784,63 +2880,39 @@ const CandlestickChart: React.FC<{
       <div className="border-b px-2 py-1" style={{ borderColor: TERMINAL_COLORS.redGrid, backgroundColor: TERMINAL_COLORS.panel }}>
         <div className="grid items-start gap-2 lg:grid-cols-[max-content_minmax(20rem,34rem)] lg:justify-between">
           <div className="min-w-0">
-            <div
-              role="tablist"
-              aria-label="K线周期"
-              className="inline-flex h-8 min-w-max items-stretch border font-mono text-[10px] leading-none"
-              style={{ borderColor: TERMINAL_COLORS.redGrid }}
-            >
-              {KLINE_PERIOD_OPTIONS.map((option) => {
-                const selected = selectedPeriod === option.value;
-                return (
-                  <button
-                    key={option.value}
-                    type="button"
-                    role="tab"
-                    aria-selected={selected}
-                    onClick={() => onPeriodChange(option.value)}
-                    className="inline-flex h-full items-center border-r px-3 last:border-r-0"
-                    style={{
-                      borderColor: TERMINAL_COLORS.redGrid,
-                      backgroundColor: selected ? TERMINAL_COLORS.cyan : TERMINAL_COLORS.panel,
-                      color: selected ? TERMINAL_COLORS.selectedText : TERMINAL_COLORS.muted,
-                    }}
-                  >
-                    {option.label}
-                  </button>
-                );
-              })}
-            </div>
+            <KLinePeriodTabs selectedPeriod={selectedPeriod} onPeriodChange={onPeriodChange} />
           </div>
           <div
             data-testid="indicator-chart-time-axis"
             className="flex h-8 min-w-0 items-stretch justify-self-start border font-mono text-[10px] leading-none lg:justify-self-end"
             style={{ borderColor: TERMINAL_COLORS.redGrid, backgroundColor: TERMINAL_COLORS.bg }}
           >
-          <button
-            type="button"
-            data-testid="indicator-chart-pan-left"
-            aria-label="向左平移K线时间"
-            title="向左平移K线时间"
-            disabled={!canPan || safeWindowStart === 0}
-            onClick={() => shiftWindow(-1)}
-            className="inline-flex h-full w-8 shrink-0 items-center justify-center border-r transition-colors hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-40"
-            style={{ borderColor: TERMINAL_COLORS.redGrid, color: TERMINAL_COLORS.text, backgroundColor: TERMINAL_COLORS.panel2 }}
-          >
-            <ChevronLeft className="h-4 w-4" />
-          </button>
-          <button
-            type="button"
-            data-testid="indicator-chart-zoom-out"
-            aria-label="缩小选中K线日期"
-            title="缩小选中K线日期"
-            disabled={!canZoomOut}
-            onClick={() => onTimelineZoomChange(-1)}
-            className="inline-flex h-full w-8 shrink-0 items-center justify-center border-r transition-colors hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-40"
-            style={{ borderColor: TERMINAL_COLORS.redGrid, color: TERMINAL_COLORS.cyan, backgroundColor: TERMINAL_COLORS.panel2 }}
-          >
-            <Minus className="h-4 w-4" />
-          </button>
+          <Tooltip content="向左平移K线时间" side="bottom" className="h-full">
+            <button
+              type="button"
+              data-testid="indicator-chart-pan-left"
+              aria-label="向左平移K线时间"
+              disabled={!canPan || safeWindowStart === 0}
+              onClick={() => shiftWindow(-1)}
+              className="inline-flex h-full w-8 shrink-0 items-center justify-center border-r transition-colors hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-40"
+              style={{ borderColor: TERMINAL_COLORS.redGrid, color: TERMINAL_COLORS.text, backgroundColor: TERMINAL_COLORS.panel2 }}
+            >
+              <ChevronLeft className="h-4 w-4" />
+            </button>
+          </Tooltip>
+          <Tooltip content="缩小选中K线日期" side="bottom" className="h-full">
+            <button
+              type="button"
+              data-testid="indicator-chart-zoom-out"
+              aria-label="缩小选中K线日期"
+              disabled={!canZoomOut}
+              onClick={() => onTimelineZoomChange(-1)}
+              className="inline-flex h-full w-8 shrink-0 items-center justify-center border-r transition-colors hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-40"
+              style={{ borderColor: TERMINAL_COLORS.redGrid, color: TERMINAL_COLORS.cyan, backgroundColor: TERMINAL_COLORS.panel2 }}
+            >
+              <Minus className="h-4 w-4" />
+            </button>
+          </Tooltip>
           <div className="flex min-w-[11rem] flex-1 items-center gap-2 px-2 sm:min-w-[17rem]">
             <span className="hidden shrink-0 sm:inline" style={{ color: TERMINAL_COLORS.muted }}>时间窗口</span>
             <div className="relative h-4 min-w-[4rem] flex-1" data-testid="indicator-window-slider-shell">
@@ -2886,40 +2958,43 @@ const CandlestickChart: React.FC<{
                 {visibleFirst?.date ?? '--'} - {visibleLast?.date ?? '--'}
               </span>
           </div>
-          <button
-            type="button"
-            data-testid="indicator-chart-zoom-in"
-            aria-label="放大选中K线日期"
-            title="放大选中K线日期"
-            disabled={!canZoomIn}
-            onClick={() => onTimelineZoomChange(1)}
-            className="inline-flex h-full w-8 shrink-0 items-center justify-center border-l border-r transition-colors hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-40"
-            style={{ borderColor: TERMINAL_COLORS.redGrid, color: TERMINAL_COLORS.cyan, backgroundColor: TERMINAL_COLORS.panel2 }}
-          >
-            <Plus className="h-4 w-4" />
-          </button>
-          <button
-            type="button"
-            data-testid="indicator-chart-pan-right"
-            aria-label="向右平移K线时间"
-            title="向右平移K线时间"
-            disabled={!canPan || safeWindowStart === maxWindowStart}
-            onClick={() => shiftWindow(1)}
-            className="inline-flex h-full w-8 shrink-0 items-center justify-center border-r transition-colors hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-40"
-            style={{ borderColor: TERMINAL_COLORS.redGrid, color: TERMINAL_COLORS.text, backgroundColor: TERMINAL_COLORS.panel2 }}
-          >
-            <ChevronRight className="h-4 w-4" />
-          </button>
-          <button
-            type="button"
-            aria-label={isMaximized ? '还原K线图' : '最大化K线图'}
-            title={isMaximized ? '还原K线图' : '最大化K线图'}
-            onClick={onToggleMaximize}
-            className="inline-flex h-full w-8 shrink-0 items-center justify-center transition-colors hover:bg-white/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/45"
-            style={{ color: TERMINAL_COLORS.cyan, backgroundColor: TERMINAL_COLORS.panel2 }}
-          >
-            {isMaximized ? <Minimize2 className="h-4 w-4" /> : <Maximize2 className="h-4 w-4" />}
-          </button>
+          <Tooltip content="放大选中K线日期" side="bottom" className="h-full">
+            <button
+              type="button"
+              data-testid="indicator-chart-zoom-in"
+              aria-label="放大选中K线日期"
+              disabled={!canZoomIn}
+              onClick={() => onTimelineZoomChange(1)}
+              className="inline-flex h-full w-8 shrink-0 items-center justify-center border-l border-r transition-colors hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-40"
+              style={{ borderColor: TERMINAL_COLORS.redGrid, color: TERMINAL_COLORS.cyan, backgroundColor: TERMINAL_COLORS.panel2 }}
+            >
+              <Plus className="h-4 w-4" />
+            </button>
+          </Tooltip>
+          <Tooltip content="向右平移K线时间" side="bottom" className="h-full">
+            <button
+              type="button"
+              data-testid="indicator-chart-pan-right"
+              aria-label="向右平移K线时间"
+              disabled={!canPan || safeWindowStart === maxWindowStart}
+              onClick={() => shiftWindow(1)}
+              className="inline-flex h-full w-8 shrink-0 items-center justify-center border-r transition-colors hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-40"
+              style={{ borderColor: TERMINAL_COLORS.redGrid, color: TERMINAL_COLORS.text, backgroundColor: TERMINAL_COLORS.panel2 }}
+            >
+              <ChevronRight className="h-4 w-4" />
+            </button>
+          </Tooltip>
+          <Tooltip content={isMaximized ? '还原K线图' : '最大化K线图'} side="bottom" className="h-full">
+            <button
+              type="button"
+              aria-label={isMaximized ? '还原K线图' : '最大化K线图'}
+              onClick={onToggleMaximize}
+              className="inline-flex h-full w-8 shrink-0 items-center justify-center transition-colors hover:bg-white/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/45"
+              style={{ color: TERMINAL_COLORS.cyan, backgroundColor: TERMINAL_COLORS.panel2 }}
+            >
+              {isMaximized ? <Minimize2 className="h-4 w-4" /> : <Maximize2 className="h-4 w-4" />}
+            </button>
+          </Tooltip>
           </div>
         </div>
         <div className="mt-1.5 flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1">
@@ -2931,11 +3006,21 @@ const CandlestickChart: React.FC<{
             latestQuote={quote}
             metrics={metrics}
             points={points}
-            showRealtimeMetrics={activeIsLatest}
-            onAddRuleMetric={onAddRuleMetric}
-          />
+              showRealtimeMetrics={activeIsLatest}
+              onAddRuleMetric={onAddRuleMetric}
+            />
+            {latestDataSource ? (
+              <span className="font-mono text-[10px]" style={{ color: TERMINAL_COLORS.axisText }}>
+                K线源 {latestDataSource}
+              </span>
+            ) : null}
+            {latestSnapshotTime ? (
+              <span className="font-mono text-[10px]" style={{ color: TERMINAL_COLORS.axisText }}>
+                快照 {formatDateTime(latestSnapshotTime)}
+              </span>
+            ) : null}
+          </div>
         </div>
-      </div>
       <div className="relative overflow-hidden">
         <svg
           viewBox={`0 0 ${width} ${chartBottom}`}
@@ -3337,16 +3422,16 @@ const VolumeActivityChart: React.FC<{
         <div className="flex min-w-0 flex-wrap items-center gap-3">
           <span style={{ color: TERMINAL_COLORS.text }}>成交量相关指标</span>
           <span style={{ color: TERMINAL_COLORS.yellow }}>{activePoint?.date ?? '--'}</span>
-          <MetricInline metricKey={primaryMetricKey} label={primaryLabel} value={headerPrimaryValue} unit={isAmountMode ? '元' : '股'} date={activePoint?.date} color={TERMINAL_COLORS.axisText} onAdd={onAddRuleMetric}>
+          <MetricInline metricKey={primaryMetricKey} label={primaryLabel} value={headerPrimaryValue} unit={isAmountMode ? '元' : '手'} date={activePoint?.date} color={TERMINAL_COLORS.axisText} onAdd={onAddRuleMetric}>
             {headerPrimaryLabel}:{formatCompactNumber(headerPrimaryValue)}
           </MetricInline>
-          <MetricInline metricKey={afterHoursMetricKey} label={afterHoursLabel} value={headerAfterHoursValue} unit={isAmountMode ? '元' : '股'} date={activePoint?.date} color={TERMINAL_COLORS.axisText} onAdd={onAddRuleMetric}>
+          <MetricInline metricKey={afterHoursMetricKey} label={afterHoursLabel} value={headerAfterHoursValue} unit={isAmountMode ? '元' : '手'} date={activePoint?.date} color={TERMINAL_COLORS.axisText} onAdd={onAddRuleMetric}>
             盘后:{formatCompactNumber(headerAfterHoursValue)}
           </MetricInline>
-          <MetricInline metricKey={ma5MetricKey} label={ma5Label} value={headerMa5} unit={isAmountMode ? '元' : '股'} date={activePoint?.date} color={LINE_COLORS.ma10} onAdd={onAddRuleMetric}>
+          <MetricInline metricKey={ma5MetricKey} label={ma5Label} value={headerMa5} unit={isAmountMode ? '元' : '手'} date={activePoint?.date} color={LINE_COLORS.ma10} onAdd={onAddRuleMetric}>
             MA5:{formatCompactNumber(headerMa5)}
           </MetricInline>
-          <MetricInline metricKey={ma10MetricKey} label={ma10Label} value={headerMa10} unit={isAmountMode ? '元' : '股'} date={activePoint?.date} color={LINE_COLORS.ma5} onAdd={onAddRuleMetric}>
+          <MetricInline metricKey={ma10MetricKey} label={ma10Label} value={headerMa10} unit={isAmountMode ? '元' : '手'} date={activePoint?.date} color={LINE_COLORS.ma5} onAdd={onAddRuleMetric}>
             10:{formatCompactNumber(headerMa10)}
           </MetricInline>
           <MetricInline metricKey="turnover_rate" label="换手率" value={headerTurnoverRate} unit="%" date={activePoint?.date} color={TERMINAL_COLORS.axisText} onAdd={onAddRuleMetric}>
@@ -4234,17 +4319,18 @@ const RelatedNewsPanel: React.FC<{
         <div className="min-w-0">
           <h3 className="text-sm font-semibold" style={{ color: TERMINAL_COLORS.text }}>相关资讯</h3>
         </div>
-        <button
-          type="button"
-          aria-label="刷新相关资讯"
-          title="刷新相关资讯"
-          disabled={isLoading}
-          onClick={() => void loadNews(true)}
-          className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded border transition-colors hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/45"
-          style={{ borderColor: TERMINAL_COLORS.redGrid, color: TERMINAL_COLORS.cyan, backgroundColor: TERMINAL_COLORS.panel2 }}
-        >
-          <RefreshCw className={`h-3.5 w-3.5 ${isLoading ? 'animate-spin' : ''}`} />
-        </button>
+        <Tooltip content="刷新相关资讯" side="bottom">
+          <button
+            type="button"
+            aria-label="刷新相关资讯"
+            disabled={isLoading}
+            onClick={() => void loadNews(true)}
+            className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded border transition-colors hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/45"
+            style={{ borderColor: TERMINAL_COLORS.redGrid, color: TERMINAL_COLORS.cyan, backgroundColor: TERMINAL_COLORS.panel2 }}
+          >
+            <RefreshCw className={`h-3.5 w-3.5 ${isLoading ? 'animate-spin' : ''}`} />
+          </button>
+        </Tooltip>
       </div>
 
       <div className="min-h-0 flex-1 overflow-y-auto px-3 py-2">
@@ -4866,8 +4952,8 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
 
     const loadInitialData = async () => {
       const [historyResult, quoteResult, metricsResult] = await Promise.allSettled([
-        stocksApi.getHistory(stockCode, dailyHistoryDays, 'daily'),
-        stocksApi.getQuote(stockCode),
+        getHistoryWithCacheWarm(stockCode, dailyHistoryDays, 'daily', 'daily'),
+        stocksApi.getQuote(stockCode, 'cache_only'),
         stocksApi.getIndicatorMetrics(stockCode),
       ]);
 
@@ -4890,6 +4976,9 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
       const dailyState = createHistoryState(stockCode, 'daily', {
         history: dailyHistory,
         quote: quoteResponse,
+        dataSource: historyResponse?.dataSource ?? null,
+        snapshotId: historyResponse?.snapshotId ?? quoteResponse?.snapshotId ?? null,
+        snapshotTime: historyResponse?.snapshotTime ?? quoteResponse?.snapshotTime ?? null,
         metrics: metricsResponse,
         metricsError,
         isLoading: false,
@@ -4923,23 +5012,22 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
 
   const selectedCachedState = historyCache[selectedPeriod];
   const dailyCachedState = historyCache.daily;
-  const displayState = selectedCachedState?.stockCode === stockCode && (selectedCachedState.history.length > 0 || selectedCachedState.isLoading)
-    ? selectedCachedState
-    : dailyCachedState?.stockCode === stockCode && dailyCachedState.history.length > 0
+  const displayState = selectedPeriod === 'daily'
+    ? dailyCachedState?.stockCode === stockCode
       ? dailyCachedState
-      : selectedCachedState?.stockCode === stockCode
-        ? selectedCachedState
-        : dailyCachedState?.stockCode === stockCode
-          ? dailyCachedState
-          : Object.values(historyCache).find((state) => state?.stockCode === stockCode);
+      : undefined
+    : selectedCachedState?.stockCode === stockCode
+      ? selectedCachedState
+      : undefined;
   const effectivePeriod = displayState?.period ?? selectedPeriod;
   const periodMeta = getPeriodMeta(effectivePeriod);
   const isLoading = !displayState || (displayState.isLoading && displayState.history.length === 0);
-  const error = displayState?.period === selectedPeriod ? displayState.error : null;
+  const error = displayState?.error ?? null;
   const history = displayState?.history ?? EMPTY_HISTORY;
   const quote = displayState?.quote ?? dailyCachedState?.quote ?? null;
   const metrics = displayState?.metrics ?? dailyCachedState?.metrics ?? null;
   const metricsError = displayState?.metricsError ?? dailyCachedState?.metricsError ?? null;
+  const emptyHistoryCopy = getEmptyHistoryCopy(effectivePeriod, displayState?.dataSource);
 
   useEffect(() => {
     if (selectedPeriod === 'daily' || !selectedCachedState) {
@@ -4954,7 +5042,7 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
 
     let ignore = false;
     const selectedMeta = getPeriodMeta(selectedPeriod);
-    stocksApi.getHistory(stockCode, selectedMeta.days, selectedMeta.requestPeriod)
+    getHistoryWithCacheWarm(stockCode, selectedMeta.days, selectedMeta.requestPeriod, selectedPeriod)
       .then((periodResponse) => {
         if (ignore) {
           return;
@@ -4977,6 +5065,9 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
             [selectedPeriod]: {
               ...currentState,
               quote: stateQuote,
+              dataSource: periodResponse.dataSource ?? currentState.dataSource ?? null,
+              snapshotId: periodResponse.snapshotId ?? currentState.snapshotId ?? stateQuote?.snapshotId ?? null,
+              snapshotTime: periodResponse.snapshotTime ?? currentState.snapshotTime ?? stateQuote?.snapshotTime ?? null,
               history: syncHistoryWithRealtimeQuote(normalizedHistory, selectedPeriod, stateQuote),
               isLoading: false,
               error: null,
@@ -5010,7 +5101,12 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
   }, [marketKind, selectedCachedState, selectedPeriod, stockCode]);
 
   useEffect(() => {
-    if ((selectedPeriod !== '1m' && selectedPeriod !== 'timeshare') || !selectedCachedState || selectedCachedState.isLoading) {
+    if (
+      (selectedPeriod !== '1m' && selectedPeriod !== 'timeshare')
+      || !selectedCachedState
+      || selectedCachedState.isLoading
+      || selectedCachedState.history.length === 0
+    ) {
       return undefined;
     }
 
@@ -5025,8 +5121,8 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
       oneMinuteRefreshInFlightRef.current = true;
       try {
         const [historyResult, quoteResult] = await Promise.allSettled([
-          stocksApi.getHistory(stockCode, oneMinuteMeta.days, oneMinuteMeta.requestPeriod),
-          stocksApi.getQuote(stockCode),
+          getHistoryWithCacheWarm(stockCode, oneMinuteMeta.days, oneMinuteMeta.requestPeriod, selectedPeriod),
+          stocksApi.getQuote(stockCode, 'cache_only'),
         ]);
 
         if (ignore) {
@@ -5059,6 +5155,15 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
               ...currentState,
               history: nextHistory,
               quote: nextQuote,
+              dataSource: historyResult.status === 'fulfilled'
+                ? historyResult.value.dataSource ?? currentState.dataSource ?? null
+                : currentState.dataSource ?? null,
+              snapshotId: historyResult.status === 'fulfilled'
+                ? historyResult.value.snapshotId ?? nextQuote?.snapshotId ?? currentState.snapshotId ?? null
+                : nextQuote?.snapshotId ?? currentState.snapshotId ?? null,
+              snapshotTime: historyResult.status === 'fulfilled'
+                ? historyResult.value.snapshotTime ?? nextQuote?.snapshotTime ?? currentState.snapshotTime ?? null
+                : nextQuote?.snapshotTime ?? currentState.snapshotTime ?? null,
               error: nextHistory.length > 0 ? null : historyError,
             },
           }, stockCode, nextQuote);
@@ -5087,7 +5192,7 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
     let ignore = false;
     const refreshQuote = async () => {
       try {
-        const nextQuote = await stocksApi.getQuote(stockCode);
+        const nextQuote = await stocksApi.getQuote(stockCode, 'cache_only');
         if (ignore) {
           return;
         }
@@ -5373,14 +5478,20 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
           {isLoading ? (
             <DashboardStateBlock loading title="加载指标数据中..." className="min-h-[24rem]" />
           ) : error ? (
-            <InlineAlert variant="danger" title="指标数据加载失败" message={error} />
+            <div className="grid gap-3">
+              <KLinePeriodTabs selectedPeriod={selectedPeriod} onPeriodChange={handlePeriodChange} />
+              <InlineAlert variant="danger" title="指标数据加载失败" message={error} />
+            </div>
           ) : points.length === 0 ? (
-            <EmptyState
-              title="暂无 K 线数据"
-              description="当前股票暂未返回历史行情，稍后刷新或更换股票再试。"
-              className="min-h-[24rem]"
-              icon={<BarChart3 className="h-5 w-5" />}
-            />
+            <div className="grid gap-3">
+              <KLinePeriodTabs selectedPeriod={selectedPeriod} onPeriodChange={handlePeriodChange} />
+              <EmptyState
+                title={emptyHistoryCopy.title}
+                description={emptyHistoryCopy.description}
+                className="min-h-[24rem]"
+                icon={<BarChart3 className="h-5 w-5" />}
+              />
+            </div>
           ) : (
             <div className="flex h-full min-h-0 flex-col gap-3">
               <section className="grid min-h-0 flex-1 gap-3 xl:grid-cols-[minmax(0,1fr)_20rem] xl:items-start">

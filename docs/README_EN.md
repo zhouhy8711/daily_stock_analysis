@@ -236,7 +236,7 @@ GEMINI_API_KEY=your_gemini_api_key_here
 
 # Stock Watchlist (Mixed markets supported)
 STOCK_LIST=600519,AAPL,hk00700
-REALTIME_CACHE_TTL=30
+REALTIME_QUOTE_CACHE_SECONDS=30
 
 # Notification Channel (Choose at least one)
 TELEGRAM_BOT_TOKEN=your_bot_token

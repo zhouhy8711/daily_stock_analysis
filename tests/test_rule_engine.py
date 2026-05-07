@@ -196,6 +196,8 @@ def test_metric_registry_groups_indicator_page_metrics_by_chart_area():
     assert registry["prev_20d_return_pct"]["category"] == "额外"
     assert registry["limit_up_price"]["category"] == "K线图"
     assert registry["volume_ma5"]["category"] == "成交量图"
+    assert registry["volume"]["unit"] == "手"
+    assert registry["volume_ma5"]["unit"] == "手"
     assert registry["after_hours_amount"]["category"] == "成交量图"
     assert registry["macd_dif"]["category"] == "MACD图"
     assert registry["rsi24"]["category"] == "RSI图"

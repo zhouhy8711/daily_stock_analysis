@@ -902,6 +902,21 @@ def main() -> int:
                 run_full_analysis(runtime_config, args, scheduled_stock_codes)
 
             background_tasks = []
+            from src.services.intraday_daily_archive_service import (
+                DEFAULT_INTRADAY_ARCHIVE_INTERVAL_SECONDS,
+                run_intraday_daily_archive_once,
+            )
+
+            def intraday_daily_archive_task():
+                run_intraday_daily_archive_once(reason="schedule_background")
+
+            background_tasks.append({
+                "task": intraday_daily_archive_task,
+                "interval_seconds": DEFAULT_INTRADAY_ARCHIVE_INTERVAL_SECONDS,
+                "run_immediately": True,
+                "name": "intraday_daily_archive",
+            })
+
             if getattr(config, 'agent_event_monitor_enabled', False):
                 from src.agent.events import build_event_monitor_from_config, run_event_monitor_once
 

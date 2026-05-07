@@ -131,7 +131,7 @@ USER_AGENTS = [
 ]
 
 
-# 缓存实时行情数据（避免重复请求），TTL 由 REALTIME_CACHE_TTL 控制
+# 缓存实时行情数据（避免重复请求），复用窗口由 REALTIME_QUOTE_CACHE_SECONDS 控制
 _realtime_cache: Dict[str, Any] = {
     'data': None,
     'timestamp': 0,
@@ -152,7 +152,15 @@ def _refresh_realtime_cache_ttl(cache: Dict[str, Any]) -> int:
     try:
         from src.config import get_config
 
-        ttl = int(getattr(get_config(), "realtime_cache_ttl", 30) or 0)
+        config = get_config()
+        ttl = int(
+            getattr(
+                config,
+                "realtime_quote_cache_seconds",
+                getattr(config, "realtime_cache_ttl", 30),
+            )
+            or 0
+        )
     except Exception:
         ttl = int(cache.get("ttl", 30) or 0)
     ttl = max(0, ttl)

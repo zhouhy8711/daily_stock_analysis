@@ -520,7 +520,7 @@ class TushareFetcher(BaseFetcher):
         date, open, high, low, close, volume, amount, pct_chg
 
         单位缩放仅适用于 A 股（及 ETF 等使用同一套单位的接口）：
-        - vol 按「手」计，乘以 100 转为「股」
+        - vol 按「手」计，保持为「手」，与 efinance / 腾讯 quote / 指标图统一
         - amount 按「千元」计，乘以 1000 转为「元」
 
         港股 hk_daily 返回的 vol / amount 已是可直接使用的量级，不做上述缩放。
@@ -541,10 +541,8 @@ class TushareFetcher(BaseFetcher):
         if 'date' in df.columns:
             df['date'] = pd.to_datetime(df['date'], format='%Y%m%d')
         
-        # 成交量 / 成交额：仅 A 股类接口做单位换算（港股 hk_daily 不换算）
-        if 'volume' in df.columns and not is_hk:
-            df['volume'] = df['volume'] * 100
-        
+        # 成交额：仅 A 股类接口做单位换算（港股 hk_daily 不换算）。
+        # 成交量保留 Tushare 返回的「手」口径。
         if 'amount' in df.columns and not is_hk:
             df['amount'] = df['amount'] * 1000
         

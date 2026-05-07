@@ -11,7 +11,9 @@
 
 from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel, Field
+import math
+
+from pydantic import BaseModel, Field, field_validator
 
 
 class StockQuote(BaseModel):
@@ -26,7 +28,7 @@ class StockQuote(BaseModel):
     high: Optional[float] = Field(None, description="最高价")
     low: Optional[float] = Field(None, description="最低价")
     prev_close: Optional[float] = Field(None, description="昨收价")
-    volume: Optional[float] = Field(None, description="成交量（股）")
+    volume: Optional[float] = Field(None, description="成交量（手）")
     amount: Optional[float] = Field(None, description="成交额（元）")
     after_hours_volume: Optional[float] = Field(None, description="盘后定价成交量（手）")
     after_hours_amount: Optional[float] = Field(None, description="盘后定价成交额（元）")
@@ -44,6 +46,9 @@ class StockQuote(BaseModel):
     entrust_ratio: Optional[float] = Field(None, description="委比 (%)")
     source: Optional[str] = Field(None, description="行情数据源")
     update_time: Optional[str] = Field(None, description="更新时间")
+    snapshot_id: Optional[str] = Field(None, description="实时行情预热快照 ID")
+    snapshot_time: Optional[str] = Field(None, description="实时行情预热快照时间")
+    quote_time: Optional[str] = Field(None, description="行情数据自身时间")
     
     class Config:
         json_schema_extra = {
@@ -91,6 +96,9 @@ class StockQuotesResponse(BaseModel):
     items: List[StockQuote] = Field(default_factory=list, description="成功获取的行情列表")
     failed_codes: List[str] = Field(default_factory=list, description="未获取到行情的股票代码")
     update_time: Optional[str] = Field(None, description="接口响应时间")
+    snapshot_id: Optional[str] = Field(None, description="实时行情预热快照 ID")
+    snapshot_time: Optional[str] = Field(None, description="实时行情预热快照时间")
+    snapshot_age_seconds: Optional[int] = Field(None, description="快照年龄（秒）")
 
 
 class KLineData(BaseModel):
@@ -101,11 +109,28 @@ class KLineData(BaseModel):
     high: float = Field(..., description="最高价")
     low: float = Field(..., description="最低价")
     close: float = Field(..., description="收盘价")
-    volume: Optional[float] = Field(None, description="成交量")
-    after_hours_volume: Optional[float] = Field(None, description="盘后成交量")
+    volume: Optional[float] = Field(None, description="成交量（手）")
+    after_hours_volume: Optional[float] = Field(None, description="盘后成交量（手）")
     amount: Optional[float] = Field(None, description="成交额")
     change_percent: Optional[float] = Field(None, description="涨跌幅 (%)")
     turnover_rate: Optional[float] = Field(None, description="换手率 (%)")
+    data_source: Optional[str] = Field(None, description="K 线点位数据来源")
+    snapshot_id: Optional[str] = Field(None, description="实时行情预热快照 ID")
+    snapshot_time: Optional[str] = Field(None, description="实时行情预热快照时间")
+
+    @field_validator("data_source", "snapshot_id", "snapshot_time", mode="before")
+    @classmethod
+    def normalize_optional_string(cls, value):
+        if value is None:
+            return None
+        if isinstance(value, float) and math.isnan(value):
+            return None
+        if hasattr(value, "isoformat"):
+            value = value.isoformat()
+        text = str(value).strip()
+        if not text or text.lower() in {"nan", "nat", "none", "null"}:
+            return None
+        return text
     
     class Config:
         json_schema_extra = {
@@ -119,7 +144,8 @@ class KLineData(BaseModel):
                 "after_hours_volume": 10400,
                 "amount": 18000000000,
                 "change_percent": 0.84,
-                "turnover_rate": 0.8
+                "turnover_rate": 0.8,
+                "data_source": "intraday_hot_table"
             }
         }
 
@@ -147,6 +173,10 @@ class StockHistoryResponse(BaseModel):
     stock_name: Optional[str] = Field(None, description="股票名称")
     period: str = Field(..., description="K 线周期: daily/1m/5m/15m/30m/60m")
     data: List[KLineData] = Field(default_factory=list, description="K 线数据列表")
+    data_source: Optional[str] = Field(None, description="K 线数据来源")
+    snapshot_id: Optional[str] = Field(None, description="实时行情预热快照 ID")
+    snapshot_time: Optional[str] = Field(None, description="实时行情预热快照时间")
+    snapshot_age_seconds: Optional[int] = Field(None, description="快照年龄（秒）")
     
     class Config:
         json_schema_extra = {

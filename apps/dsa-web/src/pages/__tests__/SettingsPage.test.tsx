@@ -203,12 +203,12 @@ function buildSystemConfigState(overrides: ConfigOverride = {}) {
           },
         },
         {
-          key: 'REALTIME_CACHE_TTL',
+          key: 'REALTIME_QUOTE_CACHE_SECONDS',
           value: '30',
           rawValueExists: true,
           isMasked: false,
           schema: {
-            key: 'REALTIME_CACHE_TTL',
+            key: 'REALTIME_QUOTE_CACHE_SECONDS',
             category: 'system',
             dataType: 'integer',
             uiControl: 'number',
@@ -365,10 +365,10 @@ describe('SettingsPage', () => {
     expect(load).toHaveBeenCalled();
   });
 
-  it('shows realtime cache memory next to the cache ttl setting', async () => {
+  it('shows realtime cache memory next to the quote cache seconds setting', async () => {
     render(<SettingsPage />);
 
-    expect(await screen.findByText('REALTIME_CACHE_TTL')).toBeInTheDocument();
+    expect(await screen.findByText('REALTIME_QUOTE_CACHE_SECONDS')).toBeInTheDocument();
     await waitFor(() => expect(getRealtimeCacheStats).toHaveBeenCalledTimes(1));
     expect(screen.getByLabelText('实时行情缓存内存')).toHaveTextContent('缓存内存');
     expect(screen.getByLabelText('实时行情缓存内存')).toHaveTextContent('1.25 MB');

@@ -340,7 +340,111 @@ class TestFetcherLogging(unittest.TestCase):
         self.assertEqual(df.iloc[-1]["date"].strftime("%Y-%m-%d %H:%M"), "2026-04-30 09:35")
         self.assertAlmostEqual(df.iloc[-1]["open"], 138.47)
         self.assertAlmostEqual(df.iloc[-1]["close"], 138.84)
-        self.assertAlmostEqual(df.iloc[-1]["volume"], 78417)
+        self.assertAlmostEqual(df.iloc[-1]["volume"], 784.17)
+
+    def test_akshare_tencent_realtime_volume_converts_shares_to_lots(self):
+        fetcher = AkshareFetcher()
+        fields = [""] * 60
+        fields[1] = "源杰科技"
+        fields[2] = "688498"
+        fields[3] = "1629.00"
+        fields[4] = "1531.01"
+        fields[5] = "1538.00"
+        fields[6] = "3879984"
+        fields[31] = "97.99"
+        fields[32] = "6.40"
+        fields[33] = "1638.00"
+        fields[34] = "1475.00"
+        fields[37] = "604699"
+        fields[38] = "4.57"
+        fields[43] = "10.65"
+        fields[44] = "1382.02"
+        fields[45] = "1400.09"
+        fields[47] = "1837.21"
+        fields[48] = "1224.81"
+        fields[49] = "1.05"
+        fields[58] = "0"
+        fields[59] = "0"
+
+        class FakeResponse:
+            status_code = 200
+            text = f'v_sh688498="{ "~".join(fields) }";'
+
+        with patch.object(fetcher, "_enforce_rate_limit", return_value=None), patch(
+            "data_provider.akshare_fetcher.requests.get",
+            return_value=FakeResponse(),
+        ):
+            quote = fetcher.get_realtime_quote("688498", source="tencent")
+
+        self.assertIsNotNone(quote)
+        self.assertAlmostEqual(quote.volume, 38799.84)
+        self.assertAlmostEqual(quote.amount, 6_046_990_000.0)
+
+    def test_akshare_tencent_batch_realtime_volume_converts_shares_to_lots(self):
+        fetcher = AkshareFetcher()
+        fields = [""] * 60
+        fields[1] = "源杰科技"
+        fields[2] = "688498"
+        fields[3] = "1629.00"
+        fields[4] = "1531.01"
+        fields[5] = "1538.00"
+        fields[6] = "3879984"
+        fields[31] = "97.99"
+        fields[32] = "6.40"
+        fields[33] = "1638.00"
+        fields[34] = "1475.00"
+        fields[37] = "604699"
+        fields[38] = "4.57"
+        fields[43] = "10.65"
+        fields[44] = "1382.02"
+        fields[45] = "1400.09"
+        fields[47] = "1837.21"
+        fields[48] = "1224.81"
+        fields[49] = "1.05"
+        fields[58] = "0"
+        fields[59] = "0"
+
+        class FakeResponse:
+            encoding = "gbk"
+            text = f'v_sh688498="{ "~".join(fields) }";'
+
+            def raise_for_status(self):
+                return None
+
+        with patch("data_provider.akshare_fetcher.requests.get", return_value=FakeResponse()):
+            quotes = fetcher.get_realtime_quotes(["688498"])
+
+        self.assertIn("688498", quotes)
+        self.assertAlmostEqual(quotes["688498"].volume, 38799.84)
+        self.assertAlmostEqual(quotes["688498"].amount, 6_046_990_000.0)
+
+    def test_akshare_sina_realtime_volume_converts_shares_to_lots(self):
+        fetcher = AkshareFetcher()
+        fields = [""] * 32
+        fields[0] = "源杰科技"
+        fields[1] = "1538.00"
+        fields[2] = "1531.01"
+        fields[3] = "1629.00"
+        fields[4] = "1638.00"
+        fields[5] = "1475.00"
+        fields[8] = "3880000"
+        fields[9] = "6046990000"
+        fields[30] = "2026-05-07"
+        fields[31] = "15:00:00"
+
+        class FakeResponse:
+            status_code = 200
+            text = f'var hq_str_sh688498="{ ",".join(fields) }";'
+
+        with patch.object(fetcher, "_enforce_rate_limit", return_value=None), patch(
+            "data_provider.akshare_fetcher.requests.get",
+            return_value=FakeResponse(),
+        ):
+            quote = fetcher.get_realtime_quote("688498", source="sina")
+
+        self.assertIsNotNone(quote)
+        self.assertEqual(quote.volume, 38800)
+        self.assertAlmostEqual(quote.amount, 6_046_990_000.0)
 
     def test_akshare_us_intraday_uses_nasdaq_chart_fallback(self):
         fetcher = AkshareFetcher()

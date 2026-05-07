@@ -219,4 +219,11 @@ class RealtimeCacheStatsResponse(BaseModel):
     provider_cache_memory_bytes: int
     provider_cache_memory_mb: float
     bucket_start: Optional[int] = None
+    snapshot_id: Optional[str] = None
+    snapshot_time: Optional[str] = None
+    snapshot_age_seconds: Optional[float] = None
+    quote_snapshot_items: int = 0
+    snapshot_requested_count: int = 0
+    snapshot_hit_count: int = 0
+    snapshot_miss_count: int = 0
     provider_breakdown: List[RealtimeCacheProviderStats] = Field(default_factory=list)

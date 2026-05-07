@@ -1810,15 +1810,15 @@ class GeminiAnalyzer:
         return prompt
     
     def _format_volume(self, volume: Optional[float]) -> str:
-        """格式化成交量显示"""
+        """格式化成交量显示，统一使用“手”口径。"""
         if volume is None:
             return 'N/A'
         if volume >= 1e8:
-            return f"{volume / 1e8:.2f} 亿股"
+            return f"{volume / 1e8:.2f} 亿手"
         elif volume >= 1e4:
-            return f"{volume / 1e4:.2f} 万股"
+            return f"{volume / 1e4:.2f} 万手"
         else:
-            return f"{volume:.0f} 股"
+            return f"{volume:.0f} 手"
     
     def _format_amount(self, amount: Optional[float]) -> str:
         """格式化成交额显示"""

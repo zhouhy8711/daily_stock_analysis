@@ -39,6 +39,7 @@ const TEXTAREA_CLASS =
   'input-surface input-focus-glow min-h-[112px] w-full resize-y rounded-xl border bg-transparent px-3 py-2 text-sm text-foreground transition-all placeholder:text-muted-text focus:outline-none disabled:cursor-not-allowed disabled:opacity-60';
 const WATCHLIST_HISTORY_LIMIT = 20;
 const LIVE_TEST_POLL_INTERVAL_MS = 30_000;
+const LIVE_TEST_MAX_CONCURRENT_CYCLES = 2;
 const UNCLASSIFIED_INDUSTRY = UNCLASSIFIED_INDUSTRY_LABEL;
 const DEFAULT_INDUSTRY = '半导体';
 
@@ -116,6 +117,13 @@ type ExecutionLogEntry = {
   time: string;
   level: LogLevel;
   message: string;
+};
+
+type LiveTestCycleRequest = {
+  sessionId: number;
+  cycleIndex: number;
+  runStartedAt: string;
+  runRuleNames: string[];
 };
 
 type IndicatorAnalysisSelection = {
@@ -625,7 +633,7 @@ function formatMetricValue(value: unknown, column: ResultValueColumn, metrics: R
   if (unit === '%') {
     return formatPercentMetric(value);
   }
-  if (unit === '股') {
+  if (unit === '股' || unit === '手') {
     return formatCompactVolume(value);
   }
   return formatNumber(value);
@@ -1107,7 +1115,10 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
   const runHeartbeatRef = useRef<number | null>(null);
   const liveTestIntervalRef = useRef<number | null>(null);
   const liveTestSessionRef = useRef<number | null>(null);
-  const liveTestCycleInFlightRef = useRef(false);
+  const liveTestCyclesInFlightRef = useRef(0);
+  const liveTestPendingCycleRef = useRef<LiveTestCycleRequest | null>(null);
+  const liveTestCycleRunnerRef = useRef<((request: LiveTestCycleRequest) => void) | null>(null);
+  const liveLatestSnapshotIdRef = useRef<string | null>(null);
   const liveResultRowsRef = useRef<RuleRunEventRow[]>(displayRows);
   const liveRunIdsRef = useRef<number[]>(selectedRun ? getRunIds(selectedRun) : []);
   const logScrollerRef = useRef<HTMLDivElement | null>(null);
@@ -1670,7 +1681,9 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
   const stopLiveTest = useCallback((message = '实测已停止') => {
     clearLiveTestInterval();
     liveTestSessionRef.current = null;
-    liveTestCycleInFlightRef.current = false;
+    liveTestCyclesInFlightRef.current = 0;
+    liveTestPendingCycleRef.current = null;
+    liveLatestSnapshotIdRef.current = null;
     setIsRunning(false);
     setRunProgressById({});
     appendExecutionLog(message, 'info');
@@ -1683,13 +1696,19 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
     runRuleNames: string[],
   ) => {
     if (liveTestSessionRef.current !== sessionId) return;
-    if (liveTestCycleInFlightRef.current) {
-      appendExecutionLog(`第 ${cycleIndex} 次触发跳过：上一轮实测仍在执行`, 'warning');
+    if (liveTestCyclesInFlightRef.current >= LIVE_TEST_MAX_CONCURRENT_CYCLES) {
+      liveTestPendingCycleRef.current = {
+        sessionId,
+        cycleIndex,
+        runStartedAt,
+        runRuleNames,
+      };
+      appendExecutionLog(`第 ${cycleIndex} 次触发排队：已有 ${LIVE_TEST_MAX_CONCURRENT_CYCLES} 个实测周期在执行`, 'warning');
       return;
     }
 
     const cycleExecutionTime = formatDateTimeToSecond(new Date().toISOString());
-    liveTestCycleInFlightRef.current = true;
+    liveTestCyclesInFlightRef.current += 1;
     updateRunProgress(sessionId, 28, `第 ${cycleIndex} 次触发：请求实时行情`);
     appendExecutionLog(`第 ${cycleIndex} 次触发：扫描 ${targetCodes.length} 只股票，执行 ${selectedRuleIds.length} 条规则`);
 
@@ -1697,12 +1716,28 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
       const result = await rulesApi.runBatch({
         ruleIds: selectedRuleIds,
         mode: 'latest',
+        dataPolicy: 'snapshot_only',
         target: {
           scope: targetScope === 'industry' ? 'custom' : targetScope,
           stockCodes: targetCodes,
         },
       });
       if (liveTestSessionRef.current !== sessionId) return;
+
+      if (result.snapshotId && liveLatestSnapshotIdRef.current) {
+        if (result.snapshotId === liveLatestSnapshotIdRef.current) {
+          updateRunProgress(sessionId, 100, `第 ${cycleIndex} 次完成：快照未变化，等待下次刷新`);
+          appendExecutionLog(`第 ${cycleIndex} 次实测跳过汇总：快照 ${result.snapshotId} 已处理`, 'info');
+          return;
+        }
+        if (result.snapshotId < liveLatestSnapshotIdRef.current) {
+          appendExecutionLog(`第 ${cycleIndex} 次实测结果已过期：快照 ${result.snapshotId} 早于 ${liveLatestSnapshotIdRef.current}`, 'warning');
+          return;
+        }
+      }
+      if (result.snapshotId) {
+        liveLatestSnapshotIdRef.current = result.snapshotId;
+      }
 
       const now = new Date().toISOString();
       const resultRuleIds = result.ruleIds && result.ruleIds.length > 0 ? result.ruleIds : selectedRuleIds;
@@ -1745,7 +1780,7 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
         `第 ${cycleIndex} 次完成，命中 ${nextRows.length} 条；等待下次刷新`,
       );
       appendExecutionLog(
-        `第 ${cycleIndex} 次实测完成：命中股票 ${result.matchCount} 只，命中记录 ${nextRows.length} 条`,
+        `第 ${cycleIndex} 次实测完成：快照 ${result.snapshotId ?? 'unknown'}，命中股票 ${result.matchCount} 只，命中记录 ${nextRows.length} 条`,
         result.errors.length > 0 ? 'warning' : 'success',
       );
       if (result.errors.length > 0) {
@@ -1762,7 +1797,16 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
       setRunError(parsedError);
       setActiveResultTab('logs');
     } finally {
-      liveTestCycleInFlightRef.current = false;
+      liveTestCyclesInFlightRef.current = Math.max(0, liveTestCyclesInFlightRef.current - 1);
+      const queuedCycle = liveTestPendingCycleRef.current;
+      if (
+        queuedCycle
+        && liveTestSessionRef.current === queuedCycle.sessionId
+        && liveTestCyclesInFlightRef.current < LIVE_TEST_MAX_CONCURRENT_CYCLES
+      ) {
+        liveTestPendingCycleRef.current = null;
+        liveTestCycleRunnerRef.current?.(queuedCycle);
+      }
     }
   }, [
     appendExecutionLog,
@@ -1776,6 +1820,20 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
     targetScope,
     updateRunProgress,
   ]);
+
+  useEffect(() => {
+    liveTestCycleRunnerRef.current = (request: LiveTestCycleRequest) => {
+      void runLiveTestCycle(
+        request.sessionId,
+        request.cycleIndex,
+        request.runStartedAt,
+        request.runRuleNames,
+      );
+    };
+    return () => {
+      liveTestCycleRunnerRef.current = null;
+    };
+  }, [runLiveTestCycle]);
 
   const startLiveTest = useCallback(() => {
     if (runDisabled || isRunning) return;
@@ -1800,7 +1858,9 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
 
     clearLiveTestInterval();
     liveTestSessionRef.current = sessionId;
-    liveTestCycleInFlightRef.current = false;
+    liveTestCyclesInFlightRef.current = 0;
+    liveTestPendingCycleRef.current = null;
+    liveLatestSnapshotIdRef.current = null;
     liveResultRowsRef.current = [];
     liveRunIdsRef.current = [];
     setIsRunning(true);
@@ -2131,7 +2191,6 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
                             <button
                               type="button"
                               aria-label={rowAnalysisLabel}
-                              title={isLiveMode ? `查看 ${rowExecutionTime} 指标分析` : `查看 ${row.eventDate} 指标分析`}
                               onClick={(event) => {
                                 event.stopPropagation();
                                 openIndicatorAnalysis(row);
@@ -2305,7 +2364,6 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
                 <button
                   type="button"
                   aria-label="展开股票列表"
-                  title="展开股票列表"
                   onClick={() => setIsStockListExpanded(true)}
                   disabled={targetCodes.length === 0}
                   className="absolute right-2 top-2 inline-flex h-7 w-7 items-center justify-center rounded-lg border border-border/70 bg-card/90 text-secondary-text shadow-soft-card transition-all hover:border-primary/50 hover:bg-primary/10 hover:text-primary disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline-none focus-visible:ring-4 focus-visible:ring-cyan/15"
@@ -2406,7 +2464,6 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
                       <button
                         type="button"
                         aria-label={`删除回测记录 #${run.id}`}
-                        title="删除这次回测结果"
                         onClick={() => setDeleteRunCandidate(run)}
                         disabled={deletingRunId === run.id}
                         className="absolute right-3 top-3 inline-flex h-8 w-8 items-center justify-center rounded-lg border border-danger/25 bg-danger/10 text-danger opacity-0 shadow-soft-card transition-all hover:bg-danger/15 focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-4 focus-visible:ring-danger/15 group-hover:opacity-100 disabled:cursor-not-allowed disabled:opacity-60"
@@ -2776,7 +2833,6 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
                       <button
                         type="button"
                         aria-label={`移除 ${item.line}`}
-                        title={`移除 ${item.line}`}
                         onClick={() => removeTargetStockCode(item.sourceCode)}
                         className="inline-flex h-6 w-6 items-center justify-center rounded-md text-muted-text transition-all hover:bg-danger/10 hover:text-danger focus-visible:outline-none focus-visible:ring-4 focus-visible:ring-danger/15"
                       >

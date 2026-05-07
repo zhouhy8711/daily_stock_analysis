@@ -90,7 +90,7 @@ class StockDaily(Base):
     close = Column(Float)
     
     # 成交数据
-    volume = Column(Float)  # 成交量（股）
+    volume = Column(Float)  # 成交量（手）
     amount = Column(Float)  # 成交额（元）
     pct_chg = Column(Float)  # 涨跌幅（%）
     
@@ -133,6 +133,62 @@ class StockDaily(Base):
             'ma20': self.ma20,
             'volume_ratio': self.volume_ratio,
             'data_source': self.data_source,
+        }
+
+
+class StockIntradayMinute(Base):
+    """
+    当日分钟级行情热表。
+
+    由后台实时行情预热快照采样写入，服务指标大盘/分时图的缓存优先读取。
+    """
+    __tablename__ = 'stock_intraday_minute'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    code = Column(String(16), nullable=False, index=True)
+    trade_date = Column(Date, nullable=False, index=True)
+    minute_ts = Column(DateTime, nullable=False, index=True)
+
+    open = Column(Float)
+    high = Column(Float)
+    low = Column(Float)
+    close = Column(Float)
+    volume = Column(Float)
+    amount = Column(Float)
+    turnover_rate = Column(Float)
+    change_percent = Column(Float)
+
+    cumulative_volume = Column(Float)
+    cumulative_amount = Column(Float)
+    source = Column(String(50))
+    snapshot_id = Column(String(64), index=True)
+    snapshot_time = Column(DateTime, index=True)
+    created_at = Column(DateTime, default=datetime.now)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+
+    __table_args__ = (
+        UniqueConstraint('code', 'trade_date', 'minute_ts', name='uix_intraday_code_date_minute'),
+        Index('ix_intraday_code_time', 'code', 'minute_ts'),
+    )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            'code': self.code,
+            'trade_date': self.trade_date,
+            'minute_ts': self.minute_ts,
+            'open': self.open,
+            'high': self.high,
+            'low': self.low,
+            'close': self.close,
+            'volume': self.volume,
+            'amount': self.amount,
+            'turnover_rate': self.turnover_rate,
+            'change_percent': self.change_percent,
+            'cumulative_volume': self.cumulative_volume,
+            'cumulative_amount': self.cumulative_amount,
+            'source': self.source,
+            'snapshot_id': self.snapshot_id,
+            'snapshot_time': self.snapshot_time,
         }
 
 
@@ -879,6 +935,23 @@ class DatabaseManager:
     @staticmethod
     def _normalize_sql_value(value: Any) -> Any:
         return None if pd.isna(value) else value
+
+    @staticmethod
+    def _normalize_stock_code(value: Any) -> str:
+        raw = str(value or "").strip().upper()
+        if not raw:
+            return ""
+        try:
+            from data_provider.base import normalize_stock_code
+
+            return normalize_stock_code(raw).strip().upper()
+        except Exception:
+            return raw
+
+    @staticmethod
+    def _is_cn_regular_intraday_minute(value: datetime) -> bool:
+        minute = value.hour * 60 + value.minute
+        return ((9 * 60 + 30) <= minute <= (11 * 60 + 30)) or ((13 * 60) <= minute <= (15 * 60))
     
     def get_session(self) -> Session:
         """
@@ -1474,6 +1547,496 @@ class DatabaseManager:
             ).scalars().all()
             
             return list(results)
+
+    @staticmethod
+    def _normalize_minute_ts(value: Any) -> datetime:
+        if isinstance(value, pd.Timestamp):
+            value = value.to_pydatetime()
+        elif isinstance(value, str):
+            value = pd.to_datetime(value, errors='coerce')
+            if pd.isna(value):
+                raise ValueError("minute_ts must be a valid datetime")
+            value = value.to_pydatetime()
+        elif not isinstance(value, datetime):
+            raise ValueError("minute_ts must be a datetime")
+        return value.replace(second=0, microsecond=0)
+
+    def save_intraday_quote_samples(
+        self,
+        items: List[Dict[str, Any]],
+        *,
+        snapshot_id: str,
+        snapshot_time: datetime,
+    ) -> Dict[str, int]:
+        """Upsert one realtime quote snapshot into the intraday minute hot table."""
+        if not items:
+            return {"saved_count": 0, "requested_count": 0}
+
+        minute_ts = self._normalize_minute_ts(snapshot_time)
+        if not self._is_cn_regular_intraday_minute(minute_ts):
+            return {"saved_count": 0, "requested_count": len(items)}
+        trade_date = minute_ts.date()
+        now = datetime.now()
+
+        def _num(value: Any) -> Optional[float]:
+            value = self._normalize_sql_value(value)
+            if value is None:
+                return None
+            try:
+                parsed = float(value)
+                return parsed if pd.notna(parsed) else None
+            except (TypeError, ValueError):
+                return None
+
+        pending: Dict[str, Dict[str, Any]] = {}
+        for item in items:
+            code = self._normalize_stock_code(item.get("stock_code") or item.get("code"))
+            price = _num(item.get("current_price") or item.get("price"))
+            if not code or price is None or price <= 0:
+                continue
+            pending[code] = {
+                "code": code,
+                "trade_date": trade_date,
+                "minute_ts": minute_ts,
+                "price": price,
+                "cumulative_volume": _num(item.get("volume")),
+                "cumulative_amount": _num(item.get("amount")),
+                "turnover_rate": _num(item.get("turnover_rate")),
+                "change_percent": _num(item.get("change_percent") or item.get("change_pct")),
+                "source": str(item.get("source") or "realtime_snapshot")[:50],
+                "snapshot_id": snapshot_id,
+                "snapshot_time": snapshot_time,
+                "created_at": now,
+                "updated_at": now,
+            }
+
+        if not pending:
+            return {"saved_count": 0, "requested_count": len(items)}
+
+        codes = list(pending.keys())
+
+        def _write(session: Session) -> int:
+            existing_rows = {
+                row.code: row
+                for row in session.execute(
+                    select(StockIntradayMinute).where(
+                        and_(
+                            StockIntradayMinute.trade_date == trade_date,
+                            StockIntradayMinute.minute_ts == minute_ts,
+                            StockIntradayMinute.code.in_(codes),
+                        )
+                    )
+                ).scalars().all()
+            }
+            previous_by_code: Dict[str, StockIntradayMinute] = {}
+            previous_rows = session.execute(
+                select(StockIntradayMinute)
+                .where(
+                    and_(
+                        StockIntradayMinute.trade_date == trade_date,
+                        StockIntradayMinute.minute_ts < minute_ts,
+                        StockIntradayMinute.code.in_(codes),
+                    )
+                )
+                .order_by(StockIntradayMinute.code, desc(StockIntradayMinute.minute_ts))
+            ).scalars().all()
+            for row in previous_rows:
+                previous_by_code.setdefault(row.code, row)
+
+            records: List[Dict[str, Any]] = []
+            for code, sample in pending.items():
+                existing = existing_rows.get(code)
+                previous = previous_by_code.get(code)
+                price = sample["price"]
+                prev_cumulative_volume = previous.cumulative_volume if previous else None
+                prev_cumulative_amount = previous.cumulative_amount if previous else None
+                cumulative_volume = sample.get("cumulative_volume")
+                cumulative_amount = sample.get("cumulative_amount")
+                volume = cumulative_volume
+                amount = cumulative_amount
+                if cumulative_volume is not None and prev_cumulative_volume is not None:
+                    delta = cumulative_volume - prev_cumulative_volume
+                    volume = delta if delta >= 0 else cumulative_volume
+                if cumulative_amount is not None and prev_cumulative_amount is not None:
+                    delta = cumulative_amount - prev_cumulative_amount
+                    amount = delta if delta >= 0 else cumulative_amount
+
+                open_price = existing.open if existing is not None and existing.open is not None else price
+                existing_high = existing.high if existing is not None else None
+                existing_low = existing.low if existing is not None else None
+                records.append({
+                    "code": code,
+                    "trade_date": trade_date,
+                    "minute_ts": minute_ts,
+                    "open": open_price,
+                    "high": max(v for v in (existing_high, price) if v is not None),
+                    "low": min(v for v in (existing_low, price) if v is not None),
+                    "close": price,
+                    "volume": volume,
+                    "amount": amount,
+                    "turnover_rate": sample.get("turnover_rate"),
+                    "change_percent": sample.get("change_percent"),
+                    "cumulative_volume": cumulative_volume,
+                    "cumulative_amount": cumulative_amount,
+                    "source": sample.get("source"),
+                    "snapshot_id": snapshot_id,
+                    "snapshot_time": snapshot_time,
+                    "created_at": existing.created_at if existing is not None else now,
+                    "updated_at": now,
+                })
+
+            if self._is_sqlite_engine:
+                for i in range(0, len(records), 50):
+                    chunk = records[i : i + 50]
+                    stmt = sqlite_insert(StockIntradayMinute).values(chunk)
+                    excluded = stmt.excluded
+                    session.execute(
+                        stmt.on_conflict_do_update(
+                            index_elements=['code', 'trade_date', 'minute_ts'],
+                            set_={
+                                'open': excluded.open,
+                                'high': excluded.high,
+                                'low': excluded.low,
+                                'close': excluded.close,
+                                'volume': excluded.volume,
+                                'amount': excluded.amount,
+                                'turnover_rate': excluded.turnover_rate,
+                                'change_percent': excluded.change_percent,
+                                'cumulative_volume': excluded.cumulative_volume,
+                                'cumulative_amount': excluded.cumulative_amount,
+                                'source': excluded.source,
+                                'snapshot_id': excluded.snapshot_id,
+                                'snapshot_time': excluded.snapshot_time,
+                                'updated_at': excluded.updated_at,
+                            },
+                        )
+                    )
+            else:
+                for record in records:
+                    existing = existing_rows.get(record["code"])
+                    if existing is None:
+                        session.add(StockIntradayMinute(**record))
+                        continue
+                    for key, value in record.items():
+                        if key not in {"code", "trade_date", "minute_ts", "created_at"}:
+                            setattr(existing, key, value)
+            return len(records)
+
+        saved_count = self._run_write_transaction(
+            f"save_intraday_quote_samples[{snapshot_id}]",
+            _write,
+        )
+        return {"saved_count": saved_count, "requested_count": len(items)}
+
+    def save_intraday_minute_dataframe(
+        self,
+        df: pd.DataFrame,
+        code: str,
+        *,
+        data_source: str,
+        snapshot_id: Optional[str] = None,
+        snapshot_time: Optional[datetime] = None,
+    ) -> int:
+        """Upsert fetched 1m/minute bars into the intraday hot table."""
+        if df is None or df.empty:
+            return 0
+
+        normalized_code = self._normalize_stock_code(code)
+        if not normalized_code:
+            return 0
+
+        now = datetime.now()
+        effective_snapshot_time = snapshot_time or now
+        effective_snapshot_id = snapshot_id or f"intraday:{data_source}:{effective_snapshot_time:%Y%m%d%H%M%S}"
+
+        def _num(value: Any) -> Optional[float]:
+            value = self._normalize_sql_value(value)
+            if value is None:
+                return None
+            try:
+                parsed = float(value)
+                return parsed if pd.notna(parsed) else None
+            except (TypeError, ValueError):
+                return None
+
+        records: List[Dict[str, Any]] = []
+        for _, row in df.iterrows():
+            raw_date = row.get("date")
+            if pd.isna(raw_date):
+                continue
+            try:
+                minute_ts = self._normalize_minute_ts(pd.to_datetime(raw_date))
+            except Exception:
+                continue
+
+            close = _num(row.get("close"))
+            if close is None or close <= 0:
+                continue
+            open_price = _num(row.get("open")) or close
+            high = _num(row.get("high"))
+            low = _num(row.get("low"))
+            high_price = max(v for v in (high, open_price, close) if v is not None)
+            low_price = min(v for v in (low, open_price, close) if v is not None)
+            records.append({
+                "code": normalized_code,
+                "trade_date": minute_ts.date(),
+                "minute_ts": minute_ts,
+                "open": open_price,
+                "high": high_price,
+                "low": low_price,
+                "close": close,
+                "volume": _num(row.get("volume")),
+                "amount": _num(row.get("amount")),
+                "turnover_rate": _num(row.get("turnover_rate")),
+                "change_percent": _num(row.get("change_percent") or row.get("pct_chg")),
+                "cumulative_volume": None,
+                "cumulative_amount": None,
+                "source": str(data_source or "intraday_fetch")[:50],
+                "snapshot_id": str(effective_snapshot_id)[:64],
+                "snapshot_time": effective_snapshot_time,
+                "created_at": now,
+                "updated_at": now,
+            })
+
+        if not records:
+            return 0
+
+        def _write(session: Session) -> int:
+            if self._is_sqlite_engine:
+                for i in range(0, len(records), 50):
+                    chunk = records[i : i + 50]
+                    stmt = sqlite_insert(StockIntradayMinute).values(chunk)
+                    excluded = stmt.excluded
+                    session.execute(
+                        stmt.on_conflict_do_update(
+                            index_elements=['code', 'trade_date', 'minute_ts'],
+                            set_={
+                                'open': excluded.open,
+                                'high': excluded.high,
+                                'low': excluded.low,
+                                'close': excluded.close,
+                                'volume': excluded.volume,
+                                'amount': excluded.amount,
+                                'turnover_rate': excluded.turnover_rate,
+                                'change_percent': excluded.change_percent,
+                                'cumulative_volume': excluded.cumulative_volume,
+                                'cumulative_amount': excluded.cumulative_amount,
+                                'source': excluded.source,
+                                'snapshot_id': excluded.snapshot_id,
+                                'snapshot_time': excluded.snapshot_time,
+                                'updated_at': excluded.updated_at,
+                            },
+                        )
+                    )
+                return len(records)
+
+            existing_rows = {
+                (row.code, row.trade_date, row.minute_ts): row
+                for row in session.execute(
+                    select(StockIntradayMinute).where(
+                        and_(
+                            StockIntradayMinute.code == normalized_code,
+                            StockIntradayMinute.minute_ts.in_([record["minute_ts"] for record in records]),
+                        )
+                    )
+                ).scalars().all()
+            }
+            for record in records:
+                key = (record["code"], record["trade_date"], record["minute_ts"])
+                existing = existing_rows.get(key)
+                if existing is None:
+                    session.add(StockIntradayMinute(**record))
+                    continue
+                for field, value in record.items():
+                    if field not in {"code", "trade_date", "minute_ts", "created_at"}:
+                        setattr(existing, field, value)
+            return len(records)
+
+        return self._run_write_transaction(
+            f"save_intraday_minute_dataframe[{normalized_code}]",
+            _write,
+        )
+
+    def get_intraday_minute_data(
+        self,
+        code: str,
+        *,
+        days: int = 1,
+        period: str = "1m",
+        trade_date: Optional[date] = None,
+    ) -> pd.DataFrame:
+        """Read intraday hot-table rows and optionally aggregate them to a wider period."""
+        target_date = trade_date or date.today()
+        bounded_days = max(1, int(days or 1))
+        start_date = target_date - timedelta(days=bounded_days - 1)
+        start_dt = datetime.combine(start_date, datetime.min.time())
+        end_dt = datetime.combine(target_date, datetime.max.time())
+        normalized_code = self._normalize_stock_code(code)
+
+        with self.get_session() as session:
+            rows = session.execute(
+                select(StockIntradayMinute)
+                .where(
+                    and_(
+                        StockIntradayMinute.code == normalized_code,
+                        StockIntradayMinute.minute_ts >= start_dt,
+                        StockIntradayMinute.minute_ts <= end_dt,
+                    )
+                )
+                .order_by(StockIntradayMinute.minute_ts)
+            ).scalars().all()
+
+        if not rows:
+            return pd.DataFrame()
+
+        if normalized_code.isdigit() and len(normalized_code) == 6:
+            rows = [
+                row
+                for row in rows
+                if row.minute_ts is not None and self._is_cn_regular_intraday_minute(row.minute_ts)
+            ]
+            if not rows:
+                return pd.DataFrame()
+
+        df = pd.DataFrame([{
+            "date": row.minute_ts,
+            "open": row.open,
+            "high": row.high,
+            "low": row.low,
+            "close": row.close,
+            "volume": row.volume,
+            "amount": row.amount,
+            "turnover_rate": row.turnover_rate,
+            "change_percent": row.change_percent,
+            "data_source": row.source or "intraday_hot_table",
+            "snapshot_id": row.snapshot_id,
+            "snapshot_time": row.snapshot_time,
+        } for row in rows])
+
+        period_map = {
+            "1m": "1min",
+            "5m": "5min",
+            "15m": "15min",
+            "30m": "30min",
+            "60m": "60min",
+        }
+        rule = period_map.get(str(period or "1m").lower())
+        if rule is None or rule == "1min":
+            return df
+
+        df = df.set_index(pd.to_datetime(df["date"]))
+        aggregated = df.resample(rule).agg({
+            "open": "first",
+            "high": "max",
+            "low": "min",
+            "close": "last",
+            "volume": "sum",
+            "amount": "sum",
+            "turnover_rate": "last",
+            "change_percent": "last",
+            "data_source": "last",
+            "snapshot_id": "last",
+            "snapshot_time": "last",
+        }).dropna(subset=["close"]).reset_index().rename(columns={"index": "date"})
+        return aggregated
+
+    def archive_intraday_minutes_to_daily(
+        self,
+        *,
+        trade_date: Optional[date] = None,
+        codes: Optional[List[str]] = None,
+    ) -> int:
+        """Aggregate intraday hot-table rows into stock_daily for one trade date."""
+        target_date = trade_date or date.today()
+        normalized_codes = {self._normalize_stock_code(code) for code in (codes or []) if str(code or "").strip()}
+        normalized_codes.discard("")
+        with self.get_session() as session:
+            conditions = [StockIntradayMinute.trade_date == target_date]
+            if normalized_codes:
+                conditions.append(StockIntradayMinute.code.in_(normalized_codes))
+            rows = session.execute(
+                select(StockIntradayMinute)
+                .where(and_(*conditions))
+                .order_by(StockIntradayMinute.code, StockIntradayMinute.minute_ts)
+            ).scalars().all()
+
+        if not rows:
+            return 0
+
+        by_code: Dict[str, List[StockIntradayMinute]] = {}
+        for row in rows:
+            by_code.setdefault(row.code, []).append(row)
+
+        saved_total = 0
+        for stock_code, stock_rows in by_code.items():
+            first = stock_rows[0]
+            last = stock_rows[-1]
+            open_price = first.open
+            close_price = last.close
+            pct_chg = None
+            if open_price not in (None, 0) and close_price is not None:
+                pct_chg = (close_price - open_price) / open_price * 100
+            df = pd.DataFrame([{
+                "date": target_date,
+                "open": open_price,
+                "high": max((row.high for row in stock_rows if row.high is not None), default=None),
+                "low": min((row.low for row in stock_rows if row.low is not None), default=None),
+                "close": close_price,
+                "volume": sum((row.volume or 0) for row in stock_rows),
+                "amount": sum((row.amount or 0) for row in stock_rows),
+                "pct_chg": pct_chg,
+            }])
+            saved_total += self.save_daily_data(df, stock_code, data_source="intraday_hot_table")
+        return saved_total
+
+    def get_intraday_minute_codes(self, *, trade_date: Optional[date] = None) -> List[str]:
+        """Return distinct stock codes stored in the intraday hot table for a trade date."""
+        target_date = trade_date or date.today()
+        with self.get_session() as session:
+            rows = session.execute(
+                select(StockIntradayMinute.code)
+                .where(StockIntradayMinute.trade_date == target_date)
+                .distinct()
+                .order_by(StockIntradayMinute.code)
+            ).scalars().all()
+        return [str(code) for code in rows if code]
+
+    def purge_intraday_minutes_for_date(
+        self,
+        *,
+        trade_date: Optional[date] = None,
+        codes: Optional[List[str]] = None,
+    ) -> int:
+        """Delete intraday hot-table rows for one trade date, optionally limited to codes."""
+        target_date = trade_date or date.today()
+        normalized_codes = None
+        if codes is not None:
+            normalized_codes = {
+                self._normalize_stock_code(code)
+                for code in codes
+                if str(code or "").strip()
+            }
+            normalized_codes.discard("")
+            if not normalized_codes:
+                return 0
+
+        conditions = [StockIntradayMinute.trade_date == target_date]
+        if normalized_codes is not None:
+            conditions.append(StockIntradayMinute.code.in_(normalized_codes))
+
+        with self.session_scope() as session:
+            result = session.execute(
+                delete(StockIntradayMinute).where(and_(*conditions))
+            )
+            return int(result.rowcount or 0)
+
+    def purge_intraday_minutes_older_than(self, retention_days: int = 3) -> int:
+        cutoff = date.today() - timedelta(days=max(0, int(retention_days)))
+        with self.session_scope() as session:
+            result = session.execute(
+                delete(StockIntradayMinute).where(StockIntradayMinute.trade_date < cutoff)
+            )
+            return int(result.rowcount or 0)
     
     def save_daily_data(
         self, 

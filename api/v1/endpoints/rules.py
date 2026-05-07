@@ -147,6 +147,7 @@ def run_rules(payload: RuleBatchRunRequest) -> RuleRunResponse:
             target_override=target,
             start_date=payload.start_date,
             end_date=payload.end_date,
+            data_policy=payload.data_policy,
         ))
     except KeyError as exc:
         raise HTTPException(status_code=404, detail={"error": "not_found", "message": "规则不存在"}) from exc
@@ -174,6 +175,7 @@ def run_rule(rule_id: int, payload: RuleRunRequest | None = None) -> RuleRunResp
             target_override=target,
             start_date=payload.start_date if payload is not None else None,
             end_date=payload.end_date if payload is not None else None,
+            data_policy=payload.data_policy if payload is not None else "default",
         ))
     except KeyError as exc:
         raise HTTPException(status_code=404, detail={"error": "not_found", "message": "规则不存在"}) from exc

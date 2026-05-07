@@ -12,9 +12,11 @@ from src.services.realtime_quote_cache_warmer import (
 class _WarmService:
     def __init__(self):
         self.calls = 0
+        self.force_refresh_values = []
 
     def warm_all_a_share_realtime_quotes(self, *, force_refresh=False):
         self.calls += 1
+        self.force_refresh_values.append(force_refresh)
         return {
             "status": "refreshed",
             "requested_count": 2,
@@ -47,6 +49,25 @@ def test_realtime_quote_cache_warmer_runs_one_all_share_pass() -> None:
     assert result["status"] == "refreshed"
     assert result["requested_count"] == 2
     assert result["cached_after"] == 2
+    assert service.force_refresh_values == [False]
+
+
+def test_realtime_quote_cache_warmer_background_run_forces_refresh() -> None:
+    service = _WarmService()
+    warmer = RealtimeQuoteCacheWarmer(service_factory=lambda: service)
+
+    with patch(
+        "src.services.realtime_quote_cache_warmer.get_config",
+        return_value=SimpleNamespace(
+            prefetch_realtime_quotes=True,
+            enable_realtime_quote=True,
+            realtime_quote_cache_seconds=30,
+        ),
+    ):
+        result = warmer.run_once(reason="background", force_refresh=True)
+
+    assert result["status"] == "refreshed"
+    assert service.force_refresh_values == [True]
 
 
 def test_realtime_quote_cache_warmer_default_interval_is_one_minute() -> None:

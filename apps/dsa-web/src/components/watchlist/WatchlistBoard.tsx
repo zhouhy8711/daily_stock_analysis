@@ -633,7 +633,6 @@ export const WatchlistBoard: React.FC<WatchlistBoardProps> = ({
                           size="sm"
                           className="h-8 w-8 shrink-0 p-0"
                           aria-label={item.isInWatchlist ? `${stockName} 已在自选` : `添加 ${stockName} 到自选`}
-                          title={item.isInWatchlist ? '已在自选' : '添加到自选'}
                           disabled={item.isInWatchlist || addingCurrent}
                           isLoading={addingCurrent}
                           loadingText=""
@@ -650,7 +649,7 @@ export const WatchlistBoard: React.FC<WatchlistBoardProps> = ({
 
                     <span className="min-w-0">
                       <span
-                        title={industryLabel}
+                        aria-label={industryLabel}
                         className={`inline-block max-w-full truncate rounded-md border px-2 py-1 text-[11px] font-semibold ${
                           item.industry
                             ? 'border-cyan/25 bg-cyan/10 text-cyan'

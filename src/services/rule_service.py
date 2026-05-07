@@ -40,6 +40,7 @@ ALLOWED_OPERATORS = {
 DISABLED_OPERATORS = {"cross_up", "cross_down"}
 MAX_RULE_TARGET_CODES = 10000
 RUN_MODES = {"latest", "history"}
+DATA_POLICIES = {"default", "snapshot_only"}
 DEFAULT_RULE_RUN_WORKERS = 3
 
 
@@ -53,6 +54,10 @@ def _model_to_dict(value: Any) -> Dict[str, Any]:
 
 class RuleValidationError(ValueError):
     """Raised when a rule definition is invalid."""
+
+
+class RuleDataUnavailable(RuntimeError):
+    """Raised when snapshot-only rule execution cannot read required local data."""
 
 
 class RuleService:
@@ -182,8 +187,10 @@ class RuleService:
         target_override: Optional[Dict[str, Any]] = None,
         start_date: Any = None,
         end_date: Any = None,
+        data_policy: str = "default",
     ) -> Dict[str, Any]:
         run_mode = self._normalize_run_mode(mode)
+        run_data_policy = self._normalize_data_policy(data_policy)
         date_from, date_to = self._normalize_date_range(start_date, end_date)
         rule, definition, stock_codes = self._prepare_rule_run(rule_id, target_override)
         run_id = self.repo.create_run(rule_id, len(stock_codes))
@@ -198,6 +205,7 @@ class RuleService:
                 run_mode,
                 date_from,
                 date_to,
+                run_data_policy,
             )
 
             status = "completed" if not errors else "partial"
@@ -222,6 +230,7 @@ class RuleService:
                 "duration_ms": duration_ms,
                 "matches": matches,
                 "errors": errors,
+                **self._build_snapshot_run_metadata(stock_codes),
             }
         except Exception as exc:
             logger.error("规则 %s 执行失败: %s", rule_id, exc, exc_info=True)
@@ -242,12 +251,14 @@ class RuleService:
         target_override: Optional[Dict[str, Any]] = None,
         start_date: Any = None,
         end_date: Any = None,
+        data_policy: str = "default",
     ) -> Dict[str, Any]:
         normalized_rule_ids = [int(rule_id) for rule_id in rule_ids if int(rule_id) > 0]
         if not normalized_rule_ids:
             raise RuleValidationError("至少选择一条规则")
 
         run_mode = self._normalize_run_mode(mode)
+        run_data_policy = self._normalize_data_policy(data_policy)
         date_from, date_to = self._normalize_date_range(start_date, end_date)
         prepared = [
             (rule_id, *self._prepare_rule_run(rule_id, target_override))
@@ -293,6 +304,7 @@ class RuleService:
                     run_mode,
                     date_from,
                     date_to,
+                    run_data_policy,
                 )
                 for match in matches:
                     match["rule_id"] = rule_id
@@ -367,6 +379,7 @@ class RuleService:
                 "duration_ms": duration_ms,
                 "matches": all_matches,
                 "errors": all_errors,
+                **self._build_snapshot_run_metadata(prepared[0][3]),
             }
         except Exception as exc:
             logger.error("批量规则回测失败: %s", exc, exc_info=True)
@@ -408,6 +421,7 @@ class RuleService:
         run_mode: str,
         date_from: Optional[date],
         date_to: Optional[date],
+        data_policy: str,
     ) -> tuple[List[Dict[str, Any]], List[str]]:
         worker_count = self._resolve_run_workers(len(stock_codes))
         logger.info(
@@ -438,6 +452,7 @@ class RuleService:
                         run_mode,
                         date_from,
                         date_to,
+                        data_policy,
                         index + 1,
                         len(stock_codes),
                     ): (index, code)
@@ -448,6 +463,8 @@ class RuleService:
                     index, code = future_to_context[future]
                     try:
                         ordered_matches[index] = future.result()
+                    except RuleDataUnavailable as exc:
+                        ordered_errors[index] = f"{code}:{exc}"
                     except Exception as exc:
                         ordered_errors[index] = f"{code}:{type(exc).__name__}"
 
@@ -491,13 +508,14 @@ class RuleService:
         mode: str,
         start_date: Optional[date],
         end_date: Optional[date],
+        data_policy: str,
         ordinal: int,
         total: int,
     ) -> Optional[Dict[str, Any]]:
         started_at = time.monotonic()
         logger.info("规则 %s 股票 %s 开始分析 (%s/%s)", rule_id, stock_code, ordinal, total)
         try:
-            match = self._evaluate_stock(rule, definition, stock_code, mode, start_date, end_date)
+            match = self._evaluate_stock(rule, definition, stock_code, mode, start_date, end_date, data_policy)
         except Exception as exc:
             elapsed_ms = int((time.monotonic() - started_at) * 1000)
             logger.warning(
@@ -532,6 +550,66 @@ class RuleService:
         return run_mode
 
     @staticmethod
+    def _normalize_data_policy(data_policy: str) -> str:
+        policy = str(data_policy or "default").strip().lower()
+        if policy not in DATA_POLICIES:
+            raise RuleValidationError("数据策略仅支持 default/snapshot_only")
+        return policy
+
+    def _build_snapshot_run_metadata(self, stock_codes: List[str]) -> Dict[str, Any]:
+        snapshot_info_getter = getattr(self.stock_service, "get_realtime_quote_snapshot_info", None)
+        snapshot_info = snapshot_info_getter() if callable(snapshot_info_getter) else {}
+        unique_codes = list(dict.fromkeys(stock_codes))
+        requested = len(unique_codes)
+        snapshot_hit_count = sum(
+            1
+            for code in unique_codes
+            if self._get_stock_realtime_quote(code, data_policy="snapshot_only") is not None
+        )
+        return {
+            "snapshot_id": snapshot_info.get("snapshot_id"),
+            "snapshot_time": snapshot_info.get("snapshot_time"),
+            "snapshot_age_seconds": snapshot_info.get("snapshot_age_seconds"),
+            "quote_hit_count": snapshot_hit_count,
+            "quote_miss_count": max(0, requested - snapshot_hit_count),
+        }
+
+    def _get_stock_history_data(
+        self,
+        stock_code: str,
+        *,
+        period: str,
+        days: int,
+        data_policy: str,
+    ) -> Dict[str, Any]:
+        try:
+            return self.stock_service.get_history_data(
+                stock_code,
+                period=period,
+                days=days,
+                data_policy=data_policy,
+            )
+        except TypeError as exc:
+            if "data_policy" not in str(exc):
+                raise
+            return self.stock_service.get_history_data(
+                stock_code,
+                period=period,
+                days=days,
+            )
+
+    def _get_stock_realtime_quote(self, stock_code: str, *, data_policy: str = "default") -> Optional[Dict[str, Any]]:
+        getter = getattr(self.stock_service, "get_realtime_quote", None)
+        if not callable(getter):
+            return None
+        try:
+            return getter(stock_code, data_policy=data_policy)
+        except TypeError as exc:
+            if "data_policy" not in str(exc):
+                raise
+            return getter(stock_code)
+
+    @staticmethod
     def _count_match_events(matches: List[Dict[str, Any]]) -> int:
         return sum(len(match.get("matched_events") or []) for match in matches)
 
@@ -564,15 +642,31 @@ class RuleService:
         mode: str,
         start_date: Optional[date] = None,
         end_date: Optional[date] = None,
+        data_policy: str = "default",
     ) -> Optional[Dict[str, Any]]:
         lookback_days = self._resolve_history_fetch_days(definition, rule, start_date)
-        history = self.stock_service.get_history_data(stock_code, period="daily", days=lookback_days)
+        history = self._get_stock_history_data(
+            stock_code,
+            period="daily",
+            days=lookback_days,
+            data_policy="snapshot_only" if data_policy == "snapshot_only" else "default",
+        )
         history_rows = history.get("data") or []
         if not history_rows:
+            if data_policy == "snapshot_only":
+                raise RuleDataUnavailable("history_cache_miss")
             return None
 
-        quote = self.stock_service.get_realtime_quote(stock_code) if mode == "latest" else None
-        indicator_metrics = self._get_indicator_metrics(stock_code, history_rows, mode)
+        quote = (
+            self._get_stock_realtime_quote(stock_code, data_policy="snapshot_only")
+            if mode == "latest" and data_policy == "snapshot_only"
+            else self._get_stock_realtime_quote(stock_code)
+            if mode == "latest"
+            else None
+        )
+        if mode == "latest" and data_policy == "snapshot_only" and quote is None:
+            raise RuleDataUnavailable("quote_snapshot_miss")
+        indicator_metrics = self._get_indicator_metrics(stock_code, history_rows, mode, data_policy)
         metric_frame = build_metric_frame(history_rows, quote, indicator_metrics)
         if metric_frame.empty:
             return None
@@ -666,7 +760,10 @@ class RuleService:
         stock_code: str,
         history_rows: List[Dict[str, Any]],
         mode: str,
+        data_policy: str = "default",
     ) -> Dict[str, Any]:
+        if data_policy == "snapshot_only":
+            return self._build_history_chip_metrics(stock_code, history_rows)
         if mode == "history":
             local_metrics = self._build_history_chip_metrics(stock_code, history_rows)
             if local_metrics.get("chip_distribution"):

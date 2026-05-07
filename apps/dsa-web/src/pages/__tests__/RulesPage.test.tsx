@@ -19,7 +19,7 @@ const stockIndexHookState = vi.hoisted(() => ({
 
 const metricItems = [
   { key: 'close', label: '收盘价', category: 'K线图', valueType: 'number', unit: '元', periods: ['daily'], description: '' },
-  { key: 'volume_ma5', label: 'MAVOL5', category: '成交量图', valueType: 'number', unit: '股', periods: ['daily'], description: '' },
+  { key: 'volume_ma5', label: 'MAVOL5', category: '成交量图', valueType: 'number', unit: '手', periods: ['daily'], description: '' },
   { key: 'profit_ratio', label: '收盘获利', category: '筹码峰-全部筹码', valueType: 'number', unit: '%', periods: ['daily'], description: '' },
   { key: 'main_profit_ratio', label: '主力收盘获利', category: '筹码峰-主力筹码', valueType: 'number', unit: '%', periods: ['daily'], description: '' },
 ];
@@ -174,7 +174,7 @@ describe('RulesPage', () => {
           right: { type: 'literal', value: 11 },
           addedAt: '2026-04-30T10:00:00',
         },
-        { id: 'm2', key: 'volume_ma5', label: 'MAVOL5', value: 10000, unit: '股', date: '2026-04-30', addedAt: '2026-04-30T10:01:00' },
+        { id: 'm2', key: 'volume_ma5', label: 'MAVOL5', value: 10000, unit: '手', date: '2026-04-30', addedAt: '2026-04-30T10:01:00' },
       ],
     }));
 

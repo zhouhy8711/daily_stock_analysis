@@ -58,18 +58,31 @@ class SystemConfigServiceTestCase(unittest.TestCase):
         self.assertFalse(items["GEMINI_API_KEY"]["is_masked"])
         self.assertTrue(items["GEMINI_API_KEY"]["raw_value_exists"])
 
-    def test_get_config_exposes_realtime_cache_ttl_in_system_settings(self) -> None:
+    def test_get_config_exposes_realtime_quote_cache_seconds_in_system_settings(self) -> None:
         payload = self.service.get_config(include_schema=True)
         items = {item["key"]: item for item in payload["items"]}
 
-        realtime_cache_ttl = items["REALTIME_CACHE_TTL"]
+        realtime_cache = items["REALTIME_QUOTE_CACHE_SECONDS"]
 
-        self.assertEqual(realtime_cache_ttl["value"], "30")
-        self.assertEqual(realtime_cache_ttl["schema"]["category"], "system")
-        self.assertEqual(realtime_cache_ttl["schema"]["data_type"], "integer")
-        self.assertEqual(realtime_cache_ttl["schema"]["ui_control"], "number")
-        self.assertTrue(realtime_cache_ttl["schema"]["is_editable"])
-        self.assertEqual(realtime_cache_ttl["schema"]["validation"]["min"], 0)
+        self.assertEqual(realtime_cache["value"], "30")
+        self.assertEqual(realtime_cache["schema"]["category"], "system")
+        self.assertEqual(realtime_cache["schema"]["data_type"], "integer")
+        self.assertEqual(realtime_cache["schema"]["ui_control"], "number")
+        self.assertTrue(realtime_cache["schema"]["is_editable"])
+        self.assertEqual(realtime_cache["schema"]["validation"]["min"], 0)
+
+    def test_get_config_maps_legacy_realtime_cache_ttl_to_new_key(self) -> None:
+        self._rewrite_env(
+            "STOCK_LIST=600519,000001",
+            "REALTIME_CACHE_TTL=45",
+        )
+
+        payload = self.service.get_config(include_schema=True)
+        items = {item["key"]: item for item in payload["items"]}
+
+        self.assertIn("REALTIME_QUOTE_CACHE_SECONDS", items)
+        self.assertNotIn("REALTIME_CACHE_TTL", items)
+        self.assertEqual(items["REALTIME_QUOTE_CACHE_SECONDS"]["value"], "45")
 
     def test_export_desktop_env_returns_raw_text(self) -> None:
         self.env_path.write_text(

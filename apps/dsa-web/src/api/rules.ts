@@ -292,6 +292,7 @@ export const rulesApi = {
   ): Promise<RuleRunResponse> {
     const requestPayload = {
       mode: payload?.mode,
+      data_policy: payload?.dataPolicy || undefined,
       target: payload?.target ? serializeRunTarget(payload.target) : undefined,
       start_date: payload?.startDate || undefined,
       end_date: payload?.endDate || undefined,
@@ -315,6 +316,13 @@ export const rulesApi = {
       durationMs: toNumber(response.data.duration_ms ?? response.data.durationMs),
       matches: (rawMatches as Array<Record<string, unknown>>).map(normalizeMatch),
       errors: Array.isArray(response.data.errors) ? response.data.errors.map(toString) : [],
+      snapshotId: toNullableString(response.data.snapshot_id ?? response.data.snapshotId),
+      snapshotTime: toNullableString(response.data.snapshot_time ?? response.data.snapshotTime),
+      snapshotAgeSeconds: response.data.snapshot_age_seconds == null && response.data.snapshotAgeSeconds == null
+        ? null
+        : toNumber(response.data.snapshot_age_seconds ?? response.data.snapshotAgeSeconds),
+      quoteHitCount: toNumber(response.data.quote_hit_count ?? response.data.quoteHitCount),
+      quoteMissCount: toNumber(response.data.quote_miss_count ?? response.data.quoteMissCount),
     };
   },
 
@@ -322,6 +330,7 @@ export const rulesApi = {
     const requestPayload = {
       rule_ids: payload.ruleIds,
       mode: payload.mode,
+      data_policy: payload.dataPolicy || undefined,
       target: payload.target ? serializeRunTarget(payload.target) : undefined,
       start_date: payload.startDate || undefined,
       end_date: payload.endDate || undefined,
@@ -345,6 +354,13 @@ export const rulesApi = {
       durationMs: toNumber(response.data.duration_ms ?? response.data.durationMs),
       matches: (rawMatches as Array<Record<string, unknown>>).map(normalizeMatch),
       errors: Array.isArray(response.data.errors) ? response.data.errors.map(toString) : [],
+      snapshotId: toNullableString(response.data.snapshot_id ?? response.data.snapshotId),
+      snapshotTime: toNullableString(response.data.snapshot_time ?? response.data.snapshotTime),
+      snapshotAgeSeconds: response.data.snapshot_age_seconds == null && response.data.snapshotAgeSeconds == null
+        ? null
+        : toNumber(response.data.snapshot_age_seconds ?? response.data.snapshotAgeSeconds),
+      quoteHitCount: toNumber(response.data.quote_hit_count ?? response.data.quoteHitCount),
+      quoteMissCount: toNumber(response.data.quote_miss_count ?? response.data.quoteMissCount),
     };
   },
 };

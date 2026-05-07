@@ -72,6 +72,7 @@ class SystemConfigService:
         "AGENT_SKILL_DIR": ("AGENT_SKILL_DIR", "AGENT_STRATEGY_DIR"),
         "AGENT_SKILL_AUTOWEIGHT": ("AGENT_SKILL_AUTOWEIGHT", "AGENT_STRATEGY_AUTOWEIGHT"),
         "AGENT_SKILL_ROUTING": ("AGENT_SKILL_ROUTING", "AGENT_STRATEGY_ROUTING"),
+        "REALTIME_QUOTE_CACHE_SECONDS": ("REALTIME_QUOTE_CACHE_SECONDS", "REALTIME_CACHE_TTL"),
     }
     _DISPLAY_VALUE_ALIASES: Dict[str, Dict[str, str]] = {
         "AGENT_ORCHESTRATOR_MODE": {
@@ -105,10 +106,17 @@ class SystemConfigService:
 
     @staticmethod
     def _get_runtime_default_display_value(key: str) -> str:
-        if key.upper() != "REALTIME_CACHE_TTL":
+        if key.upper() != "REALTIME_QUOTE_CACHE_SECONDS":
             return ""
         try:
-            return str(Config.get_instance().realtime_cache_ttl)
+            config = Config.get_instance()
+            return str(
+                getattr(
+                    config,
+                    "realtime_quote_cache_seconds",
+                    getattr(config, "realtime_cache_ttl", 30),
+                )
+            )
         except Exception:
             return "30"
 

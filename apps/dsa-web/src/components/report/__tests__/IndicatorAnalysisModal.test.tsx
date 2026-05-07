@@ -338,7 +338,7 @@ describe('IndicatorAnalysisModal', () => {
     });
 
     expect(stocksApi.getHistory).toHaveBeenCalledTimes(historyCallsBeforeRefresh + 1);
-    expect(stocksApi.getHistory).toHaveBeenLastCalledWith('BABA', 3, '1m');
+    expect(stocksApi.getHistory).toHaveBeenLastCalledWith('BABA', 3, '1m', 'cache_only');
     expect(stocksApi.getQuote).toHaveBeenCalledTimes(quoteCallsBeforeRefresh + 1);
     expect(stocksApi.getIndicatorMetrics).toHaveBeenCalledTimes(metricsCallsBeforeRefresh);
 
@@ -367,8 +367,8 @@ describe('IndicatorAnalysisModal', () => {
     );
     await flushPromises();
 
-    expect(stocksApi.getHistory).toHaveBeenCalledWith(stockCode, 120, 'daily');
-    expect(stocksApi.getQuote).toHaveBeenCalledWith(stockCode);
+    expect(stocksApi.getHistory).toHaveBeenCalledWith(stockCode, 120, 'daily', 'cache_only');
+    expect(stocksApi.getQuote).toHaveBeenCalledWith(stockCode, 'cache_only');
     expect(stocksApi.getIndicatorMetrics).toHaveBeenCalledWith(stockCode);
 
     expect(screen.getByRole('tablist', { name: 'K线周期' })).toBeInTheDocument();
@@ -570,6 +570,33 @@ describe('IndicatorAnalysisModal', () => {
     unmount();
   });
 
+  it('warms missing daily cache before rendering the daily chart', async () => {
+    vi.mocked(stocksApi.getHistory).mockImplementation(async (
+      stockCode,
+      _days,
+      period = 'daily',
+      dataPolicy = 'cache_only',
+    ) => ({
+      stockCode,
+      stockName: '贵州茅台',
+      period,
+      data: period === 'daily' && dataPolicy === 'cache_only' ? [] : makeHistory(period),
+      dataSource: period === 'daily' && dataPolicy === 'cache_only' ? 'daily_cache_miss' : 'db_cache',
+    }));
+
+    const { unmount } = render(
+      <IndicatorAnalysisModal stockCode="600519" stockName="贵州茅台" onClose={vi.fn()} />,
+    );
+    await flushPromises();
+
+    expect(stocksApi.getHistory).toHaveBeenCalledWith('600519', 120, 'daily', 'cache_only');
+    expect(stocksApi.getHistory).toHaveBeenCalledWith('600519', 120, 'daily', 'default');
+    expect(screen.getByRole('img', { name: 'K线图' })).toBeInTheDocument();
+    expect(screen.getByTestId('indicator-chart-bar-2026-04-24')).toBeInTheDocument();
+
+    unmount();
+  });
+
   it('opens on an initial hit date and highlights it across the indicator charts', async () => {
     const { unmount } = render(
       <IndicatorAnalysisModal
@@ -582,7 +609,7 @@ describe('IndicatorAnalysisModal', () => {
     );
     await flushPromises();
 
-    expect(stocksApi.getHistory).toHaveBeenCalledWith('600519', 365, 'daily');
+    expect(stocksApi.getHistory).toHaveBeenCalledWith('600519', 365, 'daily', 'cache_only');
     expect(screen.getByText('命中日 2026-04-24')).toBeInTheDocument();
     expect(screen.getByTestId('indicator-hit-highlight-2026-04-24')).toBeInTheDocument();
     expect(screen.getByTestId('indicator-volume-hit-highlight-2026-04-24')).toBeInTheDocument();
@@ -723,19 +750,52 @@ describe('IndicatorAnalysisModal', () => {
     unmount();
   });
 
+  it('derives turnover from lot-based volume when quote turnover is unavailable', async () => {
+    const historyWithoutTurnover = makeHistory('daily').map((point, index) => ({
+      date: point.date,
+      open: point.open,
+      high: point.high,
+      low: point.low,
+      close: point.close,
+      volume: 16_000 + index,
+      amount: point.amount,
+      changePercent: point.changePercent,
+    }));
+    vi.mocked(stocksApi.getHistory).mockImplementation(async (stockCode, _days, period = 'daily') => ({
+      stockCode,
+      stockName: '贵州茅台',
+      period,
+      data: period === 'daily' ? historyWithoutTurnover : makeHistory(period),
+    }));
+    vi.mocked(stocksApi.getQuote).mockResolvedValue(makeQuote('600519', {
+      volume: 16_023,
+      turnoverRate: undefined,
+      floatShares: 160_000_000,
+    }));
+
+    const { unmount } = render(
+      <IndicatorAnalysisModal stockCode="600519" stockName="贵州茅台" onClose={vi.fn()} />,
+    );
+    await flushPromises();
+
+    expect(within(screen.getByTestId('indicator-volume-header')).getByText('换手:1.00%')).toBeInTheDocument();
+
+    unmount();
+  });
+
   it('loads each intraday history range only when its period is selected', async () => {
     const { unmount } = render(
       <IndicatorAnalysisModal stockCode="600519" stockName="贵州茅台" onClose={vi.fn()} />,
     );
     await flushPromises();
 
-    expect(stocksApi.getHistory).toHaveBeenCalledWith('600519', 120, 'daily');
-    expect(stocksApi.getHistory).not.toHaveBeenCalledWith('600519', 1, '1m');
-    expect(stocksApi.getHistory).not.toHaveBeenCalledWith('600519', 3, '1m');
-    expect(stocksApi.getHistory).not.toHaveBeenCalledWith('600519', 3, '5m');
-    expect(stocksApi.getHistory).not.toHaveBeenCalledWith('600519', 30, '15m');
-    expect(stocksApi.getHistory).not.toHaveBeenCalledWith('600519', 30, '30m');
-    expect(stocksApi.getHistory).not.toHaveBeenCalledWith('600519', 30, '60m');
+    expect(stocksApi.getHistory).toHaveBeenCalledWith('600519', 120, 'daily', 'cache_only');
+    expect(stocksApi.getHistory).not.toHaveBeenCalledWith('600519', 1, '1m', 'cache_only');
+    expect(stocksApi.getHistory).not.toHaveBeenCalledWith('600519', 3, '1m', 'cache_only');
+    expect(stocksApi.getHistory).not.toHaveBeenCalledWith('600519', 3, '5m', 'cache_only');
+    expect(stocksApi.getHistory).not.toHaveBeenCalledWith('600519', 30, '15m', 'cache_only');
+    expect(stocksApi.getHistory).not.toHaveBeenCalledWith('600519', 30, '30m', 'cache_only');
+    expect(stocksApi.getHistory).not.toHaveBeenCalledWith('600519', 30, '60m', 'cache_only');
 
     for (const [label, days, period] of [
       ['分时', 1, '1m'],
@@ -747,7 +807,7 @@ describe('IndicatorAnalysisModal', () => {
     ] as const) {
       fireEvent.click(screen.getByRole('tab', { name: label }));
       await flushPromises();
-      expect(stocksApi.getHistory).toHaveBeenCalledWith('600519', days, period);
+      expect(stocksApi.getHistory).toHaveBeenCalledWith('600519', days, period, 'cache_only');
     }
 
     unmount();
@@ -768,13 +828,13 @@ describe('IndicatorAnalysisModal', () => {
 
     const periodTabs = within(screen.getByRole('tablist', { name: 'K线周期' })).getAllByRole('tab');
     expect(periodTabs.slice(0, 2).map((tab) => tab.textContent)).toEqual(['分时', '日K']);
-    expect(stocksApi.getHistory).not.toHaveBeenCalledWith('600519', 1, '1m');
+    expect(stocksApi.getHistory).not.toHaveBeenCalledWith('600519', 1, '1m', 'cache_only');
 
     fireEvent.click(screen.getByRole('tab', { name: '分时' }));
     await flushPromises();
 
     expect(screen.getByRole('tab', { name: '分时' })).toHaveAttribute('aria-selected', 'true');
-    expect(stocksApi.getHistory).toHaveBeenCalledWith('600519', 1, '1m');
+    expect(stocksApi.getHistory).toHaveBeenCalledWith('600519', 1, '1m', 'cache_only');
     expect(screen.getByTestId('indicator-chart-bar-2026-05-07 09:30')).toBeInTheDocument();
     expect(screen.getByTestId('indicator-chart-bar-2026-05-07 12:00')).toBeInTheDocument();
     expect(screen.getByTestId('indicator-chart-bar-2026-05-07 15:00')).toBeInTheDocument();
@@ -786,6 +846,65 @@ describe('IndicatorAnalysisModal', () => {
     expect(priceHeader.getByText('分时')).toBeInTheDocument();
     expect(priceHeader.getByText(/^现价:/)).toBeInTheDocument();
     expect(priceHeader.getByText(/^均价:/)).toBeInTheDocument();
+
+    unmount();
+  });
+
+  it('does not fall back to daily K when timeshare cache warm still returns empty', async () => {
+    vi.mocked(stocksApi.getHistory).mockImplementation(async (stockCode, _days, period = 'daily') => ({
+      stockCode,
+      stockName: '贵州茅台',
+      period,
+      data: period === '1m' ? [] : makeDailyHistory(3, '2026-05-05'),
+      dataSource: period === '1m' ? 'intraday_hot_table_miss' : 'daily_cache',
+    }));
+
+    const { unmount } = render(
+      <IndicatorAnalysisModal stockCode="600519" stockName="贵州茅台" onClose={vi.fn()} />,
+    );
+    await flushPromises();
+
+    expect(screen.getByTestId('indicator-chart-bar-2026-05-07')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('tab', { name: '分时' }));
+    await flushPromises();
+
+    expect(screen.getByRole('tab', { name: '分时' })).toHaveAttribute('aria-selected', 'true');
+    expect(stocksApi.getHistory).toHaveBeenCalledWith('600519', 1, '1m', 'cache_only');
+    expect(stocksApi.getHistory).toHaveBeenCalledWith('600519', 1, '1m', 'default');
+    expect(screen.getByText('暂无分时数据')).toBeInTheDocument();
+    expect(screen.getByText('当天分钟热表暂无 09:30-15:00 的 1 分钟采样数据，等待后台预热写入后刷新。')).toBeInTheDocument();
+    expect(screen.queryByTestId('indicator-chart-bar-2026-05-07')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('indicator-chart-time-axis')).not.toBeInTheDocument();
+
+    unmount();
+  });
+
+  it('warms missing timeshare cache from the same one-minute period', async () => {
+    vi.mocked(stocksApi.getHistory).mockImplementation(async (stockCode, _days, period = 'daily', dataPolicy = 'cache_only') => ({
+      stockCode,
+      stockName: '贵州茅台',
+      period,
+      data: period === '1m' && dataPolicy === 'cache_only'
+        ? []
+        : period === '1m'
+          ? makeTimeshareHistory()
+          : makeDailyHistory(3, '2026-05-05'),
+      dataSource: period === '1m' && dataPolicy === 'cache_only' ? 'intraday_hot_table_miss' : 'intraday_hot_table',
+    }));
+
+    const { unmount } = render(
+      <IndicatorAnalysisModal stockCode="600519" stockName="贵州茅台" onClose={vi.fn()} />,
+    );
+    await flushPromises();
+
+    fireEvent.click(screen.getByRole('tab', { name: '分时' }));
+    await flushPromises();
+
+    expect(stocksApi.getHistory).toHaveBeenCalledWith('600519', 1, '1m', 'cache_only');
+    expect(stocksApi.getHistory).toHaveBeenCalledWith('600519', 1, '1m', 'default');
+    expect(screen.getByTestId('indicator-chart-bar-2026-05-07 09:30')).toBeInTheDocument();
+    expect(screen.queryByTestId('indicator-chart-bar-2026-05-07')).not.toBeInTheDocument();
 
     unmount();
   });

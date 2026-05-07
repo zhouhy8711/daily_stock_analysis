@@ -29,11 +29,28 @@ logger = logging.getLogger(__name__)
 _REALTIME_QUOTE_CACHE_LOCK = RLock()
 _REALTIME_QUOTE_CACHE_BUCKET: Optional[int] = None
 _REALTIME_QUOTE_CACHE: Dict[str, Dict[str, Any]] = {}
+_REALTIME_QUOTE_SNAPSHOT_LOCK = RLock()
+_REALTIME_QUOTE_SNAPSHOT: Dict[str, Any] = {
+    "snapshot_id": None,
+    "snapshot_time": None,
+    "items_by_code": {},
+    "requested_count": 0,
+    "hit_count": 0,
+    "miss_count": 0,
+}
 
 
 def _get_realtime_cache_ttl() -> int:
     try:
-        ttl = int(getattr(get_config(), "realtime_cache_ttl", 30) or 0)
+        config = get_config()
+        ttl = int(
+            getattr(
+                config,
+                "realtime_quote_cache_seconds",
+                getattr(config, "realtime_cache_ttl", 30),
+            )
+            or 0
+        )
     except Exception:
         ttl = 30
     return max(0, ttl)
@@ -52,6 +69,15 @@ def _clear_realtime_quote_cache() -> None:
     with _REALTIME_QUOTE_CACHE_LOCK:
         _REALTIME_QUOTE_CACHE.clear()
         _REALTIME_QUOTE_CACHE_BUCKET = None
+    with _REALTIME_QUOTE_SNAPSHOT_LOCK:
+        _REALTIME_QUOTE_SNAPSHOT.update({
+            "snapshot_id": None,
+            "snapshot_time": None,
+            "items_by_code": {},
+            "requested_count": 0,
+            "hit_count": 0,
+            "miss_count": 0,
+        })
 
 
 def _realtime_quote_cache_size() -> int:
@@ -70,6 +96,87 @@ def _get_realtime_quote_cache_codes() -> set[str]:
             _REALTIME_QUOTE_CACHE_BUCKET = bucket
             return set()
         return set(_REALTIME_QUOTE_CACHE.keys())
+
+
+def _get_snapshot_payload(normalized_code: str) -> Optional[Dict[str, Any]]:
+    with _REALTIME_QUOTE_SNAPSHOT_LOCK:
+        payload = (_REALTIME_QUOTE_SNAPSHOT.get("items_by_code") or {}).get(normalized_code)
+        return deepcopy(payload) if payload is not None else None
+
+
+def _get_realtime_quote_snapshot_info() -> Dict[str, Any]:
+    with _REALTIME_QUOTE_SNAPSHOT_LOCK:
+        snapshot_time = _REALTIME_QUOTE_SNAPSHOT.get("snapshot_time")
+        age_seconds = None
+        if isinstance(snapshot_time, datetime):
+            age_seconds = max(0, int((datetime.now() - snapshot_time).total_seconds()))
+        return {
+            "snapshot_id": _REALTIME_QUOTE_SNAPSHOT.get("snapshot_id"),
+            "snapshot_time": snapshot_time.isoformat() if isinstance(snapshot_time, datetime) else snapshot_time,
+            "snapshot_age_seconds": age_seconds,
+            "quote_snapshot_items": len(_REALTIME_QUOTE_SNAPSHOT.get("items_by_code") or {}),
+            "snapshot_requested_count": int(_REALTIME_QUOTE_SNAPSHOT.get("requested_count") or 0),
+            "snapshot_hit_count": int(_REALTIME_QUOTE_SNAPSHOT.get("hit_count") or 0),
+            "snapshot_miss_count": int(_REALTIME_QUOTE_SNAPSHOT.get("miss_count") or 0),
+        }
+
+
+def get_realtime_quote_cache_diagnostics() -> Dict[str, Any]:
+    """Return code-level realtime quote cache diagnostics without exposing payloads."""
+    snapshot_info = _get_realtime_quote_snapshot_info()
+    with _REALTIME_QUOTE_SNAPSHOT_LOCK:
+        snapshot_codes = sorted((_REALTIME_QUOTE_SNAPSHOT.get("items_by_code") or {}).keys())
+
+    bucket = _get_realtime_cache_bucket()
+    with _REALTIME_QUOTE_CACHE_LOCK:
+        if bucket is not None and _REALTIME_QUOTE_CACHE_BUCKET == bucket:
+            short_cache_codes = sorted(_REALTIME_QUOTE_CACHE.keys())
+        else:
+            short_cache_codes = []
+
+    return {
+        **snapshot_info,
+        "snapshot_codes": snapshot_codes,
+        "short_cache_codes": short_cache_codes,
+        "short_cache_items": len(short_cache_codes),
+    }
+
+
+def _replace_realtime_quote_snapshot(
+    *,
+    requested_codes: List[str],
+    items: List[Dict[str, Any]],
+    failed_codes: List[str],
+    snapshot_time: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    snapshot_time = snapshot_time or datetime.now()
+    snapshot_id = snapshot_time.strftime("%Y%m%d%H%M%S")
+    items_by_code: Dict[str, Dict[str, Any]] = {}
+    for item in items:
+        code = str(item.get("stock_code") or item.get("code") or "").strip().upper()
+        if not code:
+            continue
+        payload = {
+            **item,
+            "snapshot_id": snapshot_id,
+            "snapshot_time": snapshot_time.isoformat(),
+            "quote_time": item.get("update_time") or snapshot_time.isoformat(),
+        }
+        items_by_code[code] = deepcopy(payload)
+
+    requested_set = {str(code or "").strip().upper() for code in requested_codes if str(code or "").strip()}
+    failed_set = {str(code or "").strip().upper() for code in failed_codes if str(code or "").strip()}
+    missing_count = len((requested_set - set(items_by_code.keys())) | failed_set)
+    with _REALTIME_QUOTE_SNAPSHOT_LOCK:
+        _REALTIME_QUOTE_SNAPSHOT.update({
+            "snapshot_id": snapshot_id,
+            "snapshot_time": snapshot_time,
+            "items_by_code": items_by_code,
+            "requested_count": len(requested_set),
+            "hit_count": len(items_by_code),
+            "miss_count": missing_count,
+        })
+    return _get_realtime_quote_snapshot_info()
 
 
 def _deep_getsizeof(value: Any, seen: Optional[set[int]] = None) -> int:
@@ -158,6 +265,7 @@ def get_realtime_quote_cache_stats() -> Dict[str, Any]:
         "provider_cache_memory_mb": round(provider_cache_bytes / 1024 / 1024, 4),
         "bucket_start": bucket_start,
         "provider_breakdown": provider_breakdown,
+        **_get_realtime_quote_snapshot_info(),
     }
 
 
@@ -197,6 +305,19 @@ def _to_optional_float(value: Any) -> Optional[float]:
         return number
     except (TypeError, ValueError):
         return None
+
+
+def _to_optional_string(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    if isinstance(value, float) and math.isnan(value):
+        return None
+    if hasattr(value, "isoformat"):
+        value = value.isoformat()
+    text = str(value).strip()
+    if not text or text.lower() in {"nan", "nat", "none", "null"}:
+        return None
+    return text
 
 
 def _source_to_string(source: Any) -> Optional[str]:
@@ -347,8 +468,17 @@ class StockService:
     def __init__(self):
         """初始化股票数据服务"""
         self.repo = StockRepository()
+
+    def get_realtime_quote_snapshot_info(self) -> Dict[str, Any]:
+        """Return metadata for the latest warmed realtime quote snapshot."""
+        return _get_realtime_quote_snapshot_info()
     
-    def get_realtime_quote(self, stock_code: str) -> Optional[Dict[str, Any]]:
+    def get_realtime_quote(
+        self,
+        stock_code: str,
+        *,
+        data_policy: str = "default",
+    ) -> Optional[Dict[str, Any]]:
         """
         获取股票实时行情
         
@@ -363,9 +493,18 @@ class StockService:
             from data_provider.base import DataFetcherManager, normalize_stock_code
 
             normalized_code = normalize_stock_code(stock_code)
+            normalized_policy = str(data_policy or "default").strip().lower()
+            snapshot_payload = _get_snapshot_payload(normalized_code)
+            if snapshot_payload is not None:
+                return snapshot_payload
+            if normalized_policy == "snapshot_only":
+                return None
+
             cached_payload = _get_cached_quote_payload(normalized_code)
             if cached_payload is not None:
                 return cached_payload
+            if normalized_policy == "cache_only":
+                return None
             
             manager = DataFetcherManager()
             quote = manager.get_realtime_quote(stock_code)
@@ -385,7 +524,13 @@ class StockService:
             logger.error(f"获取实时行情失败: {e}", exc_info=True)
             return None
 
-    def get_realtime_quotes(self, stock_codes: List[str], *, force_refresh: bool = False) -> Dict[str, Any]:
+    def get_realtime_quotes(
+        self,
+        stock_codes: List[str],
+        *,
+        force_refresh: bool = False,
+        data_policy: str = "default",
+    ) -> Dict[str, Any]:
         """
         批量获取股票实时行情。
 
@@ -407,6 +552,7 @@ class StockService:
         try:
             from data_provider.base import DataFetcherManager, normalize_stock_code
 
+            normalized_policy = str(data_policy or "default").strip().lower()
             items: List[Dict[str, Any]] = []
             cached_by_code: Dict[str, Dict[str, Any]] = {}
             quote_by_code: Dict[str, Any] = {}
@@ -415,11 +561,34 @@ class StockService:
             }
             missing_for_fetch: List[str] = []
             for normalized in normalized_to_original.keys():
+                snapshot_payload = None if force_refresh else _get_snapshot_payload(normalized)
+                if snapshot_payload is not None:
+                    cached_by_code[normalized] = snapshot_payload
+                    continue
+                if normalized_policy == "snapshot_only":
+                    missing_for_fetch.append(normalized)
+                    continue
                 cached_payload = None if force_refresh else _get_cached_quote_payload(normalized)
                 if cached_payload is None:
                     missing_for_fetch.append(normalized)
                 else:
                     cached_by_code[normalized] = cached_payload
+
+            if normalized_policy in {"snapshot_only", "cache_only"}:
+                found_codes = {
+                    normalize_stock_code(str(item.get("stock_code") or ""))
+                    for item in cached_by_code.values()
+                }
+                return {
+                    "items": list(cached_by_code.values()),
+                    "failed_codes": [
+                        original
+                        for normalized, original in normalized_to_original.items()
+                        if normalized not in found_codes
+                    ],
+                    "update_time": datetime.now().isoformat(),
+                    **_get_realtime_quote_snapshot_info(),
+                }
 
             manager = DataFetcherManager() if missing_for_fetch else None
             if missing_for_fetch and manager is not None:
@@ -478,6 +647,7 @@ class StockService:
                 "items": items,
                 "failed_codes": failed_codes,
                 "update_time": datetime.now().isoformat(),
+                **_get_realtime_quote_snapshot_info(),
             }
         except ImportError:
             logger.warning("DataFetcherManager 未找到，批量行情返回空数据")
@@ -498,7 +668,7 @@ class StockService:
         """
         Preload realtime quote payloads into the process cache.
 
-        The method fills only missing codes in the current REALTIME_CACHE_TTL bucket by default.
+        The method fills only missing codes in the current REALTIME_QUOTE_CACHE_SECONDS bucket by default.
         When the bucket has rolled over, all requested codes are considered missing and will be
         fetched again through the provider-level full-market cache.
         """
@@ -539,12 +709,30 @@ class StockService:
                 "failed_count": len(normalized_codes),
             }
 
+        snapshot_time = datetime.now()
         current_cached_codes = _get_realtime_quote_cache_codes()
         cached_before = sum(1 for code in normalized_codes if code in current_cached_codes)
         missing_codes = normalized_codes if force_refresh else [
             code for code in normalized_codes if code not in current_cached_codes
         ]
         if not missing_codes:
+            snapshot_items = [
+                payload
+                for code in normalized_codes
+                for payload in [_get_cached_quote_payload(code)]
+                if payload is not None
+            ]
+            snapshot_info = _replace_realtime_quote_snapshot(
+                requested_codes=normalized_codes,
+                items=snapshot_items,
+                failed_codes=[],
+                snapshot_time=snapshot_time,
+            )
+            intraday_saved = self.repo.db.save_intraday_quote_samples(
+                snapshot_items,
+                snapshot_id=str(snapshot_info.get("snapshot_id") or ""),
+                snapshot_time=snapshot_time,
+            )
             return {
                 "status": "cache_hit",
                 "requested_count": len(normalized_codes),
@@ -552,6 +740,8 @@ class StockService:
                 "fetched_count": 0,
                 "failed_count": 0,
                 "cached_after": cached_before,
+                "intraday_saved_count": intraday_saved.get("saved_count", 0),
+                **snapshot_info,
             }
 
         response = self.get_realtime_quotes(missing_codes, force_refresh=force_refresh)
@@ -559,6 +749,27 @@ class StockService:
         failed_count = len(response.get("failed_codes", []))
         cached_after_codes = _get_realtime_quote_cache_codes()
         cached_after = sum(1 for code in normalized_codes if code in cached_after_codes)
+        snapshot_items = [
+            payload
+            for code in normalized_codes
+            for payload in [_get_cached_quote_payload(code)]
+            if payload is not None
+        ]
+        snapshot_info = _replace_realtime_quote_snapshot(
+            requested_codes=normalized_codes,
+            items=snapshot_items,
+            failed_codes=response.get("failed_codes", []),
+            snapshot_time=snapshot_time,
+        )
+        intraday_saved = self.repo.db.save_intraday_quote_samples(
+            snapshot_items,
+            snapshot_id=str(snapshot_info.get("snapshot_id") or ""),
+            snapshot_time=snapshot_time,
+        )
+        try:
+            self.repo.db.purge_intraday_minutes_older_than(3)
+        except Exception as exc:
+            logger.debug("清理分钟热表旧数据失败: %s", exc)
         return {
             "status": "refreshed" if fetched_count > 0 else "miss",
             "requested_count": len(normalized_codes),
@@ -568,6 +779,8 @@ class StockService:
             "failed_count": failed_count,
             "cached_after": cached_after,
             "update_time": response.get("update_time"),
+            "intraday_saved_count": intraday_saved.get("saved_count", 0),
+            **snapshot_info,
         }
 
     def warm_all_a_share_realtime_quotes(self, *, force_refresh: bool = False) -> Dict[str, Any]:
@@ -861,8 +1074,11 @@ class StockService:
                 "volume": _to_optional_float(row.get("volume")),
                 "after_hours_volume": _to_optional_float(row.get("after_hours_volume")),
                 "amount": _to_optional_float(row.get("amount")),
-                "change_percent": _to_optional_float(row.get("pct_chg")),
+                "change_percent": _to_optional_float(row.get("pct_chg")) or _to_optional_float(row.get("change_percent")),
                 "turnover_rate": _to_optional_float(row.get("turnover_rate")),
+                "data_source": _to_optional_string(row.get("data_source")),
+                "snapshot_id": _to_optional_string(row.get("snapshot_id")),
+                "snapshot_time": _to_optional_string(row.get("snapshot_time")),
             })
         return data
 
@@ -972,6 +1188,18 @@ class StockService:
             return datetime.now().date()
 
     @staticmethod
+    def _resolve_intraday_cache_target_date(stock_code: str) -> date:
+        try:
+            market = trading_calendar.get_market_for_stock(stock_code)
+            market_today = trading_calendar.get_market_now(market).date()
+            if market in {"cn", "hk"} and not trading_calendar.is_market_open(market, market_today):
+                return trading_calendar.get_effective_trading_date(market)
+            return market_today
+        except Exception as calendar_error:
+            logger.debug("解析 %s 分钟热表交易日失败，按本地日期读取: %s", stock_code, calendar_error)
+            return datetime.now().date()
+
+    @staticmethod
     def _quote_has_realtime_daily_signal(quote_payload: Optional[Dict[str, Any]]) -> bool:
         if not quote_payload:
             return False
@@ -1031,6 +1259,8 @@ class StockService:
         self,
         df,
         stock_code: str,
+        *,
+        data_policy: str = "default",
     ) -> Tuple[Any, Optional[Dict[str, Any]]]:
         if df is None or df.empty or "date" not in df.columns or "close" not in df.columns:
             return df, None
@@ -1039,7 +1269,7 @@ class StockService:
         if realtime_date is None:
             return df, None
 
-        quote_payload = self.get_realtime_quote(stock_code)
+        quote_payload = self.get_realtime_quote(stock_code, data_policy=data_policy)
         if not self._quote_has_realtime_daily_signal(quote_payload):
             return df, quote_payload
 
@@ -1074,6 +1304,8 @@ class StockService:
         self,
         df,
         stock_code: str,
+        *,
+        data_policy: str = "default",
     ) -> Tuple[Any, Optional[Dict[str, Any]]]:
         if df is None or df.empty or "date" not in df.columns or "close" not in df.columns:
             return df, None
@@ -1086,7 +1318,7 @@ class StockService:
         if latest_date != realtime_date:
             return df, None
 
-        quote_payload = self.get_realtime_quote(stock_code)
+        quote_payload = self.get_realtime_quote(stock_code, data_policy=data_policy)
         if not self._quote_has_realtime_price(quote_payload):
             return df, quote_payload
 
@@ -1124,7 +1356,8 @@ class StockService:
         self,
         stock_code: str,
         period: str = "daily",
-        days: int = 30
+        days: int = 30,
+        data_policy: str = "default",
     ) -> Dict[str, Any]:
         """
         获取股票历史行情
@@ -1147,11 +1380,16 @@ class StockService:
             normalized_period = normalize_kline_period(period)
             manager = None
             stock_name = None
+            normalized_policy = str(data_policy or "default").strip().lower()
+            cache_only = normalized_policy in {"cache_only", "snapshot_only"}
             if normalized_period == "daily":
                 cached_history = self._load_daily_history_from_db(stock_code, days)
                 if cached_history is not None:
                     df, source = cached_history
                     stock_name = self._get_local_stock_name(stock_code)
+                elif cache_only:
+                    logger.info("日线缓存未命中，cache_only 跳过远程获取: %s", stock_code)
+                    return {"stock_code": stock_code, "period": normalized_period, "data": [], "data_source": "daily_cache_miss"}
                 else:
                     target_date = self._resolve_daily_cache_target_date(stock_code)
                     latest_cached_date = self._get_daily_cache_latest_date(stock_code)
@@ -1231,22 +1469,54 @@ class StockService:
                         df, source = stale_cached_history
                         stock_name = self._get_local_stock_name(stock_code)
             else:
-                manager = DataFetcherManager()
-                intraday_kwargs: Dict[str, Any] = {
-                    "period": normalized_period,
-                    "days": max(1, min(int(days or 1), 30)),
-                }
-                try:
-                    market = trading_calendar.get_market_for_stock(stock_code)
-                    if market in {"cn", "hk"}:
-                        market_today = trading_calendar.get_market_now(market).date()
-                        if not trading_calendar.is_market_open(market, market_today):
-                            effective_date = trading_calendar.get_effective_trading_date(market)
-                            intraday_kwargs["end_date"] = effective_date.isoformat()
-                except Exception as calendar_error:
-                    logger.debug("分钟K交易日锚定失败，按默认日期拉取: %s", calendar_error)
+                intraday_trade_date = self._resolve_intraday_cache_target_date(stock_code)
+                hot_df = self.repo.db.get_intraday_minute_data(
+                    stock_code,
+                    days=max(1, min(int(days or 1), 30)),
+                    period=normalized_period,
+                    trade_date=intraday_trade_date,
+                )
+                if hot_df is not None and not hot_df.empty:
+                    df, source = hot_df, "intraday_hot_table"
+                    stock_name = self._get_local_stock_name(stock_code)
+                elif cache_only:
+                    logger.info("分钟热表未命中，cache_only 跳过远程获取: %s period=%s", stock_code, normalized_period)
+                    return {"stock_code": stock_code, "period": normalized_period, "data": [], "data_source": "intraday_hot_table_miss"}
+                else:
+                    manager = DataFetcherManager()
+                    intraday_kwargs: Dict[str, Any] = {
+                        "period": normalized_period,
+                        "days": max(1, min(int(days or 1), 30)),
+                    }
+                    try:
+                        market = trading_calendar.get_market_for_stock(stock_code)
+                        if market in {"cn", "hk"}:
+                            market_today = trading_calendar.get_market_now(market).date()
+                            if not trading_calendar.is_market_open(market, market_today):
+                                effective_date = trading_calendar.get_effective_trading_date(market)
+                                intraday_kwargs["end_date"] = effective_date.isoformat()
+                    except Exception as calendar_error:
+                        logger.debug("分钟K交易日锚定失败，按默认日期拉取: %s", calendar_error)
 
-                df, source = manager.get_intraday_data(stock_code, **intraday_kwargs)
+                    df, source = manager.get_intraday_data(stock_code, **intraday_kwargs)
+                    if df is not None and not df.empty:
+                        try:
+                            self.repo.db.save_intraday_minute_dataframe(
+                                df,
+                                stock_code,
+                                data_source=source,
+                                snapshot_time=datetime.now(),
+                            )
+                            refreshed_hot_df = self.repo.db.get_intraday_minute_data(
+                                stock_code,
+                                days=max(1, min(int(days or 1), 30)),
+                                period=normalized_period,
+                                trade_date=intraday_trade_date,
+                            )
+                            if refreshed_hot_df is not None and not refreshed_hot_df.empty:
+                                df, source = refreshed_hot_df, "intraday_hot_table"
+                        except Exception as save_error:
+                            logger.debug("保存 %s 分钟热表失败: %s", stock_code, save_error)
             
             if df is None or df.empty:
                 logger.warning(f"获取 {stock_code} 历史数据失败")
@@ -1257,11 +1527,19 @@ class StockService:
                 stock_name = manager.get_stock_name(stock_code)
 
             if normalized_period == "daily":
-                df, quote_payload = self._augment_daily_history_with_realtime(df, stock_code)
+                df, quote_payload = self._augment_daily_history_with_realtime(
+                    df,
+                    stock_code,
+                    data_policy="snapshot_only" if cache_only else "default",
+                )
                 if stock_name is None and quote_payload:
                     stock_name = quote_payload.get("stock_name")
             else:
-                df, quote_payload = self._augment_intraday_history_with_realtime(df, stock_code)
+                df, quote_payload = self._augment_intraday_history_with_realtime(
+                    df,
+                    stock_code,
+                    data_policy="snapshot_only" if cache_only else "default",
+                )
                 if stock_name is None and quote_payload:
                     stock_name = quote_payload.get("stock_name")
             
@@ -1273,6 +1551,8 @@ class StockService:
                 "stock_name": stock_name,
                 "period": normalized_period,
                 "data": data,
+                "data_source": source,
+                **_get_realtime_quote_snapshot_info(),
             }
             
         except ImportError:
