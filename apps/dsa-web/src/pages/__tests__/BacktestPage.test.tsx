@@ -380,6 +380,105 @@ describe('BacktestPage', () => {
     expect(screen.getAllByText(/成交量/).length).toBeGreaterThan(0);
   });
 
+  it('runs live test without showing backtest run history', async () => {
+    render(<BacktestPage mode="live" />);
+
+    expect(await screen.findByText('实测结果')).toBeInTheDocument();
+    expect(screen.queryByText('回测执行历史')).not.toBeInTheDocument();
+    expect(screen.queryByText('开始日期')).not.toBeInTheDocument();
+    expect(screen.queryByText('结束日期')).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '运行实测' })).toBeInTheDocument();
+    expect(rulesApi.listRuns).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole('button', { name: '运行实测' }));
+
+    await waitFor(() => {
+      expect(rulesApi.runBatch).toHaveBeenCalledWith({
+        ruleIds: [7],
+        mode: 'latest',
+        target: {
+          scope: 'watchlist',
+          stockCodes: ['300274.SZ', '688521.SH'],
+        },
+      });
+    });
+    const executionGroupButton = await screen.findByRole('button', {
+      name: /展开执行时间 \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}，命中 1 条/,
+    });
+    expect(screen.queryByTestId('live-rule-group-7')).not.toBeInTheDocument();
+    fireEvent.click(executionGroupButton);
+
+    const liveRuleGroup = await screen.findByTestId('live-rule-group-7');
+    expect(within(liveRuleGroup).getByText('#7 放量观察')).toBeInTheDocument();
+    expect(within(liveRuleGroup).getByText('300274.SZ')).toBeInTheDocument();
+    expect(within(liveRuleGroup).queryByRole('columnheader', { name: '日期' })).not.toBeInTheDocument();
+    expect(within(liveRuleGroup).getByText(/执行 \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: '停止实测' }));
+  });
+
+  it('keeps each live test cycle as a collapsed execution group', async () => {
+    render(<BacktestPage mode="live" />);
+
+    await screen.findByText('1 / 1');
+    vi.mocked(rulesApi.runBatch)
+      .mockResolvedValueOnce({
+        runId: 12,
+        ruleId: 7,
+        status: 'completed',
+        targetCount: 2,
+        matchCount: 1,
+        eventCount: 1,
+        mode: 'history',
+        durationMs: 20,
+        matches,
+        errors: [],
+      })
+      .mockResolvedValueOnce({
+        runId: 13,
+        ruleId: 7,
+        status: 'completed',
+        targetCount: 2,
+        matchCount: 1,
+        eventCount: 1,
+        mode: 'history',
+        durationMs: 18,
+        matches: secondMatches,
+        errors: [],
+      });
+
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-05-07T03:55:10Z'));
+      fireEvent.click(screen.getByRole('button', { name: '运行实测' }));
+      await act(async () => {
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+
+      expect(screen.getByRole('button', {
+        name: '展开执行时间 2026-05-07 11:55:10，命中 1 条',
+      })).toBeInTheDocument();
+
+      vi.setSystemTime(new Date('2026-05-07T03:55:40Z'));
+      await act(async () => {
+        vi.advanceTimersByTime(30_000);
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+
+      expect(screen.getByRole('button', {
+        name: '展开执行时间 2026-05-07 11:56:10，命中 1 条',
+      })).toBeInTheDocument();
+      expect(screen.getAllByTestId('live-execution-group')).toHaveLength(2);
+      expect(screen.queryByTestId('live-rule-group-7')).not.toBeInTheDocument();
+
+      fireEvent.click(screen.getByRole('button', { name: '停止实测' }));
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('groups multi-rule backtest results by rule and can collapse a rule group', async () => {
     vi.mocked(rulesApi.list).mockResolvedValue([rule, secondRule, emptyRule]);
     vi.mocked(rulesApi.runBatch).mockResolvedValue({

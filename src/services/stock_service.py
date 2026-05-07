@@ -59,6 +59,19 @@ def _realtime_quote_cache_size() -> int:
         return len(_REALTIME_QUOTE_CACHE)
 
 
+def _get_realtime_quote_cache_codes() -> set[str]:
+    bucket = _get_realtime_cache_bucket()
+    if bucket is None:
+        return set()
+    global _REALTIME_QUOTE_CACHE_BUCKET
+    with _REALTIME_QUOTE_CACHE_LOCK:
+        if _REALTIME_QUOTE_CACHE_BUCKET != bucket:
+            _REALTIME_QUOTE_CACHE.clear()
+            _REALTIME_QUOTE_CACHE_BUCKET = bucket
+            return set()
+        return set(_REALTIME_QUOTE_CACHE.keys())
+
+
 def _deep_getsizeof(value: Any, seen: Optional[set[int]] = None) -> int:
     seen = seen or set()
     object_id = id(value)
@@ -372,7 +385,7 @@ class StockService:
             logger.error(f"获取实时行情失败: {e}", exc_info=True)
             return None
 
-    def get_realtime_quotes(self, stock_codes: List[str]) -> Dict[str, Any]:
+    def get_realtime_quotes(self, stock_codes: List[str], *, force_refresh: bool = False) -> Dict[str, Any]:
         """
         批量获取股票实时行情。
 
@@ -402,7 +415,7 @@ class StockService:
             }
             missing_for_fetch: List[str] = []
             for normalized in normalized_to_original.keys():
-                cached_payload = _get_cached_quote_payload(normalized)
+                cached_payload = None if force_refresh else _get_cached_quote_payload(normalized)
                 if cached_payload is None:
                     missing_for_fetch.append(normalized)
                 else:
@@ -480,6 +493,98 @@ class StockService:
                 "failed_codes": normalized_codes,
                 "update_time": datetime.now().isoformat(),
             }
+
+    def warm_realtime_quotes(self, stock_codes: List[str], *, force_refresh: bool = False) -> Dict[str, Any]:
+        """
+        Preload realtime quote payloads into the process cache.
+
+        The method fills only missing codes in the current REALTIME_CACHE_TTL bucket by default.
+        When the bucket has rolled over, all requested codes are considered missing and will be
+        fetched again through the provider-level full-market cache.
+        """
+        try:
+            from data_provider.base import normalize_stock_code
+        except ImportError:
+            return {
+                "status": "skipped",
+                "reason": "data_fetcher_unavailable",
+                "requested_count": len(stock_codes),
+                "cached_before": 0,
+                "fetched_count": 0,
+                "failed_count": len(stock_codes),
+            }
+
+        normalized_codes = list(dict.fromkeys(
+            normalize_stock_code(code)
+            for code in stock_codes
+            if str(code or "").strip()
+        ))
+        if not normalized_codes:
+            return {
+                "status": "skipped",
+                "reason": "empty_stock_codes",
+                "requested_count": 0,
+                "cached_before": 0,
+                "fetched_count": 0,
+                "failed_count": 0,
+            }
+
+        if _get_realtime_cache_ttl() <= 0:
+            return {
+                "status": "skipped",
+                "reason": "realtime_cache_disabled",
+                "requested_count": len(normalized_codes),
+                "cached_before": 0,
+                "fetched_count": 0,
+                "failed_count": len(normalized_codes),
+            }
+
+        current_cached_codes = _get_realtime_quote_cache_codes()
+        cached_before = sum(1 for code in normalized_codes if code in current_cached_codes)
+        missing_codes = normalized_codes if force_refresh else [
+            code for code in normalized_codes if code not in current_cached_codes
+        ]
+        if not missing_codes:
+            return {
+                "status": "cache_hit",
+                "requested_count": len(normalized_codes),
+                "cached_before": cached_before,
+                "fetched_count": 0,
+                "failed_count": 0,
+                "cached_after": cached_before,
+            }
+
+        response = self.get_realtime_quotes(missing_codes, force_refresh=force_refresh)
+        fetched_count = len(response.get("items", []))
+        failed_count = len(response.get("failed_codes", []))
+        cached_after_codes = _get_realtime_quote_cache_codes()
+        cached_after = sum(1 for code in normalized_codes if code in cached_after_codes)
+        return {
+            "status": "refreshed" if fetched_count > 0 else "miss",
+            "requested_count": len(normalized_codes),
+            "missing_before": len(missing_codes),
+            "cached_before": cached_before,
+            "fetched_count": fetched_count,
+            "failed_count": failed_count,
+            "cached_after": cached_after,
+            "update_time": response.get("update_time"),
+        }
+
+    def warm_all_a_share_realtime_quotes(self, *, force_refresh: bool = False) -> Dict[str, Any]:
+        """Preload realtime quote payloads for all active A-share stocks."""
+        from src.data.stock_index_loader import get_all_a_share_stock_codes
+
+        codes = get_all_a_share_stock_codes()
+        if not codes:
+            return {
+                "status": "skipped",
+                "reason": "empty_a_share_index",
+                "requested_count": 0,
+                "cached_before": 0,
+                "fetched_count": 0,
+                "failed_count": 0,
+            }
+        return self.warm_realtime_quotes(codes, force_refresh=force_refresh)
 
     def get_indicator_metrics(self, stock_code: str) -> Dict[str, Any]:
         """

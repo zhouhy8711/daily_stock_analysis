@@ -28,6 +28,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass, field
 from datetime import datetime
+from threading import RLock
 from typing import Optional, Dict, Any, List, Tuple
 
 import pandas as pd
@@ -136,6 +137,7 @@ _realtime_cache: Dict[str, Any] = {
     'timestamp': 0,
     'ttl': 30
 }
+_realtime_cache_lock = RLock()
 
 # ETF 实时行情缓存（与股票分开缓存）
 _etf_realtime_cache: Dict[str, Any] = {
@@ -143,6 +145,7 @@ _etf_realtime_cache: Dict[str, Any] = {
     'timestamp': 0,
     'ttl': 30
 }
+_etf_realtime_cache_lock = RLock()
 
 
 def _refresh_realtime_cache_ttl(cache: Dict[str, Any]) -> int:
@@ -155,6 +158,21 @@ def _refresh_realtime_cache_ttl(cache: Dict[str, Any]) -> int:
     ttl = max(0, ttl)
     cache["ttl"] = ttl
     return ttl
+
+
+def _get_fresh_realtime_cache(cache: Dict[str, Any], current_time: float, cache_ttl: int):
+    if (
+        cache.get('data') is not None
+        and cache_ttl > 0
+        and current_time - float(cache.get('timestamp', 0) or 0) < cache_ttl
+    ):
+        return cache.get('data')
+    return None
+
+
+def _set_realtime_cache(cache: Dict[str, Any], data: Any, current_time: float) -> None:
+    cache['data'] = data
+    cache['timestamp'] = current_time
 
 
 def _is_etf_code(stock_code: str) -> bool:
@@ -711,37 +729,32 @@ class EfinanceFetcher(BaseFetcher):
             return None
         
         try:
-            # 检查缓存
             current_time = time.time()
             cache_ttl = _refresh_realtime_cache_ttl(_realtime_cache)
-            if (_realtime_cache['data'] is not None and 
-                cache_ttl > 0 and
-                current_time - _realtime_cache['timestamp'] < cache_ttl):
-                df = _realtime_cache['data']
-                cache_age = int(current_time - _realtime_cache['timestamp'])
-                logger.debug(f"[缓存命中] 实时行情(efinance) - 缓存年龄 {cache_age}s/{cache_ttl}s")
-            else:
-                # 触发全量刷新
-                logger.info(f"[缓存未命中] 触发全量刷新 实时行情(efinance)")
-                # 防封禁策略
-                self._set_random_user_agent()
-                self._enforce_rate_limit()
-                
-                logger.info(f"[API调用] ef.stock.get_realtime_quotes() 获取实时行情...")
-                import time as _time
-                api_start = _time.time()
-                
-                # efinance 的实时行情 API (with timeout to avoid indefinite hangs)
-                df = _ef_call_with_timeout(ef.stock.get_realtime_quotes)
-                
-                api_elapsed = _time.time() - api_start
-                logger.info(f"[API返回] ef.stock.get_realtime_quotes 成功: 返回 {len(df)} 只股票, 耗时 {api_elapsed:.2f}s")
-                circuit_breaker.record_success(source_key)
-                
-                # 更新缓存
-                _realtime_cache['data'] = df
-                _realtime_cache['timestamp'] = current_time
-                logger.info(f"[缓存更新] 实时行情(efinance) 缓存已刷新，TTL={cache_ttl}s")
+            with _realtime_cache_lock:
+                df = _get_fresh_realtime_cache(_realtime_cache, current_time, cache_ttl)
+                if df is not None:
+                    cache_age = int(current_time - _realtime_cache['timestamp'])
+                    logger.debug(f"[缓存命中] 实时行情(efinance) - 缓存年龄 {cache_age}s/{cache_ttl}s")
+                else:
+                    # 触发全量刷新。锁内刷新用于合并并发 miss，避免多线程同时打全市场接口。
+                    logger.info(f"[缓存未命中] 触发全量刷新 实时行情(efinance)")
+                    self._set_random_user_agent()
+                    self._enforce_rate_limit()
+
+                    logger.info(f"[API调用] ef.stock.get_realtime_quotes() 获取实时行情...")
+                    import time as _time
+                    api_start = _time.time()
+
+                    # efinance 的实时行情 API (with timeout to avoid indefinite hangs)
+                    df = _ef_call_with_timeout(ef.stock.get_realtime_quotes)
+
+                    api_elapsed = _time.time() - api_start
+                    logger.info(f"[API返回] ef.stock.get_realtime_quotes 成功: 返回 {len(df)} 只股票, 耗时 {api_elapsed:.2f}s")
+                    circuit_breaker.record_success(source_key)
+
+                    _set_realtime_cache(_realtime_cache, df, current_time)
+                    logger.info(f"[缓存更新] 实时行情(efinance) 缓存已刷新，TTL={cache_ttl}s")
             
             # 查找指定股票
             # efinance 返回的列名可能是 '股票代码' 或 'code'
@@ -832,28 +845,24 @@ class EfinanceFetcher(BaseFetcher):
         try:
             current_time = time.time()
             cache_ttl = _refresh_realtime_cache_ttl(_realtime_cache)
-            if (
-                _realtime_cache['data'] is not None and
-                cache_ttl > 0 and
-                current_time - _realtime_cache['timestamp'] < cache_ttl
-            ):
-                df = _realtime_cache['data']
-                cache_age = int(current_time - _realtime_cache['timestamp'])
-                logger.debug(f"[缓存命中] 批量实时行情(efinance) - 缓存年龄 {cache_age}s/{cache_ttl}s")
-            else:
-                self._set_random_user_agent()
-                self._enforce_rate_limit()
+            with _realtime_cache_lock:
+                df = _get_fresh_realtime_cache(_realtime_cache, current_time, cache_ttl)
+                if df is not None:
+                    cache_age = int(current_time - _realtime_cache['timestamp'])
+                    logger.debug(f"[缓存命中] 批量实时行情(efinance) - 缓存年龄 {cache_age}s/{cache_ttl}s")
+                else:
+                    self._set_random_user_agent()
+                    self._enforce_rate_limit()
 
-                logger.info("[API调用] ef.stock.get_realtime_quotes() 批量获取实时行情...")
-                import time as _time
-                api_start = _time.time()
-                df = _ef_call_with_timeout(ef.stock.get_realtime_quotes)
-                api_elapsed = _time.time() - api_start
-                logger.info(f"[API返回] 批量实时行情成功: 返回 {len(df)} 只股票, 耗时 {api_elapsed:.2f}s")
-                circuit_breaker.record_success(source_key)
+                    logger.info("[API调用] ef.stock.get_realtime_quotes() 批量获取实时行情...")
+                    import time as _time
+                    api_start = _time.time()
+                    df = _ef_call_with_timeout(ef.stock.get_realtime_quotes)
+                    api_elapsed = _time.time() - api_start
+                    logger.info(f"[API返回] 批量实时行情成功: 返回 {len(df)} 只股票, 耗时 {api_elapsed:.2f}s")
+                    circuit_breaker.record_success(source_key)
 
-                _realtime_cache['data'] = df
-                _realtime_cache['timestamp'] = current_time
+                    _set_realtime_cache(_realtime_cache, df, current_time)
 
             if df is None or df.empty:
                 return {}
@@ -937,33 +946,29 @@ class EfinanceFetcher(BaseFetcher):
         try:
             current_time = time.time()
             cache_ttl = _refresh_realtime_cache_ttl(_etf_realtime_cache)
-            if (
-                _etf_realtime_cache['data'] is not None and
-                cache_ttl > 0 and
-                current_time - _etf_realtime_cache['timestamp'] < cache_ttl
-            ):
-                df = _etf_realtime_cache['data']
-                cache_age = int(current_time - _etf_realtime_cache['timestamp'])
-                logger.debug(f"[缓存命中] ETF实时行情(efinance) - 缓存年龄 {cache_age}s/{cache_ttl}s")
-            else:
-                self._set_random_user_agent()
-                self._enforce_rate_limit()
-
-                logger.info("[API调用] ef.stock.get_realtime_quotes(['ETF']) 获取ETF实时行情...")
-                import time as _time
-                api_start = _time.time()
-                df = _ef_call_with_timeout(ef.stock.get_realtime_quotes, ['ETF'])
-                api_elapsed = _time.time() - api_start
-
-                if df is not None and not df.empty:
-                    logger.info(f"[API返回] ETF 实时行情成功: {len(df)} 条, 耗时 {api_elapsed:.2f}s")
-                    circuit_breaker.record_success(source_key)
+            with _etf_realtime_cache_lock:
+                df = _get_fresh_realtime_cache(_etf_realtime_cache, current_time, cache_ttl)
+                if df is not None:
+                    cache_age = int(current_time - _etf_realtime_cache['timestamp'])
+                    logger.debug(f"[缓存命中] ETF实时行情(efinance) - 缓存年龄 {cache_age}s/{cache_ttl}s")
                 else:
-                    logger.info(f"[API返回] ETF 实时行情为空, 耗时 {api_elapsed:.2f}s")
-                    df = pd.DataFrame()
+                    self._set_random_user_agent()
+                    self._enforce_rate_limit()
 
-                _etf_realtime_cache['data'] = df
-                _etf_realtime_cache['timestamp'] = current_time
+                    logger.info("[API调用] ef.stock.get_realtime_quotes(['ETF']) 获取ETF实时行情...")
+                    import time as _time
+                    api_start = _time.time()
+                    df = _ef_call_with_timeout(ef.stock.get_realtime_quotes, ['ETF'])
+                    api_elapsed = _time.time() - api_start
+
+                    if df is not None and not df.empty:
+                        logger.info(f"[API返回] ETF 实时行情成功: {len(df)} 条, 耗时 {api_elapsed:.2f}s")
+                        circuit_breaker.record_success(source_key)
+                    else:
+                        logger.info(f"[API返回] ETF 实时行情为空, 耗时 {api_elapsed:.2f}s")
+                        df = pd.DataFrame()
+
+                    _set_realtime_cache(_etf_realtime_cache, df, current_time)
 
             if df is None or df.empty:
                 logger.info(f"[实时行情] ETF实时行情数据为空(efinance)，跳过 {stock_code}")
@@ -1113,17 +1118,12 @@ class EfinanceFetcher(BaseFetcher):
 
             current_time = time.time()
             cache_ttl = _refresh_realtime_cache_ttl(_realtime_cache)
-            if (
-                _realtime_cache['data'] is not None and
-                cache_ttl > 0 and
-                current_time - _realtime_cache['timestamp'] < cache_ttl
-            ):
-                df = _realtime_cache['data']
-            else:
-                logger.info("[API调用] ef.stock.get_realtime_quotes() 获取市场统计...")
-                df = _ef_call_with_timeout(ef.stock.get_realtime_quotes)
-                _realtime_cache['data'] = df
-                _realtime_cache['timestamp'] = current_time
+            with _realtime_cache_lock:
+                df = _get_fresh_realtime_cache(_realtime_cache, current_time, cache_ttl)
+                if df is None:
+                    logger.info("[API调用] ef.stock.get_realtime_quotes() 获取市场统计...")
+                    df = _ef_call_with_timeout(ef.stock.get_realtime_quotes)
+                    _set_realtime_cache(_realtime_cache, df, current_time)
 
             if df is None or df.empty:
                 logger.warning("[API返回] 市场统计数据为空")

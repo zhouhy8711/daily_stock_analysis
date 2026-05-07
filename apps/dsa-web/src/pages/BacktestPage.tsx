@@ -38,8 +38,11 @@ const INPUT_CLASS =
 const TEXTAREA_CLASS =
   'input-surface input-focus-glow min-h-[112px] w-full resize-y rounded-xl border bg-transparent px-3 py-2 text-sm text-foreground transition-all placeholder:text-muted-text focus:outline-none disabled:cursor-not-allowed disabled:opacity-60';
 const WATCHLIST_HISTORY_LIMIT = 20;
+const LIVE_TEST_POLL_INTERVAL_MS = 30_000;
 const UNCLASSIFIED_INDUSTRY = UNCLASSIFIED_INDUSTRY_LABEL;
 const DEFAULT_INDUSTRY = '半导体';
+
+export type BacktestPageMode = 'backtest' | 'live';
 
 type StockListDisplayItem = {
   code: string;
@@ -80,6 +83,7 @@ type RuleRunEventRow = {
   stockCode: string;
   stockName?: string | null;
   eventDate: string;
+  executionTime?: string | null;
   event: Record<string, unknown>;
   explanation?: string | null;
 };
@@ -91,6 +95,13 @@ type RuleResultGroup = {
   rows: RuleRunEventRow[];
   columns: ResultValueColumn[];
   tableMinWidth: number;
+};
+
+type LiveExecutionResultGroup = {
+  key: string;
+  executionTime: string;
+  hitCount: number;
+  ruleGroups: RuleResultGroup[];
 };
 
 type RunProgressState = {
@@ -139,10 +150,19 @@ function createEmptyBacktestRuntimeState(): BacktestRuntimeState {
   };
 }
 
-let backtestRuntimeState = createEmptyBacktestRuntimeState();
-const backtestRuntimeListeners = new Set<BacktestRuntimeListener>();
+const backtestRuntimeStates: Record<BacktestPageMode, BacktestRuntimeState> = {
+  backtest: createEmptyBacktestRuntimeState(),
+  live: createEmptyBacktestRuntimeState(),
+};
+const backtestRuntimeListeners: Record<BacktestPageMode, Set<BacktestRuntimeListener>> = {
+  backtest: new Set<BacktestRuntimeListener>(),
+  live: new Set<BacktestRuntimeListener>(),
+};
 
-function cloneBacktestRuntimeState(state: BacktestRuntimeState = backtestRuntimeState): BacktestRuntimeState {
+function cloneBacktestRuntimeState(
+  mode: BacktestPageMode,
+  state: BacktestRuntimeState = backtestRuntimeStates[mode],
+): BacktestRuntimeState {
   return {
     ...state,
     runHistory: [...state.runHistory],
@@ -152,7 +172,8 @@ function cloneBacktestRuntimeState(state: BacktestRuntimeState = backtestRuntime
   };
 }
 
-function hasBacktestRuntimeSession(state: BacktestRuntimeState = backtestRuntimeState): boolean {
+function hasBacktestRuntimeSession(mode: BacktestPageMode): boolean {
+  const state = backtestRuntimeStates[mode];
   return (
     state.isRunning
     || state.runHistory.length > 0
@@ -165,11 +186,12 @@ function hasBacktestRuntimeSession(state: BacktestRuntimeState = backtestRuntime
 }
 
 function updateBacktestRuntime(
+  mode: BacktestPageMode,
   updater: (current: BacktestRuntimeState) => BacktestRuntimeState,
 ): void {
-  backtestRuntimeState = updater(backtestRuntimeState);
-  const snapshot = cloneBacktestRuntimeState();
-  backtestRuntimeListeners.forEach((listener) => listener(snapshot));
+  backtestRuntimeStates[mode] = updater(backtestRuntimeStates[mode]);
+  const snapshot = cloneBacktestRuntimeState(mode);
+  backtestRuntimeListeners[mode].forEach((listener) => listener(snapshot));
 }
 
 function resolveStateAction<T>(current: T, action: React.SetStateAction<T>): T {
@@ -402,13 +424,54 @@ function formatNumber(value: unknown): string {
   return numberValue.toLocaleString('zh-CN', { maximumFractionDigits: 4 });
 }
 
-function formatDateTime(value?: string | null): string {
+function formatNaiveDateTimeText(value: string, withSeconds: boolean): string {
+  return value.slice(0, withSeconds ? 19 : 16).replace('T', ' ');
+}
+
+function hasExplicitTimezone(value: string): boolean {
+  return /(?:z|[+-]\d{2}:?\d{2})$/i.test(value);
+}
+
+function formatShanghaiDateTime(value?: string | null, withSeconds = false): string {
   if (!value) return '--';
-  return value.slice(0, 16).replace('T', ' ');
+  if (/^\d{4}-\d{2}-\d{2}$/.test(value)) return value;
+  if (!hasExplicitTimezone(value)) {
+    return formatNaiveDateTimeText(value, withSeconds);
+  }
+
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return formatNaiveDateTimeText(value, withSeconds);
+  }
+
+  const options: Intl.DateTimeFormatOptions = {
+    timeZone: 'Asia/Shanghai',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    hourCycle: 'h23',
+  };
+  if (withSeconds) {
+    options.second = '2-digit';
+  }
+  const parts = new Intl.DateTimeFormat('en-CA', options).formatToParts(date);
+  const getPart = (type: string) => parts.find((part) => part.type === type)?.value ?? '';
+  const timeText = `${getPart('hour')}:${getPart('minute')}${withSeconds ? `:${getPart('second')}` : ''}`;
+  return `${getPart('year')}-${getPart('month')}-${getPart('day')} ${timeText}`;
+}
+
+function formatDateTime(value?: string | null): string {
+  return formatShanghaiDateTime(value);
+}
+
+function formatDateTimeToSecond(value?: string | null): string {
+  return formatShanghaiDateTime(value, true);
 }
 
 function formatLogTime(value: string): string {
-  return value.slice(11, 19);
+  return formatDateTimeToSecond(value).slice(11, 19);
 }
 
 function getIndicatorHistoryDays(eventDate: string): number {
@@ -452,6 +515,14 @@ function metricUnit(metrics: RuleMetricItem[], metricKey: string): string | null
 
 function getEventDate(event: Record<string, unknown>): string {
   return typeof event.date === 'string' && event.date ? event.date : '--';
+}
+
+function getRowExecutionTime(row: RuleRunEventRow): string {
+  return row.executionTime || row.eventDate || '--';
+}
+
+function toDomId(value: string): string {
+  return value.replace(/[^a-zA-Z0-9_-]/g, '-');
 }
 
 function getMatchedGroups(event: Record<string, unknown>): Record<string, unknown>[] {
@@ -695,9 +766,38 @@ function buildRuleResultGroups(
   return groups;
 }
 
+function buildLiveExecutionGroups(
+  rows: RuleRunEventRow[],
+  resultRules: RuleItem[],
+  allRules: RuleItem[],
+  metrics: RuleMetricItem[],
+): LiveExecutionResultGroup[] {
+  const rowsByExecutionTime = new Map<string, RuleRunEventRow[]>();
+  for (const row of rows) {
+    const executionTime = getRowExecutionTime(row);
+    rowsByExecutionTime.set(executionTime, [...(rowsByExecutionTime.get(executionTime) ?? []), row]);
+  }
+
+  return Array.from(rowsByExecutionTime.entries())
+    .sort(([left], [right]) => {
+      const leftTime = Date.parse(left);
+      const rightTime = Date.parse(right);
+      if (Number.isFinite(leftTime) && Number.isFinite(rightTime)) {
+        return rightTime - leftTime;
+      }
+      return right.localeCompare(left);
+    })
+    .map(([executionTime, executionRows]) => ({
+      key: `execution-${executionTime}`,
+      executionTime,
+      hitCount: executionRows.length,
+      ruleGroups: buildRuleResultGroups(executionRows, resultRules, allRules, metrics),
+    }));
+}
+
 function flattenMatches(
   matches: RuleMatchItem[],
-  runMeta: { runId?: number; ruleId: number; ruleName?: string | null },
+  runMeta: { runId?: number; ruleId: number; ruleName?: string | null; executionTime?: string | null },
 ): RuleRunEventRow[] {
   return matches.flatMap((match, matchIndex) => {
     const rowRunMeta = {
@@ -709,12 +809,13 @@ function flattenMatches(
     if (match.matchedEvents.length > 0) {
       return match.matchedEvents.map((rawEvent, eventIndex) => {
         const event = asRecord(rawEvent);
+        const eventDate = getEventDate(event);
         return {
-          id: `${rowRunMeta.runId ?? 'pending'}-${rowRunMeta.ruleId}-${match.stockCode}-${getEventDate(event)}-${matchIndex}-${eventIndex}`,
+          id: `${rowRunMeta.runId ?? 'pending'}-${rowRunMeta.ruleId}-${match.stockCode}-${eventDate}-${rowRunMeta.executionTime ?? 'history'}-${matchIndex}-${eventIndex}`,
           ...rowRunMeta,
           stockCode: match.stockCode,
           stockName: match.stockName,
-          eventDate: getEventDate(event),
+          eventDate,
           event,
           explanation: typeof event.explanation === 'string' ? event.explanation : match.explanation,
         };
@@ -722,7 +823,7 @@ function flattenMatches(
     }
 
     return match.matchedDates.map((date, eventIndex) => ({
-      id: `${rowRunMeta.runId ?? 'pending'}-${rowRunMeta.ruleId}-${match.stockCode}-${date}-${matchIndex}-${eventIndex}`,
+      id: `${rowRunMeta.runId ?? 'pending'}-${rowRunMeta.ruleId}-${match.stockCode}-${date}-${rowRunMeta.executionTime ?? 'history'}-${matchIndex}-${eventIndex}`,
       ...rowRunMeta,
       stockCode: match.stockCode,
       stockName: match.stockName,
@@ -763,18 +864,20 @@ function getRunHistoryEventCount(run: RuleRunHistoryItem, fallbackRows?: number)
   return run.matchCount;
 }
 
-function getRunHistoryLabel(run: RuleRunHistoryItem): string {
+function getRunHistoryLabel(run: RuleRunHistoryItem, mode: BacktestPageMode = 'backtest'): string {
   const runIds = getRunIds(run);
   const ruleCount = getRuleIdsForRun(run).length;
+  const runningText = mode === 'live' ? '实测中' : '回测中';
+  const multiRunText = mode === 'live' ? '多规则实测' : '多规则回测';
   if (run.id < 0) {
-    return ruleCount > 1 ? `回测中 ${ruleCount} 条规则` : `回测中 ${run.ruleName || `规则 ${run.ruleId}`}`;
+    return ruleCount > 1 ? `${runningText} ${ruleCount} 条规则` : `${runningText} ${run.ruleName || `规则 ${run.ruleId}`}`;
   }
   if (ruleCount > 1) {
     const sortedIds = [...runIds].sort((left, right) => left - right);
     const idText = sortedIds.length > 1
       ? `#${sortedIds[0]}-${sortedIds[sortedIds.length - 1]}`
       : `#${run.id}`;
-    return `${idText} 多规则回测`;
+    return `${idText} ${multiRunText}`;
   }
   return `#${run.id} ${run.ruleName || `规则 ${run.ruleId}`}`;
 }
@@ -892,10 +995,39 @@ const scopeOptions: Array<{ value: BacktestTargetScope; label: string }> = [
   { value: 'custom', label: '自定义股票列表' },
 ];
 
-const BacktestPage: React.FC = () => {
+type BacktestPageProps = {
+  mode?: BacktestPageMode;
+};
+
+const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
+  const isLiveMode = mode === 'live';
+  const pageCopy = isLiveMode
+    ? {
+        documentTitle: '规则实测 - DSA',
+        action: '实测',
+        runningLabel: '实测中...',
+        resultTitle: '实测结果',
+        resultAriaLabel: '实测结果视图',
+        progressTitle: '实测进度',
+        emptyLogDescription: '点击运行实测后，这里会显示每次实时触发、进度和命中状态。',
+        emptyResultDescription: '实时实测命中后会按执行时间折叠展示规则、股票和当前规则每个条件的左值和右值。',
+        detailDialogLabel: '实测指标明细',
+      }
+    : {
+        documentTitle: '规则回测 - DSA',
+        action: '回测',
+        runningLabel: '回测中...',
+        resultTitle: '回测结果',
+        resultAriaLabel: '回测结果视图',
+        progressTitle: '回测进度',
+        emptyLogDescription: '点击运行回测后，这里会显示请求、进度和完成状态。',
+        emptyResultDescription: '历史回测命中后会按股票、日期以及当前规则每个条件的左值和右值展示。',
+        detailDialogLabel: '回测指标明细',
+      };
+
   useEffect(() => {
-    document.title = '规则回测 - DSA';
-  }, []);
+    document.title = pageCopy.documentTitle;
+  }, [pageCopy.documentTitle]);
 
   const {
     index: stockIndex,
@@ -912,32 +1044,32 @@ const BacktestPage: React.FC = () => {
   const [endDate, setEndDate] = useState(() => getTodayInShanghai());
   const [watchlistItems, setWatchlistItems] = useState<StockListDisplayItem[]>([]);
   const [runHistory, setRunHistoryState] = useState<RuleRunHistoryItem[]>(
-    () => cloneBacktestRuntimeState().runHistory,
+    () => cloneBacktestRuntimeState(mode).runHistory,
   );
   const [selectedRun, setSelectedRunState] = useState<RuleRunHistoryItem | null>(
-    () => cloneBacktestRuntimeState().selectedRun,
+    () => cloneBacktestRuntimeState(mode).selectedRun,
   );
   const [displayRows, setDisplayRowsState] = useState<RuleRunEventRow[]>(
-    () => cloneBacktestRuntimeState().displayRows,
+    () => cloneBacktestRuntimeState(mode).displayRows,
   );
   const [activeResultTab, setActiveResultTabState] = useState<ResultTab>(
-    () => cloneBacktestRuntimeState().activeResultTab,
+    () => cloneBacktestRuntimeState(mode).activeResultTab,
   );
   const [executionLogs, setExecutionLogsState] = useState<ExecutionLogEntry[]>(
-    () => cloneBacktestRuntimeState().executionLogs,
+    () => cloneBacktestRuntimeState(mode).executionLogs,
   );
   const [runProgressById, setRunProgressByIdState] = useState<Record<number, RunProgressState>>(
-    () => cloneBacktestRuntimeState().runProgressById,
+    () => cloneBacktestRuntimeState(mode).runProgressById,
   );
   const [isLoading, setIsLoading] = useState(false);
   const [isLoadingMatches, setIsLoadingMatches] = useState(false);
-  const [isRunning, setIsRunningState] = useState(() => cloneBacktestRuntimeState().isRunning);
+  const [isRunning, setIsRunningState] = useState(() => cloneBacktestRuntimeState(mode).isRunning);
   const [pageError, setPageError] = useState<ParsedApiError | null>(null);
   const [runError, setRunErrorState] = useState<ParsedApiError | null>(
-    () => cloneBacktestRuntimeState().runError,
+    () => cloneBacktestRuntimeState(mode).runError,
   );
   const [runWarning, setRunWarningState] = useState<string | null>(
-    () => cloneBacktestRuntimeState().runWarning,
+    () => cloneBacktestRuntimeState(mode).runWarning,
   );
   const [selectedRow, setSelectedRow] = useState<RuleRunEventRow | null>(null);
   const [deleteRunCandidate, setDeleteRunCandidate] = useState<RuleRunHistoryItem | null>(null);
@@ -950,70 +1082,75 @@ const BacktestPage: React.FC = () => {
   const [selectedStockListIndustries, setSelectedStockListIndustries] = useState<string[]>([]);
   const [expandedResultGroups, setExpandedResultGroups] = useState<Record<string, boolean>>({});
   const runHeartbeatRef = useRef<number | null>(null);
+  const liveTestIntervalRef = useRef<number | null>(null);
+  const liveTestSessionRef = useRef<number | null>(null);
+  const liveTestCycleInFlightRef = useRef(false);
+  const liveResultRowsRef = useRef<RuleRunEventRow[]>(displayRows);
+  const liveRunIdsRef = useRef<number[]>(selectedRun ? getRunIds(selectedRun) : []);
   const logScrollerRef = useRef<HTMLDivElement | null>(null);
 
   const setRunHistory = useCallback((action: React.SetStateAction<RuleRunHistoryItem[]>) => {
-    updateBacktestRuntime((current) => ({
+    updateBacktestRuntime(mode, (current) => ({
       ...current,
       runHistory: resolveStateAction(current.runHistory, action),
     }));
-  }, []);
+  }, [mode]);
 
   const setSelectedRun = useCallback((action: React.SetStateAction<RuleRunHistoryItem | null>) => {
-    updateBacktestRuntime((current) => ({
+    updateBacktestRuntime(mode, (current) => ({
       ...current,
       selectedRun: resolveStateAction(current.selectedRun, action),
     }));
-  }, []);
+  }, [mode]);
 
   const setDisplayRows = useCallback((action: React.SetStateAction<RuleRunEventRow[]>) => {
-    updateBacktestRuntime((current) => ({
+    updateBacktestRuntime(mode, (current) => ({
       ...current,
       displayRows: resolveStateAction(current.displayRows, action),
     }));
-  }, []);
+  }, [mode]);
 
   const setActiveResultTab = useCallback((action: React.SetStateAction<ResultTab>) => {
-    updateBacktestRuntime((current) => ({
+    updateBacktestRuntime(mode, (current) => ({
       ...current,
       activeResultTab: resolveStateAction(current.activeResultTab, action),
     }));
-  }, []);
+  }, [mode]);
 
   const setExecutionLogs = useCallback((action: React.SetStateAction<ExecutionLogEntry[]>) => {
-    updateBacktestRuntime((current) => ({
+    updateBacktestRuntime(mode, (current) => ({
       ...current,
       executionLogs: resolveStateAction(current.executionLogs, action),
     }));
-  }, []);
+  }, [mode]);
 
   const setRunProgressById = useCallback((action: React.SetStateAction<Record<number, RunProgressState>>) => {
-    updateBacktestRuntime((current) => ({
+    updateBacktestRuntime(mode, (current) => ({
       ...current,
       runProgressById: resolveStateAction(current.runProgressById, action),
     }));
-  }, []);
+  }, [mode]);
 
   const setIsRunning = useCallback((action: React.SetStateAction<boolean>) => {
-    updateBacktestRuntime((current) => ({
+    updateBacktestRuntime(mode, (current) => ({
       ...current,
       isRunning: resolveStateAction(current.isRunning, action),
     }));
-  }, []);
+  }, [mode]);
 
   const setRunError = useCallback((action: React.SetStateAction<ParsedApiError | null>) => {
-    updateBacktestRuntime((current) => ({
+    updateBacktestRuntime(mode, (current) => ({
       ...current,
       runError: resolveStateAction(current.runError, action),
     }));
-  }, []);
+  }, [mode]);
 
   const setRunWarning = useCallback((action: React.SetStateAction<string | null>) => {
-    updateBacktestRuntime((current) => ({
+    updateBacktestRuntime(mode, (current) => ({
       ...current,
       runWarning: resolveStateAction(current.runWarning, action),
     }));
-  }, []);
+  }, [mode]);
 
   useEffect(() => {
     const syncRuntimeState = (state: BacktestRuntimeState) => {
@@ -1027,18 +1164,18 @@ const BacktestPage: React.FC = () => {
       setRunErrorState(state.runError);
       setRunWarningState(state.runWarning);
     };
-    backtestRuntimeListeners.add(syncRuntimeState);
-    syncRuntimeState(cloneBacktestRuntimeState());
+    backtestRuntimeListeners[mode].add(syncRuntimeState);
+    syncRuntimeState(cloneBacktestRuntimeState(mode));
     return () => {
-      backtestRuntimeListeners.delete(syncRuntimeState);
+      backtestRuntimeListeners[mode].delete(syncRuntimeState);
     };
-  }, []);
+  }, [mode]);
 
   useEffect(() => () => {
-    if (import.meta.env.MODE === 'test' && !backtestRuntimeState.isRunning) {
-      backtestRuntimeState = createEmptyBacktestRuntimeState();
+    if (import.meta.env.MODE === 'test' && !backtestRuntimeStates[mode].isRunning) {
+      backtestRuntimeStates[mode] = createEmptyBacktestRuntimeState();
     }
-  }, []);
+  }, [mode]);
 
   const clearRunHeartbeat = useCallback(() => {
     if (runHeartbeatRef.current != null) {
@@ -1047,7 +1184,29 @@ const BacktestPage: React.FC = () => {
     }
   }, []);
 
+  const clearLiveTestInterval = useCallback(() => {
+    if (liveTestIntervalRef.current != null) {
+      window.clearInterval(liveTestIntervalRef.current);
+      liveTestIntervalRef.current = null;
+    }
+  }, []);
+
   useEffect(() => clearRunHeartbeat, [clearRunHeartbeat]);
+
+  useEffect(() => () => {
+    clearLiveTestInterval();
+    liveTestSessionRef.current = null;
+    if (isLiveMode) {
+      setIsRunning(false);
+      setRunProgressById({});
+    }
+  }, [clearLiveTestInterval, isLiveMode, setIsRunning, setRunProgressById]);
+
+  useEffect(() => {
+    if (!isLiveMode) return;
+    liveResultRowsRef.current = displayRows;
+    liveRunIdsRef.current = selectedRun ? getRunIds(selectedRun) : [];
+  }, [displayRows, isLiveMode, selectedRun]);
 
   useEffect(() => {
     if (activeResultTab !== 'logs') return;
@@ -1122,15 +1281,25 @@ const BacktestPage: React.FC = () => {
     () => buildRuleResultGroups(runRows, resultRules, rules, metrics),
     [metrics, resultRules, rules, runRows],
   );
-  const hasCompletedResultContext = selectedRun !== null && selectedRun.status !== 'running';
-  const hasResultContent = resultRuleGroups.length > 0 && (
-    runRows.length > 0
-    || hasCompletedResultContext
-    || runWarning !== null
+  const liveExecutionGroups = useMemo(
+    () => buildLiveExecutionGroups(runRows, resultRules, rules, metrics),
+    [metrics, resultRules, rules, runRows],
   );
-  const headerControlGridClass = targetScope === 'industry'
-    ? 'grid min-w-0 gap-3 sm:grid-cols-2 xl:grid-cols-[12rem_12rem_10rem_10rem]'
-    : 'grid min-w-0 gap-3 sm:grid-cols-2 xl:grid-cols-[12rem_10rem_10rem]';
+  const hasCompletedResultContext = selectedRun !== null && selectedRun.status !== 'running';
+  const hasResultContent = isLiveMode
+    ? liveExecutionGroups.length > 0 || runWarning !== null
+    : resultRuleGroups.length > 0 && (
+      runRows.length > 0
+      || hasCompletedResultContext
+      || runWarning !== null
+    );
+  const headerControlGridClass = isLiveMode
+    ? targetScope === 'industry'
+      ? 'grid min-w-0 gap-3 sm:grid-cols-2 xl:grid-cols-[12rem_12rem]'
+      : 'grid min-w-0 gap-3 sm:grid-cols-2 xl:grid-cols-[12rem]'
+    : targetScope === 'industry'
+      ? 'grid min-w-0 gap-3 sm:grid-cols-2 xl:grid-cols-[12rem_12rem_10rem_10rem]'
+      : 'grid min-w-0 gap-3 sm:grid-cols-2 xl:grid-cols-[12rem_10rem_10rem]';
   const activeRunEventCount = runRows.length;
   const targetListReadOnly = targetScope !== 'custom';
   const stockListIndustryOptions = useMemo(
@@ -1152,8 +1321,8 @@ const BacktestPage: React.FC = () => {
     : selectedStockListIndustries.length === 1
       ? selectedStockListIndustries[0]
       : `行业 ${selectedStockListIndustries.length}`;
-  const isDateRangeInvalid = Boolean(startDate && endDate && startDate > endDate);
-  const runDisabled = selectedRuleIds.length === 0 || targetCodes.length === 0 || isDateRangeInvalid || isRunning;
+  const isDateRangeInvalid = !isLiveMode && Boolean(startDate && endDate && startDate > endDate);
+  const runDisabled = selectedRuleIds.length === 0 || targetCodes.length === 0 || isDateRangeInvalid || (!isLiveMode && isRunning);
   const hasActiveRun = Object.values(runProgressById).some((item) => item.progress < 100);
 
   useEffect(() => {
@@ -1201,7 +1370,7 @@ const BacktestPage: React.FC = () => {
         id: `${now}-running-${run.id}`,
         time: now,
         level: 'info',
-        message: `${getRunHistoryLabel(run)} 仍在执行，暂未生成命中结果`,
+        message: `${getRunHistoryLabel(run, mode)} 仍在执行，暂未生成命中结果`,
       }]);
       setActiveResultTab('logs');
       return;
@@ -1233,6 +1402,7 @@ const BacktestPage: React.FC = () => {
       setIsLoadingMatches(false);
     }
   }, [
+    mode,
     setActiveResultTab,
     setDisplayRows,
     setExecutionLogs,
@@ -1302,7 +1472,7 @@ const BacktestPage: React.FC = () => {
         rulesApi.getMetrics(),
         rulesApi.list(),
         systemConfigApi.getConfig(false),
-        rulesApi.listRuns(30),
+        isLiveMode ? Promise.resolve([]) : rulesApi.listRuns(30),
         historyApi.getList({
           startDate: getRecentStartDate(30),
           endDate: getTodayInShanghai(),
@@ -1321,7 +1491,7 @@ const BacktestPage: React.FC = () => {
         .map(getStockDisplayCode)));
       const groupedPersistedRuns = groupLegacyRunHistory(persistedRuns);
       const firstRule = ruleItems[0];
-      const shouldHydratePersistedRuns = !hasBacktestRuntimeSession();
+      const shouldHydratePersistedRuns = !isLiveMode && !hasBacktestRuntimeSession(mode);
       let persistedSelectedRun = shouldHydratePersistedRuns
         ? groupedPersistedRuns.find((run) => run.status !== 'running') ?? groupedPersistedRuns[0] ?? null
         : null;
@@ -1372,6 +1542,15 @@ const BacktestPage: React.FC = () => {
         setRunProgressById({});
         setRunWarning(null);
         setRunError(null);
+      } else if (isLiveMode && !hasBacktestRuntimeSession(mode)) {
+        setRunHistory([]);
+        setSelectedRun(null);
+        setDisplayRows([]);
+        setActiveResultTab('results');
+        setExecutionLogs([]);
+        setRunProgressById({});
+        setRunWarning(null);
+        setRunError(null);
       }
       setSelectedRuleIds(firstRule ? [firstRule.id] : []);
       applyTargetFromRule(firstRule, nextWatchlistCodes, nextAllAshareCodes);
@@ -1382,6 +1561,8 @@ const BacktestPage: React.FC = () => {
     }
   }, [
     applyTargetFromRule,
+    isLiveMode,
+    mode,
     setActiveResultTab,
     setDisplayRows,
     setExecutionLogs,
@@ -1460,10 +1641,181 @@ const BacktestPage: React.FC = () => {
         progress: Math.max(0, Math.min(100, progress)),
       stage,
     },
-  }));
+    }));
   }, [setRunProgressById]);
 
-  const handleRun = async () => {
+  const stopLiveTest = useCallback((message = '实测已停止') => {
+    clearLiveTestInterval();
+    liveTestSessionRef.current = null;
+    liveTestCycleInFlightRef.current = false;
+    setIsRunning(false);
+    setRunProgressById({});
+    appendExecutionLog(message, 'info');
+  }, [appendExecutionLog, clearLiveTestInterval, setIsRunning, setRunProgressById]);
+
+  const runLiveTestCycle = useCallback(async (
+    sessionId: number,
+    cycleIndex: number,
+    runStartedAt: string,
+    runRuleNames: string[],
+  ) => {
+    if (liveTestSessionRef.current !== sessionId) return;
+    if (liveTestCycleInFlightRef.current) {
+      appendExecutionLog(`第 ${cycleIndex} 次触发跳过：上一轮实测仍在执行`, 'warning');
+      return;
+    }
+
+    const cycleExecutionTime = formatDateTimeToSecond(new Date().toISOString());
+    liveTestCycleInFlightRef.current = true;
+    updateRunProgress(sessionId, 28, `第 ${cycleIndex} 次触发：请求实时行情`);
+    appendExecutionLog(`第 ${cycleIndex} 次触发：扫描 ${targetCodes.length} 只股票，执行 ${selectedRuleIds.length} 条规则`);
+
+    try {
+      const result = await rulesApi.runBatch({
+        ruleIds: selectedRuleIds,
+        mode: 'latest',
+        target: {
+          scope: targetScope === 'industry' ? 'custom' : targetScope,
+          stockCodes: targetCodes,
+        },
+      });
+      if (liveTestSessionRef.current !== sessionId) return;
+
+      const now = new Date().toISOString();
+      const resultRuleIds = result.ruleIds && result.ruleIds.length > 0 ? result.ruleIds : selectedRuleIds;
+      const resultRuleNames = result.ruleNames && result.ruleNames.length > 0 ? result.ruleNames : runRuleNames;
+      const resultRuleName = resultRuleIds.length > 1 ? `多规则实测（${resultRuleIds.length} 条）` : resultRuleNames[0] ?? null;
+      const nextRows = flattenMatches(result.matches, {
+        runId: result.runId,
+        ruleId: result.ruleId,
+        ruleName: resultRuleName,
+        executionTime: cycleExecutionTime,
+      });
+      const cumulativeRows = [...nextRows, ...liveResultRowsRef.current];
+      const cumulativeRunIds = Array.from(new Set([result.runId, ...liveRunIdsRef.current]));
+      liveResultRowsRef.current = cumulativeRows;
+      liveRunIdsRef.current = cumulativeRunIds;
+      const runMeta: RuleRunHistoryItem = {
+        id: sessionId,
+        runIds: cumulativeRunIds,
+        ruleId: result.ruleId,
+        ruleIds: resultRuleIds,
+        ruleName: resultRuleName,
+        ruleNames: resultRuleNames,
+        status: result.status,
+        targetCount: result.targetCount,
+        matchCount: new Set(cumulativeRows.map((row) => row.stockCode)).size || result.matchCount,
+        eventCount: cumulativeRows.length,
+        error: result.errors.length > 0 ? result.errors.join('；') : null,
+        startedAt: runStartedAt,
+        finishedAt: now,
+        durationMs: result.durationMs,
+      };
+
+      setSelectedRun(runMeta);
+      setDisplayRows(cumulativeRows);
+      setRunWarning(result.errors.length > 0 ? result.errors.join('；') : null);
+      updateRunProgress(
+        sessionId,
+        100,
+        `第 ${cycleIndex} 次完成，命中 ${nextRows.length} 条；等待下次刷新`,
+      );
+      appendExecutionLog(
+        `第 ${cycleIndex} 次实测完成：命中股票 ${result.matchCount} 只，命中记录 ${nextRows.length} 条`,
+        result.errors.length > 0 ? 'warning' : 'success',
+      );
+      if (result.errors.length > 0) {
+        appendExecutionLog(`本次实测存在部分错误：${result.errors.join('，')}`, 'warning');
+      }
+      setRunError(null);
+      setActiveResultTab('results');
+      setPageError(null);
+    } catch (err) {
+      if (liveTestSessionRef.current !== sessionId) return;
+      const parsedError = getParsedApiError(err);
+      updateRunProgress(sessionId, 100, `第 ${cycleIndex} 次触发失败，等待下次刷新`);
+      appendExecutionLog(`第 ${cycleIndex} 次实测失败：${parsedError.message}`, 'error');
+      setRunError(parsedError);
+      setActiveResultTab('logs');
+    } finally {
+      liveTestCycleInFlightRef.current = false;
+    }
+  }, [
+    appendExecutionLog,
+    selectedRuleIds,
+    setActiveResultTab,
+    setDisplayRows,
+    setRunError,
+    setRunWarning,
+    setSelectedRun,
+    targetCodes,
+    targetScope,
+    updateRunProgress,
+  ]);
+
+  const startLiveTest = useCallback(() => {
+    if (runDisabled || isRunning) return;
+    const sessionId = -Date.now();
+    const runStartedAt = new Date().toISOString();
+    const runRuleNames = selectedRuleIds
+      .map((ruleId) => rules.find((item) => item.id === ruleId)?.name ?? `规则 ${ruleId}`);
+    const temporaryRun: RuleRunHistoryItem = {
+      id: sessionId,
+      ruleId: selectedRuleIds[0],
+      ruleIds: selectedRuleIds,
+      ruleName: selectedRuleIds.length > 1 ? `多规则实测（${selectedRuleIds.length} 条）` : runRuleNames[0],
+      ruleNames: runRuleNames,
+      status: 'running',
+      targetCount: targetCodes.length,
+      matchCount: 0,
+      eventCount: 0,
+      startedAt: runStartedAt,
+      finishedAt: null,
+      durationMs: null,
+    };
+
+    clearLiveTestInterval();
+    liveTestSessionRef.current = sessionId;
+    liveTestCycleInFlightRef.current = false;
+    liveResultRowsRef.current = [];
+    liveRunIdsRef.current = [];
+    setIsRunning(true);
+    setRunError(null);
+    setRunWarning(null);
+    setExecutionLogs([]);
+    setRunProgressById({ [sessionId]: { progress: 8, stage: '等待首次触发' } });
+    setDisplayRows([]);
+    setSelectedRun(temporaryRun);
+    setActiveResultTab('logs');
+    appendExecutionLog(`开始实测：${selectedRuleIds.length} 条规则，${targetCodes.length} 只股票，实时模式会每 ${LIVE_TEST_POLL_INTERVAL_MS / 1000} 秒重新触发一次`);
+
+    let cycleIndex = 0;
+    const triggerCycle = () => {
+      cycleIndex += 1;
+      void runLiveTestCycle(sessionId, cycleIndex, runStartedAt, runRuleNames);
+    };
+    triggerCycle();
+    liveTestIntervalRef.current = window.setInterval(triggerCycle, LIVE_TEST_POLL_INTERVAL_MS);
+  }, [
+    appendExecutionLog,
+    clearLiveTestInterval,
+    isRunning,
+    rules,
+    runDisabled,
+    runLiveTestCycle,
+    selectedRuleIds,
+    setActiveResultTab,
+    setDisplayRows,
+    setExecutionLogs,
+    setIsRunning,
+    setRunError,
+    setRunProgressById,
+    setRunWarning,
+    setSelectedRun,
+    targetCodes.length,
+  ]);
+
+  const handleBacktestRun = async () => {
     if (runDisabled) return;
     setIsRunning(true);
     setRunError(null);
@@ -1605,6 +1957,18 @@ const BacktestPage: React.FC = () => {
     }
   };
 
+  const handleRun = () => {
+    if (isLiveMode) {
+      if (isRunning) {
+        stopLiveTest();
+        return;
+      }
+      startLiveTest();
+      return;
+    }
+    void handleBacktestRun();
+  };
+
   const removeTargetStockCode = useCallback((sourceCode: string) => {
     setTargetCodes((current) => current.filter((code) => code !== sourceCode));
   }, []);
@@ -1630,10 +1994,10 @@ const BacktestPage: React.FC = () => {
     setSelectedStockListIndustries([]);
   }, []);
 
-  const toggleResultGroup = useCallback((groupKey: string) => {
+  const toggleResultGroup = useCallback((groupKey: string, defaultExpanded = true) => {
     setExpandedResultGroups((current) => ({
       ...current,
-      [groupKey]: !(current[groupKey] ?? true),
+      [groupKey]: !(current[groupKey] ?? defaultExpanded),
     }));
   }, []);
 
@@ -1657,20 +2021,126 @@ const BacktestPage: React.FC = () => {
       : `已选择 ${selectedRules.length} 条规则`;
   const activeDateRangeText = `${startDate || '不限'} - ${endDate || '不限'}`;
   const resultSubtitle = hasActiveRun
-    ? `回测运行中 · ${executionLogs.length} 条执行日志`
+    ? `${pageCopy.action}运行中 · ${executionLogs.length} 条执行日志`
     : activeResultTab === 'logs' && executionLogs.length > 0
       ? `本次执行日志 · ${executionLogs.length} 条`
       : selectedRun
-        ? `${getRunHistoryLabel(selectedRun)} · ${activeRunEventCount} 条命中记录`
+        ? `${getRunHistoryLabel(selectedRun, mode)} · ${activeRunEventCount} 条命中记录`
         : runRows.length > 0
-          ? `本次回测 · ${activeDateRangeText} · ${selectedRuleIds.length} 条规则 · ${activeRunEventCount} 条命中记录`
-          : '运行一次规则回测后展示本次命中结果';
+          ? isLiveMode
+            ? `本次实测 · ${selectedRuleIds.length} 条规则 · ${activeRunEventCount} 条命中记录`
+            : `本次回测 · ${activeDateRangeText} · ${selectedRuleIds.length} 条规则 · ${activeRunEventCount} 条命中记录`
+          : isLiveMode ? '运行一次规则实测后展示实时命中结果' : '运行一次规则回测后展示本次命中结果';
   const resultSetName = selectedRun && getRuleIdsForRun(selectedRun).length > 1
-    ? selectedRun.ruleName || `多规则回测（${getRuleIdsForRun(selectedRun).length} 条）`
+    ? selectedRun.ruleName || `多规则${pageCopy.action}（${getRuleIdsForRun(selectedRun).length} 条）`
     : selectedRunRule?.name
     || selectedRun?.ruleName
-    || (selectedRules.length > 1 ? `本次多规则回测（${selectedRules.length} 条）` : selectedRule?.name)
-    || '规则回测';
+    || (selectedRules.length > 1 ? `本次多规则${pageCopy.action}（${selectedRules.length} 条）` : selectedRule?.name)
+    || `规则${pageCopy.action}`;
+  const renderRuleResultGroup = (
+    group: RuleResultGroup,
+    options: { groupKey?: string; testIdPrefix?: string; panelIdPrefix?: string } = {},
+  ) => {
+    const groupKey = options.groupKey ?? group.key;
+    const expanded = expandedResultGroups[groupKey] ?? true;
+    const panelId = `${options.panelIdPrefix ?? 'backtest-rule-group-panel'}-${toDomId(groupKey)}`;
+    const tableMinWidth = Math.max(
+      (isLiveMode ? 400 : 520) + group.columns.length * 140,
+      isLiveMode ? 680 : 760,
+    );
+
+    return (
+      <section
+        key={groupKey}
+        data-testid={`${options.testIdPrefix ?? 'backtest-rule-group'}-${group.ruleId}`}
+        className="overflow-hidden rounded-xl border border-border/60 bg-elevated/25"
+      >
+        <button
+          type="button"
+          aria-expanded={expanded}
+          aria-controls={panelId}
+          aria-label={`${expanded ? '收起' : '展开'}规则 #${group.ruleId} ${group.ruleName}`}
+          onClick={() => toggleResultGroup(groupKey, true)}
+          className="flex w-full items-center gap-3 border-b border-border/45 px-3 py-3 text-left transition-all hover:bg-hover/60"
+        >
+          <span className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-lg border border-primary/35 bg-primary/10 text-primary">
+            {expanded ? <ChevronDown className="h-4 w-4" /> : <ChevronRight className="h-4 w-4" />}
+          </span>
+          <span className="min-w-0 flex-1">
+            <span className="block truncate text-sm font-semibold text-foreground">#{group.ruleId} {group.ruleName}</span>
+            <span className="mt-0.5 block text-xs text-secondary-text">命中 {group.rows.length} 条</span>
+          </span>
+        </button>
+        {expanded ? (
+          <div id={panelId}>
+            {group.rows.length === 0 ? (
+              <div className="px-4 py-6 text-sm text-muted-text">该规则暂无命中记录</div>
+            ) : (
+              <div className="backtest-table-wrapper rounded-none border-0">
+                <table className="backtest-table w-full text-sm" style={{ minWidth: `${tableMinWidth}px` }}>
+                  <thead className="backtest-table-head">
+                    <tr className="text-left">
+                      <th className="backtest-table-head-cell">股票</th>
+                      {!isLiveMode ? <th className="backtest-table-head-cell">日期</th> : null}
+                      {group.columns.map((column) => (
+                        <th key={column.key} className="backtest-table-head-cell">
+                          <span className={column.side === 'left' ? 'text-danger' : undefined}>
+                            {column.header}
+                          </span>
+                        </th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {group.rows.map((row) => {
+                      const rowExecutionTime = formatDateTimeToSecond(row.executionTime);
+                      const rowAnalysisLabel = isLiveMode
+                        ? `查看 ${row.stockName || row.stockCode} ${rowExecutionTime} 指标分析`
+                        : `查看 ${row.stockName || row.stockCode} ${row.eventDate} 指标分析`;
+                      return (
+                        <tr
+                          key={row.id}
+                          className="backtest-table-row cursor-pointer"
+                          onClick={() => setSelectedRow(row)}
+                        >
+                          <td className="backtest-table-cell backtest-table-code">
+                            <button
+                              type="button"
+                              aria-label={rowAnalysisLabel}
+                              title={isLiveMode ? `查看 ${rowExecutionTime} 指标分析` : `查看 ${row.eventDate} 指标分析`}
+                              onClick={(event) => {
+                                event.stopPropagation();
+                                openIndicatorAnalysis(row);
+                              }}
+                              className="flex flex-col rounded-lg px-2 py-1 text-left transition-all hover:bg-primary/10 focus-visible:outline-none focus-visible:ring-4 focus-visible:ring-cyan/20"
+                            >
+                              <span>{row.stockCode}</span>
+                              <span className="text-xs text-muted-text">{row.stockName || '--'}</span>
+                              {isLiveMode ? (
+                                <span className="mt-0.5 text-[11px] font-mono text-muted-text">执行 {rowExecutionTime}</span>
+                              ) : null}
+                            </button>
+                          </td>
+                          {!isLiveMode ? (
+                            <td className="backtest-table-cell font-mono text-secondary-text">{row.eventDate}</td>
+                          ) : null}
+                          {group.columns.map((column) => (
+                            <td key={`${row.id}:${column.key}`} className="backtest-table-cell font-mono text-secondary-text">
+                              {formatMetricValue(getConditionColumnValue(row, column), column, metrics)}
+                            </td>
+                          ))}
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
+        ) : null}
+      </section>
+    );
+  };
 
   return (
     <div className="flex min-h-full flex-col rounded-[1.5rem] bg-transparent">
@@ -1684,7 +2154,7 @@ const BacktestPage: React.FC = () => {
             <details className="relative">
               <summary
                 className={`${INPUT_CLASS} flex cursor-pointer list-none items-center justify-between gap-2 text-foreground marker:hidden`}
-                aria-label="选择回测规则"
+                aria-label={`选择${pageCopy.action}规则`}
               >
                 <span className="min-w-0 truncate">{selectedRuleSummary}</span>
                 <ListFilter className="h-4 w-4 flex-shrink-0 text-primary" />
@@ -1769,28 +2239,32 @@ const BacktestPage: React.FC = () => {
                   </select>
                 </label>
               ) : null}
-              <label className="flex min-w-0 flex-col gap-1 text-xs text-muted-text">
-                <span>开始日期</span>
-                <input
-                  type="date"
-                  value={startDate}
-                  max={endDate || undefined}
-                  onChange={(event) => setStartDate(event.target.value)}
-                  disabled={isRunning}
-                  className={INPUT_CLASS}
-                />
-              </label>
-              <label className="flex min-w-0 flex-col gap-1 text-xs text-muted-text">
-                <span>结束日期</span>
-                <input
-                  type="date"
-                  value={endDate}
-                  min={startDate || undefined}
-                  onChange={(event) => setEndDate(event.target.value)}
-                  disabled={isRunning}
-                  className={INPUT_CLASS}
-                />
-              </label>
+              {!isLiveMode ? (
+                <>
+                  <label className="flex min-w-0 flex-col gap-1 text-xs text-muted-text">
+                    <span>开始日期</span>
+                    <input
+                      type="date"
+                      value={startDate}
+                      max={endDate || undefined}
+                      onChange={(event) => setStartDate(event.target.value)}
+                      disabled={isRunning}
+                      className={INPUT_CLASS}
+                    />
+                  </label>
+                  <label className="flex min-w-0 flex-col gap-1 text-xs text-muted-text">
+                    <span>结束日期</span>
+                    <input
+                      type="date"
+                      value={endDate}
+                      min={startDate || undefined}
+                      onChange={(event) => setEndDate(event.target.value)}
+                      disabled={isRunning}
+                      className={INPUT_CLASS}
+                    />
+                  </label>
+                </>
+              ) : null}
             </div>
             <label className="flex min-w-0 flex-col gap-1 text-xs text-muted-text">
               <span>行业 / 股票代码 / 股票名称</span>
@@ -1820,15 +2294,15 @@ const BacktestPage: React.FC = () => {
 
           <div className="flex flex-col justify-end gap-2">
             <Button
-              variant="primary"
+              variant={isLiveMode && isRunning ? 'danger-subtle' : 'primary'}
               size="md"
               onClick={handleRun}
               disabled={runDisabled}
-              isLoading={isRunning}
-              loadingText="回测中..."
+              isLoading={!isLiveMode && isRunning}
+              loadingText={pageCopy.runningLabel}
             >
-              <Play className="h-4 w-4" />
-              运行回测
+              {isLiveMode && isRunning ? <X className="h-4 w-4" /> : <Play className="h-4 w-4" />}
+              {isLiveMode && isRunning ? '停止实测' : `运行${pageCopy.action}`}
             </Button>
             <div className="text-right text-[11px] text-muted-text">
               {targetCodes.length} 只股票
@@ -1838,34 +2312,35 @@ const BacktestPage: React.FC = () => {
           </div>
         </div>
 
-        {isDateRangeInvalid ? (
+        {!isLiveMode && isDateRangeInvalid ? (
           <InlineAlert variant="warning" message="开始日期不能晚于结束日期" className="mt-3" />
         ) : null}
         {runError ? <ApiErrorAlert error={runError} className="mt-3" /> : null}
       </header>
 
-      <main className="grid min-h-0 flex-1 gap-3 overflow-hidden p-3 lg:grid-cols-[18rem_minmax(0,1fr)]">
-        <aside className="flex min-h-0 flex-col rounded-2xl border border-border/60 bg-card/70 shadow-soft-card">
-          <div className="flex items-center justify-between border-b border-border/50 px-4 py-3">
-            <div>
-              <span className="label-uppercase">Run History</span>
-              <h2 className="mt-1 text-base font-semibold text-foreground">回测执行历史</h2>
+      <main className={`grid min-h-0 flex-1 gap-3 overflow-hidden p-3 ${isLiveMode ? '' : 'lg:grid-cols-[18rem_minmax(0,1fr)]'}`}>
+        {!isLiveMode ? (
+          <aside className="flex min-h-0 flex-col rounded-2xl border border-border/60 bg-card/70 shadow-soft-card">
+            <div className="flex items-center justify-between border-b border-border/50 px-4 py-3">
+              <div>
+                <span className="label-uppercase">Run History</span>
+                <h2 className="mt-1 text-base font-semibold text-foreground">回测执行历史</h2>
+              </div>
+              <ClipboardList className="h-4 w-4 text-primary" />
             </div>
-            <ClipboardList className="h-4 w-4 text-primary" />
-          </div>
-          <div className="min-h-0 flex-1 space-y-2 overflow-y-auto p-3">
-            {runHistory.length === 0 ? (
-              <EmptyState
-                title="暂无执行记录"
-                description="运行一次规则回测后会出现在这里。"
-                className="h-full min-h-[14rem] border-dashed bg-transparent shadow-none"
-              />
-            ) : (
-              runHistory.map((run) => {
-                const progressState = runProgressById[run.id];
-                const canDeleteRun = run.id > 0 && run.status !== 'running';
-                return (
-                  <div key={run.id} className="group relative">
+            <div className="min-h-0 flex-1 space-y-2 overflow-y-auto p-3">
+              {runHistory.length === 0 ? (
+                <EmptyState
+                  title="暂无执行记录"
+                  description="运行一次规则回测后会出现在这里。"
+                  className="h-full min-h-[14rem] border-dashed bg-transparent shadow-none"
+                />
+              ) : (
+                runHistory.map((run) => {
+                  const progressState = runProgressById[run.id];
+                  const canDeleteRun = run.id > 0 && run.status !== 'running';
+                  return (
+                    <div key={run.id} className="group relative">
                     <button
                       type="button"
                       onClick={() => void loadRunMatches(run)}
@@ -1877,7 +2352,7 @@ const BacktestPage: React.FC = () => {
                     >
                       <div className="flex items-center justify-between gap-2">
                         <span className="min-w-0 truncate text-sm font-semibold text-foreground">
-                          {getRunHistoryLabel(run)}
+                          {getRunHistoryLabel(run, mode)}
                         </span>
                         <Badge variant={run.status === 'completed' ? 'success' : run.status === 'failed' ? 'danger' : 'warning'}>
                           {formatRunStatus(run.status)}
@@ -1921,20 +2396,21 @@ const BacktestPage: React.FC = () => {
             )}
           </div>
         </aside>
+        ) : null}
 
         <section className="min-h-0 overflow-hidden rounded-2xl border border-border/60 bg-card/70 shadow-soft-card">
           <div className="flex flex-col gap-3 border-b border-border/50 px-4 py-3 md:flex-row md:items-center md:justify-between">
             <div className="flex items-center gap-2">
               <Table2 className="h-5 w-5 text-primary" />
               <div>
-                <h2 className="text-lg font-semibold text-foreground">回测结果</h2>
+                <h2 className="text-lg font-semibold text-foreground">{pageCopy.resultTitle}</h2>
                 <p className="text-xs text-secondary-text">{resultSubtitle}</p>
               </div>
             </div>
             <div className="flex flex-wrap items-center gap-2 text-xs text-secondary-text">
               <div
                 role="tablist"
-                aria-label="回测结果视图"
+                aria-label={pageCopy.resultAriaLabel}
                 className="inline-flex rounded-xl border border-border/60 bg-elevated/45 p-1"
               >
                 {[
@@ -1965,7 +2441,7 @@ const BacktestPage: React.FC = () => {
                   </button>
                 ))}
               </div>
-              {selectedRun ? (
+              {selectedRun && !isLiveMode ? (
                 <>
                   <span className="inline-flex items-center gap-1 rounded-lg border border-border/60 px-2 py-1">
                     <CalendarDays className="h-3.5 w-3.5" />
@@ -1986,7 +2462,7 @@ const BacktestPage: React.FC = () => {
                     <div className="mb-3 flex items-center justify-between gap-2">
                       <div>
                         <span className="label-uppercase">Progress</span>
-                        <h3 className="mt-1 text-sm font-semibold text-foreground">回测进度</h3>
+                        <h3 className="mt-1 text-sm font-semibold text-foreground">{pageCopy.progressTitle}</h3>
                       </div>
                       {hasActiveRun ? (
                         <span className="rounded-full border border-primary/35 bg-primary/10 px-2 py-1 text-xs text-primary">运行中</span>
@@ -1999,7 +2475,11 @@ const BacktestPage: React.FC = () => {
                           <div key={runId} className="rounded-lg border border-border/50 bg-card/55 p-3">
                             <div className="flex items-center justify-between gap-3 text-xs">
                               <span className="min-w-0 truncate font-medium text-foreground">
-                                {historyItem ? getRunHistoryLabel(historyItem) : `运行 ${runId}`}
+                                {historyItem
+                                  ? getRunHistoryLabel(historyItem, mode)
+                                  : selectedRun?.id === Number(runId)
+                                    ? getRunHistoryLabel(selectedRun, mode)
+                                    : `运行 ${runId}`}
                               </span>
                               <span className="shrink-0 font-mono text-primary">{progressState.progress}%</span>
                             </div>
@@ -2019,7 +2499,7 @@ const BacktestPage: React.FC = () => {
                 {executionLogs.length === 0 ? (
                   <EmptyState
                     title="暂无执行日志"
-                    description="点击运行回测后，这里会显示请求、进度和完成状态。"
+                    description={pageCopy.emptyLogDescription}
                     className="backtest-empty-state border-dashed"
                     icon={<ClipboardList className="h-6 w-6" />}
                   />
@@ -2053,7 +2533,7 @@ const BacktestPage: React.FC = () => {
             ) : !hasResultContent ? (
               <EmptyState
                 title="暂无命中结果"
-                description="历史回测命中后会按股票、日期以及当前规则每个条件的左值和右值展示。"
+                description={pageCopy.emptyResultDescription}
                 className="backtest-empty-state border-dashed"
                 icon={<ListFilter className="h-6 w-6" />}
               />
@@ -2067,95 +2547,62 @@ const BacktestPage: React.FC = () => {
                 ) : null}
                 <div className="backtest-table-toolbar">
                   <div className="backtest-table-toolbar-meta">
-                    <span className="label-uppercase">Rule Groups</span>
-                    <span className="text-xs text-secondary-text">{resultSetName}</span>
+                    <span className="label-uppercase">{isLiveMode ? 'Execution Groups' : 'Rule Groups'}</span>
+                    <span className="text-xs text-secondary-text">
+                      {isLiveMode
+                        ? `${liveExecutionGroups.length} 次执行 · ${activeRunEventCount} 条命中`
+                        : resultSetName}
+                    </span>
                   </div>
-                  <span className="backtest-table-scroll-hint">展开规则查看命中明细，点击股票查看命中日指标分析，点击行查看条件快照</span>
+                  <span className="backtest-table-scroll-hint">
+                    {isLiveMode
+                      ? '展开执行时间查看命中策略，点击股票查看命中日指标分析，点击行查看条件快照'
+                      : '展开规则查看命中明细，点击股票查看命中日指标分析，点击行查看条件快照'}
+                  </span>
                 </div>
                 <div className="space-y-3">
-                  {resultRuleGroups.map((group) => {
-                    const expanded = expandedResultGroups[group.key] ?? true;
-                    return (
-                      <section
-                        key={group.key}
-                        data-testid={`backtest-rule-group-${group.ruleId}`}
-                        className="overflow-hidden rounded-xl border border-border/60 bg-elevated/25"
-                      >
-                        <button
-                          type="button"
-                          aria-expanded={expanded}
-                          aria-controls={`backtest-rule-group-panel-${group.ruleId}`}
-                          aria-label={`${expanded ? '收起' : '展开'}规则 #${group.ruleId} ${group.ruleName}`}
-                          onClick={() => toggleResultGroup(group.key)}
-                          className="flex w-full items-center gap-3 border-b border-border/45 px-3 py-3 text-left transition-all hover:bg-hover/60"
+                  {isLiveMode ? (
+                    liveExecutionGroups.map((executionGroup) => {
+                      const expanded = expandedResultGroups[executionGroup.key] ?? false;
+                      const executionTimeText = formatDateTimeToSecond(executionGroup.executionTime);
+                      const panelId = `live-execution-group-panel-${toDomId(executionGroup.key)}`;
+                      return (
+                        <section
+                          key={executionGroup.key}
+                          data-testid="live-execution-group"
+                          className="overflow-hidden rounded-xl border border-border/60 bg-elevated/25"
                         >
-                          <span className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-lg border border-primary/35 bg-primary/10 text-primary">
-                            {expanded ? <ChevronDown className="h-4 w-4" /> : <ChevronRight className="h-4 w-4" />}
-                          </span>
-                          <span className="min-w-0 flex-1">
-                            <span className="block truncate text-sm font-semibold text-foreground">#{group.ruleId} {group.ruleName}</span>
-                            <span className="mt-0.5 block text-xs text-secondary-text">命中 {group.rows.length} 条</span>
-                          </span>
-                        </button>
-                        {expanded ? (
-                          <div id={`backtest-rule-group-panel-${group.ruleId}`}>
-                            {group.rows.length === 0 ? (
-                              <div className="px-4 py-6 text-sm text-muted-text">该规则暂无命中记录</div>
-                            ) : (
-                              <div className="backtest-table-wrapper rounded-none border-0">
-                                <table className="backtest-table w-full text-sm" style={{ minWidth: `${group.tableMinWidth}px` }}>
-                                  <thead className="backtest-table-head">
-                                    <tr className="text-left">
-                                      <th className="backtest-table-head-cell">股票</th>
-                                      <th className="backtest-table-head-cell">日期</th>
-                                      {group.columns.map((column) => (
-                                        <th key={column.key} className="backtest-table-head-cell">
-                                          <span className={column.side === 'left' ? 'text-danger' : undefined}>
-                                            {column.header}
-                                          </span>
-                                        </th>
-                                      ))}
-                                    </tr>
-                                  </thead>
-                                  <tbody>
-                                    {group.rows.map((row) => (
-                                      <tr
-                                        key={row.id}
-                                        className="backtest-table-row cursor-pointer"
-                                        onClick={() => setSelectedRow(row)}
-                                      >
-                                        <td className="backtest-table-cell backtest-table-code">
-                                          <button
-                                            type="button"
-                                            aria-label={`查看 ${row.stockName || row.stockCode} ${row.eventDate} 指标分析`}
-                                            title={`查看 ${row.eventDate} 指标分析`}
-                                            onClick={(event) => {
-                                              event.stopPropagation();
-                                              openIndicatorAnalysis(row);
-                                            }}
-                                            className="flex flex-col rounded-lg px-2 py-1 text-left transition-all hover:bg-primary/10 focus-visible:outline-none focus-visible:ring-4 focus-visible:ring-cyan/20"
-                                          >
-                                            <span>{row.stockCode}</span>
-                                            <span className="text-xs text-muted-text">{row.stockName || '--'}</span>
-                                          </button>
-                                        </td>
-                                        <td className="backtest-table-cell font-mono text-secondary-text">{row.eventDate}</td>
-                                        {group.columns.map((column) => (
-                                          <td key={`${row.id}:${column.key}`} className="backtest-table-cell font-mono text-secondary-text">
-                                            {formatMetricValue(getConditionColumnValue(row, column), column, metrics)}
-                                          </td>
-                                        ))}
-                                      </tr>
-                                    ))}
-                                  </tbody>
-                                </table>
-                              </div>
-                            )}
-                          </div>
-                        ) : null}
-                      </section>
-                    );
-                  })}
+                          <button
+                            type="button"
+                            aria-expanded={expanded}
+                            aria-controls={panelId}
+                            aria-label={`${expanded ? '收起' : '展开'}执行时间 ${executionTimeText}，命中 ${executionGroup.hitCount} 条`}
+                            onClick={() => toggleResultGroup(executionGroup.key, false)}
+                            className="flex w-full items-center gap-3 border-b border-border/45 px-3 py-3 text-left transition-all hover:bg-hover/60"
+                          >
+                            <span className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-lg border border-primary/35 bg-primary/10 text-primary">
+                              {expanded ? <ChevronDown className="h-4 w-4" /> : <ChevronRight className="h-4 w-4" />}
+                            </span>
+                            <span className="min-w-0 flex-1">
+                              <span className="block truncate text-sm font-semibold text-foreground">执行时间 {executionTimeText}</span>
+                              <span className="mt-0.5 block text-xs text-secondary-text">命中 {executionGroup.hitCount} 条</span>
+                            </span>
+                          </button>
+                          {expanded ? (
+                            <div id={panelId} className="space-y-3 p-3">
+                              {executionGroup.ruleGroups.map((group) => renderRuleResultGroup(group, {
+                                groupKey: `${executionGroup.key}-${group.key}`,
+                                testIdPrefix: 'live-rule-group',
+                                panelIdPrefix: `live-rule-group-panel-${toDomId(executionGroup.key)}`,
+                              }))}
+                            </div>
+                          ) : null}
+                        </section>
+                      );
+                    })
+                  ) : (
+                    resultRuleGroups.map((group) => renderRuleResultGroup(group))
+                  )}
                 </div>
               </div>
             )}
@@ -2335,7 +2782,7 @@ const BacktestPage: React.FC = () => {
           className="fixed inset-0 z-[70] flex items-center justify-center bg-background/75 p-3 backdrop-blur-sm"
           role="dialog"
           aria-modal="true"
-          aria-label="回测指标明细"
+          aria-label={pageCopy.detailDialogLabel}
           onClick={() => setSelectedRow(null)}
         >
           <div

@@ -68,6 +68,7 @@ const AppContent: React.FC = () => {
         <Route path="/chat" element={<ChatPage />} />
         <Route path="/indicators/:stockCode" element={<IndicatorAnalysisPage />} />
         <Route path="/portfolio" element={<PortfolioPage />} />
+        <Route path="/live-test" element={<BacktestPage mode="live" />} />
         <Route path="/backtest" element={<BacktestPage />} />
         <Route path="/settings" element={<SettingsPage />} />
         <Route path="*" element={<NotFoundPage />} />

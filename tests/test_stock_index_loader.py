@@ -101,6 +101,29 @@ class TestStockIndexLoader(unittest.TestCase):
             ):
                 self.assertEqual(stock_index_loader.get_index_stock_name("000001"), "平安银行")
 
+    def test_get_all_a_share_stock_codes_filters_active_cn_and_bse_stocks(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            index_path = Path(temp_dir) / "stocks.index.json"
+            index_path.write_text(
+                json.dumps(
+                    [
+                        ["000001.SZ", "000001", "平安银行", "", "", [], "CN", "stock", True, 100],
+                        ["920001.BJ", "920001", "北交样本", "", "", [], "BSE", "stock", True, 100],
+                        ["510300.SH", "510300", "沪深300ETF", "", "", [], "CN", "etf", True, 100],
+                        ["00700.HK", "00700", "腾讯控股", "", "", [], "HK", "stock", True, 100],
+                        ["600000.SH", "600000", "退市样本", "", "", [], "CN", "stock", False, 100],
+                    ],
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            with patch.object(stock_index_loader, "get_stock_index_candidate_paths", return_value=(index_path,)):
+                self.assertEqual(
+                    stock_index_loader.get_all_a_share_stock_codes(),
+                    ["000001", "920001"],
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

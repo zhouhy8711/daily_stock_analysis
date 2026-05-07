@@ -27,7 +27,7 @@ vi.mock('../../theme/ThemeToggle', () => ({
 }));
 
 describe('SidebarNav', () => {
-  it('places backtest between rules and chat', () => {
+  it('places live test above backtest between rules and chat', () => {
     render(
       <MemoryRouter initialEntries={['/backtest']}>
         <SidebarNav />
@@ -36,8 +36,9 @@ describe('SidebarNav', () => {
 
     const labels = screen.getAllByRole('link').map((link) => link.getAttribute('aria-label'));
 
-    expect(labels).toEqual(expect.arrayContaining(['规则', '回测', '问股']));
-    expect(labels.indexOf('规则')).toBeLessThan(labels.indexOf('回测'));
+    expect(labels).toEqual(expect.arrayContaining(['规则', '实测', '回测', '问股']));
+    expect(labels.indexOf('规则')).toBeLessThan(labels.indexOf('实测'));
+    expect(labels.indexOf('实测')).toBeLessThan(labels.indexOf('回测'));
     expect(labels.indexOf('回测')).toBeLessThan(labels.indexOf('问股'));
   });
 

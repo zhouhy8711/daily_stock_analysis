@@ -1,3 +1,7 @@
+import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -366,6 +370,29 @@ def test_batch_realtime_quotes_fetches_only_missing_codes() -> None:
     assert result["failed_codes"] == []
 
 
+def test_warm_all_a_share_realtime_quotes_fills_missing_current_bucket() -> None:
+    fetcher = _BatchQuoteFetcher()
+    manager = _BatchRealtimeManager(fetcher)
+
+    with (
+        patch("src.data.stock_index_loader.get_all_a_share_stock_codes", return_value=["600519", "000001"]),
+        patch("src.services.stock_service.get_config", return_value=SimpleNamespace(realtime_cache_ttl=30)),
+        patch("src.services.stock_service.time.time", return_value=1000),
+        patch("data_provider.base.DataFetcherManager", return_value=manager),
+    ):
+        first = StockService().warm_all_a_share_realtime_quotes()
+        second = StockService().warm_all_a_share_realtime_quotes()
+
+    assert fetcher.requested_batches == [["600519", "000001"]]
+    assert first["status"] == "refreshed"
+    assert first["cached_before"] == 0
+    assert first["fetched_count"] == 2
+    assert first["cached_after"] == 2
+    assert second["status"] == "cache_hit"
+    assert second["cached_before"] == 2
+    assert second["fetched_count"] == 0
+
+
 def test_data_provider_realtime_cache_ttl_reads_config() -> None:
     from data_provider.akshare_fetcher import (
         _realtime_cache as akshare_cache,
@@ -379,6 +406,78 @@ def test_data_provider_realtime_cache_ttl_reads_config() -> None:
     with patch("src.config.get_config", return_value=SimpleNamespace(realtime_cache_ttl=17)):
         assert refresh_efinance_ttl(efinance_cache) == 17
         assert refresh_akshare_ttl(akshare_cache) == 17
+
+
+def test_efinance_realtime_cache_coalesces_concurrent_refreshes() -> None:
+    from data_provider.efinance_fetcher import (
+        EfinanceFetcher,
+        _realtime_cache,
+        _realtime_cache_lock,
+    )
+
+    fake_df = pd.DataFrame({
+        "股票代码": ["600519", "000001"],
+        "股票名称": ["贵州茅台", "平安银行"],
+        "最新价": [123.45, 12.34],
+        "涨跌幅": [0.98, -0.5],
+        "涨跌额": [1.2, -0.06],
+        "成交量": [1000000, 2000000],
+        "成交额": [123450000, 24680000],
+        "换手率": [0.86, 1.1],
+        "振幅": [2.1, 1.7],
+        "最高": [125.0, 12.5],
+        "最低": [121.0, 12.1],
+        "开盘": [122.0, 12.2],
+        "昨收": [122.25, 12.4],
+        "量比": [1.23, 0.92],
+        "市盈率": [23.89, 8.4],
+        "总市值": [2_200_000_000_000, 100_000_000_000],
+        "流通市值": [2_180_000_000_000, 90_000_000_000],
+    })
+    call_count = 0
+    call_lock = threading.Lock()
+    first_call_started = threading.Event()
+
+    def fake_get_realtime_quotes(*_args, **_kwargs):
+        nonlocal call_count
+        with call_lock:
+            call_count += 1
+        first_call_started.set()
+        time.sleep(0.1)
+        return fake_df
+
+    fake_efinance = SimpleNamespace(
+        stock=SimpleNamespace(get_realtime_quotes=fake_get_realtime_quotes)
+    )
+    fetcher = EfinanceFetcher()
+
+    with _realtime_cache_lock:
+        _realtime_cache["data"] = None
+        _realtime_cache["timestamp"] = 0
+
+    try:
+        with (
+            patch.dict(sys.modules, {"efinance": fake_efinance}),
+            patch("src.config.get_config", return_value=SimpleNamespace(realtime_cache_ttl=30)),
+            patch("data_provider.efinance_fetcher.time.time", return_value=1000),
+            patch.object(fetcher, "_set_random_user_agent", return_value=None),
+            patch.object(fetcher, "_enforce_rate_limit", return_value=None),
+            ThreadPoolExecutor(max_workers=2) as executor,
+        ):
+            first = executor.submit(fetcher.get_realtime_quotes, ["600519"])
+            assert first_call_started.wait(timeout=1)
+            second = executor.submit(fetcher.get_realtime_quotes, ["000001"])
+
+            first_result = first.result(timeout=2)
+            second_result = second.result(timeout=2)
+
+        assert call_count == 1
+        assert set(first_result) == {"600519"}
+        assert set(second_result) == {"000001"}
+    finally:
+        with _realtime_cache_lock:
+            _realtime_cache["data"] = None
+            _realtime_cache["timestamp"] = 0
 
 
 def test_realtime_quote_derives_after_hours_volume_from_amount_and_price() -> None:
