@@ -11,7 +11,7 @@
 
 import logging
 from copy import deepcopy
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 import math
 import re
 import sys
@@ -754,32 +754,248 @@ class StockService:
                 "low": _to_optional_float(row.get("low")) or 0.0,
                 "close": _to_optional_float(row.get("close")) or 0.0,
                 "volume": _to_optional_float(row.get("volume")),
+                "after_hours_volume": _to_optional_float(row.get("after_hours_volume")),
                 "amount": _to_optional_float(row.get("amount")),
                 "change_percent": _to_optional_float(row.get("pct_chg")),
                 "turnover_rate": _to_optional_float(row.get("turnover_rate")),
             })
         return data
 
-    def _load_daily_history_from_db(self, stock_code: str, days: int):
+    @staticmethod
+    def _normalize_daily_cache_date(value: Any) -> Optional[date]:
+        if isinstance(value, datetime):
+            return value.date()
+        if isinstance(value, date):
+            return value
+        if isinstance(value, str) and len(value) >= 10:
+            try:
+                return datetime.strptime(value[:10], "%Y-%m-%d").date()
+            except ValueError:
+                return None
+        return None
+
+    @staticmethod
+    def _resolve_daily_cache_target_date(stock_code: str) -> date:
+        try:
+            market = trading_calendar.get_market_for_stock(stock_code)
+            market_today = trading_calendar.get_market_now(market).date()
+            target_date = market_today - timedelta(days=1)
+            for _ in range(10):
+                if trading_calendar.is_market_open(market, target_date):
+                    return target_date
+                target_date -= timedelta(days=1)
+            return market_today - timedelta(days=1)
+        except Exception as calendar_error:
+            logger.debug("解析 %s 最新已完成交易日失败，按昨天校验日线缓存: %s", stock_code, calendar_error)
+            return datetime.now().date() - timedelta(days=1)
+
+    def _get_daily_cache_latest_date(self, stock_code: str) -> Optional[date]:
+        from data_provider.base import normalize_stock_code
+
+        candidates = list(dict.fromkeys([stock_code, normalize_stock_code(stock_code)]))
+        latest_date: Optional[date] = None
+        for candidate in candidates:
+            for bar in self.repo.get_latest(candidate, days=1):
+                bar_date = self._normalize_daily_cache_date(getattr(bar, "date", None))
+                if bar_date and (latest_date is None or bar_date > latest_date):
+                    latest_date = bar_date
+        return latest_date
+
+    def _load_daily_history_from_db(
+        self,
+        stock_code: str,
+        days: int,
+        *,
+        require_fresh: bool = True,
+        end_date: Optional[date] = None,
+    ):
         from data_provider.base import normalize_stock_code
         import pandas as pd
 
         requested_days = max(1, int(days or 1))
-        end_date = datetime.now().date()
-        start_date = end_date - timedelta(days=int(requested_days * 1.8) + 10)
-        required_rows = min(requested_days, max(5, int(requested_days * 0.3)))
+        target_date = end_date or (
+            self._resolve_daily_cache_target_date(stock_code) if require_fresh else None
+        )
+        query_end_date = target_date or datetime.now().date()
+        start_date = query_end_date - timedelta(days=int(requested_days * 1.8) + 10)
+        required_rows = requested_days if require_fresh else 1
         candidates = list(dict.fromkeys([stock_code, normalize_stock_code(stock_code)]))
 
         for candidate in candidates:
-            bars = self.repo.get_range(candidate, start_date, end_date)
+            bars = self.repo.get_range(candidate, start_date, query_end_date)
             if len(bars) < required_rows:
                 continue
             selected_bars = bars[-requested_days:]
+            latest_cached_date = (
+                self._normalize_daily_cache_date(getattr(selected_bars[-1], "date", None))
+                if selected_bars else None
+            )
+            if require_fresh and target_date and latest_cached_date and latest_cached_date < target_date:
+                logger.info(
+                    "日线缓存过期，刷新 %s: cache_latest=%s target=%s",
+                    stock_code,
+                    latest_cached_date.isoformat(),
+                    target_date.isoformat(),
+                )
+                continue
             df = pd.DataFrame([bar.to_dict() for bar in selected_bars])
             if not df.empty:
                 return df, "db_cache"
 
         return None
+
+    @staticmethod
+    def _history_frame_row_count(cached_history) -> int:
+        if cached_history is None:
+            return 0
+        df, _source = cached_history
+        try:
+            return len(df.index)
+        except Exception:
+            return 0
+
+    @staticmethod
+    def _resolve_realtime_daily_date(stock_code: str) -> Optional[date]:
+        try:
+            market = trading_calendar.get_market_for_stock(stock_code)
+            market_today = trading_calendar.get_market_now(market).date()
+            if market and not trading_calendar.is_market_open(market, market_today):
+                return None
+            return market_today
+        except Exception as calendar_error:
+            logger.debug("解析 %s 当天实时渲染日期失败，按本地自然日处理: %s", stock_code, calendar_error)
+            return datetime.now().date()
+
+    @staticmethod
+    def _quote_has_realtime_daily_signal(quote_payload: Optional[Dict[str, Any]]) -> bool:
+        if not quote_payload:
+            return False
+        price = _to_optional_float(quote_payload.get("current_price"))
+        if price is None or price <= 0:
+            return False
+        for key in ("open", "high", "low", "volume", "amount", "change", "change_percent"):
+            value = _to_optional_float(quote_payload.get(key))
+            if value is not None:
+                return True
+        return False
+
+    @staticmethod
+    def _quote_has_realtime_price(quote_payload: Optional[Dict[str, Any]]) -> bool:
+        if not quote_payload:
+            return False
+        price = _to_optional_float(quote_payload.get("current_price"))
+        return price is not None and price > 0
+
+    @staticmethod
+    def _build_realtime_daily_row(
+        quote_payload: Dict[str, Any],
+        stock_code: str,
+        realtime_date: date,
+        previous_close: Optional[float],
+    ) -> Dict[str, Any]:
+        price = _to_optional_float(quote_payload.get("current_price")) or 0.0
+        open_price = (
+            _to_optional_float(quote_payload.get("open"))
+            or _to_optional_float(quote_payload.get("prev_close"))
+            or previous_close
+            or price
+        )
+        high_price = _to_optional_float(quote_payload.get("high")) or price
+        low_price = _to_optional_float(quote_payload.get("low")) or price
+        high_price = max(high_price, open_price, price)
+        low_price = min(low_price, open_price, price)
+        change_percent = _to_optional_float(quote_payload.get("change_percent"))
+        if change_percent is None and previous_close and previous_close > 0:
+            change_percent = (price - previous_close) / previous_close * 100
+
+        return {
+            "code": stock_code,
+            "date": realtime_date,
+            "open": open_price,
+            "high": high_price,
+            "low": low_price,
+            "close": price,
+            "volume": _to_optional_float(quote_payload.get("volume")) or 0,
+            "after_hours_volume": _to_optional_float(quote_payload.get("after_hours_volume")),
+            "amount": _to_optional_float(quote_payload.get("amount")) or 0,
+            "pct_chg": change_percent if change_percent is not None else 0,
+            "turnover_rate": _to_optional_float(quote_payload.get("turnover_rate")),
+        }
+
+    def _augment_daily_history_with_realtime(
+        self,
+        df,
+        stock_code: str,
+    ) -> Tuple[Any, Optional[Dict[str, Any]]]:
+        if df is None or df.empty or "date" not in df.columns or "close" not in df.columns:
+            return df, None
+
+        realtime_date = self._resolve_realtime_daily_date(stock_code)
+        if realtime_date is None:
+            return df, None
+
+        quote_payload = self.get_realtime_quote(stock_code)
+        if not self._quote_has_realtime_daily_signal(quote_payload):
+            return df, quote_payload
+
+        import pandas as pd
+
+        df = df.copy()
+        last_value = df["date"].max()
+        last_date = self._normalize_daily_cache_date(last_value)
+        if last_date and last_date > realtime_date:
+            return df, quote_payload
+
+        previous_close = _to_optional_float(df.iloc[-1].get("close")) if len(df.index) > 0 else None
+        realtime_row = self._build_realtime_daily_row(
+            quote_payload or {},
+            stock_code,
+            realtime_date,
+            previous_close,
+        )
+
+        if last_date and last_date == realtime_date:
+            idx = df.index[-1]
+            for key, value in realtime_row.items():
+                if key == "code" or value is None:
+                    continue
+                df.loc[idx, key] = value
+            return df, quote_payload
+
+        df = pd.concat([df, pd.DataFrame([realtime_row])], ignore_index=True)
+        return df, quote_payload
+
+    def _augment_intraday_history_with_realtime(
+        self,
+        df,
+        stock_code: str,
+    ) -> Tuple[Any, Optional[Dict[str, Any]]]:
+        if df is None or df.empty or "date" not in df.columns or "close" not in df.columns:
+            return df, None
+
+        realtime_date = self._resolve_realtime_daily_date(stock_code)
+        if realtime_date is None:
+            return df, None
+
+        latest_date = self._normalize_daily_cache_date(df.iloc[-1].get("date"))
+        if latest_date != realtime_date:
+            return df, None
+
+        quote_payload = self.get_realtime_quote(stock_code)
+        if not self._quote_has_realtime_price(quote_payload):
+            return df, quote_payload
+
+        price = _to_optional_float((quote_payload or {}).get("current_price")) or 0.0
+        df = df.copy()
+        idx = df.index[-1]
+        open_price = _to_optional_float(df.loc[idx].get("open")) or price
+        high_price = _to_optional_float(df.loc[idx].get("high")) or price
+        low_price = _to_optional_float(df.loc[idx].get("low")) or price
+
+        df.loc[idx, "close"] = price
+        df.loc[idx, "high"] = max(high_price, open_price, price)
+        df.loc[idx, "low"] = min(low_price, open_price, price)
+        return df, quote_payload
 
     @staticmethod
     def _get_local_stock_name(stock_code: str) -> Optional[str]:
@@ -832,13 +1048,83 @@ class StockService:
                     df, source = cached_history
                     stock_name = self._get_local_stock_name(stock_code)
                 else:
+                    target_date = self._resolve_daily_cache_target_date(stock_code)
+                    latest_cached_date = self._get_daily_cache_latest_date(stock_code)
+                    stale_cached_history = self._load_daily_history_from_db(
+                        stock_code,
+                        days,
+                        require_fresh=False,
+                        end_date=target_date,
+                    )
                     manager = DataFetcherManager()
-                    df, source = manager.get_daily_data(stock_code, days=days)
+                    loaded_from_stale_cache = False
+                    try:
+                        stale_row_count = self._history_frame_row_count(stale_cached_history)
+                        if (
+                            latest_cached_date
+                            and latest_cached_date < target_date
+                            and stale_row_count >= max(1, int(days or 1))
+                        ):
+                            start_date = latest_cached_date + timedelta(days=1)
+                            logger.info(
+                                "补齐 %s 日线缓存: start=%s end=%s latest_cache=%s",
+                                stock_code,
+                                start_date.isoformat(),
+                                target_date.isoformat(),
+                                latest_cached_date.isoformat(),
+                            )
+                            df, source = manager.get_daily_data(
+                                stock_code,
+                                start_date=start_date.isoformat(),
+                                end_date=target_date.isoformat(),
+                                days=days,
+                            )
+                        else:
+                            logger.info(
+                                "刷新 %s 日线缓存窗口: rows=%s latest_cache=%s target=%s days=%s",
+                                stock_code,
+                                stale_row_count,
+                                latest_cached_date.isoformat() if latest_cached_date else None,
+                                target_date.isoformat(),
+                                days,
+                            )
+                            df, source = manager.get_daily_data(
+                                stock_code,
+                                end_date=target_date.isoformat(),
+                                days=days,
+                            )
+                    except Exception as fetch_error:
+                        if stale_cached_history is None:
+                            raise
+                        logger.warning(
+                            "刷新 %s 日线失败，暂用过期 DB 缓存兜底: %s",
+                            stock_code,
+                            fetch_error,
+                        )
+                        df, source = stale_cached_history
+                        stock_name = self._get_local_stock_name(stock_code)
+                        loaded_from_stale_cache = True
                     if df is not None and not df.empty:
-                        try:
-                            self.repo.save_dataframe(df, stock_code, source)
-                        except Exception as save_error:
-                            logger.debug("保存 %s 日线缓存失败: %s", stock_code, save_error)
+                        if not loaded_from_stale_cache:
+                            try:
+                                self.repo.save_dataframe(df, stock_code, source)
+                                refreshed_cache = self._load_daily_history_from_db(stock_code, days)
+                                if refreshed_cache is None:
+                                    refreshed_cache = self._load_daily_history_from_db(
+                                        stock_code,
+                                        days,
+                                        require_fresh=False,
+                                        end_date=target_date,
+                                    )
+                                if refreshed_cache is not None:
+                                    df, source = refreshed_cache
+                                    stock_name = self._get_local_stock_name(stock_code)
+                            except Exception as save_error:
+                                logger.debug("保存 %s 日线缓存失败: %s", stock_code, save_error)
+                    elif stale_cached_history is not None:
+                        logger.warning("刷新 %s 日线返回空结果，暂用过期 DB 缓存兜底", stock_code)
+                        df, source = stale_cached_history
+                        stock_name = self._get_local_stock_name(stock_code)
             else:
                 manager = DataFetcherManager()
                 intraday_kwargs: Dict[str, Any] = {
@@ -864,6 +1150,15 @@ class StockService:
             # 获取股票名称
             if stock_name is None and manager is not None:
                 stock_name = manager.get_stock_name(stock_code)
+
+            if normalized_period == "daily":
+                df, quote_payload = self._augment_daily_history_with_realtime(df, stock_code)
+                if stock_name is None and quote_payload:
+                    stock_name = quote_payload.get("stock_name")
+            else:
+                df, quote_payload = self._augment_intraday_history_with_realtime(df, stock_code)
+                if stock_name is None and quote_payload:
+                    stock_name = quote_payload.get("stock_name")
             
             # 转换为响应格式
             data = self._build_kline_payload(df, normalized_period)

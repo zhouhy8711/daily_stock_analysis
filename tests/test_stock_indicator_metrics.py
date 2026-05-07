@@ -146,6 +146,25 @@ class _FakeHistoryManager:
         return "贵州茅台"
 
 
+class _FakeRealtimeIntradayHistoryManager(_FakeHistoryManager):
+    def get_realtime_quote(self, stock_code, **_kwargs):
+        assert stock_code == "600519"
+        return SimpleNamespace(
+            code="600519",
+            name="贵州茅台",
+            price=1411.23,
+            change_amount=3.24,
+            change_pct=0.23,
+            open_price=1408.0,
+            high=1411.23,
+            low=1405.1,
+            pre_close=1407.99,
+            volume=1000000,
+            amount=141123000,
+            source=RealtimeSource.EFINANCE,
+        )
+
+
 def _make_quote(code: str, name: str = "测试股票", price: float = 10.0):
     return SimpleNamespace(
         code=code,
@@ -444,6 +463,25 @@ def test_history_data_anchors_cn_intraday_to_previous_session_when_market_closed
 
     assert result["period"] == "5m"
     assert manager.last_intraday_kwargs["end_date"] == "2026-04-30"
+
+
+def test_history_data_syncs_intraday_tail_with_realtime_quote() -> None:
+    manager = _FakeRealtimeIntradayHistoryManager()
+
+    with (
+        patch("data_provider.base.DataFetcherManager", return_value=manager),
+        patch(
+            "src.services.stock_service.StockService._resolve_realtime_daily_date",
+            return_value=date(2026, 4, 30),
+        ),
+    ):
+        result = StockService().get_history_data("600519", period="5m", days=1)
+
+    assert result["period"] == "5m"
+    assert result["data"][-1]["date"] == "2026-04-30 09:40"
+    assert result["data"][-1]["close"] == 1411.23
+    assert result["data"][-1]["high"] == 1411.23
+    assert result["data"][-1]["low"] == 1406.0
 
 
 def test_history_endpoint_exposes_turnover_rate() -> None:

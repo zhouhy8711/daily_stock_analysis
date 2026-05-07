@@ -73,6 +73,7 @@ type IndicatorAnalysisViewProps = {
 };
 
 type ChartPoint = KLineData & {
+  averagePrice?: number;
   ma5?: number;
   ma10?: number;
   ma20?: number;
@@ -96,7 +97,7 @@ type ChartPoint = KLineData & {
 
 type HistoryState = {
   stockCode: string;
-  period: KLinePeriod;
+  period: ChartPeriod;
   history: KLineData[];
   quote: StockQuote | null;
   metrics: StockIndicatorMetrics | null;
@@ -105,7 +106,7 @@ type HistoryState = {
   error: string | null;
 };
 
-type HistoryCache = Partial<Record<KLinePeriod, HistoryState>>;
+type HistoryCache = Partial<Record<ChartPeriod, HistoryState>>;
 
 type StructureTrendPoint = {
   date: string;
@@ -166,6 +167,13 @@ type ChipPanelScope = 'all' | 'main';
 type ChipRangeLevel = '90' | '70';
 type SidePanelTab = 'chip' | 'flow';
 type MaximizedChart = 'kline' | 'volume' | 'momentum';
+type ChartPeriod = KLinePeriod | 'timeshare';
+type KLinePeriodOption = {
+  value: ChartPeriod;
+  label: string;
+  days: number;
+  requestPeriod: KLinePeriod;
+};
 type RuleMetricAddPayload = {
   key: string;
   label: string;
@@ -178,19 +186,21 @@ type AddRuleMetricHandler = (metric: RuleMetricAddPayload) => void;
 const EMPTY_HISTORY: KLineData[] = [];
 const EMPTY_HOLDERS: MajorHolder[] = [];
 const ALL_HOLDERS_KEY = 'all';
-const KLINE_PERIOD_OPTIONS: Array<{ value: KLinePeriod; label: string; days: number }> = [
-  { value: 'daily', label: '日K', days: 120 },
-  { value: '1m', label: '1分', days: 3 },
-  { value: '5m', label: '5分', days: 3 },
-  { value: '15m', label: '15分', days: 30 },
-  { value: '30m', label: '30分', days: 30 },
-  { value: '60m', label: '60分', days: 30 },
+const KLINE_PERIOD_OPTIONS: KLinePeriodOption[] = [
+  { value: 'timeshare', label: '分时', days: 1, requestPeriod: '1m' },
+  { value: 'daily', label: '日K', days: 120, requestPeriod: 'daily' },
+  { value: '1m', label: '1分', days: 3, requestPeriod: '1m' },
+  { value: '5m', label: '5分', days: 3, requestPeriod: '5m' },
+  { value: '15m', label: '15分', days: 30, requestPeriod: '15m' },
+  { value: '30m', label: '30分', days: 30, requestPeriod: '30m' },
+  { value: '60m', label: '60分', days: 30, requestPeriod: '60m' },
 ];
-const INTRADAY_PERIOD_OPTIONS = KLINE_PERIOD_OPTIONS.filter((option) => option.value !== 'daily');
 const MAX_VISIBLE_KLINE_POINTS = 80;
 const MIN_VISIBLE_KLINE_POINTS = 24;
 const MAX_EXPANDED_KLINE_POINTS = 160;
 const ONE_MINUTE_REFRESH_MS = 10_000;
+const TIMESHARE_START_MINUTE = (9 * 60) + 30;
+const TIMESHARE_END_MINUTE = 15 * 60;
 const LINE_COLORS = {
   close: 'var(--indicator-line-close)',
   avgCost: 'var(--indicator-line-avg-cost)',
@@ -946,19 +956,23 @@ const MetricInline: React.FC<{
   </span>
 );
 
-function getPeriodMeta(period: KLinePeriod) {
+function getPeriodMeta(period: ChartPeriod) {
   const option = KLINE_PERIOD_OPTIONS.find((item) => item.value === period) ?? KLINE_PERIOD_OPTIONS[0];
   const isDaily = option.value === 'daily';
+  const isTimeshare = option.value === 'timeshare';
   return {
     ...option,
     isDaily,
-    sampleUnit: isDaily ? '个交易日' : '根K线',
-    recentLabel: isDaily ? '最近' : '当前窗口',
-    supportLabel: isDaily ? '近20日支撑' : '近20根支撑',
-    resistanceLabel: isDaily ? '近20日压力' : '近20根压力',
-    returnLabel: isDaily ? '5日 / 20日收益' : '5根 / 20根收益',
+    isTimeshare,
+    sampleUnit: isDaily ? '个交易日' : isTimeshare ? '分钟' : '根K线',
+    recentLabel: isDaily ? '最近' : isTimeshare ? '当天' : '当前窗口',
+    supportLabel: isDaily ? '近20日支撑' : isTimeshare ? '日内支撑' : '近20根支撑',
+    resistanceLabel: isDaily ? '近20日压力' : isTimeshare ? '日内压力' : '近20根压力',
+    returnLabel: isDaily ? '5日 / 20日收益' : isTimeshare ? '日内波动' : '5根 / 20根收益',
     description: isDaily
       ? '当前展示基于历史日 K 计算的技术指标，可切换上方分钟周期查看分段 K 线。五档盘口和逐笔成交暂不在此图中展示。'
+      : isTimeshare
+        ? '当前展示最新交易日 09:30-15:00 的 1 分钟分时波动，自动过滤其他日期和盘前盘后分钟数据。'
       : '当前展示分钟 K 线数据，按所选周期分段展示 OHLC、成交量、成交额与均线；可拖动下方时间窗口回看返回区间内的更早分钟数据。五档盘口和逐笔成交暂不在此图中展示。',
   };
 }
@@ -976,7 +990,7 @@ function getMarketKind(stockCode: string): 'cn' | 'hk' | 'us' {
 
 function createHistoryState(
   stockCode: string,
-  period: KLinePeriod,
+  period: ChartPeriod,
   overrides: Partial<HistoryState> = {},
 ): HistoryState {
   return {
@@ -1010,12 +1024,46 @@ function getLatestHistoryDate(history: KLineData[]): string | null {
   return null;
 }
 
+function getKLineMinuteOfDay(value?: string | null): number | null {
+  if (!value) {
+    return null;
+  }
+  const match = value.match(/(?:\s|T)(\d{1,2}):(\d{2})/);
+  if (!match) {
+    return null;
+  }
+  const hour = Number(match[1]);
+  const minute = Number(match[2]);
+  if (!Number.isFinite(hour) || !Number.isFinite(minute)) {
+    return null;
+  }
+  return (hour * 60) + minute;
+}
+
+function normalizeTimeshareHistory(history: KLineData[]): KLineData[] {
+  const inSession = history.filter((item) => {
+    const minute = getKLineMinuteOfDay(item.date);
+    return minute !== null && minute >= TIMESHARE_START_MINUTE && minute <= TIMESHARE_END_MINUTE;
+  });
+  const latestDate = Array.from(new Set(
+    inSession.map((item) => getKLineDateOnly(item.date)).filter((date): date is string => Boolean(date)),
+  )).sort().at(-1);
+  if (!latestDate) {
+    return [];
+  }
+  return inSession.filter((item) => getKLineDateOnly(item.date) === latestDate);
+}
+
 function normalizeHistoryForPeriod(
   history: KLineData[],
-  period: KLinePeriod,
+  period: ChartPeriod,
   market: 'cn' | 'hk' | 'us',
   dailyCutoffDate?: string | null,
 ): KLineData[] {
+  if (period === 'timeshare') {
+    return normalizeTimeshareHistory(history);
+  }
+
   if (period === 'daily' || market === 'us' || !dailyCutoffDate) {
     return history;
   }
@@ -1037,9 +1085,123 @@ function normalizeHistoryForPeriod(
   });
 }
 
-function formatAxisDate(value: string, period: KLinePeriod): string {
+function getQuoteDateOnly(quote: StockQuote | null): string | null {
+  return getKLineDateOnly(quote?.updateTime);
+}
+
+function syncPointWithRealtimeQuote(
+  point: KLineData,
+  previous: KLineData | undefined,
+  quote: StockQuote,
+  period: ChartPeriod,
+): KLineData {
+  const price = quote.currentPrice;
+  if (period === 'daily') {
+    const open = quote.open ?? point.open ?? quote.prevClose ?? previous?.close ?? price;
+    const high = Math.max(quote.high ?? point.high ?? price, open, price);
+    const low = Math.min(quote.low ?? point.low ?? price, open, price);
+    const previousClose = quote.prevClose ?? previous?.close;
+    const changePercent = quote.changePercent
+      ?? point.changePercent
+      ?? (isValidNumber(previousClose) && previousClose !== 0 ? ((price - previousClose) / previousClose) * 100 : undefined);
+    return {
+      ...point,
+      open,
+      high,
+      low,
+      close: price,
+      volume: quote.volume ?? point.volume,
+      afterHoursVolume: quote.afterHoursVolume ?? point.afterHoursVolume,
+      amount: quote.amount ?? point.amount,
+      changePercent,
+      turnoverRate: quote.turnoverRate ?? point.turnoverRate,
+    };
+  }
+
+  const open = point.open ?? price;
+  return {
+    ...point,
+    high: Math.max(point.high ?? price, open, price),
+    low: Math.min(point.low ?? price, open, price),
+    close: price,
+  };
+}
+
+function syncHistoryWithRealtimeQuote(
+  history: KLineData[],
+  period: ChartPeriod,
+  quote: StockQuote | null,
+): KLineData[] {
+  if (!quote || !isValidNumber(quote.currentPrice) || quote.currentPrice <= 0 || history.length === 0) {
+    return history;
+  }
+
+  const latest = history.at(-1);
+  if (!latest) {
+    return history;
+  }
+
+  const latestDate = getKLineDateOnly(latest.date);
+  const quoteDate = getQuoteDateOnly(quote);
+  if (latestDate && quoteDate && latestDate !== quoteDate) {
+    return history;
+  }
+
+  const previous = history.length > 1 ? history[history.length - 2] : undefined;
+  const syncedLatest = syncPointWithRealtimeQuote(latest, previous, quote, period);
+  if (
+    syncedLatest.close === latest.close
+    && syncedLatest.high === latest.high
+    && syncedLatest.low === latest.low
+    && syncedLatest.open === latest.open
+    && syncedLatest.volume === latest.volume
+    && syncedLatest.amount === latest.amount
+    && syncedLatest.changePercent === latest.changePercent
+    && syncedLatest.turnoverRate === latest.turnoverRate
+    && syncedLatest.afterHoursVolume === latest.afterHoursVolume
+  ) {
+    return history;
+  }
+
+  return [...history.slice(0, -1), syncedLatest];
+}
+
+function syncHistoryCacheWithRealtimeQuote(
+  cache: HistoryCache,
+  stockCode: string,
+  quote: StockQuote | null,
+): HistoryCache {
+  if (!quote) {
+    return cache;
+  }
+
+  let changed = false;
+  const next: HistoryCache = { ...cache };
+  KLINE_PERIOD_OPTIONS.forEach((option) => {
+    const state = next[option.value];
+    if (!state || state.stockCode !== stockCode) {
+      return;
+    }
+    const syncedHistory = syncHistoryWithRealtimeQuote(state.history, state.period, quote);
+    if (state.quote !== quote || syncedHistory !== state.history) {
+      next[option.value] = {
+        ...state,
+        quote,
+        history: syncedHistory,
+      };
+      changed = true;
+    }
+  });
+
+  return changed ? next : cache;
+}
+
+function formatAxisDate(value: string, period: ChartPeriod): string {
   if (period === 'daily') {
     return value.slice(5);
+  }
+  if (period === 'timeshare') {
+    return value.match(/(?:\s|T)(\d{1,2}:\d{2})/)?.[1] ?? value;
   }
   return value.includes(' ') ? value.slice(5) : value;
 }
@@ -1218,9 +1380,11 @@ function buildChartPoints(data: KLineData[]): ChartPoint[] {
   let ema12: number | undefined;
   let ema26: number | undefined;
   let dea = 0;
+  let closeSum = 0;
 
   return data.map((item, index) => {
     const close = item.close;
+    closeSum += close;
     ema12 = typeof ema12 === 'number' ? (close * (2 / 13)) + (ema12 * (11 / 13)) : close;
     ema26 = typeof ema26 === 'number' ? (close * (2 / 27)) + (ema26 * (25 / 27)) : close;
     const dif = ema12 - ema26;
@@ -1228,6 +1392,7 @@ function buildChartPoints(data: KLineData[]): ChartPoint[] {
 
     return {
       ...item,
+      averagePrice: closeSum / (index + 1),
       ma5: movingAverage(data, index, 5, (point) => point.close),
       ma10: movingAverage(data, index, 10, (point) => point.close),
       ma20: movingAverage(data, index, 20, (point) => point.close),
@@ -1583,7 +1748,10 @@ function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value));
 }
 
-function getVisiblePointCount(total: number, zoomLevel: number): number {
+function getVisiblePointCount(total: number, zoomLevel: number, period?: ChartPeriod): number {
+  if (period === 'timeshare') {
+    return total;
+  }
   const base = Math.min(MAX_VISIBLE_KLINE_POINTS, total);
   const zoomed = Math.round(base / (1.45 ** zoomLevel));
   return clamp(zoomed, Math.min(MIN_VISIBLE_KLINE_POINTS, total), Math.min(MAX_EXPANDED_KLINE_POINTS, total));
@@ -2236,12 +2404,13 @@ const ChartLegend: React.FC<{
   point?: ChartPoint;
   previous?: ChartPoint;
   periodLabel: string;
+  isTimeshare?: boolean;
   latestQuote: StockQuote | null;
   metrics: StockIndicatorMetrics | null;
   points: ChartPoint[];
   showRealtimeMetrics: boolean;
   onAddRuleMetric?: AddRuleMetricHandler;
-}> = ({ point, previous, periodLabel, latestQuote, metrics, points, showRealtimeMetrics, onAddRuleMetric }) => {
+}> = ({ point, previous, periodLabel, isTimeshare = false, latestQuote, metrics, points, showRealtimeMetrics, onAddRuleMetric }) => {
   const [moreOpen, setMoreOpen] = useState(false);
   const totalMv = latestQuote?.totalMv;
   const circMv = latestQuote?.circMv;
@@ -2270,21 +2439,46 @@ const ChartLegend: React.FC<{
   return (
     <div data-testid="indicator-price-header" className="flex min-w-0 flex-1 flex-wrap items-center gap-x-2 gap-y-1 font-mono text-[11px] leading-none">
       <span style={{ color: TERMINAL_COLORS.text }}>{periodLabel}</span>
-      <span className="inline-flex items-center gap-1" style={{ color: TERMINAL_COLORS.cyan }}>
-        <i className="h-2 w-4 border" style={{ borderColor: TERMINAL_COLORS.cyan, backgroundColor: TERMINAL_COLORS.cyan }} />阳线
-      </span>
-      <span className="inline-flex items-center gap-1" style={{ color: TERMINAL_COLORS.orange }}>
-        <i className="h-2 w-4 border bg-transparent" style={{ borderColor: TERMINAL_COLORS.orange }} />阴线
-      </span>
+      {isTimeshare ? (
+        <>
+          <span className="inline-flex items-center gap-1" style={{ color: TERMINAL_COLORS.cyan }}>
+            <i className="h-0.5 w-4" style={{ backgroundColor: TERMINAL_COLORS.cyan }} />价格
+          </span>
+          <span className="inline-flex items-center gap-1" style={{ color: TERMINAL_COLORS.yellow }}>
+            <i className="h-0.5 w-4" style={{ backgroundColor: TERMINAL_COLORS.yellow }} />均价
+          </span>
+        </>
+      ) : (
+        <>
+          <span className="inline-flex items-center gap-1" style={{ color: TERMINAL_COLORS.cyan }}>
+            <i className="h-2 w-4 border" style={{ borderColor: TERMINAL_COLORS.cyan, backgroundColor: TERMINAL_COLORS.cyan }} />阳线
+          </span>
+          <span className="inline-flex items-center gap-1" style={{ color: TERMINAL_COLORS.orange }}>
+            <i className="h-2 w-4 border bg-transparent" style={{ borderColor: TERMINAL_COLORS.orange }} />阴线
+          </span>
+        </>
+      )}
       <span style={{ color: TERMINAL_COLORS.yellow }}>{point?.date ?? '--'}</span>
-      <span style={{ color: (point?.close ?? 0) >= (point?.open ?? 0) ? TERMINAL_COLORS.cyan : TERMINAL_COLORS.orange }}>
-        {point ? (point.close >= point.open ? '阳线' : '阴线') : '--'}
-      </span>
-      <MetricInline metricKey="ma5" label="MA5" value={point?.ma5} unit="元" date={point?.date} color={LINE_COLORS.ma5} onAdd={onAddRuleMetric}>MA5:{formatNumber(point?.ma5)}</MetricInline>
-      <MetricInline metricKey="ma10" label="MA10" value={point?.ma10} unit="元" date={point?.date} color={LINE_COLORS.ma10} onAdd={onAddRuleMetric}>MA10:{formatNumber(point?.ma10)}</MetricInline>
-      <MetricInline metricKey="ma20" label="MA20" value={point?.ma20} unit="元" date={point?.date} color={LINE_COLORS.ma20} onAdd={onAddRuleMetric}>MA20:{formatNumber(point?.ma20)}</MetricInline>
-      <MetricInline metricKey="ma30" label="MA30" value={point?.ma30} unit="元" date={point?.date} color={LINE_COLORS.ma30} onAdd={onAddRuleMetric}>MA30:{formatNumber(point?.ma30)}</MetricInline>
-      <MetricInline metricKey="ma60" label="MA60" value={point?.ma60} unit="元" date={point?.date} color={LINE_COLORS.ma60} onAdd={onAddRuleMetric}>MA60:{formatNumber(point?.ma60)}</MetricInline>
+      {isTimeshare ? (
+        <>
+          <MetricInline metricKey="close" label="分时价" value={point?.close} unit="元" date={point?.date} color={TERMINAL_COLORS.cyan} onAdd={onAddRuleMetric}>现价:{formatNumber(point?.close)}</MetricInline>
+          <MetricInline metricKey="average_price" label="分时均价" value={point?.averagePrice} unit="元" date={point?.date} color={TERMINAL_COLORS.yellow}>均价:{formatNumber(point?.averagePrice)}</MetricInline>
+          <MetricInline metricKey="pct_chg" label="分时涨跌幅" value={point ? getPointChangePct(point, previous) : undefined} unit="%" date={point?.date} color={TERMINAL_COLORS.axisText} onAdd={onAddRuleMetric}>
+            涨跌:{formatPct(point ? getPointChangePct(point, previous) : undefined)}
+          </MetricInline>
+        </>
+      ) : (
+        <>
+          <span style={{ color: (point?.close ?? 0) >= (point?.open ?? 0) ? TERMINAL_COLORS.cyan : TERMINAL_COLORS.orange }}>
+            {point ? (point.close >= point.open ? '阳线' : '阴线') : '--'}
+          </span>
+          <MetricInline metricKey="ma5" label="MA5" value={point?.ma5} unit="元" date={point?.date} color={LINE_COLORS.ma5} onAdd={onAddRuleMetric}>MA5:{formatNumber(point?.ma5)}</MetricInline>
+          <MetricInline metricKey="ma10" label="MA10" value={point?.ma10} unit="元" date={point?.date} color={LINE_COLORS.ma10} onAdd={onAddRuleMetric}>MA10:{formatNumber(point?.ma10)}</MetricInline>
+          <MetricInline metricKey="ma20" label="MA20" value={point?.ma20} unit="元" date={point?.date} color={LINE_COLORS.ma20} onAdd={onAddRuleMetric}>MA20:{formatNumber(point?.ma20)}</MetricInline>
+          <MetricInline metricKey="ma30" label="MA30" value={point?.ma30} unit="元" date={point?.date} color={LINE_COLORS.ma30} onAdd={onAddRuleMetric}>MA30:{formatNumber(point?.ma30)}</MetricInline>
+          <MetricInline metricKey="ma60" label="MA60" value={point?.ma60} unit="元" date={point?.date} color={LINE_COLORS.ma60} onAdd={onAddRuleMetric}>MA60:{formatNumber(point?.ma60)}</MetricInline>
+        </>
+      )}
       <span className="relative ml-auto inline-flex shrink-0">
         <button
           type="button"
@@ -2416,10 +2610,10 @@ const CandlestickChart: React.FC<{
   canZoomIn: boolean;
   canZoomOut: boolean;
   onAddRuleMetric?: AddRuleMetricHandler;
-  period: KLinePeriod;
+  period: ChartPeriod;
   periodLabel: string;
-  selectedPeriod: KLinePeriod;
-  onPeriodChange: (period: KLinePeriod) => void;
+  selectedPeriod: ChartPeriod;
+  onPeriodChange: (period: ChartPeriod) => void;
   highlightedDate?: string;
   quote: StockQuote | null;
   metrics: StockIndicatorMetrics | null;
@@ -2453,6 +2647,7 @@ const CandlestickChart: React.FC<{
   isMaximized = false,
   onToggleMaximize,
 }) => {
+  const isTimesharePeriod = selectedPeriod === 'timeshare' || period === 'timeshare';
   const width = 1320;
   const axisWidth = 76;
   const plotRight = width - axisWidth;
@@ -2490,6 +2685,12 @@ const CandlestickChart: React.FC<{
   const ma20Path = buildPath(visible, plotRight, priceTop, priceHeight, chartMin, chartMax, (point) => point.ma20);
   const ma30Path = buildPath(visible, plotRight, priceTop, priceHeight, chartMin, chartMax, (point) => point.ma30);
   const ma60Path = buildPath(visible, plotRight, priceTop, priceHeight, chartMin, chartMax, (point) => point.ma60);
+  const timeshareClosePath = buildPath(visible, plotRight, priceTop, priceHeight, chartMin, chartMax, (point) => point.close);
+  const timeshareAveragePath = buildPath(visible, plotRight, priceTop, priceHeight, chartMin, chartMax, (point) => point.averagePrice);
+  const timeshareAreaPath = timeshareClosePath && visible.length > 0
+    ? `${timeshareClosePath} L${((visible.length - 1) * step).toFixed(2)},${(priceTop + priceHeight).toFixed(2)} L0,${(priceTop + priceHeight).toFixed(2)} Z`
+    : '';
+  const xAxisLabelStep = isTimesharePeriod ? Math.max(Math.floor(visible.length / 6), 1) : 12;
   const hoveredVisibleIndex = hoveredIndex !== null && hoveredIndex >= visibleStartIndex && hoveredIndex < visibleStartIndex + visible.length
     ? hoveredIndex - visibleStartIndex
     : null;
@@ -2681,6 +2882,7 @@ const CandlestickChart: React.FC<{
             point={activePoint}
             previous={activePrevious}
             periodLabel={periodLabel}
+            isTimeshare={isTimesharePeriod}
             latestQuote={quote}
             metrics={metrics}
             points={points}
@@ -2757,82 +2959,129 @@ const CandlestickChart: React.FC<{
             </g>
           ) : null}
 
-          {visible.map((point, index) => {
-            const x = index * step;
-            const isUp = point.close >= point.open;
-            const candleColor = isUp ? TERMINAL_COLORS.cyan : TERMINAL_COLORS.orange;
-            const highY = yForPrice(point.high);
-            const lowY = yForPrice(point.low);
-            const openY = yForPrice(point.open);
-            const closeY = yForPrice(point.close);
-            const bodyTop = Math.min(openY, closeY);
-            const bodyHeight = Math.max(Math.abs(closeY - openY), 1);
-            const isHighlighted = highlightedDateKey !== null && normalizeDateKey(point.date) === highlightedDateKey;
-            const highlightWidth = Math.max(bodyWidth + 12, Math.min(step * 0.76, 22));
-            return (
-              <g key={`${point.date}-${index}`}>
-                {isHighlighted ? (
-                  <rect
-                    data-testid={`indicator-hit-highlight-${point.date}`}
-                    x={x - highlightWidth / 2}
-                    y={priceTop - 5}
-                    width={highlightWidth}
-                    height={priceHeight + 10}
-                    fill="none"
-                    stroke={TERMINAL_COLORS.hitHighlight}
-                    strokeWidth="2.4"
-                    rx="4"
-                    pointerEvents="none"
-                  />
-                ) : null}
-                <line x1={x} y1={highY} x2={x} y2={lowY} stroke={candleColor} strokeWidth="1.5" />
-                <rect
-                  x={x - bodyWidth / 2}
-                  y={bodyTop}
-                  width={bodyWidth}
-                  height={bodyHeight}
-                  fill={isUp ? candleColor : TERMINAL_COLORS.bg}
-                  stroke={candleColor}
-                  strokeWidth="1.4"
-                  opacity={isUp ? 0.92 : 1}
-                />
-                {index % 12 === 0 || index === visible.length - 1 ? (
-                  <text
-                    data-testid="indicator-kline-x-axis-label"
-                    x={clamp(x, 28, plotRight - 28)}
-                    y={xAxisLabelY}
-                    textAnchor="middle"
-                    fill={TERMINAL_COLORS.axisText}
-                    className="text-[10px]"
-                  >
-                    {formatAxisDate(point.date, period)}
-                  </text>
-                ) : null}
-                {index > 0 && index % 11 === 0 ? (
-                  <text x={x} y={Math.max(12, highY - 8)} textAnchor="middle" fill={TERMINAL_COLORS.purple} className="text-[10px] font-bold">
-                    {(index % 9) + 1}
-                  </text>
-                ) : null}
-                {index > 0 && index % 17 === 0 ? (
-                  <rect
-                    x={x - 3.5}
-                    y={Math.max(6, highY - 28)}
-                    width="7"
-                    height="7"
-                    fill={TERMINAL_COLORS.cyan}
-                    opacity="0.9"
-                    transform={`rotate(45 ${x} ${Math.max(6, highY - 24.5)})`}
-                  />
-                ) : null}
-              </g>
-            );
-          })}
+          {isTimesharePeriod ? (
+            <>
+              {timeshareAreaPath ? (
+                <path d={timeshareAreaPath} fill={TERMINAL_COLORS.cyan} opacity="0.08" />
+              ) : null}
+              <path d={timeshareAveragePath} fill="none" stroke={TERMINAL_COLORS.yellow} strokeWidth="1.8" strokeDasharray="5 4" />
+              <path d={timeshareClosePath} fill="none" stroke={TERMINAL_COLORS.cyan} strokeWidth="2.4" />
+              {visible.map((point, index) => {
+                const x = index * step;
+                const isHighlighted = highlightedDateKey !== null && normalizeDateKey(point.date) === highlightedDateKey;
+                const highlightWidth = Math.max(bodyWidth + 12, Math.min(step * 0.76, 22));
+                return (
+                  <g key={`${point.date}-${index}`}>
+                    {isHighlighted ? (
+                      <rect
+                        data-testid={`indicator-hit-highlight-${point.date}`}
+                        x={x - highlightWidth / 2}
+                        y={priceTop - 5}
+                        width={highlightWidth}
+                        height={priceHeight + 10}
+                        fill="none"
+                        stroke={TERMINAL_COLORS.hitHighlight}
+                        strokeWidth="2.4"
+                        rx="4"
+                        pointerEvents="none"
+                      />
+                    ) : null}
+                    {index % xAxisLabelStep === 0 || index === visible.length - 1 ? (
+                      <text
+                        data-testid="indicator-kline-x-axis-label"
+                        x={clamp(x, 28, plotRight - 28)}
+                        y={xAxisLabelY}
+                        textAnchor="middle"
+                        fill={TERMINAL_COLORS.axisText}
+                        className="text-[10px]"
+                      >
+                        {formatAxisDate(point.date, period)}
+                      </text>
+                    ) : null}
+                  </g>
+                );
+              })}
+            </>
+          ) : (
+            <>
+              {visible.map((point, index) => {
+                const x = index * step;
+                const isUp = point.close >= point.open;
+                const candleColor = isUp ? TERMINAL_COLORS.cyan : TERMINAL_COLORS.orange;
+                const highY = yForPrice(point.high);
+                const lowY = yForPrice(point.low);
+                const openY = yForPrice(point.open);
+                const closeY = yForPrice(point.close);
+                const bodyTop = Math.min(openY, closeY);
+                const bodyHeight = Math.max(Math.abs(closeY - openY), 1);
+                const isHighlighted = highlightedDateKey !== null && normalizeDateKey(point.date) === highlightedDateKey;
+                const highlightWidth = Math.max(bodyWidth + 12, Math.min(step * 0.76, 22));
+                return (
+                  <g key={`${point.date}-${index}`}>
+                    {isHighlighted ? (
+                      <rect
+                        data-testid={`indicator-hit-highlight-${point.date}`}
+                        x={x - highlightWidth / 2}
+                        y={priceTop - 5}
+                        width={highlightWidth}
+                        height={priceHeight + 10}
+                        fill="none"
+                        stroke={TERMINAL_COLORS.hitHighlight}
+                        strokeWidth="2.4"
+                        rx="4"
+                        pointerEvents="none"
+                      />
+                    ) : null}
+                    <line x1={x} y1={highY} x2={x} y2={lowY} stroke={candleColor} strokeWidth="1.5" />
+                    <rect
+                      x={x - bodyWidth / 2}
+                      y={bodyTop}
+                      width={bodyWidth}
+                      height={bodyHeight}
+                      fill={isUp ? candleColor : TERMINAL_COLORS.bg}
+                      stroke={candleColor}
+                      strokeWidth="1.4"
+                      opacity={isUp ? 0.92 : 1}
+                    />
+                    {index % xAxisLabelStep === 0 || index === visible.length - 1 ? (
+                      <text
+                        data-testid="indicator-kline-x-axis-label"
+                        x={clamp(x, 28, plotRight - 28)}
+                        y={xAxisLabelY}
+                        textAnchor="middle"
+                        fill={TERMINAL_COLORS.axisText}
+                        className="text-[10px]"
+                      >
+                        {formatAxisDate(point.date, period)}
+                      </text>
+                    ) : null}
+                    {index > 0 && index % 11 === 0 ? (
+                      <text x={x} y={Math.max(12, highY - 8)} textAnchor="middle" fill={TERMINAL_COLORS.purple} className="text-[10px] font-bold">
+                        {(index % 9) + 1}
+                      </text>
+                    ) : null}
+                    {index > 0 && index % 17 === 0 ? (
+                      <rect
+                        x={x - 3.5}
+                        y={Math.max(6, highY - 28)}
+                        width="7"
+                        height="7"
+                        fill={TERMINAL_COLORS.cyan}
+                        opacity="0.9"
+                        transform={`rotate(45 ${x} ${Math.max(6, highY - 24.5)})`}
+                      />
+                    ) : null}
+                  </g>
+                );
+              })}
 
-          <path d={ma5Path} fill="none" stroke={LINE_COLORS.ma5} strokeWidth="2" />
-          <path d={ma10Path} fill="none" stroke={LINE_COLORS.ma10} strokeWidth="2" />
-          <path d={ma20Path} fill="none" stroke={LINE_COLORS.ma20} strokeWidth="2" />
-          <path d={ma30Path} fill="none" stroke={LINE_COLORS.ma30} strokeWidth="2" />
-          <path d={ma60Path} fill="none" stroke={LINE_COLORS.ma60} strokeWidth="2" />
+              <path d={ma5Path} fill="none" stroke={LINE_COLORS.ma5} strokeWidth="2" />
+              <path d={ma10Path} fill="none" stroke={LINE_COLORS.ma10} strokeWidth="2" />
+              <path d={ma20Path} fill="none" stroke={LINE_COLORS.ma20} strokeWidth="2" />
+              <path d={ma30Path} fill="none" stroke={LINE_COLORS.ma30} strokeWidth="2" />
+              <path d={ma60Path} fill="none" stroke={LINE_COLORS.ma60} strokeWidth="2" />
+            </>
+          )}
 
           {visible.map((point, index) => {
             const x = index * step;
@@ -2917,7 +3166,7 @@ const VolumeActivityChart: React.FC<{
   onHoverPinnedChange: (value: boolean) => void;
   onStepHoverIndex: (direction: HoverStepDirection) => void;
   onOpenChartMenu: (event: React.MouseEvent) => void;
-  period: KLinePeriod;
+  period: ChartPeriod;
   highlightedDate?: string;
   onAddRuleMetric?: AddRuleMetricHandler;
   isMaximized?: boolean;
@@ -3213,7 +3462,7 @@ const MacdSignalChart: React.FC<{
   onHoverPinnedChange: (value: boolean) => void;
   onStepHoverIndex: (direction: HoverStepDirection) => void;
   onOpenChartMenu: (event: React.MouseEvent) => void;
-  period: KLinePeriod;
+  period: ChartPeriod;
   highlightedDate?: string;
   onAddRuleMetric?: AddRuleMetricHandler;
   isMaximized?: boolean;
@@ -4370,7 +4619,7 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
   onClose,
   variant = 'page',
 }) => {
-  const [selectedPeriod, setSelectedPeriod] = useState<KLinePeriod>('daily');
+  const [selectedPeriod, setSelectedPeriod] = useState<ChartPeriod>('daily');
   const [hoveredIndex, setHoveredIndex] = useState<number | null>(null);
   const [isHoverPinned, setIsHoverPinned] = useState(false);
   const [timelineZoom, setTimelineZoom] = useState(0);
@@ -4400,10 +4649,28 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
     [ruleDraft],
   );
 
-  const handlePeriodChange = useCallback((period: KLinePeriod) => {
+  const handlePeriodChange = useCallback((period: ChartPeriod) => {
     selectedRefreshTokenRef.current = null;
     setSelectedPeriod(period);
-  }, []);
+    if (period === 'daily') {
+      return;
+    }
+    setHistoryCache((current) => {
+      const existing = current[period];
+      if (existing?.stockCode === stockCode && (existing.isLoading || existing.history.length > 0)) {
+        return current;
+      }
+      const currentDaily = current.daily;
+      return {
+        ...current,
+        [period]: createHistoryState(stockCode, period, {
+          quote: currentDaily?.quote ?? null,
+          metrics: currentDaily?.metrics ?? null,
+          metricsError: currentDaily?.metricsError ?? null,
+        }),
+      };
+    });
+  }, [stockCode]);
 
   const handleAddRuleMetric = useCallback((metric: RuleMetricAddPayload) => {
     const currentDraft = readRuleMetricDraftForStock(stockCode);
@@ -4566,7 +4833,7 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
       const historyResponse = historyResult.status === 'fulfilled' ? historyResult.value : null;
       const quoteResponse = quoteResult.status === 'fulfilled' ? quoteResult.value : null;
       const metricsResponse = metricsResult.status === 'fulfilled' ? metricsResult.value : null;
-      const dailyHistory = historyResponse?.data ?? [];
+      const dailyHistory = syncHistoryWithRealtimeQuote(historyResponse?.data ?? [], 'daily', quoteResponse);
       const dailyCutoffDate = getLatestHistoryDate(dailyHistory);
       dailyCutoffDateRef.current = dailyCutoffDate;
       const metricsError = metricsResult.status === 'rejected'
@@ -4590,66 +4857,6 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
 
       setHistoryCache({ daily: dailyState });
 
-      INTRADAY_PERIOD_OPTIONS.forEach((option) => {
-        setHistoryCache((current) => ({
-          ...current,
-          [option.value]: createHistoryState(stockCode, option.value, {
-            quote: current.daily?.quote ?? quoteResponse,
-            metrics: current.daily?.metrics ?? metricsResponse,
-            metricsError: current.daily?.metricsError ?? metricsError,
-          }),
-        }));
-
-        void stocksApi.getHistory(stockCode, option.days, option.value)
-          .then((periodResponse) => {
-            if (ignore) {
-              return;
-            }
-            setHistoryCache((current) => {
-              const currentDaily = current.daily;
-              if (currentDaily?.stockCode !== stockCode) {
-                return current;
-              }
-              const cutoffDate = getLatestHistoryDate(currentDaily.history) ?? dailyCutoffDate;
-              const normalizedHistory = normalizeHistoryForPeriod(
-                periodResponse.data,
-                option.value,
-                marketKind,
-                cutoffDate,
-              );
-              return {
-                ...current,
-                [option.value]: createHistoryState(stockCode, option.value, {
-                  history: normalizedHistory,
-                  quote: currentDaily.quote,
-                  metrics: currentDaily.metrics,
-                  metricsError: currentDaily.metricsError,
-                  isLoading: false,
-                  error: null,
-                }),
-              };
-            });
-          })
-          .catch((err: unknown) => {
-            if (ignore) {
-              return;
-            }
-            setHistoryCache((current) => {
-              const currentState = current[option.value];
-              if (currentState?.stockCode !== stockCode) {
-                return current;
-              }
-              return {
-                ...current,
-                [option.value]: {
-                  ...currentState,
-                  isLoading: false,
-                  error: err instanceof Error ? err.message : '指标数据加载失败',
-                },
-              };
-            });
-          });
-      });
     };
 
     void loadInitialData().catch((err: unknown) => {
@@ -4671,7 +4878,7 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
 
   const selectedCachedState = historyCache[selectedPeriod];
   const dailyCachedState = historyCache.daily;
-  const displayState = selectedCachedState?.stockCode === stockCode && selectedCachedState.history.length > 0
+  const displayState = selectedCachedState?.stockCode === stockCode && (selectedCachedState.history.length > 0 || selectedCachedState.isLoading)
     ? selectedCachedState
     : dailyCachedState?.stockCode === stockCode && dailyCachedState.history.length > 0
       ? dailyCachedState
@@ -4690,7 +4897,7 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
   const metricsError = displayState?.metricsError ?? dailyCachedState?.metricsError ?? null;
 
   useEffect(() => {
-    if (selectedPeriod === 'daily' || !selectedCachedState || selectedCachedState.isLoading) {
+    if (selectedPeriod === 'daily' || !selectedCachedState) {
       return undefined;
     }
 
@@ -4702,7 +4909,7 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
 
     let ignore = false;
     const selectedMeta = getPeriodMeta(selectedPeriod);
-    stocksApi.getHistory(stockCode, selectedMeta.days, selectedPeriod)
+    stocksApi.getHistory(stockCode, selectedMeta.days, selectedMeta.requestPeriod)
       .then((periodResponse) => {
         if (ignore) {
           return;
@@ -4719,11 +4926,13 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
             marketKind,
             cutoffDate,
           );
+          const stateQuote = currentState.quote ?? current.daily?.quote ?? null;
           return {
             ...current,
             [selectedPeriod]: {
               ...currentState,
-              history: normalizedHistory,
+              quote: stateQuote,
+              history: syncHistoryWithRealtimeQuote(normalizedHistory, selectedPeriod, stateQuote),
               isLoading: false,
               error: null,
             },
@@ -4756,12 +4965,12 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
   }, [marketKind, selectedCachedState, selectedPeriod, stockCode]);
 
   useEffect(() => {
-    if (selectedPeriod !== '1m' || !selectedCachedState || selectedCachedState.isLoading) {
+    if ((selectedPeriod !== '1m' && selectedPeriod !== 'timeshare') || !selectedCachedState || selectedCachedState.isLoading) {
       return undefined;
     }
 
     let ignore = false;
-    const oneMinuteMeta = getPeriodMeta('1m');
+    const oneMinuteMeta = getPeriodMeta(selectedPeriod);
 
     const refreshOneMinuteData = async () => {
       if (oneMinuteRefreshInFlightRef.current) {
@@ -4771,7 +4980,7 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
       oneMinuteRefreshInFlightRef.current = true;
       try {
         const [historyResult, quoteResult] = await Promise.allSettled([
-          stocksApi.getHistory(stockCode, oneMinuteMeta.days, '1m'),
+          stocksApi.getHistory(stockCode, oneMinuteMeta.days, oneMinuteMeta.requestPeriod),
           stocksApi.getQuote(stockCode),
         ]);
 
@@ -4780,33 +4989,34 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
         }
 
         setHistoryCache((current) => {
-          const currentState = current['1m'];
+          const currentState = current[selectedPeriod];
           if (currentState?.stockCode !== stockCode) {
             return current;
           }
 
           const cutoffDate = getLatestHistoryDate(current.daily?.history ?? []) ?? dailyCutoffDateRef.current;
-          const nextHistory = historyResult.status === 'fulfilled'
-            ? normalizeHistoryForPeriod(historyResult.value.data, '1m', marketKind, cutoffDate)
+          const normalizedHistory = historyResult.status === 'fulfilled'
+            ? normalizeHistoryForPeriod(historyResult.value.data, selectedPeriod, marketKind, cutoffDate)
             : currentState.history;
           const nextQuote = quoteResult.status === 'fulfilled'
             ? quoteResult.value
             : currentState.quote;
+          const nextHistory = syncHistoryWithRealtimeQuote(normalizedHistory, selectedPeriod, nextQuote);
           const historyError = historyResult.status === 'rejected'
             ? historyResult.reason instanceof Error
               ? historyResult.reason.message
               : '指标数据刷新失败'
             : null;
 
-          return {
+          return syncHistoryCacheWithRealtimeQuote({
             ...current,
-            '1m': {
+            [selectedPeriod]: {
               ...currentState,
               history: nextHistory,
               quote: nextQuote,
               error: nextHistory.length > 0 ? null : historyError,
             },
-          };
+          }, stockCode, nextQuote);
         });
       } finally {
         oneMinuteRefreshInFlightRef.current = false;
@@ -4825,7 +5035,7 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
   }, [marketKind, selectedCachedState, selectedPeriod, stockCode]);
 
   useEffect(() => {
-    if (isLoading || selectedPeriod === '1m') {
+    if (isLoading || selectedPeriod === '1m' || selectedPeriod === 'timeshare') {
       return undefined;
     }
 
@@ -4837,17 +5047,7 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
           return;
         }
         setHistoryCache((current) => {
-          const next: HistoryCache = { ...current };
-          KLINE_PERIOD_OPTIONS.forEach((option) => {
-            const state = next[option.value];
-            if (state?.stockCode === stockCode) {
-              next[option.value] = {
-                ...state,
-                quote: nextQuote,
-              };
-            }
-          });
-          return next;
+          return syncHistoryCacheWithRealtimeQuote(current, stockCode, nextQuote);
         });
       } catch {
         // Quote refresh is a soft realtime enhancement; keep the last usable quote.
@@ -4865,7 +5065,7 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
   }, [isLoading, selectedPeriod, stockCode]);
 
   const points = useMemo(() => buildChartPoints(history), [history]);
-  const visibleCount = useMemo(() => getVisiblePointCount(points.length, timelineZoom), [points.length, timelineZoom]);
+  const visibleCount = useMemo(() => getVisiblePointCount(points.length, timelineZoom, effectivePeriod), [effectivePeriod, points.length, timelineZoom]);
   const maxWindowStart = Math.max(points.length - visibleCount, 0);
   const safeWindowStart = clamp(windowStart, 0, maxWindowStart);
   const visiblePoints = points.slice(safeWindowStart, safeWindowStart + visibleCount);
@@ -4973,15 +5173,15 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
     setChartMenu({ x: event.clientX, y: event.clientY });
   };
 
-  const canZoomIn = points.length > 0 && getVisiblePointCount(points.length, clamp(timelineZoom + 1, -1, 4)) < visibleCount;
-  const canZoomOut = points.length > 0 && getVisiblePointCount(points.length, clamp(timelineZoom - 1, -1, 4)) > visibleCount;
+  const canZoomIn = effectivePeriod !== 'timeshare' && points.length > 0 && getVisiblePointCount(points.length, clamp(timelineZoom + 1, -1, 4), effectivePeriod) < visibleCount;
+  const canZoomOut = effectivePeriod !== 'timeshare' && points.length > 0 && getVisiblePointCount(points.length, clamp(timelineZoom - 1, -1, 4), effectivePeriod) > visibleCount;
 
   const adjustTimelineZoom = (delta: number) => {
-    if (points.length === 0) {
+    if (points.length === 0 || effectivePeriod === 'timeshare') {
       return;
     }
     const nextZoom = clamp(timelineZoom + delta, -1, 4);
-    const nextVisibleCount = getVisiblePointCount(points.length, nextZoom);
+    const nextVisibleCount = getVisiblePointCount(points.length, nextZoom, effectivePeriod);
     const nextMaxWindowStart = Math.max(points.length - nextVisibleCount, 0);
     const fallbackAnchorIndex = Math.min(safeWindowStart + visibleCount - 1, points.length - 1);
     const anchorIndex = safeHoveredIndex
@@ -5285,7 +5485,7 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
             type="button"
             className="block w-full px-3 py-1.5 text-left hover:bg-white/10"
             onClick={() => {
-              const resetVisibleCount = getVisiblePointCount(points.length, 0);
+              const resetVisibleCount = getVisiblePointCount(points.length, 0, effectivePeriod);
               const resetMaxWindowStart = Math.max(points.length - resetVisibleCount, 0);
               setTimelineZoom(0);
               setIsHoverPinned(false);

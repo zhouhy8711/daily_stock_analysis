@@ -914,7 +914,7 @@ FastAPI provides RESTful API service for configuration management and triggering
 | `/api/v1/analysis/tasks/stream` | GET (SSE) | Subscribe to realtime task updates |
 | `/api/v1/analysis/status/{task_id}` | GET | Query task status |
 | `/api/v1/history` | GET | Query analysis history |
-| `/api/v1/stocks/{code}/history?period=1m` | GET | Query K-line data; `period` supports `daily`, `1m`, `5m`, `15m`, `30m`, `60m`; US minute bars prefer CNBC multi-day OHLCV and fall back to Nasdaq same-day chart prices when YFinance is rate-limited or CNBC is unavailable |
+| `/api/v1/stocks/{code}/history?period=1m` | GET | Query K-line data; `period` supports `daily`, `1m`, `5m`, `15m`, `30m`, `60m`; daily history is DB-first, backfills missing windows from providers into DB, appends an in-memory realtime-cache virtual daily bar for the current trading day, and calibrates the current trading day's latest minute bar with the realtime last price; US minute bars prefer CNBC multi-day OHLCV and fall back to Nasdaq same-day chart prices when YFinance is rate-limited or CNBC is unavailable |
 | `/api/v1/backtest/run` | POST | Trigger backtest |
 | `/api/v1/backtest/results` | GET | Query backtest results (paginated) |
 | `/api/v1/backtest/performance` | GET | Get overall backtest performance |

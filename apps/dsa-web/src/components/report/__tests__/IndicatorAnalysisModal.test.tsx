@@ -69,6 +69,51 @@ function makeDailyHistory(length: number, startDate = '2026-01-01'): KLineData[]
   });
 }
 
+function makeTimeshareHistory(): KLineData[] {
+  return [
+    ['2026-05-06 14:59', 118],
+    ['2026-05-07 09:29', 119],
+    ['2026-05-07 09:30', 120],
+    ['2026-05-07 12:00', 121],
+    ['2026-05-07 15:00', 122],
+    ['2026-05-07 15:01', 123],
+  ].map(([date, rawClose], index) => {
+    const close = Number(rawClose);
+    return {
+      date: String(date),
+      open: close - 0.1,
+      high: close + 0.2,
+      low: close - 0.2,
+      close,
+      volume: 10000 + index,
+      amount: close * (10000 + index),
+      changePercent: 0.1,
+      turnoverRate: 1 + index * 0.02,
+    };
+  });
+}
+
+function makeRealtimeMismatchIntradayHistory(): KLineData[] {
+  return [
+    ['2026-05-07 09:30', 139.11],
+    ['2026-05-07 10:18', 138.92],
+    ['2026-05-07 10:19', 138.82],
+  ].map(([date, rawClose], index) => {
+    const close = Number(rawClose);
+    return {
+      date: String(date),
+      open: close - 0.1,
+      high: close + 0.2,
+      low: close - 0.2,
+      close,
+      volume: 10000 + index,
+      amount: close * (10000 + index),
+      changePercent: 0.1,
+      turnoverRate: 1 + index * 0.02,
+    };
+  });
+}
+
 function makeChipSnapshot(date: string, avgCost: number, profitRatio: number) {
   return {
     code: '600519',
@@ -659,17 +704,106 @@ describe('IndicatorAnalysisModal', () => {
     unmount();
   });
 
-  it('requests a wider history range for slower intraday periods', async () => {
+  it('loads each intraday history range only when its period is selected', async () => {
     const { unmount } = render(
       <IndicatorAnalysisModal stockCode="600519" stockName="贵州茅台" onClose={vi.fn()} />,
     );
     await flushPromises();
 
-    expect(stocksApi.getHistory).toHaveBeenCalledWith('600519', 3, '1m');
-    expect(stocksApi.getHistory).toHaveBeenCalledWith('600519', 3, '5m');
-    expect(stocksApi.getHistory).toHaveBeenCalledWith('600519', 30, '15m');
-    expect(stocksApi.getHistory).toHaveBeenCalledWith('600519', 30, '30m');
-    expect(stocksApi.getHistory).toHaveBeenCalledWith('600519', 30, '60m');
+    expect(stocksApi.getHistory).toHaveBeenCalledWith('600519', 120, 'daily');
+    expect(stocksApi.getHistory).not.toHaveBeenCalledWith('600519', 1, '1m');
+    expect(stocksApi.getHistory).not.toHaveBeenCalledWith('600519', 3, '1m');
+    expect(stocksApi.getHistory).not.toHaveBeenCalledWith('600519', 3, '5m');
+    expect(stocksApi.getHistory).not.toHaveBeenCalledWith('600519', 30, '15m');
+    expect(stocksApi.getHistory).not.toHaveBeenCalledWith('600519', 30, '30m');
+    expect(stocksApi.getHistory).not.toHaveBeenCalledWith('600519', 30, '60m');
+
+    for (const [label, days, period] of [
+      ['分时', 1, '1m'],
+      ['1分', 3, '1m'],
+      ['5分', 3, '5m'],
+      ['15分', 30, '15m'],
+      ['30分', 30, '30m'],
+      ['60分', 30, '60m'],
+    ] as const) {
+      fireEvent.click(screen.getByRole('tab', { name: label }));
+      await flushPromises();
+      expect(stocksApi.getHistory).toHaveBeenCalledWith('600519', days, period);
+    }
+
+    unmount();
+  });
+
+  it('shows a timeshare tab before daily K and keeps it to the latest day 09:30-15:00', async () => {
+    vi.mocked(stocksApi.getHistory).mockImplementation(async (stockCode, _days, period = 'daily') => ({
+      stockCode,
+      stockName: '贵州茅台',
+      period,
+      data: period === '1m' ? makeTimeshareHistory() : makeHistory(period),
+    }));
+
+    const { unmount } = render(
+      <IndicatorAnalysisModal stockCode="600519" stockName="贵州茅台" onClose={vi.fn()} />,
+    );
+    await flushPromises();
+
+    const periodTabs = within(screen.getByRole('tablist', { name: 'K线周期' })).getAllByRole('tab');
+    expect(periodTabs.slice(0, 2).map((tab) => tab.textContent)).toEqual(['分时', '日K']);
+    expect(stocksApi.getHistory).not.toHaveBeenCalledWith('600519', 1, '1m');
+
+    fireEvent.click(screen.getByRole('tab', { name: '分时' }));
+    await flushPromises();
+
+    expect(screen.getByRole('tab', { name: '分时' })).toHaveAttribute('aria-selected', 'true');
+    expect(stocksApi.getHistory).toHaveBeenCalledWith('600519', 1, '1m');
+    expect(screen.getByTestId('indicator-chart-bar-2026-05-07 09:30')).toBeInTheDocument();
+    expect(screen.getByTestId('indicator-chart-bar-2026-05-07 12:00')).toBeInTheDocument();
+    expect(screen.getByTestId('indicator-chart-bar-2026-05-07 15:00')).toBeInTheDocument();
+    expect(screen.queryByTestId('indicator-chart-bar-2026-05-06 14:59')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('indicator-chart-bar-2026-05-07 09:29')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('indicator-chart-bar-2026-05-07 15:01')).not.toBeInTheDocument();
+
+    const priceHeader = within(screen.getByTestId('indicator-price-header'));
+    expect(priceHeader.getByText('分时')).toBeInTheDocument();
+    expect(priceHeader.getByText(/^现价:/)).toBeInTheDocument();
+    expect(priceHeader.getByText(/^均价:/)).toBeInTheDocument();
+
+    unmount();
+  });
+
+  it('syncs the realtime quote price into timeshare and loaded K-line periods', async () => {
+    vi.mocked(stocksApi.getHistory).mockImplementation(async (stockCode, _days, period = 'daily') => ({
+      stockCode,
+      stockName: '贵州茅台',
+      period,
+      data: period === 'daily' ? makeDailyHistory(3, '2026-05-05') : makeRealtimeMismatchIntradayHistory(),
+    }));
+    vi.mocked(stocksApi.getQuote).mockImplementation(async (stockCode) => makeQuote(stockCode, {
+      currentPrice: 138.68,
+      change: -1.85,
+      changePercent: -1.32,
+      open: 140.61,
+      high: 141.87,
+      low: 138.38,
+      updateTime: '2026-05-07T10:19:00',
+    }));
+
+    const { unmount } = render(
+      <IndicatorAnalysisModal stockCode="600519" stockName="贵州茅台" onClose={vi.fn()} />,
+    );
+    await flushPromises();
+
+    fireEvent.click(screen.getByRole('tab', { name: '分时' }));
+    await flushPromises();
+
+    expect(within(screen.getByTestId('indicator-price-header')).getByText('现价:138.68')).toBeInTheDocument();
+    expect(within(screen.getByRole('img', { name: 'K线图' })).getByText('138.68')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('tab', { name: '5分' }));
+    await flushPromises();
+
+    expect(screen.getByRole('tab', { name: '5分' })).toHaveAttribute('aria-selected', 'true');
+    expect(within(screen.getByRole('img', { name: 'K线图' })).getByText('138.68')).toBeInTheDocument();
 
     unmount();
   });

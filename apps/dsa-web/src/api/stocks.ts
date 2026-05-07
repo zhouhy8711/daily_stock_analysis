@@ -1,6 +1,8 @@
 import apiClient from './index';
 import type { NewsIntelItem, NewsIntelResponse } from '../types/analysis';
 
+const STOCK_HISTORY_TIMEOUT_MS = 75_000;
+
 export type ExtractItem = {
   code?: string | null;
   name?: string | null;
@@ -327,6 +329,7 @@ export const stocksApi = {
       `/api/v1/stocks/${encodeURIComponent(stockCode)}/history`,
       {
         params: { days, period },
+        timeout: STOCK_HISTORY_TIMEOUT_MS,
       },
     );
     const data = response.data as {
