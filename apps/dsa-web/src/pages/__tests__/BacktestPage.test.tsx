@@ -403,8 +403,9 @@ describe('BacktestPage', () => {
       });
     });
     const executionGroupButton = await screen.findByRole('button', {
-      name: /展开执行时间 \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}，命中 1 条/,
+      name: /展开执行时间 \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}，命中 1 条，完成时间 \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/,
     });
+    expect(within(executionGroupButton).getByText(/完成时间 \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/)).toBeInTheDocument();
     expect(screen.queryByTestId('live-rule-group-7')).not.toBeInTheDocument();
     fireEvent.click(executionGroupButton);
 
@@ -457,7 +458,7 @@ describe('BacktestPage', () => {
       });
 
       expect(screen.getByRole('button', {
-        name: '展开执行时间 2026-05-07 11:55:10，命中 1 条',
+        name: '展开执行时间 2026-05-07 11:55:10，命中 1 条，完成时间 2026-05-07 11:55:10',
       })).toBeInTheDocument();
 
       vi.setSystemTime(new Date('2026-05-07T03:55:40Z'));
@@ -468,7 +469,7 @@ describe('BacktestPage', () => {
       });
 
       expect(screen.getByRole('button', {
-        name: '展开执行时间 2026-05-07 11:56:10，命中 1 条',
+        name: '展开执行时间 2026-05-07 11:56:10，命中 1 条，完成时间 2026-05-07 11:56:10',
       })).toBeInTheDocument();
       expect(screen.getAllByTestId('live-execution-group')).toHaveLength(2);
       expect(screen.queryByTestId('live-rule-group-7')).not.toBeInTheDocument();

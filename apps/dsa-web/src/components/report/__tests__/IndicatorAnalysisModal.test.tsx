@@ -287,6 +287,25 @@ describe('IndicatorAnalysisModal', () => {
     vi.useRealTimers();
   });
 
+  it('shows a live current-time clock in the indicator header', async () => {
+    vi.setSystemTime(new Date(2026, 4, 7, 13, 58, 1));
+
+    const { unmount } = render(
+      <IndicatorAnalysisView stockCode="600519" stockName="贵州茅台" onClose={vi.fn()} variant="page" />,
+    );
+    await flushPromises();
+
+    const clock = screen.getByTestId('indicator-current-time');
+    expect(clock).toHaveTextContent('2026-05-07 13:58:01');
+
+    await act(async () => {
+      vi.advanceTimersByTime(1000);
+    });
+
+    expect(clock).toHaveTextContent('2026-05-07 13:58:02');
+    unmount();
+  });
+
   it('refreshes quote every 10 seconds and refreshes one-minute history only on 1m period', async () => {
     const { unmount } = render(
       <IndicatorAnalysisModal stockCode="BABA" stockName="阿里巴巴" onClose={vi.fn()} />,

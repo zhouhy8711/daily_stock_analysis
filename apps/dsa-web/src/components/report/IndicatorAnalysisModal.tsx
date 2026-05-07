@@ -7,6 +7,7 @@ import {
   ChevronDown,
   ChevronLeft,
   ChevronRight,
+  Clock,
   Layers3,
   LineChart,
   Maximize2,
@@ -1307,6 +1308,50 @@ function formatDateTime(value?: string | null): string {
     hour12: false,
   });
 }
+
+function padDateTimePart(value: number): string {
+  return String(value).padStart(2, '0');
+}
+
+function formatCurrentDateTime(value: Date): string {
+  return [
+    value.getFullYear(),
+    padDateTimePart(value.getMonth() + 1),
+    padDateTimePart(value.getDate()),
+  ].join('-')
+    + ` ${[
+      padDateTimePart(value.getHours()),
+      padDateTimePart(value.getMinutes()),
+      padDateTimePart(value.getSeconds()),
+    ].join(':')}`;
+}
+
+const CurrentDateTimeClock: React.FC = () => {
+  const [now, setNow] = useState(() => new Date());
+  const displayValue = formatCurrentDateTime(now);
+
+  useEffect(() => {
+    const intervalId = window.setInterval(() => {
+      setNow(new Date());
+    }, 1000);
+
+    return () => {
+      window.clearInterval(intervalId);
+    };
+  }, []);
+
+  return (
+    <time
+      dateTime={now.toISOString()}
+      data-testid="indicator-current-time"
+      aria-label={`当前时间 ${displayValue}`}
+      className="inline-flex w-full items-center gap-1.5 rounded-lg border border-primary/30 bg-primary/10 px-2.5 py-1 font-mono text-[12px] font-semibold tabular-nums text-primary shadow-[0_0_18px_hsl(var(--primary)_/_0.08)] sm:w-auto sm:min-w-[12.5rem]"
+    >
+      <Clock className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+      <span>{displayValue}</span>
+    </time>
+  );
+};
 
 function movingAverage(data: KLineData[], index: number, period: number, pick: (item: KLineData) => number | null | undefined): number | undefined {
   if (index + 1 < period) {
@@ -5288,6 +5333,7 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
               <Badge variant="info" size="sm">{stockCode}</Badge>
               {initialDateKey ? <Badge variant="danger" size="sm">命中日 {initialDateKey}</Badge> : null}
               <span className="truncate text-sm text-secondary-text">{stockName}</span>
+              <CurrentDateTimeClock />
             </div>
             {ruleDraftFeedback ? (
               <p className="mt-1 max-w-2xl truncate text-xs text-secondary-text">{ruleDraftFeedback}</p>

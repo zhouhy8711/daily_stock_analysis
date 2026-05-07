@@ -84,6 +84,7 @@ type RuleRunEventRow = {
   stockName?: string | null;
   eventDate: string;
   executionTime?: string | null;
+  finishedAt?: string | null;
   event: Record<string, unknown>;
   explanation?: string | null;
 };
@@ -100,6 +101,7 @@ type RuleResultGroup = {
 type LiveExecutionResultGroup = {
   key: string;
   executionTime: string;
+  finishedAt?: string | null;
   hitCount: number;
   ruleGroups: RuleResultGroup[];
 };
@@ -790,6 +792,7 @@ function buildLiveExecutionGroups(
     .map(([executionTime, executionRows]) => ({
       key: `execution-${executionTime}`,
       executionTime,
+      finishedAt: getLatestDateTime(executionRows.map((row) => row.finishedAt)),
       hitCount: executionRows.length,
       ruleGroups: buildRuleResultGroups(executionRows, resultRules, allRules, metrics),
     }));
@@ -797,7 +800,13 @@ function buildLiveExecutionGroups(
 
 function flattenMatches(
   matches: RuleMatchItem[],
-  runMeta: { runId?: number; ruleId: number; ruleName?: string | null; executionTime?: string | null },
+  runMeta: {
+    runId?: number;
+    ruleId: number;
+    ruleName?: string | null;
+    executionTime?: string | null;
+    finishedAt?: string | null;
+  },
 ): RuleRunEventRow[] {
   return matches.flatMap((match, matchIndex) => {
     const rowRunMeta = {
@@ -886,6 +895,20 @@ function parseRunTime(value?: string | null): number | null {
   if (!value) return null;
   const parsed = new Date(value).getTime();
   return Number.isFinite(parsed) ? parsed : null;
+}
+
+function getLatestDateTime(values: Array<string | null | undefined>): string | null {
+  let latestValue: string | null = null;
+  let latestTime: number | null = null;
+  for (const value of values) {
+    const parsed = parseRunTime(value);
+    if (parsed == null) continue;
+    if (latestTime == null || parsed > latestTime) {
+      latestTime = parsed;
+      latestValue = value ?? null;
+    }
+  }
+  return latestValue ?? values.find((value): value is string => Boolean(value)) ?? null;
 }
 
 function canGroupLegacyRunBatch(group: RuleRunHistoryItem[], candidate: RuleRunHistoryItem): boolean {
@@ -1690,6 +1713,7 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
         ruleId: result.ruleId,
         ruleName: resultRuleName,
         executionTime: cycleExecutionTime,
+        finishedAt: now,
       });
       const cumulativeRows = [...nextRows, ...liveResultRowsRef.current];
       const cumulativeRunIds = Array.from(new Set([result.runId, ...liveRunIdsRef.current]));
@@ -2565,6 +2589,7 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
                     liveExecutionGroups.map((executionGroup) => {
                       const expanded = expandedResultGroups[executionGroup.key] ?? false;
                       const executionTimeText = formatDateTimeToSecond(executionGroup.executionTime);
+                      const finishedAtText = executionGroup.finishedAt ? formatDateTimeToSecond(executionGroup.finishedAt) : '--';
                       const panelId = `live-execution-group-panel-${toDomId(executionGroup.key)}`;
                       return (
                         <section
@@ -2576,16 +2601,21 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
                             type="button"
                             aria-expanded={expanded}
                             aria-controls={panelId}
-                            aria-label={`${expanded ? '收起' : '展开'}执行时间 ${executionTimeText}，命中 ${executionGroup.hitCount} 条`}
+                            aria-label={`${expanded ? '收起' : '展开'}执行时间 ${executionTimeText}，命中 ${executionGroup.hitCount} 条，完成时间 ${finishedAtText}`}
                             onClick={() => toggleResultGroup(executionGroup.key, false)}
                             className="flex w-full items-center gap-3 border-b border-border/45 px-3 py-3 text-left transition-all hover:bg-hover/60"
                           >
                             <span className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-lg border border-primary/35 bg-primary/10 text-primary">
                               {expanded ? <ChevronDown className="h-4 w-4" /> : <ChevronRight className="h-4 w-4" />}
                             </span>
-                            <span className="min-w-0 flex-1">
-                              <span className="block truncate text-sm font-semibold text-foreground">执行时间 {executionTimeText}</span>
-                              <span className="mt-0.5 block text-xs text-secondary-text">命中 {executionGroup.hitCount} 条</span>
+                            <span className="grid min-w-0 flex-1 gap-2 sm:grid-cols-[minmax(0,1fr)_minmax(180px,auto)] sm:items-center">
+                              <span className="min-w-0">
+                                <span className="block truncate text-sm font-semibold text-foreground">执行时间 {executionTimeText}</span>
+                                <span className="mt-0.5 block text-xs text-secondary-text">命中 {executionGroup.hitCount} 条</span>
+                              </span>
+                              <span className="min-w-0 text-xs text-secondary-text sm:text-right">
+                                <span className="block truncate font-medium text-foreground">完成时间 {finishedAtText}</span>
+                              </span>
                             </span>
                           </button>
                           {expanded ? (
