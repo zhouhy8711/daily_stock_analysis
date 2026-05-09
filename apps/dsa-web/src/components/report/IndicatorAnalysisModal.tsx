@@ -206,6 +206,14 @@ const MAX_EXPANDED_KLINE_POINTS = 160;
 const ONE_MINUTE_REFRESH_MS = 10_000;
 const TIMESHARE_START_MINUTE = (9 * 60) + 30;
 const TIMESHARE_END_MINUTE = 15 * 60;
+const TIMESHARE_EMPTY_AXIS_LABELS = [
+  { ratio: 0, label: '09:30' },
+  { ratio: 0.2, label: '10:18' },
+  { ratio: 0.4, label: '11:06' },
+  { ratio: 0.6, label: '13:24' },
+  { ratio: 0.8, label: '14:12' },
+  { ratio: 1, label: '15:00' },
+];
 const LINE_COLORS = {
   close: 'var(--indicator-line-close)',
   avgCost: 'var(--indicator-line-avg-cost)',
@@ -1095,16 +1103,25 @@ function getKLineMinuteOfDay(value?: string | null): number | null {
   return (hour * 60) + minute;
 }
 
-function normalizeTimeshareHistory(history: KLineData[]): KLineData[] {
+function normalizeTimeshareHistory(history: KLineData[], targetDate?: string | null): KLineData[] {
   const inSession = history.filter((item) => {
     const minute = getKLineMinuteOfDay(item.date);
     return minute !== null && minute >= TIMESHARE_START_MINUTE && minute <= TIMESHARE_END_MINUTE;
   });
-  const latestDate = Array.from(new Set(
+  const dates = Array.from(new Set(
     inSession.map((item) => getKLineDateOnly(item.date)).filter((date): date is string => Boolean(date)),
-  )).sort().at(-1);
+  )).sort();
+  const latestDate = dates.at(-1);
   if (!latestDate) {
     return [];
+  }
+  if (targetDate) {
+    if (dates.includes(targetDate)) {
+      return inSession.filter((item) => getKLineDateOnly(item.date) === targetDate);
+    }
+    if (targetDate > latestDate) {
+      return [];
+    }
   }
   return inSession.filter((item) => getKLineDateOnly(item.date) === latestDate);
 }
@@ -1116,7 +1133,7 @@ function normalizeHistoryForPeriod(
   dailyCutoffDate?: string | null,
 ): KLineData[] {
   if (period === 'timeshare') {
-    return normalizeTimeshareHistory(history);
+    return normalizeTimeshareHistory(history, dailyCutoffDate);
   }
 
   if (period === 'daily' || market === 'us' || !dailyCutoffDate) {
@@ -2808,8 +2825,9 @@ const CandlestickChart: React.FC<{
     point.ma60,
   ])
     .filter((value): value is number => typeof value === 'number' && !Number.isNaN(value));
-  const maxPrice = Math.max(...priceValues);
-  const minPrice = Math.min(...priceValues);
+  const fallbackPrice = isValidNumber(quote?.currentPrice) && quote.currentPrice > 0 ? quote.currentPrice : 1;
+  const maxPrice = priceValues.length > 0 ? Math.max(...priceValues) : fallbackPrice * 1.02;
+  const minPrice = priceValues.length > 0 ? Math.min(...priceValues) : fallbackPrice * 0.98;
   const pricePadding = Math.max((maxPrice - minPrice) * 0.08, 0.01);
   const chartMax = maxPrice + pricePadding;
   const chartMin = Math.max(0, minPrice - pricePadding);
@@ -3131,6 +3149,19 @@ const CandlestickChart: React.FC<{
                   </g>
                 );
               })}
+              {visible.length === 0 ? TIMESHARE_EMPTY_AXIS_LABELS.map((item) => (
+                <text
+                  key={`timeshare-empty-axis-${item.label}`}
+                  data-testid="indicator-kline-x-axis-label"
+                  x={clamp(plotRight * item.ratio, 28, plotRight - 28)}
+                  y={xAxisLabelY}
+                  textAnchor="middle"
+                  fill={TERMINAL_COLORS.axisText}
+                  className="text-[10px]"
+                >
+                  {item.label}
+                </text>
+              )) : null}
             </>
           ) : (
             <>
@@ -3840,9 +3871,8 @@ const ChipPeakPanel: React.FC<{
   currentPoint?: ChartPoint | null;
   chip: ChipDistributionMetrics | null;
   mainChip: ChipDistributionMetrics | null;
-  requiresRealChipData: boolean;
   onAddRuleMetric?: AddRuleMetricHandler;
-}> = ({ points, currentPoint, chip, mainChip, requiresRealChipData, onAddRuleMetric }) => {
+}> = ({ points, currentPoint, chip, mainChip, onAddRuleMetric }) => {
   const [activeScope, setActiveScope] = useState<ChipPanelScope>('all');
   const [activeRange, setActiveRange] = useState<ChipRangeLevel>('90');
   const activeChip = activeScope === 'main' ? mainChip : chip;
@@ -3901,13 +3931,20 @@ const ChipPeakPanel: React.FC<{
 
       <div className="px-2 py-2">
         {rows.length === 0 ? (
-          <div className="border border-dashed px-3 py-6 text-center text-xs" style={{ borderColor: TERMINAL_COLORS.redGrid, color: TERMINAL_COLORS.muted }}>
-            {activeScope === 'main'
-              ? '暂无同源主力筹码峰明细'
-              : requiresRealChipData
-                ? '真实筹码明细与本地模型均不可用，无法与同花顺对齐'
-                : '暂无真实筹码峰明细'}
-          </div>
+          <svg viewBox={`0 0 ${svgWidth} ${svgHeight}`} role="img" aria-label="筹码峰分布图" className="h-[10rem] w-full">
+            <rect x="0" y="0" width={svgWidth} height={svgHeight} fill={TERMINAL_COLORS.bg} />
+            <rect x="0.5" y="0.5" width={svgWidth - 1} height={svgHeight - 1} fill="none" stroke={TERMINAL_COLORS.redGrid} />
+            {[0, 0.25, 0.5, 0.75, 1].map((ratio) => {
+              const y = chartTop + chartHeight * ratio;
+              return (
+                <g key={`empty-chip-grid-${ratio}`}>
+                  <line x1={axisX} y1={y} x2={svgWidth - 10} y2={y} stroke={TERMINAL_COLORS.redGridSoft} strokeDasharray="2 5" opacity="0.74" />
+                  <text x="8" y={y + 4} fill={TERMINAL_COLORS.axisText} className="text-[10px] font-semibold tabular-nums">--</text>
+                </g>
+              );
+            })}
+            <line x1={axisX} y1={chartTop - 4} x2={axisX} y2={chartBottom + 4} stroke={TERMINAL_COLORS.axis} strokeWidth="1.1" />
+          </svg>
         ) : (
           <svg viewBox={`0 0 ${svgWidth} ${svgHeight}`} role="img" aria-label="筹码峰分布图" className="h-[10rem] w-full">
             <rect x="0" y="0" width={svgWidth} height={svgHeight} fill={TERMINAL_COLORS.bg} />
@@ -4211,7 +4248,6 @@ const IndicatorSidePanel: React.FC<{
   chipPoint?: ChartPoint | null;
   chip: ChipDistributionMetrics | null;
   mainChip: ChipDistributionMetrics | null;
-  requiresRealChipData: boolean;
   quote: StockQuote | null;
   onAddRuleMetric?: AddRuleMetricHandler;
 }> = ({
@@ -4220,7 +4256,6 @@ const IndicatorSidePanel: React.FC<{
   chipPoint,
   chip,
   mainChip,
-  requiresRealChipData,
   quote,
   onAddRuleMetric,
 }) => {
@@ -4268,7 +4303,6 @@ const IndicatorSidePanel: React.FC<{
             currentPoint={chipPoint}
             chip={chip}
             mainChip={mainChip}
-            requiresRealChipData={requiresRealChipData}
             onAddRuleMetric={onAddRuleMetric}
           />
         ) : (
@@ -5105,7 +5139,6 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
       (selectedPeriod !== '1m' && selectedPeriod !== 'timeshare')
       || !selectedCachedState
       || selectedCachedState.isLoading
-      || selectedCachedState.history.length === 0
     ) {
       return undefined;
     }
@@ -5261,17 +5294,26 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
   const displayVolume = quote?.volume ?? latest?.volume;
   const volumeRatio = displayVolume && latest?.volumeMa5 ? displayVolume / latest.volumeMa5 : undefined;
   const chipPoints = points;
-  const requiresRealChipData = marketKind === 'cn';
   const estimatedChip: ChipDistributionMetrics | null = null;
   const selectedPoint = safeHoveredIndex !== null ? points[safeHoveredIndex] : visibleAnchorPoint;
   const baseChip = metrics?.chipDistribution ?? null;
   const chip = useMemo(() => pickChipSnapshot(baseChip, selectedPoint?.date), [baseChip, selectedPoint?.date]);
+  const displayChip = useMemo(() => {
+    if (effectivePeriod !== 'timeshare') {
+      return chip;
+    }
+    if (!selectedPoint?.date) {
+      return null;
+    }
+    return isChipForDate(chip, selectedPoint.date) ? chip : null;
+  }, [chip, effectivePeriod, selectedPoint?.date]);
   const chipPoint = useMemo(
-    () => (isChipForDate(chip, selectedPoint?.date) ? selectedPoint : findPointByDate(points, chip?.date) ?? selectedPoint ?? latest),
-    [chip, latest, points, selectedPoint],
+    () => (isChipForDate(displayChip, selectedPoint?.date) ? selectedPoint : findPointByDate(points, displayChip?.date) ?? selectedPoint ?? latest),
+    [displayChip, latest, points, selectedPoint],
   );
   const mainChip: ChipDistributionMetrics | null = null;
   const modal = variant === 'modal';
+  const shouldRenderEmptyTimeshareBoard = effectivePeriod === 'timeshare' && points.length === 0;
 
   useEffect(() => {
     const resetKey = `${stockCode}:${effectivePeriod}:${points.length}`;
@@ -5482,7 +5524,7 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
               <KLinePeriodTabs selectedPeriod={selectedPeriod} onPeriodChange={handlePeriodChange} />
               <InlineAlert variant="danger" title="指标数据加载失败" message={error} />
             </div>
-          ) : points.length === 0 ? (
+          ) : points.length === 0 && !shouldRenderEmptyTimeshareBoard ? (
             <div className="grid gap-3">
               <KLinePeriodTabs selectedPeriod={selectedPeriod} onPeriodChange={handlePeriodChange} />
               <EmptyState
@@ -5587,9 +5629,8 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
                     points={points}
                     chipPoints={chipPoints}
                     chipPoint={chipPoint}
-                    chip={chip}
+                    chip={displayChip}
                     mainChip={mainChip}
-                    requiresRealChipData={requiresRealChipData}
                     quote={quote}
                     onAddRuleMetric={handleAddRuleMetric}
                   />

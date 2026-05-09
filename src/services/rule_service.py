@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Optional
 import pandas as pd
 
 from src.config import get_config
+from src.core import trading_calendar
 from src.repositories.rule_repo import RuleRepository, encode_rule_batch_metadata
 from src.rules.engine import AGGREGATE_METHODS, COMPARE_OPERATORS, evaluate_rule_at_index, evaluate_rule_history
 from src.rules.metrics import METRIC_BY_KEY, build_metric_frame, get_metric_registry
@@ -464,7 +465,12 @@ class RuleService:
                     try:
                         ordered_matches[index] = future.result()
                     except RuleDataUnavailable as exc:
-                        ordered_errors[index] = f"{code}:{exc}"
+                        logger.info(
+                            "规则 %s 股票 %s 数据暂不可用，按无命中跳过: %s",
+                            rule_id,
+                            code,
+                            exc,
+                        )
                     except Exception as exc:
                         ordered_errors[index] = f"{code}:{type(exc).__name__}"
 
@@ -516,6 +522,18 @@ class RuleService:
         logger.info("规则 %s 股票 %s 开始分析 (%s/%s)", rule_id, stock_code, ordinal, total)
         try:
             match = self._evaluate_stock(rule, definition, stock_code, mode, start_date, end_date, data_policy)
+        except RuleDataUnavailable as exc:
+            elapsed_ms = int((time.monotonic() - started_at) * 1000)
+            logger.info(
+                "规则 %s 股票 %s 数据暂不可用，跳过 (%s/%s)，耗时 %s ms: %s",
+                rule_id,
+                stock_code,
+                ordinal,
+                total,
+                elapsed_ms,
+                exc,
+            )
+            return None
         except Exception as exc:
             elapsed_ms = int((time.monotonic() - started_at) * 1000)
             logger.warning(
@@ -613,6 +631,201 @@ class RuleService:
     def _count_match_events(matches: List[Dict[str, Any]]) -> int:
         return sum(len(match.get("matched_events") or []) for match in matches)
 
+    @staticmethod
+    def _count_notification_events(matches: List[Dict[str, Any]]) -> int:
+        total = 0
+        for match in matches:
+            matched_events = match.get("matched_events") or []
+            if matched_events:
+                total += len(matched_events)
+                continue
+            matched_dates = match.get("matched_dates") or []
+            total += len(matched_dates)
+        return total
+
+    def notify_live_matches(
+        self,
+        run_id: int,
+        *,
+        execution_time: Optional[str] = None,
+        rule_ids: Optional[List[int]] = None,
+        rule_names: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """Push live-test rule matches to every configured notification channel."""
+        matches = self.repo.list_matches(run_id)
+        event_count = self._count_notification_events(matches)
+        if event_count <= 0:
+            return {
+                "sent": False,
+                "message": "本次实测没有命中结果，未推送通知",
+                "match_count": len(matches),
+                "event_count": 0,
+            }
+
+        content = self._build_live_match_notification(
+            run_id,
+            matches,
+            execution_time=execution_time,
+            rule_ids=rule_ids or [],
+            rule_names=rule_names or [],
+        )
+
+        try:
+            from src.notification import NotificationService
+
+            notifier = NotificationService()
+            if not notifier.is_available():
+                logger.warning("通知渠道未配置，实测命中未推送: run_id=%s", run_id)
+                return {
+                    "sent": False,
+                    "message": "通知渠道未配置，未推送",
+                    "match_count": len(matches),
+                    "event_count": event_count,
+                }
+
+            sent = notifier.send(content)
+            return {
+                "sent": bool(sent),
+                "message": "实测命中通知已发送" if sent else "实测命中通知发送失败",
+                "match_count": len(matches),
+                "event_count": event_count,
+            }
+        except Exception as exc:
+            logger.error("实测命中通知异常: run_id=%s, error=%s", run_id, exc, exc_info=True)
+            return {
+                "sent": False,
+                "message": f"实测命中通知异常: {type(exc).__name__}",
+                "match_count": len(matches),
+                "event_count": event_count,
+            }
+
+    @classmethod
+    def _build_live_match_notification(
+        cls,
+        run_id: int,
+        matches: List[Dict[str, Any]],
+        *,
+        execution_time: Optional[str],
+        rule_ids: List[int],
+        rule_names: List[str],
+    ) -> str:
+        metric_labels = {
+            str(item.get("key")): str(item.get("label") or item.get("key"))
+            for item in get_metric_registry()
+        }
+        rule_name_by_id = {
+            int(rule_id): rule_names[index]
+            for index, rule_id in enumerate(rule_ids)
+            if index < len(rule_names)
+        }
+        event_count = cls._count_notification_events(matches)
+        snapshot_id = cls._first_snapshot_value(matches, "snapshot_id") or "unknown"
+        snapshot_time = cls._first_snapshot_value(matches, "snapshot_time")
+        title_time = execution_time or snapshot_time or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        lines = [
+            "# 规则实测命中提醒",
+            "",
+            f"> 执行时间：{title_time} | 运行 #{run_id} | 快照：{snapshot_id}",
+            f"> 命中股票：{len(matches)} 只 | 命中记录：{event_count} 条",
+            "",
+        ]
+
+        for match in matches:
+            stock_name = match.get("stock_name") or ""
+            stock_code = match.get("stock_code") or ""
+            display_name = f"{stock_name}({stock_code})" if stock_name else str(stock_code)
+            events = match.get("matched_events") or []
+            if not events and match.get("matched_dates"):
+                events = [
+                    {
+                        "date": matched_date,
+                        "matched_groups": match.get("matched_groups") or [],
+                        "snapshot": match.get("snapshot") or {},
+                    }
+                    for matched_date in match.get("matched_dates") or []
+                ]
+
+            for event in events:
+                rule_id = int(match.get("rule_id") or 0)
+                rule_label = rule_name_by_id.get(rule_id) or f"规则 {rule_id}" if rule_id else "规则"
+                event_date = event.get("date") or "--"
+                lines.extend([
+                    f"## #{rule_id} {rule_label}",
+                    f"- {display_name} | 命中日：{event_date}",
+                ])
+                condition_lines = cls._format_matched_conditions(
+                    event.get("matched_groups") or match.get("matched_groups") or [],
+                    metric_labels,
+                )
+                if condition_lines:
+                    lines.extend(f"  - {line}" for line in condition_lines)
+                explanation = event.get("explanation") or match.get("explanation")
+                if explanation:
+                    lines.append(f"  - 说明：{explanation}")
+                lines.append("")
+
+        return "\n".join(lines).strip()
+
+    @staticmethod
+    def _first_snapshot_value(matches: List[Dict[str, Any]], key: str) -> Optional[str]:
+        for match in matches:
+            snapshot = match.get("snapshot") or {}
+            if snapshot.get(key):
+                return str(snapshot.get(key))
+            for event in match.get("matched_events") or []:
+                event_snapshot = event.get("snapshot") or {}
+                if event_snapshot.get(key):
+                    return str(event_snapshot.get(key))
+        return None
+
+    @classmethod
+    def _format_matched_conditions(
+        cls,
+        matched_groups: List[Dict[str, Any]],
+        metric_labels: Dict[str, str],
+    ) -> List[str]:
+        lines: List[str] = []
+        for group in matched_groups:
+            conditions = group.get("conditions") or []
+            for condition in conditions:
+                metric_key = str(condition.get("left_metric") or condition.get("leftMetric") or "")
+                metric_label = metric_labels.get(metric_key, metric_key or "指标")
+                operator = str(condition.get("operator") or "")
+                values = condition.get("values") or {}
+                left_value = cls._format_condition_value(values.get("left"))
+                right_value = cls._format_condition_right_value(values)
+                if right_value:
+                    lines.append(f"{metric_label}: {left_value} {operator} {right_value}")
+                else:
+                    lines.append(f"{metric_label}: {left_value} {operator}".strip())
+        return lines
+
+    @staticmethod
+    def _format_condition_right_value(values: Dict[str, Any]) -> str:
+        if values.get("right") is not None:
+            return RuleService._format_condition_value(values.get("right"))
+        if values.get("threshold") is not None:
+            return RuleService._format_condition_value(values.get("threshold"))
+        if values.get("min") is not None or values.get("max") is not None:
+            return (
+                f"{RuleService._format_condition_value(values.get('min'))}"
+                f" - {RuleService._format_condition_value(values.get('max'))}"
+            )
+        if values.get("matched_count") is not None:
+            return RuleService._format_condition_value(values.get("matched_count"))
+        return ""
+
+    @staticmethod
+    def _format_condition_value(value: Any) -> str:
+        if value is None:
+            return "--"
+        if isinstance(value, float):
+            return f"{value:,.4f}".rstrip("0").rstrip(".")
+        if isinstance(value, int):
+            return f"{value:,}"
+        return str(value)
+
     @classmethod
     def _normalize_date_range(cls, start_date: Any, end_date: Any) -> tuple[Optional[date], Optional[date]]:
         date_from = cls._coerce_date(start_date)
@@ -667,6 +880,9 @@ class RuleService:
         if mode == "latest" and data_policy == "snapshot_only" and quote is None:
             raise RuleDataUnavailable("quote_snapshot_miss")
         indicator_metrics = self._get_indicator_metrics(stock_code, history_rows, mode, data_policy)
+        if mode == "latest" and quote is not None:
+            quote = StockService._normalize_quote_payload_units(stock_code, quote) or quote
+            history_rows = self._sync_latest_history_rows_with_quote(stock_code, history_rows, quote)
         metric_frame = build_metric_frame(history_rows, quote, indicator_metrics)
         if metric_frame.empty:
             return None
@@ -706,6 +922,81 @@ class RuleService:
             "condition_results": result.get("condition_results") or [],
             "snapshot": result.get("snapshot") or {},
         }]
+
+    @staticmethod
+    def _coerce_history_date(value: Any) -> Optional[date]:
+        return StockService._normalize_daily_cache_date(value)
+
+    @classmethod
+    def _resolve_latest_evaluation_date(cls, stock_code: str, quote: Optional[Dict[str, Any]]) -> Optional[date]:
+        market = trading_calendar.get_market_for_stock(stock_code)
+        for key in ("snapshot_time", "quote_time", "update_time"):
+            parsed = pd.to_datetime((quote or {}).get(key), errors="coerce")
+            if pd.isna(parsed):
+                continue
+            quote_datetime = parsed.to_pydatetime() if hasattr(parsed, "to_pydatetime") else parsed
+            quote_datetime = trading_calendar.get_market_now(market, current_time=quote_datetime)
+            quote_date = quote_datetime.date()
+            if market and not trading_calendar.is_market_open(market, quote_date):
+                return trading_calendar.get_effective_trading_date(market, current_time=quote_datetime)
+            return quote_date
+
+        try:
+            market_today = trading_calendar.get_market_now(market).date()
+            if market and not trading_calendar.is_market_open(market, market_today):
+                return trading_calendar.get_effective_trading_date(market)
+            return market_today
+        except Exception as calendar_error:
+            logger.debug("解析 %s 实时规则判断日失败，按本地自然日处理: %s", stock_code, calendar_error)
+            return datetime.now().date()
+
+    @classmethod
+    def _sync_latest_history_rows_with_quote(
+        cls,
+        stock_code: str,
+        history_rows: List[Dict[str, Any]],
+        quote: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        if not history_rows:
+            return history_rows
+        evaluation_date = cls._resolve_latest_evaluation_date(stock_code, quote)
+        if evaluation_date is None:
+            return history_rows
+
+        rows = []
+        for row in history_rows:
+            normalized_row = dict(row)
+            row_date = cls._coerce_history_date(normalized_row.get("date"))
+            if row_date:
+                normalized_row["date"] = row_date.isoformat()
+            rows.append(normalized_row)
+        last_date = cls._coerce_history_date(rows[-1].get("date"))
+        if last_date and last_date > evaluation_date:
+            return rows
+
+        previous_close = None
+        if last_date == evaluation_date and len(rows) >= 2:
+            previous_close = rows[-2].get("close")
+        elif rows:
+            previous_close = rows[-1].get("close")
+
+        realtime_row = StockService._build_realtime_daily_row(
+            quote,
+            stock_code,
+            evaluation_date,
+            previous_close,
+        )
+        realtime_row["date"] = evaluation_date.isoformat()
+        realtime_row["snapshot_id"] = quote.get("snapshot_id")
+        realtime_row["snapshot_time"] = quote.get("snapshot_time")
+        realtime_row["data_source"] = quote.get("source") or "realtime_quote"
+
+        if last_date == evaluation_date:
+            rows[-1].update({key: value for key, value in realtime_row.items() if value is not None})
+            return rows
+
+        rows.append(realtime_row)
+        return rows
 
     def _evaluate_history_events(
         self,

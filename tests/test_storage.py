@@ -159,6 +159,50 @@ class TestStorage(unittest.TestCase):
 
         DatabaseManager.reset_instance()
 
+    def test_intraday_quote_samples_normalize_raw_share_volume_before_archive(self):
+        DatabaseManager.reset_instance()
+        db = DatabaseManager(db_url="sqlite:///:memory:")
+        first_time = datetime(2026, 5, 7, 10, 0, 0)
+        second_time = datetime(2026, 5, 7, 10, 1, 0)
+
+        try:
+            db.save_intraday_quote_samples(
+                [
+                    {
+                        "stock_code": "000001",
+                        "current_price": 10.0,
+                        "volume": 100_000,
+                        "amount": 1_000_000,
+                        "source": "snapshot",
+                    }
+                ],
+                snapshot_id="20260507100000",
+                snapshot_time=first_time,
+            )
+            db.save_intraday_quote_samples(
+                [
+                    {
+                        "stock_code": "000001",
+                        "current_price": 10.2,
+                        "volume": 130_000,
+                        "amount": 1_306_000,
+                        "source": "snapshot",
+                    }
+                ],
+                snapshot_id="20260507100100",
+                snapshot_time=second_time,
+            )
+
+            minute_df = db.get_intraday_minute_data("000001", trade_date=first_time.date())
+            archived = db.archive_intraday_minutes_to_daily(trade_date=first_time.date(), codes=["000001"])
+            daily_rows = db.get_latest_data("000001", days=1)
+
+            self.assertEqual(list(minute_df["volume"]), [1000.0, 300.0])
+            self.assertEqual(archived, 1)
+            self.assertEqual(daily_rows[0].volume, 1300.0)
+        finally:
+            DatabaseManager.reset_instance()
+
     def test_file_sqlite_enables_wal_and_busy_timeout(self):
         temp_dir = tempfile.TemporaryDirectory()
         db_path = os.path.join(temp_dir.name, "sqlite_pragmas.db")

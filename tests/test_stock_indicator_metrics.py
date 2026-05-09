@@ -284,6 +284,7 @@ def test_realtime_quote_exposes_volume_turnover_and_source_fields() -> None:
         result = StockService().get_realtime_quote("600519")
 
     assert result is not None
+    assert result["volume"] == 10000
     assert result["volume_ratio"] == 1.23
     assert result["turnover_rate"] == 0.86
     assert result["amplitude"] == 2.1
@@ -431,7 +432,10 @@ def test_intraday_history_cache_only_reads_hot_table_without_remote_fetch() -> N
         snapshot_time=snapshot_time,
     )
 
-    with patch("data_provider.base.DataFetcherManager", side_effect=AssertionError("remote fetch forbidden")):
+    with (
+        patch("data_provider.base.DataFetcherManager", side_effect=AssertionError("remote fetch forbidden")),
+        patch.object(StockService, "_resolve_intraday_cache_target_date", return_value=snapshot_time.date()),
+    ):
         result = service.get_history_data("600519", period="1m", days=1, data_policy="cache_only")
 
     assert result["data_source"] == "intraday_hot_table"
@@ -479,6 +483,7 @@ def test_intraday_history_default_backfills_hot_table_from_remote_without_daily_
     with (
         patch("data_provider.base.DataFetcherManager", return_value=manager),
         patch.object(StockService, "_resolve_intraday_cache_target_date", return_value=date(2026, 5, 7)),
+        patch("src.services.stock_service.trading_calendar.is_market_open", return_value=True),
         patch.object(service, "get_realtime_quote", return_value=None),
     ):
         result = service.get_history_data("600519.SH", period="1m", days=1, data_policy="default")
@@ -497,6 +502,26 @@ def test_intraday_history_default_backfills_hot_table_from_remote_without_daily_
 
     assert cached["data_source"] == "intraday_hot_table"
     assert len(cached["data"]) == 2
+    DatabaseManager.reset_instance()
+
+
+def test_intraday_history_default_discards_single_day_remote_rows_outside_target_date() -> None:
+    DatabaseManager.reset_instance()
+    db = DatabaseManager(db_url="sqlite:///:memory:")
+    service = StockService()
+    service.repo = StockRepository(db)
+    manager = _IntradayBackfillManager()
+
+    with (
+        patch("data_provider.base.DataFetcherManager", return_value=manager),
+        patch.object(StockService, "_resolve_intraday_cache_target_date", return_value=date(2026, 5, 8)),
+        patch.object(service, "get_realtime_quote", return_value=None),
+    ):
+        result = service.get_history_data("600519.SH", period="1m", days=1, data_policy="default")
+
+    assert result["data_source"] == "intraday_hot_table_miss"
+    assert result["data"] == []
+    assert db.get_intraday_minute_data("600519", trade_date=date(2026, 5, 7)).empty
     DatabaseManager.reset_instance()
 
 
@@ -641,6 +666,26 @@ def test_realtime_quote_derives_after_hours_volume_from_amount_and_price() -> No
     assert result["after_hours_amount"] == 1_429_064
 
 
+def test_kline_payload_normalizes_raw_share_volume_to_lots() -> None:
+    df = pd.DataFrame([
+        {
+            "date": date(2026, 5, 7),
+            "open": 11.23,
+            "high": 11.48,
+            "low": 11.20,
+            "close": 11.37,
+            "volume": 563_111_758,
+            "amount": 7_439_315_238.5,
+            "pct_chg": 1.23,
+            "data_source": "intraday_hot_table",
+        }
+    ])
+
+    payload = StockService._build_kline_payload(df, "daily", "000001")
+
+    assert payload[0]["volume"] == pytest.approx(5_631_117.58)
+
+
 def test_realtime_quote_derives_market_values_from_share_counts_and_price() -> None:
     manager = _FakeManager()
     manager.quote.price = 137.41
@@ -688,7 +733,10 @@ def test_history_data_supports_intraday_period() -> None:
     service = StockService()
     service.repo = StockRepository(db)
 
-    with patch("data_provider.base.DataFetcherManager", return_value=manager):
+    with (
+        patch("data_provider.base.DataFetcherManager", return_value=manager),
+        patch.object(StockService, "_resolve_intraday_cache_target_date", return_value=date(2026, 4, 30)),
+    ):
         result = service.get_history_data("600519", period="5m", days=1)
 
     assert result["period"] == "5m"
@@ -730,6 +778,7 @@ def test_history_data_syncs_intraday_tail_with_realtime_quote() -> None:
 
     with (
         patch("data_provider.base.DataFetcherManager", return_value=manager),
+        patch.object(StockService, "_resolve_intraday_cache_target_date", return_value=date(2026, 4, 30)),
         patch(
             "src.services.stock_service.StockService._resolve_realtime_daily_date",
             return_value=date(2026, 4, 30),

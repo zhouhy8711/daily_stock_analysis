@@ -12,6 +12,8 @@ from api.v1.schemas.rules import (
     RuleMetricRegistryResponse,
     RuleRunHistoryResponse,
     RuleRunMatchListResponse,
+    RuleRunNotifyRequest,
+    RuleRunNotifyResponse,
     RuleRunRequest,
     RuleRunResponse,
     RuleUpdateRequest,
@@ -53,6 +55,23 @@ def list_rule_runs(limit: int = 30) -> RuleRunHistoryResponse:
 def list_rule_run_matches(run_id: int) -> RuleRunMatchListResponse:
     service = RuleService()
     return RuleRunMatchListResponse(items=service.list_run_matches(run_id))
+
+
+@router.post(
+    "/runs/{run_id}/notify",
+    response_model=RuleRunNotifyResponse,
+    summary="推送规则实测命中通知",
+)
+def notify_rule_run_matches(run_id: int, payload: RuleRunNotifyRequest | None = None) -> RuleRunNotifyResponse:
+    service = RuleService()
+    data = payload or RuleRunNotifyRequest()
+    result = service.notify_live_matches(
+        run_id,
+        execution_time=data.execution_time,
+        rule_ids=data.rule_ids,
+        rule_names=data.rule_names,
+    )
+    return RuleRunNotifyResponse(**result)
 
 
 @router.delete(

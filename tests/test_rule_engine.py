@@ -1,5 +1,6 @@
 import threading
 import time
+from unittest import mock
 
 from src.rules.engine import evaluate_rule, evaluate_rule_history
 from src.rules.metrics import build_metric_frame, get_metric_registry
@@ -458,6 +459,41 @@ class _FakeStockService:
     def get_indicator_metrics(self, stock_code):
         return {}
 
+    def get_realtime_quote_snapshot_info(self):
+        return {}
+
+
+class _RealtimeRuleStockService(_FakeStockService):
+    def get_history_data(self, stock_code, period="daily", days=30, data_policy="default"):
+        return {
+            "stock_code": stock_code,
+            "stock_name": "盛景微",
+            "period": period,
+            "data": [
+                {"date": "2026-05-04", "open": 38, "high": 39, "low": 37, "close": 38, "volume": 40000, "amount": 152000000, "pct_chg": 0},
+                {"date": "2026-05-05", "open": 38, "high": 39, "low": 37, "close": 38, "volume": 50000, "amount": 190000000, "pct_chg": 0},
+                {"date": "2026-05-06", "open": 38, "high": 39, "low": 37, "close": 38, "volume": 60000, "amount": 228000000, "pct_chg": 0},
+                {"date": "2026-05-07", "open": 38, "high": 39, "low": 37, "close": 38, "volume": 70000, "amount": 266000000, "pct_chg": 0},
+            ],
+        }
+
+    def get_realtime_quote(self, stock_code, data_policy="default"):
+        return {
+            "stock_code": stock_code,
+            "stock_name": "盛景微",
+            "current_price": 39.5,
+            "open": 38.06,
+            "high": 39.57,
+            "low": 38.0,
+            "prev_close": 38.45,
+            "volume": 20_000_000,
+            "amount": 790_000_000,
+            "change_percent": 2.73,
+            "quote_time": "2026-05-07T15:00:00",
+            "snapshot_id": "20260508091506",
+            "snapshot_time": "2026-05-08T09:15:06",
+        }
+
 
 def _service_rule_for_run_mode():
     return {
@@ -501,6 +537,28 @@ class _PartiallyFailingStockService(_FakeStockService):
         return super().get_history_data(stock_code, period=period, days=days)
 
 
+class _SnapshotMissingStockService(_FakeStockService):
+    def get_history_data(self, stock_code, period="daily", days=30, data_policy="default"):
+        return {
+            "stock_code": stock_code,
+            "stock_name": "测试股票",
+            "period": period,
+            "data": [],
+            "data_source": "daily_cache_miss",
+        }
+
+    def get_realtime_quote(self, stock_code, data_policy="default"):
+        return None
+
+
+class _NotifyRuleRepo:
+    def __init__(self, matches):
+        self.matches = matches
+
+    def list_matches(self, run_id):
+        return self.matches
+
+
 class _ConcurrentProbeStockService(_FakeStockService):
     def __init__(self):
         self._lock = threading.Lock()
@@ -537,6 +595,36 @@ def test_rule_service_run_modes_separate_latest_from_history():
     assert history_result["matches"][0]["matched_events"][0]["snapshot"]["close"] == 15
 
 
+def test_rule_service_latest_mode_uses_realtime_day_against_previous_window():
+    rule = _service_rule_for_run_mode()
+    rule["definition"]["groups"][0]["conditions"] = [
+        {
+            "id": "c1",
+            "left": {"metric": "volume", "offset": 0},
+            "operator": ">",
+            "right": {
+                "type": "aggregate",
+                "metric": "volume",
+                "method": "avg",
+                "window": 3,
+                "offset": 1,
+                "multiplier": 2,
+            },
+        }
+    ]
+    service = RuleService(repo=_FakeRuleRepo(rule), stock_service=_RealtimeRuleStockService())
+
+    result = service.run_rule(1, mode="latest", data_policy="snapshot_only")
+
+    assert result["event_count"] == 1
+    event = result["matches"][0]["matched_events"][0]
+    values = event["matched_groups"][0]["conditions"][0]["values"]
+    assert event["date"] == "2026-05-08"
+    assert values["left"] == 200000
+    assert values["right"] == 120000
+    assert result["matches"][0]["matched_dates"] == ["2026-05-08"]
+
+
 def test_rule_service_history_mode_respects_date_range():
     service = RuleService(repo=_FakeRuleRepo(_service_rule_for_run_mode()), stock_service=_FakeStockService())
 
@@ -564,6 +652,93 @@ def test_rule_service_run_rule_keeps_stock_order_with_worker_errors():
     assert [match["stock_code"] for match in result["matches"]] == ["600519", "AAPL"]
     assert result["errors"] == ["000001:RuntimeError"]
     assert [match["stock_code"] for match in repo.finished_matches] == ["600519", "AAPL"]
+
+
+def test_rule_service_run_rules_treats_snapshot_cache_miss_as_empty_result():
+    first_rule = _service_rule_for_codes(["600519", "000001"])
+    second_rule = {**_service_rule_for_codes(["600519", "000001"]), "id": 2, "name": "第二条规则"}
+    repo = _FakeMultiRuleRepo([first_rule, second_rule])
+    service = RuleService(repo=repo, stock_service=_SnapshotMissingStockService())
+    service._resolve_run_workers = lambda target_count: 1
+    service._resolve_batch_rule_workers = lambda rule_count: 1
+
+    result = service.run_rules([1, 2], mode="latest", data_policy="snapshot_only")
+
+    assert result["status"] == "completed"
+    assert result["matches"] == []
+    assert result["errors"] == []
+    assert repo.finished_matches == []
+
+
+def test_rule_service_notify_live_matches_sends_configured_notifications():
+    repo = _NotifyRuleRepo([
+        {
+            "run_id": 12,
+            "rule_id": 7,
+            "stock_code": "300274.SZ",
+            "stock_name": "阳光电源",
+            "matched_dates": ["2026-05-08"],
+            "matched_events": [
+                {
+                    "date": "2026-05-08",
+                    "snapshot": {
+                        "snapshot_id": "20260508100000",
+                        "snapshot_time": "2026-05-08T10:00:00",
+                    },
+                    "matched_groups": [
+                        {
+                            "id": "group-1",
+                            "conditions": [
+                                {
+                                    "id": "cond-1",
+                                    "left_metric": "volume",
+                                    "operator": ">",
+                                    "values": {"left": 123456, "right": 100000},
+                                }
+                            ],
+                        }
+                    ],
+                    "explanation": "成交量放大",
+                }
+            ],
+            "matched_groups": [],
+            "snapshot": {},
+            "explanation": "成交量放大",
+        }
+    ])
+    fake_notifier = mock.Mock()
+    fake_notifier.is_available.return_value = True
+    fake_notifier.send.return_value = True
+    service = RuleService(repo=repo, stock_service=object())
+
+    with mock.patch("src.notification.NotificationService", return_value=fake_notifier):
+        result = service.notify_live_matches(
+            12,
+            execution_time="2026-05-08 10:00:00",
+            rule_ids=[7],
+            rule_names=["放量观察"],
+        )
+
+    assert result["sent"] is True
+    assert result["match_count"] == 1
+    assert result["event_count"] == 1
+    message = fake_notifier.send.call_args.args[0]
+    assert "规则实测命中提醒" in message
+    assert "#7 放量观察" in message
+    assert "阳光电源(300274.SZ)" in message
+    assert "成交量: 123,456 > 100,000" in message
+
+
+def test_rule_service_notify_live_matches_skips_empty_result():
+    fake_notifier = mock.Mock()
+    service = RuleService(repo=_NotifyRuleRepo([]), stock_service=object())
+
+    with mock.patch("src.notification.NotificationService", return_value=fake_notifier):
+        result = service.notify_live_matches(12)
+
+    assert result["sent"] is False
+    assert result["event_count"] == 0
+    fake_notifier.send.assert_not_called()
 
 
 def test_rule_service_run_rules_creates_one_run_with_rule_tagged_matches():

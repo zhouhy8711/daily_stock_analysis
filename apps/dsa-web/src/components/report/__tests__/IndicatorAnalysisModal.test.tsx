@@ -69,14 +69,14 @@ function makeDailyHistory(length: number, startDate = '2026-01-01'): KLineData[]
   });
 }
 
-function makeTimeshareHistory(): KLineData[] {
+function makeTimeshareHistory(date = '2026-05-07'): KLineData[] {
   return [
     ['2026-05-06 14:59', 118],
-    ['2026-05-07 09:29', 119],
-    ['2026-05-07 09:30', 120],
-    ['2026-05-07 12:00', 121],
-    ['2026-05-07 15:00', 122],
-    ['2026-05-07 15:01', 123],
+    [`${date} 09:29`, 119],
+    [`${date} 09:30`, 120],
+    [`${date} 12:00`, 121],
+    [`${date} 15:00`, 122],
+    [`${date} 15:01`, 123],
   ].map(([date, rawClose], index) => {
     const close = Number(rawClose);
     return {
@@ -439,7 +439,8 @@ describe('IndicatorAnalysisModal', () => {
     expect(within(chipPeakPanel).queryByText(/local_chip_model/)).not.toBeInTheDocument();
     fireEvent.click(within(chipPeakPanel).getByRole('tab', { name: '主力筹码' }));
     expect(within(screen.getByTestId('chip-peak-panel')).getByRole('tab', { name: '主力筹码' })).toHaveAttribute('aria-selected', 'true');
-    expect(within(screen.getByTestId('chip-peak-panel')).getByText('暂无同源主力筹码峰明细')).toBeInTheDocument();
+    expect(within(screen.getByTestId('chip-peak-panel')).queryByText('暂无同源主力筹码峰明细')).not.toBeInTheDocument();
+    expect(within(screen.getByTestId('chip-peak-panel')).getByRole('img', { name: '筹码峰分布图' })).toBeInTheDocument();
     fireEvent.click(within(screen.getByTestId('chip-peak-panel')).getByRole('tab', { name: '全部筹码' }));
 
     fireEvent.click(within(sidePanel).getByRole('tab', { name: '实时监控' }));
@@ -850,6 +851,36 @@ describe('IndicatorAnalysisModal', () => {
     unmount();
   });
 
+  it('hides stale previous-day timeshare when the daily target date has advanced', async () => {
+    vi.mocked(stocksApi.getHistory).mockImplementation(async (stockCode, _days, period = 'daily') => ({
+      stockCode,
+      stockName: '贵州茅台',
+      period,
+      data: period === '1m' ? makeTimeshareHistory() : makeDailyHistory(2, '2026-05-07'),
+    }));
+
+    const { unmount } = render(
+      <IndicatorAnalysisModal stockCode="600519" stockName="贵州茅台" onClose={vi.fn()} />,
+    );
+    await flushPromises();
+
+    fireEvent.click(screen.getByRole('tab', { name: '分时' }));
+    await flushPromises();
+
+    expect(screen.getByRole('tab', { name: '分时' })).toHaveAttribute('aria-selected', 'true');
+    expect(screen.queryByText('暂无分时数据')).not.toBeInTheDocument();
+    expect(screen.getByRole('img', { name: 'K线图' })).toBeInTheDocument();
+    expect(screen.getByRole('img', { name: '成交量图' })).toBeInTheDocument();
+    expect(screen.getByRole('img', { name: 'MACD指标图' })).toBeInTheDocument();
+    expect(screen.getByRole('img', { name: '筹码峰分布图' })).toBeInTheDocument();
+    expect(screen.getByTestId('indicator-chart-time-axis')).toBeInTheDocument();
+    expect(screen.getByText('09:30')).toBeInTheDocument();
+    expect(screen.getByText('15:00')).toBeInTheDocument();
+    expect(screen.queryByTestId('indicator-chart-bar-2026-05-07 09:30')).not.toBeInTheDocument();
+
+    unmount();
+  });
+
   it('does not fall back to daily K when timeshare cache warm still returns empty', async () => {
     vi.mocked(stocksApi.getHistory).mockImplementation(async (stockCode, _days, period = 'daily') => ({
       stockCode,
@@ -872,10 +903,59 @@ describe('IndicatorAnalysisModal', () => {
     expect(screen.getByRole('tab', { name: '分时' })).toHaveAttribute('aria-selected', 'true');
     expect(stocksApi.getHistory).toHaveBeenCalledWith('600519', 1, '1m', 'cache_only');
     expect(stocksApi.getHistory).toHaveBeenCalledWith('600519', 1, '1m', 'default');
-    expect(screen.getByText('暂无分时数据')).toBeInTheDocument();
-    expect(screen.getByText('当天分钟热表暂无 09:30-15:00 的 1 分钟采样数据，等待后台预热写入后刷新。')).toBeInTheDocument();
+    expect(screen.queryByText('暂无分时数据')).not.toBeInTheDocument();
+    expect(screen.queryByText('当天分钟热表暂无 09:30-15:00 的 1 分钟采样数据，等待后台预热写入后刷新。')).not.toBeInTheDocument();
+    expect(screen.getByRole('img', { name: 'K线图' })).toBeInTheDocument();
+    expect(screen.getByRole('img', { name: '成交量图' })).toBeInTheDocument();
+    expect(screen.getByRole('img', { name: 'MACD指标图' })).toBeInTheDocument();
     expect(screen.queryByTestId('indicator-chart-bar-2026-05-07')).not.toBeInTheDocument();
-    expect(screen.queryByTestId('indicator-chart-time-axis')).not.toBeInTheDocument();
+    expect(screen.getByTestId('indicator-chart-time-axis')).toBeInTheDocument();
+
+    unmount();
+  });
+
+  it('keeps polling an empty timeshare board and renders when today minute data arrives', async () => {
+    let oneMinuteCalls = 0;
+    vi.mocked(stocksApi.getHistory).mockImplementation(async (stockCode, _days, period = 'daily') => {
+      if (period === '1m') {
+        oneMinuteCalls += 1;
+        const hasTodayMinutes = oneMinuteCalls >= 3;
+        return {
+          stockCode,
+          stockName: '贵州茅台',
+          period,
+          data: hasTodayMinutes ? makeTimeshareHistory('2026-05-08') : [],
+          dataSource: hasTodayMinutes ? 'intraday_hot_table' : 'intraday_hot_table_miss',
+        };
+      }
+      return {
+        stockCode,
+        stockName: '贵州茅台',
+        period,
+        data: makeDailyHistory(2, '2026-05-07'),
+      };
+    });
+
+    const { unmount } = render(
+      <IndicatorAnalysisModal stockCode="600519" stockName="贵州茅台" onClose={vi.fn()} />,
+    );
+    await flushPromises();
+
+    fireEvent.click(screen.getByRole('tab', { name: '分时' }));
+    await flushPromises();
+
+    expect(screen.getByRole('img', { name: 'K线图' })).toBeInTheDocument();
+    expect(screen.queryByTestId('indicator-chart-bar-2026-05-08 09:30')).not.toBeInTheDocument();
+
+    await act(async () => {
+      vi.advanceTimersByTime(10_000);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(screen.getByTestId('indicator-chart-bar-2026-05-08 09:30')).toBeInTheDocument();
+    expect(screen.getByTestId('indicator-volume-bar-2026-05-08 09:30')).toBeInTheDocument();
+    expect(screen.queryByText('暂无分时数据')).not.toBeInTheDocument();
 
     unmount();
   });

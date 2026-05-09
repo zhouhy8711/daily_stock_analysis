@@ -136,6 +136,19 @@ export type RuleRunResponse = {
   quoteMissCount?: number;
 };
 
+export type RuleRunNotifyPayload = {
+  executionTime?: string | null;
+  ruleIds?: number[];
+  ruleNames?: string[];
+};
+
+export type RuleRunNotifyResponse = {
+  sent: boolean;
+  message: string;
+  matchCount: number;
+  eventCount: number;
+};
+
 export type RuleRunPayload = {
   mode?: RuleRunMode;
   dataPolicy?: RuleDataPolicy;

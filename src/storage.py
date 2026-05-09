@@ -16,6 +16,7 @@ from contextlib import contextmanager
 import hashlib
 import json
 import logging
+import math
 import re
 import time
 from datetime import datetime, date, timedelta
@@ -949,6 +950,61 @@ class DatabaseManager:
             return raw
 
     @staticmethod
+    def _to_optional_float(value: Any) -> Optional[float]:
+        value = DatabaseManager._normalize_sql_value(value)
+        if value is None:
+            return None
+        try:
+            parsed = float(value)
+            return parsed if pd.notna(parsed) else None
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _is_cn_equity_code(value: Any) -> bool:
+        code = str(value or "").strip().upper()
+        if "." in code:
+            code = code.split(".", 1)[0]
+        code = re.sub(r"^(SH|SZ|BJ)", "", code)
+        return bool(re.fullmatch(r"\d{6}", code))
+
+    @staticmethod
+    def _relative_gap(value: float, target: float) -> float:
+        if target <= 0:
+            return math.inf
+        return abs(value - target) / target
+
+    @staticmethod
+    def _normalize_cn_volume_to_lots(
+        stock_code: Any,
+        volume: Any,
+        amount: Any,
+        price: Any,
+    ) -> Optional[float]:
+        volume_value = DatabaseManager._to_optional_float(volume)
+        if volume_value is None:
+            return None
+        if not DatabaseManager._is_cn_equity_code(stock_code):
+            return volume_value
+
+        amount_value = DatabaseManager._to_optional_float(amount)
+        price_value = DatabaseManager._to_optional_float(price)
+        if amount_value is None or price_value is None or price_value <= 0:
+            return volume_value
+
+        inferred_shares = amount_value / price_value
+        inferred_lots = inferred_shares / 100
+        if inferred_shares <= 0 or inferred_lots <= 0:
+            return volume_value
+
+        if (
+            DatabaseManager._relative_gap(volume_value, inferred_shares) <= 0.2
+            and DatabaseManager._relative_gap(volume_value, inferred_lots) > 0.2
+        ):
+            return volume_value / 100
+        return volume_value
+
+    @staticmethod
     def _is_cn_regular_intraday_minute(value: datetime) -> bool:
         minute = value.hour * 60 + value.minute
         return ((9 * 60 + 30) <= minute <= (11 * 60 + 30)) or ((13 * 60) <= minute <= (15 * 60))
@@ -1594,13 +1650,19 @@ class DatabaseManager:
             price = _num(item.get("current_price") or item.get("price"))
             if not code or price is None or price <= 0:
                 continue
+            amount = _num(item.get("amount"))
             pending[code] = {
                 "code": code,
                 "trade_date": trade_date,
                 "minute_ts": minute_ts,
                 "price": price,
-                "cumulative_volume": _num(item.get("volume")),
-                "cumulative_amount": _num(item.get("amount")),
+                "cumulative_volume": self._normalize_cn_volume_to_lots(
+                    code,
+                    item.get("volume"),
+                    amount,
+                    price,
+                ),
+                "cumulative_amount": amount,
                 "turnover_rate": _num(item.get("turnover_rate")),
                 "change_percent": _num(item.get("change_percent") or item.get("change_pct")),
                 "source": str(item.get("source") or "realtime_snapshot")[:50],
@@ -1777,6 +1839,7 @@ class DatabaseManager:
             low = _num(row.get("low"))
             high_price = max(v for v in (high, open_price, close) if v is not None)
             low_price = min(v for v in (low, open_price, close) if v is not None)
+            amount = _num(row.get("amount"))
             records.append({
                 "code": normalized_code,
                 "trade_date": minute_ts.date(),
@@ -1785,8 +1848,13 @@ class DatabaseManager:
                 "high": high_price,
                 "low": low_price,
                 "close": close,
-                "volume": _num(row.get("volume")),
-                "amount": _num(row.get("amount")),
+                "volume": self._normalize_cn_volume_to_lots(
+                    normalized_code,
+                    row.get("volume"),
+                    amount,
+                    close,
+                ),
+                "amount": amount,
                 "turnover_rate": _num(row.get("turnover_rate")),
                 "change_percent": _num(row.get("change_percent") or row.get("pct_chg")),
                 "cumulative_volume": None,
@@ -1976,13 +2044,24 @@ class DatabaseManager:
             pct_chg = None
             if open_price not in (None, 0) and close_price is not None:
                 pct_chg = (close_price - open_price) / open_price * 100
+            volume_total = sum(
+                (
+                    self._normalize_cn_volume_to_lots(
+                        stock_code,
+                        row.volume,
+                        row.amount,
+                        row.close,
+                    ) or 0
+                )
+                for row in stock_rows
+            )
             df = pd.DataFrame([{
                 "date": target_date,
                 "open": open_price,
                 "high": max((row.high for row in stock_rows if row.high is not None), default=None),
                 "low": min((row.low for row in stock_rows if row.low is not None), default=None),
                 "close": close_price,
-                "volume": sum((row.volume or 0) for row in stock_rows),
+                "volume": volume_total,
                 "amount": sum((row.amount or 0) for row in stock_rows),
                 "pct_chg": pct_chg,
             }])

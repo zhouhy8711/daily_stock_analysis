@@ -216,6 +216,7 @@ vi.mock('../../api/rules', () => ({
     listRuns: vi.fn(),
     getRunMatches: vi.fn(),
     deleteRun: vi.fn(),
+    notifyRunMatches: vi.fn(),
     run: vi.fn(),
     runBatch: vi.fn(),
   },
@@ -265,6 +266,12 @@ describe('BacktestPage', () => {
     vi.mocked(rulesApi.listRuns).mockResolvedValue([]);
     vi.mocked(rulesApi.getRunMatches).mockResolvedValue(matches);
     vi.mocked(rulesApi.deleteRun).mockResolvedValue(undefined);
+    vi.mocked(rulesApi.notifyRunMatches).mockResolvedValue({
+      sent: true,
+      message: '实测命中通知已发送',
+      matchCount: 1,
+      eventCount: 1,
+    });
     vi.mocked(rulesApi.runBatch).mockResolvedValue({
       runId: 12,
       ruleId: 7,
@@ -403,6 +410,13 @@ describe('BacktestPage', () => {
           scope: 'watchlist',
           stockCodes: ['300274.SZ', '688521.SH'],
         },
+      });
+    });
+    await waitFor(() => {
+      expect(rulesApi.notifyRunMatches).toHaveBeenCalledWith(12, {
+        executionTime: expect.any(String),
+        ruleIds: [7],
+        ruleNames: ['放量观察'],
       });
     });
     const executionGroupButton = await screen.findByRole('button', {

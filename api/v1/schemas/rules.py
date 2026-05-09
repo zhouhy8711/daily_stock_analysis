@@ -77,6 +77,19 @@ class RuleBatchRunRequest(RuleRunRequest):
     rule_ids: List[int] = Field(..., min_length=1, description="Rule IDs to run as one batch")
 
 
+class RuleRunNotifyRequest(BaseModel):
+    execution_time: Optional[str] = Field(None, description="Live-test execution time shown in the notification")
+    rule_ids: List[int] = Field(default_factory=list, description="Rule IDs included in this run")
+    rule_names: List[str] = Field(default_factory=list, description="Rule names included in this run")
+
+
+class RuleRunNotifyResponse(BaseModel):
+    sent: bool
+    message: str
+    match_count: int = 0
+    event_count: int = 0
+
+
 class RuleRunHistoryItem(BaseModel):
     id: int
     rule_id: int

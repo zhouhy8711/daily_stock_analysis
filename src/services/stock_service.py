@@ -357,6 +357,12 @@ def _derive_after_hours_amount(after_hours_volume: Optional[float], price: Optio
     return amount if amount > 0 and math.isfinite(amount) else None
 
 
+def _relative_gap(value: float, target: float) -> float:
+    if target <= 0:
+        return math.inf
+    return abs(value - target) / target
+
+
 def _pure_stock_code(stock_code: str) -> str:
     value = str(stock_code or "").strip().upper()
     if "." in value:
@@ -368,6 +374,36 @@ def _pure_stock_code(stock_code: str) -> str:
 def _is_cn_equity_code(stock_code: str) -> bool:
     code = _pure_stock_code(stock_code)
     return bool(re.fullmatch(r"\d{6}", code))
+
+
+def _normalize_cn_volume_to_lots(
+    stock_code: str,
+    volume: Any,
+    amount: Any,
+    price: Any,
+) -> Optional[float]:
+    volume_value = _to_optional_float(volume)
+    if volume_value is None:
+        return None
+    if not _is_cn_equity_code(stock_code):
+        return volume_value
+
+    amount_value = _to_optional_float(amount)
+    price_value = _to_optional_float(price)
+    if amount_value is None or price_value is None or price_value <= 0:
+        return volume_value
+
+    inferred_shares = amount_value / price_value
+    inferred_lots = inferred_shares / 100
+    if inferred_shares <= 0 or inferred_lots <= 0:
+        return volume_value
+
+    if (
+        _relative_gap(volume_value, inferred_shares) <= 0.2
+        and _relative_gap(volume_value, inferred_lots) > 0.2
+    ):
+        return volume_value / 100
+    return volume_value
 
 
 def _infer_cn_limit_ratio(stock_code: str, stock_name: Optional[str]) -> float:
@@ -400,6 +436,8 @@ def _build_quote_payload(quote: Any, fallback_code: str) -> Dict[str, Any]:
     stock_code = getattr(quote, "code", fallback_code)
     stock_name = getattr(quote, "name", None)
     price = _to_optional_float(getattr(quote, "price", None))
+    amount = _to_optional_float(getattr(quote, "amount", None))
+    volume = _normalize_cn_volume_to_lots(stock_code, getattr(quote, "volume", None), amount, price)
     total_mv = _to_optional_float(getattr(quote, "total_mv", None))
     circ_mv = _to_optional_float(getattr(quote, "circ_mv", None))
     prev_close = _to_optional_float(getattr(quote, "pre_close", None))
@@ -437,8 +475,8 @@ def _build_quote_payload(quote: Any, fallback_code: str) -> Dict[str, Any]:
         "high": getattr(quote, "high", None),
         "low": getattr(quote, "low", None),
         "prev_close": prev_close,
-        "volume": getattr(quote, "volume", None),
-        "amount": getattr(quote, "amount", None),
+        "volume": volume,
+        "amount": amount,
         "after_hours_volume": after_hours_volume,
         "after_hours_amount": after_hours_amount,
         "volume_ratio": getattr(quote, "volume_ratio", None),
@@ -1062,16 +1100,25 @@ class StockService:
         return str(value)
 
     @staticmethod
-    def _build_kline_payload(df, period: str) -> List[Dict[str, Any]]:
+    def _build_kline_payload(df, period: str, stock_code: Optional[str] = None) -> List[Dict[str, Any]]:
         data: List[Dict[str, Any]] = []
         for _, row in df.iterrows():
+            close = _to_optional_float(row.get("close")) or 0.0
+            volume = _to_optional_float(row.get("volume"))
+            if volume is not None:
+                volume = _normalize_cn_volume_to_lots(
+                    stock_code or row.get("code"),
+                    volume,
+                    row.get("amount"),
+                    close,
+                )
             data.append({
                 "date": StockService._format_kline_date(row.get("date"), period),
                 "open": _to_optional_float(row.get("open")) or 0.0,
                 "high": _to_optional_float(row.get("high")) or 0.0,
                 "low": _to_optional_float(row.get("low")) or 0.0,
-                "close": _to_optional_float(row.get("close")) or 0.0,
-                "volume": _to_optional_float(row.get("volume")),
+                "close": close,
+                "volume": volume,
                 "after_hours_volume": _to_optional_float(row.get("after_hours_volume")),
                 "amount": _to_optional_float(row.get("amount")),
                 "change_percent": _to_optional_float(row.get("pct_chg")) or _to_optional_float(row.get("change_percent")),
@@ -1176,6 +1223,16 @@ class StockService:
             return 0
 
     @staticmethod
+    def _filter_intraday_frame_to_trade_date(df, trade_date: date):
+        if df is None or df.empty or "date" not in df.columns:
+            return df
+
+        import pandas as pd
+
+        parsed_dates = pd.to_datetime(df["date"], errors="coerce").dt.date
+        return df.loc[parsed_dates == trade_date].reset_index(drop=True)
+
+    @staticmethod
     def _resolve_realtime_daily_date(stock_code: str) -> Optional[date]:
         try:
             market = trading_calendar.get_market_for_stock(stock_code)
@@ -1220,6 +1277,20 @@ class StockService:
         return price is not None and price > 0
 
     @staticmethod
+    def _normalize_quote_payload_units(stock_code: str, quote_payload: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        if quote_payload is None:
+            return None
+        payload = dict(quote_payload)
+        price = _to_optional_float(payload.get("current_price"))
+        payload["volume"] = _normalize_cn_volume_to_lots(
+            stock_code,
+            payload.get("volume"),
+            payload.get("amount"),
+            price,
+        )
+        return payload
+
+    @staticmethod
     def _build_realtime_daily_row(
         quote_payload: Dict[str, Any],
         stock_code: str,
@@ -1248,7 +1319,12 @@ class StockService:
             "high": high_price,
             "low": low_price,
             "close": price,
-            "volume": _to_optional_float(quote_payload.get("volume")) or 0,
+            "volume": _normalize_cn_volume_to_lots(
+                stock_code,
+                quote_payload.get("volume"),
+                quote_payload.get("amount"),
+                price,
+            ) or 0,
             "after_hours_volume": _to_optional_float(quote_payload.get("after_hours_volume")),
             "amount": _to_optional_float(quote_payload.get("amount")) or 0,
             "pct_chg": change_percent if change_percent is not None else 0,
@@ -1272,6 +1348,7 @@ class StockService:
         quote_payload = self.get_realtime_quote(stock_code, data_policy=data_policy)
         if not self._quote_has_realtime_daily_signal(quote_payload):
             return df, quote_payload
+        quote_payload = self._normalize_quote_payload_units(stock_code, quote_payload)
 
         import pandas as pd
 
@@ -1469,10 +1546,11 @@ class StockService:
                         df, source = stale_cached_history
                         stock_name = self._get_local_stock_name(stock_code)
             else:
+                intraday_days = max(1, min(int(days or 1), 30))
                 intraday_trade_date = self._resolve_intraday_cache_target_date(stock_code)
                 hot_df = self.repo.db.get_intraday_minute_data(
                     stock_code,
-                    days=max(1, min(int(days or 1), 30)),
+                    days=intraday_days,
                     period=normalized_period,
                     trade_date=intraday_trade_date,
                 )
@@ -1486,7 +1564,7 @@ class StockService:
                     manager = DataFetcherManager()
                     intraday_kwargs: Dict[str, Any] = {
                         "period": normalized_period,
-                        "days": max(1, min(int(days or 1), 30)),
+                        "days": intraday_days,
                     }
                     try:
                         market = trading_calendar.get_market_for_stock(stock_code)
@@ -1499,6 +1577,19 @@ class StockService:
                         logger.debug("分钟K交易日锚定失败，按默认日期拉取: %s", calendar_error)
 
                     df, source = manager.get_intraday_data(stock_code, **intraday_kwargs)
+                    if intraday_days == 1 and df is not None and not df.empty:
+                        remote_row_count = len(df.index)
+                        df = self._filter_intraday_frame_to_trade_date(df, intraday_trade_date)
+                        if df is None or df.empty:
+                            logger.info(
+                                "忽略 %s 非目标交易日分钟数据: target=%s period=%s source=%s remote_rows=%s",
+                                stock_code,
+                                intraday_trade_date.isoformat(),
+                                normalized_period,
+                                source,
+                                remote_row_count,
+                            )
+                            source = "intraday_hot_table_miss"
                     if df is not None and not df.empty:
                         try:
                             self.repo.db.save_intraday_minute_dataframe(
@@ -1509,7 +1600,7 @@ class StockService:
                             )
                             refreshed_hot_df = self.repo.db.get_intraday_minute_data(
                                 stock_code,
-                                days=max(1, min(int(days or 1), 30)),
+                                days=intraday_days,
                                 period=normalized_period,
                                 trade_date=intraday_trade_date,
                             )
@@ -1520,7 +1611,10 @@ class StockService:
             
             if df is None or df.empty:
                 logger.warning(f"获取 {stock_code} 历史数据失败")
-                return {"stock_code": stock_code, "period": normalized_period, "data": []}
+                payload = {"stock_code": stock_code, "period": normalized_period, "data": []}
+                if normalized_period != "daily":
+                    payload["data_source"] = "intraday_hot_table_miss"
+                return payload
             
             # 获取股票名称
             if stock_name is None and manager is not None:
@@ -1544,7 +1638,7 @@ class StockService:
                     stock_name = quote_payload.get("stock_name")
             
             # 转换为响应格式
-            data = self._build_kline_payload(df, normalized_period)
+            data = self._build_kline_payload(df, normalized_period, stock_code)
             
             return {
                 "stock_code": stock_code,

@@ -1783,6 +1783,25 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
         `第 ${cycleIndex} 次实测完成：快照 ${result.snapshotId ?? 'unknown'}，命中股票 ${result.matchCount} 只，命中记录 ${nextRows.length} 条`,
         result.errors.length > 0 ? 'warning' : 'success',
       );
+      if (nextRows.length > 0) {
+        void rulesApi.notifyRunMatches(result.runId, {
+          executionTime: cycleExecutionTime,
+          ruleIds: resultRuleIds,
+          ruleNames: resultRuleNames,
+        }).then((notification) => {
+          if (liveTestSessionRef.current !== sessionId) return;
+          appendExecutionLog(
+            notification.sent
+              ? `第 ${cycleIndex} 次实测命中已推送通知：${notification.eventCount} 条`
+              : `第 ${cycleIndex} 次实测命中未推送通知：${notification.message}`,
+            notification.sent ? 'success' : 'warning',
+          );
+        }).catch((notifyError) => {
+          if (liveTestSessionRef.current !== sessionId) return;
+          const parsedNotifyError = getParsedApiError(notifyError);
+          appendExecutionLog(`第 ${cycleIndex} 次实测命中通知推送失败：${parsedNotifyError.message}`, 'warning');
+        });
+      }
       if (result.errors.length > 0) {
         appendExecutionLog(`本次实测存在部分错误：${result.errors.join('，')}`, 'warning');
       }

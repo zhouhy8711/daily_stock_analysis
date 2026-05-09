@@ -10,6 +10,8 @@ import type {
   RuleMatchItem,
   RuleMetricItem,
   RuleRunHistoryItem,
+  RuleRunNotifyPayload,
+  RuleRunNotifyResponse,
   RuleRunPayload,
   RuleRunResponse,
   RuleTargetScope,
@@ -284,6 +286,23 @@ export const rulesApi = {
 
   async deleteRun(runId: number): Promise<void> {
     await apiClient.delete(`/api/v1/rules/runs/${encodeURIComponent(String(runId))}`);
+  },
+
+  async notifyRunMatches(runId: number, payload?: RuleRunNotifyPayload): Promise<RuleRunNotifyResponse> {
+    const response = await apiClient.post<Record<string, unknown>>(
+      `/api/v1/rules/runs/${encodeURIComponent(String(runId))}/notify`,
+      {
+        execution_time: payload?.executionTime || undefined,
+        rule_ids: payload?.ruleIds || undefined,
+        rule_names: payload?.ruleNames || undefined,
+      },
+    );
+    return {
+      sent: toBoolean(response.data.sent),
+      message: toString(response.data.message),
+      matchCount: toNumber(response.data.match_count ?? response.data.matchCount),
+      eventCount: toNumber(response.data.event_count ?? response.data.eventCount),
+    };
   },
 
   async run(
