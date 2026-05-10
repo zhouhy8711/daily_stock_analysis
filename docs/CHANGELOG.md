@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 <!-- 新条目格式：- [类型] 描述（类型取值：新功能/改进/修复/文档/测试/chore）-->
+- [改进] Web 回测结果列表按命中日期倒序展示，同一天命中按股票 ID 正序排列
 - [修复] Web 规则历史回测改为异步后台执行，前端轮询已完成股票数并在全部完成后加载结果，避免长时间补齐日线时请求超时
 - [新功能] 新增 `tools/backfill_a_share_daily_history.py`，可按指定日期范围并发补齐全部 A 股缺失历史日线并写入 `stock_daily`
 - [修复] 指标分析页按成交额和价格校验 A 股分钟热表成交量单位，避免热表归档行以“股”口径撑大日 K 成交量图纵轴

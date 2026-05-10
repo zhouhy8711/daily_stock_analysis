@@ -531,6 +531,40 @@ function getRowExecutionTime(row: RuleRunEventRow): string {
   return row.executionTime || row.eventDate || '--';
 }
 
+function getResultRowDateSortValue(row: RuleRunEventRow): number | null {
+  const timestamp = Date.parse(row.eventDate);
+  return Number.isFinite(timestamp) ? timestamp : null;
+}
+
+function getStockIdSortKey(stockCode: string): string {
+  const normalized = stockCode.trim().toUpperCase();
+  const numericId = normalized.match(/\d+/)?.[0];
+  return numericId ? numericId.padStart(12, '0') : normalized;
+}
+
+function compareResultRows(left: RuleRunEventRow, right: RuleRunEventRow): number {
+  const leftDate = getResultRowDateSortValue(left);
+  const rightDate = getResultRowDateSortValue(right);
+  if (leftDate != null && rightDate != null && leftDate !== rightDate) {
+    return rightDate - leftDate;
+  }
+
+  const dateTextCompare = right.eventDate.localeCompare(left.eventDate);
+  if (dateTextCompare !== 0) return dateTextCompare;
+
+  const stockIdCompare = getStockIdSortKey(left.stockCode).localeCompare(getStockIdSortKey(right.stockCode));
+  if (stockIdCompare !== 0) return stockIdCompare;
+
+  const stockCodeCompare = left.stockCode.localeCompare(right.stockCode);
+  if (stockCodeCompare !== 0) return stockCodeCompare;
+
+  return left.id.localeCompare(right.id);
+}
+
+function sortResultRows(rows: RuleRunEventRow[]): RuleRunEventRow[] {
+  return [...rows].sort(compareResultRows);
+}
+
 function toDomId(value: string): string {
   return value.replace(/[^a-zA-Z0-9_-]/g, '-');
 }
@@ -754,7 +788,7 @@ function buildRuleResultGroups(
   const includedRuleIds = new Set<number>();
   const addGroup = (ruleId: number, rule?: RuleItem) => {
     if (includedRuleIds.has(ruleId)) return;
-    const groupRows = rowsByRule.get(ruleId) ?? [];
+    const groupRows = sortResultRows(rowsByRule.get(ruleId) ?? []);
     const resolvedRule = rule ?? allRules.find((item) => item.id === ruleId);
     const columns = resolvedRule
       ? buildResultValueColumns([resolvedRule], metrics)

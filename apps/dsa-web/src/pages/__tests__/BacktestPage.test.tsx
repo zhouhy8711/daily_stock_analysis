@@ -179,6 +179,19 @@ const secondMatches = [{
   explanation: '筹码集中度较低',
 }];
 
+function makeBacktestMatch(stockCode: string, stockName: string, dates: string[]) {
+  return {
+    ...matches[0],
+    stockCode,
+    stockName,
+    matchedDates: dates,
+    matchedEvents: dates.map((date) => ({
+      ...matches[0].matchedEvents[0],
+      date,
+    })),
+  };
+}
+
 function createDeferred<T>() {
   let resolve!: (value: T) => void;
   let reject!: (reason?: unknown) => void;
@@ -618,6 +631,41 @@ describe('BacktestPage', () => {
     expect(screen.getByText('2026-05-01')).toBeInTheDocument();
     expect(screen.getByText('2026-05-03')).toBeInTheDocument();
     expect(screen.getAllByText('300274.SZ').length).toBeGreaterThan(0);
+  });
+
+  it('sorts backtest result rows by date descending and stock id ascending', async () => {
+    vi.mocked(rulesApi.getRunMatches).mockResolvedValueOnce([
+      makeBacktestMatch('603375', '盛景微', ['2025-11-17', '2026-04-30']),
+      makeBacktestMatch('600126.SH', '杭钢股份', ['2026-03-12']),
+      makeBacktestMatch('000333.SZ', '美的集团', ['2025-11-17']),
+    ]);
+    vi.mocked(rulesApi.listRuns).mockResolvedValue([{
+      id: 13,
+      ruleId: 7,
+      ruleName: '放量观察',
+      status: 'completed',
+      targetCount: 3,
+      matchCount: 3,
+      eventCount: 4,
+      startedAt: '2026-05-03T09:30:00',
+      finishedAt: '2026-05-03T09:31:00',
+      durationMs: 1000,
+    }]);
+
+    render(<BacktestPage />);
+
+    const group = await screen.findByTestId('backtest-rule-group-7');
+    const rows = within(group).getAllByRole('row').slice(1);
+    expect(rows).toHaveLength(4);
+
+    expect(within(rows[0]).getByText('603375')).toBeInTheDocument();
+    expect(within(rows[0]).getByText('2026-04-30')).toBeInTheDocument();
+    expect(within(rows[1]).getByText('600126.SH')).toBeInTheDocument();
+    expect(within(rows[1]).getByText('2026-03-12')).toBeInTheDocument();
+    expect(within(rows[2]).getByText('000333.SZ')).toBeInTheDocument();
+    expect(within(rows[2]).getByText('2025-11-17')).toBeInTheDocument();
+    expect(within(rows[3]).getByText('603375')).toBeInTheDocument();
+    expect(within(rows[3]).getByText('2025-11-17')).toBeInTheDocument();
   });
 
   it('clears stale result rows when selecting a running persisted run', async () => {
