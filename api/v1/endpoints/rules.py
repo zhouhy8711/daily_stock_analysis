@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """Stock rule API endpoints."""
 
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, BackgroundTasks, HTTPException, status
 
 from api.v1.schemas.common import ErrorResponse
 from api.v1.schemas.rules import (
@@ -11,6 +11,7 @@ from api.v1.schemas.rules import (
     RuleListResponse,
     RuleMetricRegistryResponse,
     RuleRunHistoryResponse,
+    RuleRunHistoryItem,
     RuleRunMatchListResponse,
     RuleRunNotifyRequest,
     RuleRunNotifyResponse,
@@ -21,6 +22,11 @@ from api.v1.schemas.rules import (
 from src.services.rule_service import RuleService, RuleValidationError
 
 router = APIRouter()
+
+
+def _complete_async_rule_batch(context: dict) -> None:
+    service = RuleService()
+    service.complete_started_run_rules(**context)
 
 
 @router.get(
@@ -44,6 +50,20 @@ def list_rule_runs(limit: int = 30) -> RuleRunHistoryResponse:
     service = RuleService()
     bounded_limit = min(max(int(limit or 30), 1), 100)
     return RuleRunHistoryResponse(items=service.list_runs(limit=bounded_limit))
+
+
+@router.get(
+    "/runs/{run_id}",
+    response_model=RuleRunHistoryItem,
+    responses={404: {"description": "运行记录不存在", "model": ErrorResponse}},
+    summary="获取规则运行状态",
+)
+def get_rule_run(run_id: int) -> RuleRunHistoryItem:
+    service = RuleService()
+    run = service.get_run(run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail={"error": "not_found", "message": "运行记录不存在"})
+    return RuleRunHistoryItem(**run)
 
 
 @router.get(
@@ -145,6 +165,35 @@ def delete_rule(rule_id: int) -> None:
     service = RuleService()
     if not service.delete_rule(rule_id):
         raise HTTPException(status_code=404, detail={"error": "not_found", "message": "规则不存在"})
+
+
+@router.post(
+    "/run-batch/async",
+    response_model=RuleRunResponse,
+    responses={
+        400: {"description": "规则无效", "model": ErrorResponse},
+        404: {"description": "规则不存在", "model": ErrorResponse},
+    },
+    summary="异步批量运行规则",
+)
+def start_async_rule_run(payload: RuleBatchRunRequest, background_tasks: BackgroundTasks) -> RuleRunResponse:
+    service = RuleService()
+    try:
+        target = payload.target.model_dump() if payload.target is not None else None
+        response, context = service.start_run_rules(
+            payload.rule_ids,
+            mode=payload.mode,
+            target_override=target,
+            start_date=payload.start_date,
+            end_date=payload.end_date,
+            data_policy=payload.data_policy,
+        )
+        background_tasks.add_task(_complete_async_rule_batch, context)
+        return RuleRunResponse(**response)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail={"error": "not_found", "message": "规则不存在"}) from exc
+    except RuleValidationError as exc:
+        raise HTTPException(status_code=400, detail={"error": "invalid_rule", "message": str(exc)}) from exc
 
 
 @router.post(

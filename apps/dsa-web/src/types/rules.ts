@@ -1,7 +1,7 @@
 export type RuleTargetScope = 'watchlist' | 'all_a_shares' | 'custom';
 export type RulePeriod = 'daily';
 export type RuleRunMode = 'latest' | 'history';
-export type RuleDataPolicy = 'default' | 'snapshot_only';
+export type RuleDataPolicy = 'default' | 'snapshot_only' | 'cache_only' | 'db_only';
 export type RuleAggregateMethod = 'max' | 'min' | 'avg' | 'sum' | 'median' | 'std';
 export type RuleOperator =
   | '>'
@@ -123,6 +123,7 @@ export type RuleRunResponse = {
   ruleNames?: string[];
   status: string;
   targetCount: number;
+  completedCount?: number;
   matchCount: number;
   eventCount: number;
   mode: RuleRunMode | string;
@@ -173,6 +174,7 @@ export type RuleRunHistoryItem = {
   ruleNames?: string[];
   status: string;
   targetCount: number;
+  completedCount?: number;
   matchCount: number;
   eventCount?: number;
   error?: string | null;

@@ -1931,6 +1931,7 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
     const runStartedAt = new Date().toISOString();
     appendExecutionLog(`开始回测：${selectedRuleIds.length} 条规则，${targetCodes.length} 只股票，时间范围 ${startDate || '不限'} 至 ${endDate || '不限'}`);
     let currentTemporaryRunId: number | null = null;
+    let keepRunningAfterRequest = false;
     try {
       const temporaryRunId = -Date.now();
       currentTemporaryRunId = temporaryRunId;
@@ -1954,21 +1955,10 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
       setRunHistory((current) => [temporaryRun, ...current]);
       updateRunProgress(temporaryRunId, 8, '已加入执行队列');
       appendExecutionLog(`已加入执行队列：${selectedRuleIds.length} 条规则`);
-      updateRunProgress(temporaryRunId, 20, '请求后端执行');
-      const backendModeText = selectedRuleIds.length > 1 ? '后端并行执行' : '后端执行';
-      appendExecutionLog(`正在请求${backendModeText}，扫描 ${targetCodes.length} 只股票，${selectedRuleIds.length} 条规则`);
+      updateRunProgress(temporaryRunId, 12, '请求后端启动后台任务');
+      appendExecutionLog(`正在启动后台回测任务，扫描 ${targetCodes.length} 只股票，${selectedRuleIds.length} 条规则`);
       clearRunHeartbeat();
-      const heartbeatStartedAt = Date.now();
-      let heartbeatTick = 0;
-      runHeartbeatRef.current = window.setInterval(() => {
-        heartbeatTick += 1;
-        const elapsedSeconds = Math.max(1, Math.floor((Date.now() - heartbeatStartedAt) / 1000));
-        const nextProgress = Math.min(80, 32 + heartbeatTick * 6);
-        updateRunProgress(temporaryRunId, nextProgress, `${backendModeText}中，已等待 ${elapsedSeconds} 秒`);
-        appendExecutionLog(`${backendModeText}中：已等待 ${elapsedSeconds} 秒，结果返回后会自动切换`);
-      }, 5000);
-
-      const result = await rulesApi.runBatch({
+      const startedRun = await rulesApi.runBatchAsync({
         ruleIds: selectedRuleIds,
         mode: 'history',
         target: {
@@ -1978,52 +1968,125 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
         startDate,
         endDate,
       });
-      clearRunHeartbeat();
-      updateRunProgress(temporaryRunId, 82, '后端已返回结果');
-      appendExecutionLog(`后端返回：命中股票 ${result.matchCount} 只，命中记录 ${result.eventCount} 条`);
-      if (result.errors.length > 0) {
-        appendExecutionLog(`本次回测存在部分错误：${result.errors.join('，')}`, 'warning');
-      }
-      const now = new Date().toISOString();
-      const resultRuleIds = result.ruleIds && result.ruleIds.length > 0 ? result.ruleIds : selectedRuleIds;
-      const resultRuleNames = result.ruleNames && result.ruleNames.length > 0 ? result.ruleNames : runRuleNames;
+
+      const runId = startedRun.runId;
+      const resultRuleIds = startedRun.ruleIds && startedRun.ruleIds.length > 0 ? startedRun.ruleIds : selectedRuleIds;
+      const resultRuleNames = startedRun.ruleNames && startedRun.ruleNames.length > 0 ? startedRun.ruleNames : runRuleNames;
       const resultRuleName = resultRuleIds.length > 1 ? `多规则回测（${resultRuleIds.length} 条）` : resultRuleNames[0] ?? null;
-      const nextRows = flattenMatches(result.matches, {
-        runId: result.runId,
-        ruleId: result.ruleId,
-        ruleName: resultRuleName,
-      });
-      const runMeta: RuleRunHistoryItem = {
-        id: result.runId,
-        runIds: [result.runId],
-        ruleId: result.ruleId,
+      const totalCount = Math.max(0, startedRun.targetCount || targetCodes.length);
+      const runningRun: RuleRunHistoryItem = {
+        id: runId,
+        runIds: [runId],
+        ruleId: startedRun.ruleId,
         ruleIds: resultRuleIds,
         ruleName: resultRuleName,
         ruleNames: resultRuleNames,
-        status: result.status,
-        targetCount: result.targetCount,
-        matchCount: result.matchCount,
-        eventCount: result.eventCount || nextRows.length,
-        error: result.errors.length > 0 ? result.errors.join('；') : null,
-        startedAt: now,
-        finishedAt: now,
-        durationMs: result.durationMs,
+        status: 'running',
+        targetCount: totalCount,
+        completedCount: startedRun.completedCount || 0,
+        matchCount: 0,
+        eventCount: 0,
+        error: null,
+        startedAt: runStartedAt,
+        finishedAt: null,
+        durationMs: null,
       };
-      setSelectedRun(runMeta);
-      setDisplayRows(nextRows);
-      setRunHistory((current) => current.map((item) => (item.id === temporaryRunId ? runMeta : item)));
+      setSelectedRun(runningRun);
+      setRunHistory((current) => current.map((item) => (item.id === temporaryRunId ? runningRun : item)));
       setRunProgressById((current) => {
         const next = { ...current };
         delete next[temporaryRunId];
-        next[result.runId] = { progress: 100, stage: '执行完成' };
+        next[runId] = { progress: 0, stage: `执行完成 0/${totalCount}` };
         return next;
       });
       currentTemporaryRunId = null;
-      setRules(await rulesApi.list());
-      setRunWarning(result.errors.length > 0 ? result.errors.join('；') : null);
-      appendExecutionLog(`本次回测完成：共 ${nextRows.length} 条命中记录`, result.errors.length > 0 ? 'warning' : 'success');
-      setActiveResultTab('results');
+      keepRunningAfterRequest = true;
+      appendExecutionLog(`#${runId} 后台回测已启动：执行完成 0/${totalCount}`);
       setPageError(null);
+
+      let pollInFlight = false;
+      let pollingFinished = false;
+      let lastCompletedCount = -1;
+      const pollRun = async () => {
+        if (pollInFlight || pollingFinished) return;
+        pollInFlight = true;
+        try {
+          const run = await rulesApi.getRun(runId);
+          const nextTotal = Math.max(0, run.targetCount || totalCount);
+          const completed = Math.min(nextTotal, Math.max(0, run.completedCount || 0));
+          const isStillRunning = run.status === 'running';
+          const progress = nextTotal > 0
+            ? Math.min(isStillRunning ? 99 : 100, Math.round((completed / nextTotal) * 100))
+            : isStillRunning ? 50 : 100;
+          const stage = isStillRunning ? `执行完成 ${completed}/${nextTotal}` : `执行完成 ${nextTotal}/${nextTotal}`;
+          updateRunProgress(runId, progress, stage);
+          const nextRun: RuleRunHistoryItem = {
+            ...runningRun,
+            ...run,
+            runIds: [runId],
+            ruleIds: run.ruleIds && run.ruleIds.length > 0 ? run.ruleIds : resultRuleIds,
+            ruleNames: run.ruleNames && run.ruleNames.length > 0 ? run.ruleNames : resultRuleNames,
+            ruleName: run.ruleName ?? resultRuleName,
+            completedCount: completed,
+            targetCount: nextTotal,
+          };
+          setSelectedRun(nextRun);
+          setRunHistory((current) => current.map((item) => (item.id === runId ? nextRun : item)));
+          if (completed !== lastCompletedCount) {
+            lastCompletedCount = completed;
+            appendExecutionLog(`#${runId} ${stage}`);
+          }
+          if (isStillRunning) return;
+
+          updateRunProgress(runId, 100, stage);
+          if (run.status === 'failed') {
+            pollingFinished = true;
+            clearRunHeartbeat();
+            const failureMessage = run.error || '回测执行失败';
+            setRunError(getParsedApiError(new Error(failureMessage)));
+            setRunWarning(null);
+            appendExecutionLog(`#${runId} 回测失败：${failureMessage}`, 'error');
+            setActiveResultTab('logs');
+            setIsRunning(false);
+            return;
+          }
+
+          const matches = await rulesApi.getRunMatches(runId);
+          const nextRows = flattenMatches(matches, {
+            runId,
+            ruleId: nextRun.ruleId,
+            ruleName: nextRun.ruleName,
+          });
+          const finalRun = {
+            ...nextRun,
+            eventCount: nextRows.length,
+            matchCount: nextRun.matchCount,
+          };
+          setSelectedRun(finalRun);
+          setDisplayRows(nextRows);
+          setRunHistory((current) => current.map((item) => (item.id === runId ? finalRun : item)));
+          setRules(await rulesApi.list());
+          setRunWarning(run.error || null);
+          pollingFinished = true;
+          clearRunHeartbeat();
+          appendExecutionLog(
+            `#${runId} 本次回测完成：共 ${nextRows.length} 条命中记录`,
+            run.status === 'partial' || run.error ? 'warning' : 'success',
+          );
+          setActiveResultTab('results');
+          setIsRunning(false);
+        } catch (pollError) {
+          const parsedPollError = getParsedApiError(pollError);
+          appendExecutionLog(`读取 #${runId} 进度失败，将继续重试：${parsedPollError.message}`, 'warning');
+        } finally {
+          pollInFlight = false;
+        }
+      };
+
+      void pollRun();
+      runHeartbeatRef.current = window.setInterval(() => {
+        void pollRun();
+      }, 5000);
     } catch (err) {
       clearRunHeartbeat();
       const parsedError = getParsedApiError(err);
@@ -2055,8 +2118,10 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
       setActiveResultTab('logs');
       setRunError(parsedError);
     } finally {
-      clearRunHeartbeat();
-      setIsRunning(false);
+      if (!keepRunningAfterRequest) {
+        clearRunHeartbeat();
+        setIsRunning(false);
+      }
     }
   };
 
@@ -2459,11 +2524,15 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
                           {formatRunStatus(run.status)}
                         </Badge>
                       </div>
-                      <div className="mt-2 grid grid-cols-2 gap-1 text-xs text-secondary-text">
-                        <span>扫描 {run.targetCount}</span>
-                        <span>命中记录 {getRunHistoryEventCount(run)}</span>
-                        <span className="col-span-2 font-mono text-muted-text">{formatDateTime(run.startedAt)}</span>
-                      </div>
+	                      <div className="mt-2 grid grid-cols-2 gap-1 text-xs text-secondary-text">
+	                        <span>扫描 {run.targetCount}</span>
+	                        <span>
+	                          {run.status === 'running'
+	                            ? `完成 ${Math.min(run.completedCount || 0, run.targetCount)}/${run.targetCount}`
+	                            : `命中记录 ${getRunHistoryEventCount(run)}`}
+	                        </span>
+	                        <span className="col-span-2 font-mono text-muted-text">{formatDateTime(run.startedAt)}</span>
+	                      </div>
                       {progressState ? (
                         <div className="mt-3">
                           <div className="flex items-center justify-between gap-2 text-[11px] text-muted-text">

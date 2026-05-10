@@ -88,8 +88,20 @@ ENABLE_REALTIME_QUOTE=false
 - 修改 `.env` 后需要重启 API 进程，后台预热线程才会按新配置启动。
 - Web 系统设置页目前可编辑 `REALTIME_QUOTE_CACHE_SECONDS`，并显示当前进程内实时行情缓存内存占用。
 - `REALTIME_QUOTE_CACHE_SECONDS` 调大不会改变后台 60 秒预热频率，只会延长请求路径对进程内 quote 和全市场 DataFrame 的复用时间。
-- 默认 quote 请求顺序为：最新预热快照、短缓存、远程实时源；`snapshot_only` 和 `cache_only` 不会触发远程实时行情请求。
+- 默认 quote 请求顺序为：最新预热快照、短缓存、远程实时源；`snapshot_only`、`cache_only` 和 `db_only` 不会触发远程实时行情请求。
 - 指标大盘的 1m / 分时 K 线优先读 `stock_intraday_minute`；`cache_only` 缺热表数据时返回空结果，默认策略或页面按需预热会回源拉取同周期分钟 K 并写回热表，不会降级展示日 K。
+
+## 历史日线补齐
+
+可用 `tools/backfill_a_share_daily_history.py` 批量补齐全部活跃 A 股在指定时间范围内的历史日线，并写入 SQLite `stock_daily` 表：
+
+```bash
+python tools/backfill_a_share_daily_history.py --start-date 2025-01-01 --end-date 2025-12-31
+python tools/backfill_a_share_daily_history.py --start-date 2025-01-01 --end-date 2025-12-31 --parallelism 20
+python tools/backfill_a_share_daily_history.py --start-date 2025-01-01 --end-date 2025-12-31 --fetcher baostock
+```
+
+脚本会先读取 A 股交易日历，再按 `stock_daily(code,date)` 判断每只股票在目标交易日内已有的数据；只有缺失的交易日会被合并成连续区间回源拉取，已有日期不会重复写入。`--parallelism` 控制并发抓取股票数，默认 `10`。股票范围默认来自 `stocks.index.json` 中活跃 A 股，也可通过 `--codes 600519,000001` 做小范围补齐。默认 `--fetcher manager` 使用系统数据源 fallback 链；如果当前网络下东方财富类接口不可用，可用 `--fetcher baostock` 直连 Baostock 补数，避免继续探测不适用的兜底源。
 
 ## 数据诊断
 

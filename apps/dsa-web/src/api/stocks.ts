@@ -32,7 +32,7 @@ export type KLineData = {
 };
 
 export type KLinePeriod = 'daily' | '1m' | '5m' | '15m' | '30m' | '60m';
-export type StockDataPolicy = 'default' | 'cache_only' | 'snapshot_only';
+export type StockDataPolicy = 'default' | 'cache_only' | 'snapshot_only' | 'db_only';
 
 export type StockHistoryResponse = {
   stockCode: string;

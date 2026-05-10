@@ -258,7 +258,7 @@ async def parse_import(request: Request) -> ExtractFromImageResponse:
 )
 def get_stock_quotes(
     payload: StockQuotesRequest,
-    data_policy: str = Query("default", description="数据策略: default/cache_only/snapshot_only"),
+    data_policy: str = Query("default", description="数据策略: default/cache_only/snapshot_only/db_only"),
 ) -> StockQuotesResponse:
     stock_codes = list(dict.fromkeys(code.strip() for code in payload.stock_codes if code and code.strip()))
     if not stock_codes:
@@ -393,7 +393,7 @@ def get_stock_news(
 )
 def get_stock_quote(
     stock_code: str,
-    data_policy: str = Query("default", description="数据策略: default/cache_only/snapshot_only"),
+    data_policy: str = Query("default", description="数据策略: default/cache_only/snapshot_only/db_only"),
 ) -> StockQuote:
     """
     获取股票实时行情
@@ -517,7 +517,7 @@ def get_stock_history(
     stock_code: str,
     period: str = Query("daily", description="K 线周期: daily/1m/5m/15m/30m/60m", pattern=KLINE_PERIOD_PATTERN),
     days: int = Query(30, ge=1, le=365, description="获取天数"),
-    data_policy: str = Query("default", description="数据策略: default/cache_only/snapshot_only"),
+    data_policy: str = Query("default", description="数据策略: default/cache_only/snapshot_only/db_only"),
 ) -> StockHistoryResponse:
     """
     获取股票历史行情

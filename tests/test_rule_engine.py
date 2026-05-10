@@ -440,6 +440,27 @@ class _FakeMultiRuleRepo(_FakeRuleRepo):
         return self.rules.get(rule_id)
 
 
+class _ProgressRuleRepo(_FakeMultiRuleRepo):
+    def __init__(self, rules):
+        super().__init__(rules)
+        self.progress_updates = []
+        self.finished_status = None
+
+    def create_run(self, rule_id, target_count, error=None):
+        self.created_error = error
+        self.created_target_count = target_count
+        return 202
+
+    def update_run_progress(self, **kwargs):
+        self.progress_updates.append(kwargs)
+
+    def finish_run(self, **kwargs):
+        self.finished_status = kwargs["status"]
+        self.finished_error = kwargs.get("error")
+        self.finished_matches = kwargs["matches"]
+        return len(kwargs["matches"]), 34
+
+
 class _FakeStockService:
     def get_history_data(self, stock_code, period="daily", days=30):
         return {
@@ -549,6 +570,15 @@ class _SnapshotMissingStockService(_FakeStockService):
 
     def get_realtime_quote(self, stock_code, data_policy="default"):
         return None
+
+
+class _PolicyRecordingStockService(_FakeStockService):
+    def __init__(self):
+        self.history_policies = []
+
+    def get_history_data(self, stock_code, period="daily", days=30, data_policy="default"):
+        self.history_policies.append(data_policy)
+        return super().get_history_data(stock_code, period=period, days=days)
 
 
 class _NotifyRuleRepo:
@@ -668,6 +698,50 @@ def test_rule_service_run_rules_treats_snapshot_cache_miss_as_empty_result():
     assert result["matches"] == []
     assert result["errors"] == []
     assert repo.finished_matches == []
+
+
+def test_rule_service_history_mode_uses_default_data_policy_for_backfill():
+    stock_service = _PolicyRecordingStockService()
+    service = RuleService(repo=_FakeRuleRepo(_service_rule_for_run_mode()), stock_service=stock_service)
+
+    result = service.run_rule(1, mode="history")
+
+    assert result["status"] == "completed"
+    assert stock_service.history_policies == ["default"]
+
+
+def test_rule_service_history_db_only_cache_miss_is_empty_result():
+    repo = _FakeRuleRepo(_service_rule_for_run_mode())
+    service = RuleService(repo=repo, stock_service=_SnapshotMissingStockService())
+    service._resolve_run_workers = lambda target_count: 1
+
+    result = service.run_rule(1, mode="history", data_policy="db_only")
+
+    assert result["status"] == "completed"
+    assert result["matches"] == []
+    assert result["errors"] == []
+    assert repo.finished_matches == []
+
+
+def test_rule_service_async_batch_updates_completed_stock_progress():
+    first_rule = _service_rule_for_codes(["600519", "000001"])
+    second_rule = {**_service_rule_for_codes(["600519", "000001"]), "id": 2, "name": "第二条规则"}
+    repo = _ProgressRuleRepo([first_rule, second_rule])
+    service = RuleService(repo=repo, stock_service=_FakeStockService())
+    service._resolve_run_workers = lambda target_count: 1
+
+    response, context = service.start_run_rules(
+        [1, 2],
+        mode="history",
+        target_override={"scope": "custom", "stock_codes": ["600519", "000001"]},
+    )
+    service.complete_started_run_rules(**context)
+
+    assert response["status"] == "running"
+    assert response["target_count"] == 2
+    assert [item["completed_count"] for item in repo.progress_updates] == [1, 2]
+    assert repo.finished_status == "completed"
+    assert len(repo.finished_matches) == 4
 
 
 def test_rule_service_notify_live_matches_sends_configured_notifications():

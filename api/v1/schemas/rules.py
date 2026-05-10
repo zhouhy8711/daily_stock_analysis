@@ -70,7 +70,7 @@ class RuleRunRequest(BaseModel):
     target: Optional[RuleTarget] = Field(None, description="Optional runtime target override")
     start_date: Optional[date] = Field(None, description="Optional backtest start date")
     end_date: Optional[date] = Field(None, description="Optional backtest end date")
-    data_policy: str = Field("default", description="default/snapshot_only")
+    data_policy: str = Field("default", description="default/snapshot_only/cache_only/db_only")
 
 
 class RuleBatchRunRequest(RuleRunRequest):
@@ -98,6 +98,7 @@ class RuleRunHistoryItem(BaseModel):
     rule_names: List[str] = Field(default_factory=list)
     status: str
     target_count: int = 0
+    completed_count: int = 0
     match_count: int = 0
     event_count: int = 0
     error: Optional[str] = None
@@ -163,6 +164,7 @@ class RuleRunResponse(BaseModel):
     rule_names: List[str] = Field(default_factory=list)
     status: str
     target_count: int
+    completed_count: int = 0
     match_count: int
     event_count: int = 0
     mode: str = "history"

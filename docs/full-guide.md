@@ -1082,13 +1082,14 @@ FastAPI 提供 RESTful API 服务，支持配置管理和触发分析。
 | `/api/v1/analysis/tasks/stream` | GET (SSE) | 订阅任务实时状态流 |
 | `/api/v1/analysis/status/{task_id}` | GET | 查询任务状态 |
 | `/api/v1/history` | GET | 查询分析历史 |
-| `/api/v1/stocks/{code}/history?period=1m` | GET | 获取 K 线数据，`period` 支持 `daily`、`1m`、`5m`、`15m`、`30m`、`60m`；日线历史优先读取 DB，不足时回源补齐并写回 DB，交易日当天渲染会追加实时行情缓存生成的虚拟日线点，分钟 K 当前交易日最后一根会用实时最新价校准；A 股分钟K在东方财富不可用时回退腾讯当日分时并本地聚合，美股分钟K优先使用 CNBC 多日 OHLCV，在 YFinance 限流或 CNBC 不可用时回退 Nasdaq 当日 chart 价格序列 |
+| `/api/v1/stocks/{code}/history?period=1m` | GET | 获取 K 线数据，`period` 支持 `daily`、`1m`、`5m`、`15m`、`30m`、`60m`；日线历史优先读取 DB，不足时回源补齐并写回 DB，交易日当天渲染会追加实时行情缓存生成的虚拟日线点，分钟 K 当前交易日最后一根会用实时最新价校准；`data_policy=db_only` 时只读 DB 且不追加实时点；A 股分钟K在东方财富不可用时回退腾讯当日分时并本地聚合，美股分钟K优先使用 CNBC 多日 OHLCV，在 YFinance 限流或 CNBC 不可用时回退 Nasdaq 当日 chart 价格序列 |
 | `/api/v1/backtest/run` | POST | 触发回测 |
 | `/api/v1/backtest/results` | GET | 查询回测结果（分页） |
 | `/api/v1/backtest/performance` | GET | 获取整体回测表现 |
 | `/api/v1/backtest/performance/{code}` | GET | 获取单股回测表现 |
 | `/api/v1/rules/{rule_id}/run` | POST | 运行单条规则历史扫描 |
-| `/api/v1/rules/run-batch` | POST | 将多条规则作为一次回测运行，历史中保存为单条记录，结果按规则分组 |
+| `/api/v1/rules/run-batch` | POST | 同步批量运行规则 |
+| `/api/v1/rules/run-batch/async` | POST | 异步批量运行规则；Web 回测使用该接口启动后台任务，执行中可轮询已完成股票数 / 总股票数，全部完成后再读取命中结果 |
 | `/api/v1/agent/skill-output/{filename}` | GET | 查看自定义 Codex skill 后台任务生成的 Markdown 结果 |
 | `/api/v1/stocks/extract-from-image` | POST | 从图片提取股票代码（multipart，超时 60s） |
 | `/api/v1/stocks/parse-import` | POST | 解析 CSV/Excel/剪贴板（multipart file 或 JSON `{"text":"..."}`，文件≤2MB，文本≤100KB） |

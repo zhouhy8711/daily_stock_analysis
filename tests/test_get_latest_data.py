@@ -422,6 +422,48 @@ class GetLatestDataTestCase(unittest.TestCase):
         self.assertAlmostEqual(rows[0].close, 123.45, places=6)
         self.assertEqual(rows[0].data_source, "FakeDailyFetcher")
 
+    def test_daily_history_db_only_uses_partial_merged_db_rows_without_remote(self) -> None:
+        first_date = date.today() - timedelta(days=5)
+        second_date = date.today() - timedelta(days=4)
+        self.db.save_daily_data(pd.DataFrame([{
+            "date": first_date,
+            "open": 100.0,
+            "high": 101.0,
+            "low": 99.0,
+            "close": 100.5,
+            "volume": 1000000,
+            "amount": 100500000,
+            "pct_chg": 0.5,
+        }]), "600519", data_source="TestData")
+        self.db.save_daily_data(pd.DataFrame([{
+            "date": second_date,
+            "open": 101.0,
+            "high": 102.0,
+            "low": 100.0,
+            "close": 101.5,
+            "volume": 1100000,
+            "amount": 111650000,
+            "pct_chg": 1.0,
+        }]), "600519.SH", data_source="TestData")
+
+        with (
+            patch(
+                "data_provider.base.DataFetcherManager",
+                side_effect=AssertionError("db_only must not fetch remotely"),
+            ),
+            patch(
+                "src.services.stock_service.StockService._augment_daily_history_with_realtime",
+                side_effect=AssertionError("db_only must not append realtime quotes"),
+            ),
+        ):
+            result = StockService().get_history_data("600519", period="daily", days=20, data_policy="db_only")
+
+        self.assertEqual(result["data_source"], "db_cache")
+        self.assertEqual([item["date"] for item in result["data"]], [
+            first_date.isoformat(),
+            second_date.isoformat(),
+        ])
+
     def test_realtime_quote_does_not_write_daily_history_cache(self) -> None:
         with patch("data_provider.base.DataFetcherManager", return_value=_FakeRealtimeQuoteManager()):
             result = StockService().get_realtime_quote("600519")

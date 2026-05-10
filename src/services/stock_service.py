@@ -535,13 +535,13 @@ class StockService:
             snapshot_payload = _get_snapshot_payload(normalized_code)
             if snapshot_payload is not None:
                 return snapshot_payload
-            if normalized_policy == "snapshot_only":
+            if normalized_policy in {"snapshot_only", "db_only"}:
                 return None
 
             cached_payload = _get_cached_quote_payload(normalized_code)
             if cached_payload is not None:
                 return cached_payload
-            if normalized_policy == "cache_only":
+            if normalized_policy in {"cache_only", "db_only"}:
                 return None
             
             manager = DataFetcherManager()
@@ -603,7 +603,7 @@ class StockService:
                 if snapshot_payload is not None:
                     cached_by_code[normalized] = snapshot_payload
                     continue
-                if normalized_policy == "snapshot_only":
+                if normalized_policy in {"snapshot_only", "db_only"}:
                     missing_for_fetch.append(normalized)
                     continue
                 cached_payload = None if force_refresh else _get_cached_quote_payload(normalized)
@@ -612,7 +612,7 @@ class StockService:
                 else:
                     cached_by_code[normalized] = cached_payload
 
-            if normalized_policy in {"snapshot_only", "cache_only"}:
+            if normalized_policy in {"snapshot_only", "cache_only", "db_only"}:
                 found_codes = {
                     normalize_stock_code(str(item.get("stock_code") or ""))
                     for item in cached_by_code.values()
@@ -1158,16 +1158,46 @@ class StockService:
             return datetime.now().date() - timedelta(days=1)
 
     def _get_daily_cache_latest_date(self, stock_code: str) -> Optional[date]:
-        from data_provider.base import normalize_stock_code
-
-        candidates = list(dict.fromkeys([stock_code, normalize_stock_code(stock_code)]))
         latest_date: Optional[date] = None
-        for candidate in candidates:
+        for candidate in self._daily_cache_code_candidates(stock_code):
             for bar in self.repo.get_latest(candidate, days=1):
                 bar_date = self._normalize_daily_cache_date(getattr(bar, "date", None))
                 if bar_date and (latest_date is None or bar_date > latest_date):
                     latest_date = bar_date
         return latest_date
+
+    @staticmethod
+    def _daily_cache_code_candidates(stock_code: str) -> List[str]:
+        from data_provider.base import normalize_stock_code
+
+        raw_code = str(stock_code or "").strip()
+        normalized_code = normalize_stock_code(raw_code) if raw_code else ""
+        candidates = [raw_code, normalized_code]
+        upper_code = raw_code.upper()
+        has_exchange_hint = (
+            upper_code.startswith(("SH", "SZ", "BJ"))
+            or upper_code.endswith((".SH", ".SS", ".SZ", ".BJ"))
+        )
+        if normalized_code.isdigit() and len(normalized_code) == 6:
+            hinted_suffix = None
+            if upper_code.startswith(("SH", "SZ", "BJ")):
+                hinted_suffix = upper_code[:2]
+            elif upper_code.endswith((".SH", ".SS")):
+                hinted_suffix = "SH"
+            elif upper_code.endswith(".SZ"):
+                hinted_suffix = "SZ"
+            elif upper_code.endswith(".BJ"):
+                hinted_suffix = "BJ"
+            if hinted_suffix:
+                candidates.append(f"{normalized_code}.{hinted_suffix}")
+            elif not has_exchange_hint:
+                if normalized_code.startswith(("5", "6")):
+                    candidates.append(f"{normalized_code}.SH")
+                elif normalized_code.startswith(("0", "2", "3", "15", "16", "18")):
+                    candidates.append(f"{normalized_code}.SZ")
+                elif normalized_code.startswith(("8", "9")):
+                    candidates.append(f"{normalized_code}.BJ")
+        return list(dict.fromkeys(code for code in candidates if code))
 
     def _load_daily_history_from_db(
         self,
@@ -1176,8 +1206,8 @@ class StockService:
         *,
         require_fresh: bool = True,
         end_date: Optional[date] = None,
+        allow_partial: bool = False,
     ):
-        from data_provider.base import normalize_stock_code
         import pandas as pd
 
         requested_days = max(1, int(days or 1))
@@ -1187,7 +1217,38 @@ class StockService:
         query_end_date = target_date or datetime.now().date()
         start_date = query_end_date - timedelta(days=int(requested_days * 1.8) + 10)
         required_rows = requested_days if require_fresh else 1
-        candidates = list(dict.fromkeys([stock_code, normalize_stock_code(stock_code)]))
+        candidates = self._daily_cache_code_candidates(stock_code)
+
+        if allow_partial:
+            merged_bars: Dict[date, Any] = {}
+            for candidate in candidates:
+                for bar in self.repo.get_range(candidate, start_date, query_end_date):
+                    bar_date = self._normalize_daily_cache_date(getattr(bar, "date", None))
+                    if not bar_date:
+                        continue
+                    if bar_date not in merged_bars or candidate == stock_code:
+                        merged_bars[bar_date] = bar
+            if merged_bars:
+                selected_bars = [
+                    merged_bars[bar_date]
+                    for bar_date in sorted(merged_bars.keys())[-requested_days:]
+                ]
+                latest_cached_date = (
+                    self._normalize_daily_cache_date(getattr(selected_bars[-1], "date", None))
+                    if selected_bars else None
+                )
+                if require_fresh and target_date and latest_cached_date and latest_cached_date < target_date:
+                    logger.info(
+                        "日线缓存过期，刷新 %s: cache_latest=%s target=%s",
+                        stock_code,
+                        latest_cached_date.isoformat(),
+                        target_date.isoformat(),
+                    )
+                    return None
+                df = pd.DataFrame([bar.to_dict() for bar in selected_bars])
+                if not df.empty:
+                    return df, "db_cache"
+            return None
 
         for candidate in candidates:
             bars = self.repo.get_range(candidate, start_date, query_end_date)
@@ -1458,15 +1519,26 @@ class StockService:
             manager = None
             stock_name = None
             normalized_policy = str(data_policy or "default").strip().lower()
-            cache_only = normalized_policy in {"cache_only", "snapshot_only"}
+            cache_only = normalized_policy in {"cache_only", "snapshot_only", "db_only"}
+            db_only = normalized_policy == "db_only"
             if normalized_period == "daily":
-                cached_history = self._load_daily_history_from_db(stock_code, days)
+                cached_history = self._load_daily_history_from_db(
+                    stock_code,
+                    days,
+                    require_fresh=not db_only,
+                    allow_partial=db_only,
+                )
                 if cached_history is not None:
                     df, source = cached_history
                     stock_name = self._get_local_stock_name(stock_code)
                 elif cache_only:
-                    logger.info("日线缓存未命中，cache_only 跳过远程获取: %s", stock_code)
-                    return {"stock_code": stock_code, "period": normalized_period, "data": [], "data_source": "daily_cache_miss"}
+                    logger.info("日线缓存未命中，%s 跳过远程获取: %s", normalized_policy, stock_code)
+                    return {
+                        "stock_code": stock_code,
+                        "period": normalized_period,
+                        "data": [],
+                        "data_source": "daily_cache_miss",
+                    }
                 else:
                     target_date = self._resolve_daily_cache_target_date(stock_code)
                     latest_cached_date = self._get_daily_cache_latest_date(stock_code)
@@ -1620,20 +1692,23 @@ class StockService:
             if stock_name is None and manager is not None:
                 stock_name = manager.get_stock_name(stock_code)
 
+            quote_payload = None
             if normalized_period == "daily":
-                df, quote_payload = self._augment_daily_history_with_realtime(
-                    df,
-                    stock_code,
-                    data_policy="snapshot_only" if cache_only else "default",
-                )
+                if not db_only:
+                    df, quote_payload = self._augment_daily_history_with_realtime(
+                        df,
+                        stock_code,
+                        data_policy="snapshot_only" if cache_only else "default",
+                    )
                 if stock_name is None and quote_payload:
                     stock_name = quote_payload.get("stock_name")
             else:
-                df, quote_payload = self._augment_intraday_history_with_realtime(
-                    df,
-                    stock_code,
-                    data_policy="snapshot_only" if cache_only else "default",
-                )
+                if not db_only:
+                    df, quote_payload = self._augment_intraday_history_with_realtime(
+                        df,
+                        stock_code,
+                        data_policy="snapshot_only" if cache_only else "default",
+                    )
                 if stock_name is None and quote_payload:
                     stock_name = quote_payload.get("stock_name")
             

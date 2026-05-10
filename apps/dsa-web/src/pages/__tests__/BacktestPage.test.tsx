@@ -214,11 +214,13 @@ vi.mock('../../api/rules', () => ({
     getMetrics: vi.fn(),
     list: vi.fn(),
     listRuns: vi.fn(),
+    getRun: vi.fn(),
     getRunMatches: vi.fn(),
     deleteRun: vi.fn(),
     notifyRunMatches: vi.fn(),
     run: vi.fn(),
     runBatch: vi.fn(),
+    runBatchAsync: vi.fn(),
   },
 }));
 
@@ -283,6 +285,37 @@ describe('BacktestPage', () => {
       durationMs: 20,
       matches,
       errors: [],
+    });
+    vi.mocked(rulesApi.runBatchAsync).mockResolvedValue({
+      runId: 12,
+      ruleId: 7,
+      ruleIds: [7],
+      ruleNames: ['放量观察'],
+      status: 'running',
+      targetCount: 2,
+      completedCount: 0,
+      matchCount: 0,
+      eventCount: 0,
+      mode: 'history',
+      durationMs: 0,
+      matches: [],
+      errors: [],
+    });
+    vi.mocked(rulesApi.getRun).mockResolvedValue({
+      id: 12,
+      runIds: [12],
+      ruleId: 7,
+      ruleIds: [7],
+      ruleName: '放量观察',
+      ruleNames: ['放量观察'],
+      status: 'completed',
+      targetCount: 2,
+      completedCount: 2,
+      matchCount: 1,
+      eventCount: 1,
+      startedAt: '2026-05-10T08:00:00',
+      finishedAt: '2026-05-10T08:00:20',
+      durationMs: 20,
     });
     vi.mocked(stocksApi.getHistory).mockImplementation(async (stockCode, _days, period = 'daily') => ({
       stockCode,
@@ -499,23 +532,41 @@ describe('BacktestPage', () => {
 
   it('groups multi-rule backtest results by rule and can collapse a rule group', async () => {
     vi.mocked(rulesApi.list).mockResolvedValue([rule, secondRule, emptyRule]);
-    vi.mocked(rulesApi.runBatch).mockResolvedValue({
+    vi.mocked(rulesApi.runBatchAsync).mockResolvedValue({
       runId: 12,
       ruleId: 7,
       ruleIds: [7, 8, 9],
       ruleNames: ['放量观察', '低集中度观察', '零命中观察'],
-      status: 'completed',
+      status: 'running',
       targetCount: 2,
-      matchCount: 2,
-      eventCount: 2,
+      completedCount: 0,
+      matchCount: 0,
+      eventCount: 0,
       mode: 'history',
-      durationMs: 53,
-      matches: [
-        { ...matches[0], ruleId: 7 },
-        { ...secondMatches[0], ruleId: 8 },
-      ],
+      durationMs: 0,
+      matches: [],
       errors: [],
     });
+    vi.mocked(rulesApi.getRun).mockResolvedValue({
+      id: 12,
+      runIds: [12],
+      ruleId: 7,
+      ruleIds: [7, 8, 9],
+      ruleName: '多规则回测（3 条）',
+      ruleNames: ['放量观察', '低集中度观察', '零命中观察'],
+      status: 'completed',
+      targetCount: 2,
+      completedCount: 2,
+      matchCount: 2,
+      eventCount: 2,
+      startedAt: '2026-05-10T08:00:00',
+      finishedAt: '2026-05-10T08:00:53',
+      durationMs: 53,
+    });
+    vi.mocked(rulesApi.getRunMatches).mockResolvedValue([
+      { ...matches[0], ruleId: 7 },
+      { ...secondMatches[0], ruleId: 8 },
+    ]);
 
     render(<BacktestPage />);
 
@@ -659,7 +710,7 @@ describe('BacktestPage', () => {
     fireEvent.click(screen.getByRole('button', { name: '运行回测' }));
 
     await waitFor(() => {
-      expect(rulesApi.runBatch).toHaveBeenCalledWith({
+      expect(rulesApi.runBatchAsync).toHaveBeenCalledWith({
         ruleIds: [7],
         mode: 'history',
         target: {
@@ -673,8 +724,8 @@ describe('BacktestPage', () => {
   });
 
   it('shows running history, progress, and logs while a run is in flight', async () => {
-    const deferredRun = createDeferred<Awaited<ReturnType<typeof rulesApi.runBatch>>>();
-    vi.mocked(rulesApi.runBatch).mockReturnValueOnce(deferredRun.promise);
+    const deferredRun = createDeferred<Awaited<ReturnType<typeof rulesApi.runBatchAsync>>>();
+    vi.mocked(rulesApi.runBatchAsync).mockReturnValueOnce(deferredRun.promise);
     render(<BacktestPage />);
 
     await screen.findByText('回测执行历史');
@@ -682,8 +733,8 @@ describe('BacktestPage', () => {
 
     expect(await screen.findByRole('tab', { name: /执行日志/ })).toHaveAttribute('aria-selected', 'true');
     expect(screen.getAllByText('运行中').length).toBeGreaterThan(0);
-    expect(screen.getAllByText('请求后端执行').length).toBeGreaterThan(0);
-    expect(screen.getByText(/正在请求后端执行/)).toBeInTheDocument();
+    expect(screen.getAllByText('请求后端启动后台任务').length).toBeGreaterThan(0);
+    expect(screen.getByText(/正在启动后台回测任务/)).toBeInTheDocument();
 
     await act(async () => {
       deferredRun.resolve({
@@ -707,8 +758,8 @@ describe('BacktestPage', () => {
   });
 
   it('keeps the active run visible after leaving and returning to the page', async () => {
-    const deferredRun = createDeferred<Awaited<ReturnType<typeof rulesApi.runBatch>>>();
-    vi.mocked(rulesApi.runBatch).mockReturnValueOnce(deferredRun.promise);
+    const deferredRun = createDeferred<Awaited<ReturnType<typeof rulesApi.runBatchAsync>>>();
+    vi.mocked(rulesApi.runBatchAsync).mockReturnValueOnce(deferredRun.promise);
     const view = render(<BacktestPage />);
 
     await screen.findByText('回测执行历史');
@@ -721,7 +772,7 @@ describe('BacktestPage', () => {
 
     expect(await screen.findByRole('tab', { name: /执行日志/ })).toHaveAttribute('aria-selected', 'true');
     expect(screen.getAllByText('运行中').length).toBeGreaterThan(0);
-    expect(screen.getByText(/正在请求后端执行/)).toBeInTheDocument();
+    expect(screen.getByText(/正在启动后台回测任务/)).toBeInTheDocument();
 
     await act(async () => {
       deferredRun.resolve({
@@ -790,7 +841,7 @@ describe('BacktestPage', () => {
     fireEvent.click(screen.getByRole('button', { name: '运行回测' }));
 
     await waitFor(() => {
-      expect(rulesApi.runBatch).toHaveBeenCalledWith(expect.objectContaining({
+      expect(rulesApi.runBatchAsync).toHaveBeenCalledWith(expect.objectContaining({
         ruleIds: [7],
         target: {
           scope: 'custom',

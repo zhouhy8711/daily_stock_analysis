@@ -225,6 +225,7 @@ function normalizeRunHistory(raw: Record<string, unknown>): RuleRunHistoryItem {
     ruleNames: toStringArray(raw.rule_names ?? raw.ruleNames),
     status: toString(raw.status),
     targetCount: toNumber(raw.target_count ?? raw.targetCount),
+    completedCount: toNumber(raw.completed_count ?? raw.completedCount),
     matchCount: toNumber(raw.match_count ?? raw.matchCount),
     eventCount: toNumber(raw.event_count ?? raw.eventCount),
     error: toNullableString(raw.error),
@@ -275,6 +276,13 @@ export const rulesApi = {
       params: { limit },
     });
     return (response.data.items ?? []).map(normalizeRunHistory);
+  },
+
+  async getRun(runId: number): Promise<RuleRunHistoryItem> {
+    const response = await apiClient.get<Record<string, unknown>>(
+      `/api/v1/rules/runs/${encodeURIComponent(String(runId))}`,
+    );
+    return normalizeRunHistory(response.data);
   },
 
   async getRunMatches(runId: number): Promise<RuleMatchItem[]> {
@@ -329,6 +337,7 @@ export const rulesApi = {
       ruleNames: toStringArray(response.data.rule_names ?? response.data.ruleNames),
       status: toString(response.data.status),
       targetCount: toNumber(response.data.target_count ?? response.data.targetCount),
+      completedCount: toNumber(response.data.completed_count ?? response.data.completedCount),
       matchCount: toNumber(response.data.match_count ?? response.data.matchCount),
       eventCount: toNumber(response.data.event_count ?? response.data.eventCount),
       mode: toString(response.data.mode || payload?.mode || 'history'),
@@ -367,6 +376,46 @@ export const rulesApi = {
       ruleNames: toStringArray(response.data.rule_names ?? response.data.ruleNames),
       status: toString(response.data.status),
       targetCount: toNumber(response.data.target_count ?? response.data.targetCount),
+      completedCount: toNumber(response.data.completed_count ?? response.data.completedCount),
+      matchCount: toNumber(response.data.match_count ?? response.data.matchCount),
+      eventCount: toNumber(response.data.event_count ?? response.data.eventCount),
+      mode: toString(response.data.mode || payload.mode || 'history'),
+      durationMs: toNumber(response.data.duration_ms ?? response.data.durationMs),
+      matches: (rawMatches as Array<Record<string, unknown>>).map(normalizeMatch),
+      errors: Array.isArray(response.data.errors) ? response.data.errors.map(toString) : [],
+      snapshotId: toNullableString(response.data.snapshot_id ?? response.data.snapshotId),
+      snapshotTime: toNullableString(response.data.snapshot_time ?? response.data.snapshotTime),
+      snapshotAgeSeconds: response.data.snapshot_age_seconds == null && response.data.snapshotAgeSeconds == null
+        ? null
+        : toNumber(response.data.snapshot_age_seconds ?? response.data.snapshotAgeSeconds),
+      quoteHitCount: toNumber(response.data.quote_hit_count ?? response.data.quoteHitCount),
+      quoteMissCount: toNumber(response.data.quote_miss_count ?? response.data.quoteMissCount),
+    };
+  },
+
+  async runBatchAsync(payload: RuleBatchRunPayload): Promise<RuleRunResponse> {
+    const requestPayload = {
+      rule_ids: payload.ruleIds,
+      mode: payload.mode,
+      data_policy: payload.dataPolicy || undefined,
+      target: payload.target ? serializeRunTarget(payload.target) : undefined,
+      start_date: payload.startDate || undefined,
+      end_date: payload.endDate || undefined,
+    };
+    const response = await apiClient.post<Record<string, unknown>>(
+      '/api/v1/rules/run-batch/async',
+      requestPayload,
+      { timeout: RULE_RUN_TIMEOUT_MS },
+    );
+    const rawMatches = Array.isArray(response.data.matches) ? response.data.matches : [];
+    return {
+      runId: toNumber(response.data.run_id ?? response.data.runId),
+      ruleId: toNumber(response.data.rule_id ?? response.data.ruleId),
+      ruleIds: toNumberArray(response.data.rule_ids ?? response.data.ruleIds),
+      ruleNames: toStringArray(response.data.rule_names ?? response.data.ruleNames),
+      status: toString(response.data.status),
+      targetCount: toNumber(response.data.target_count ?? response.data.targetCount),
+      completedCount: toNumber(response.data.completed_count ?? response.data.completedCount),
       matchCount: toNumber(response.data.match_count ?? response.data.matchCount),
       eventCount: toNumber(response.data.event_count ?? response.data.eventCount),
       mode: toString(response.data.mode || payload.mode || 'history'),

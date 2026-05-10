@@ -27,12 +27,20 @@ def _json_loads(value: Optional[str], fallback: Any) -> Any:
         return fallback
 
 
-def encode_rule_batch_metadata(rule_ids: List[int], rule_names: List[str], errors: List[str]) -> str:
-    return RULE_BATCH_META_PREFIX + _json_dumps({
+def encode_rule_batch_metadata(
+    rule_ids: List[int],
+    rule_names: List[str],
+    errors: List[str],
+    completed_count: Optional[int] = None,
+) -> str:
+    payload = {
         "rule_ids": rule_ids,
         "rule_names": rule_names,
         "errors": errors,
-    })
+    }
+    if completed_count is not None:
+        payload["completed_count"] = max(0, int(completed_count or 0))
+    return RULE_BATCH_META_PREFIX + _json_dumps(payload)
 
 
 def _decode_rule_batch_metadata(error: Optional[str]) -> Tuple[Dict[str, Any], Optional[str]]:
@@ -111,6 +119,7 @@ class RuleRepository:
             "rule_names": rule_names,
             "status": row.status,
             "target_count": int(row.target_count or 0),
+            "completed_count": int(batch_metadata.get("completed_count") or 0),
             "match_count": int(row.match_count or 0),
             "event_count": int(row.match_count or 0),
             "error": public_error,
@@ -166,6 +175,24 @@ class RuleRepository:
                         item["rule_name"] = f"多规则回测（{len(rule_ids)} 条）"
                 items.append(item)
             return items
+
+    def get_run(self, run_id: int) -> Optional[Dict[str, Any]]:
+        with self.db.get_session() as session:
+            row = session.execute(
+                select(StockRuleRun, StockRule.name)
+                .join(StockRule, StockRule.id == StockRuleRun.rule_id)
+                .where(StockRuleRun.id == run_id)
+                .limit(1)
+            ).one_or_none()
+            if row is None:
+                return None
+            run, rule_name = row
+            item = self.run_to_dict(run, rule_name)
+            snapshot_json_values = session.execute(
+                select(StockRuleMatch.snapshot_json).where(StockRuleMatch.run_id == run.id)
+            ).scalars().all()
+            item["event_count"] = self._count_event_rows_from_snapshots(list(snapshot_json_values))
+            return item
 
     def get_rule(self, rule_id: int) -> Optional[Dict[str, Any]]:
         with self.db.get_session() as session:
@@ -237,13 +264,34 @@ class RuleRepository:
             session.commit()
             return True
 
-    def create_run(self, rule_id: int, target_count: int) -> int:
+    def create_run(self, rule_id: int, target_count: int, error: Optional[str] = None) -> int:
         with self.db.get_session() as session:
-            row = StockRuleRun(rule_id=rule_id, target_count=target_count, status="running")
+            row = StockRuleRun(rule_id=rule_id, target_count=target_count, status="running", error=error)
             session.add(row)
             session.commit()
             session.refresh(row)
             return int(row.id)
+
+    def update_run_progress(
+        self,
+        *,
+        run_id: int,
+        rule_ids: List[int],
+        rule_names: List[str],
+        completed_count: int,
+        errors: Optional[List[str]] = None,
+    ) -> None:
+        with self.db.get_session() as session:
+            run = session.execute(select(StockRuleRun).where(StockRuleRun.id == run_id).limit(1)).scalar_one_or_none()
+            if run is None or run.status != "running":
+                return
+            run.error = encode_rule_batch_metadata(
+                rule_ids,
+                rule_names,
+                errors or [],
+                completed_count=completed_count,
+            )
+            session.commit()
 
     def finish_run(
         self,
