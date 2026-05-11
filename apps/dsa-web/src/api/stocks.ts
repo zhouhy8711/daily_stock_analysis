@@ -2,6 +2,7 @@ import apiClient from './index';
 import type { NewsIntelItem, NewsIntelResponse } from '../types/analysis';
 
 const STOCK_HISTORY_TIMEOUT_MS = 75_000;
+const STOCK_INDICATOR_METRICS_TIMEOUT_MS = 75_000;
 
 export type ExtractItem = {
   code?: string | null;
@@ -25,7 +26,13 @@ export type KLineData = {
   afterHoursVolume?: number | null;
   amount?: number | null;
   changePercent?: number | null;
+  volumeRatio?: number | null;
   turnoverRate?: number | null;
+  peRatio?: number | null;
+  totalMv?: number | null;
+  circMv?: number | null;
+  totalShares?: number | null;
+  floatShares?: number | null;
   dataSource?: string | null;
   snapshotId?: string | null;
   snapshotTime?: string | null;
@@ -143,6 +150,12 @@ export type StockIndicatorMetrics = {
   updateTime?: string | null;
 };
 
+export type StockIndicatorMetricsOptions = {
+  dataPolicy?: StockDataPolicy;
+  tradeDate?: string;
+  days?: number;
+};
+
 function toNullableNumber(value: unknown): number | null {
   const numberValue = typeof value === 'number'
     ? value
@@ -176,7 +189,13 @@ function normalizeKLine(item: Record<string, unknown>): KLineData {
     ),
     amount: toNullableNumber(item.amount),
     changePercent: toNullableNumber(item.change_percent ?? item.changePercent),
+    volumeRatio: toNullableNumber(item.volume_ratio ?? item.volumeRatio),
     turnoverRate: toNullableNumber(item.turnover_rate ?? item.turnoverRate),
+    peRatio: toNullableNumber(item.pe_ratio ?? item.peRatio),
+    totalMv: toNullableNumber(item.total_mv ?? item.totalMv),
+    circMv: toNullableNumber(item.circ_mv ?? item.circMv),
+    totalShares: toNullableNumber(item.total_shares ?? item.totalShares),
+    floatShares: toNullableNumber(item.float_shares ?? item.floatShares),
     dataSource: toNullableString(item.data_source ?? item.dataSource),
     snapshotId: toNullableString(item.snapshot_id ?? item.snapshotId),
     snapshotTime: toNullableString(item.snapshot_time ?? item.snapshotTime),
@@ -384,9 +403,26 @@ export const stocksApi = {
     };
   },
 
-  async getIndicatorMetrics(stockCode: string): Promise<StockIndicatorMetrics> {
+  async getIndicatorMetrics(
+    stockCode: string,
+    options: StockIndicatorMetricsOptions = {},
+  ): Promise<StockIndicatorMetrics> {
+    const params: Record<string, string | number> = {};
+    if (options.dataPolicy) {
+      params.data_policy = options.dataPolicy;
+    }
+    if (options.tradeDate) {
+      params.trade_date = options.tradeDate;
+    }
+    if (typeof options.days === 'number') {
+      params.days = options.days;
+    }
+    const requestConfig = Object.keys(params).length > 0
+      ? { params, timeout: STOCK_INDICATOR_METRICS_TIMEOUT_MS }
+      : { timeout: STOCK_INDICATOR_METRICS_TIMEOUT_MS };
     const response = await apiClient.get<Record<string, unknown>>(
       `/api/v1/stocks/${encodeURIComponent(stockCode)}/indicator-metrics`,
+      requestConfig,
     );
     return normalizeIndicatorMetrics(response.data, stockCode);
   },

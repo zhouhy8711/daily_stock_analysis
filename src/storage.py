@@ -94,6 +94,12 @@ class StockDaily(Base):
     volume = Column(Float)  # 成交量（手）
     amount = Column(Float)  # 成交额（元）
     pct_chg = Column(Float)  # 涨跌幅（%）
+    turnover_rate = Column(Float)  # 换手率（%）
+    pe_ratio = Column(Float)  # 市盈率 TTM/动态
+    total_mv = Column(Float)  # 总市值（元）
+    circ_mv = Column(Float)  # 流通市值（元）
+    total_shares = Column(Float)  # 总股本（股）
+    float_shares = Column(Float)  # 流通股本（股）
     
     # 技术指标
     ma5 = Column(Float)
@@ -129,12 +135,55 @@ class StockDaily(Base):
             'volume': self.volume,
             'amount': self.amount,
             'pct_chg': self.pct_chg,
+            'turnover_rate': self.turnover_rate,
+            'pe_ratio': self.pe_ratio,
+            'total_mv': self.total_mv,
+            'circ_mv': self.circ_mv,
+            'total_shares': self.total_shares,
+            'float_shares': self.float_shares,
             'ma5': self.ma5,
             'ma10': self.ma10,
             'ma20': self.ma20,
             'volume_ratio': self.volume_ratio,
             'data_source': self.data_source,
         }
+
+
+class StockChipDaily(Base):
+    """
+    股票每日筹码峰缓存。
+
+    由离线补数任务基于日 K 和换手率计算，指标分析页按 code/date 读取，
+    避免用户点击时临时访问外部筹码或行情接口。
+    """
+    __tablename__ = 'stock_chip_daily'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    code = Column(String(16), nullable=False, index=True)
+    date = Column(Date, nullable=False, index=True)
+    source = Column(String(80))
+
+    profit_ratio = Column(Float)
+    avg_cost = Column(Float)
+    cost_90_low = Column(Float)
+    cost_90_high = Column(Float)
+    concentration_90 = Column(Float)
+    cost_70_low = Column(Float)
+    cost_70_high = Column(Float)
+    concentration_70 = Column(Float)
+    distribution = Column(Text)
+    chip_status = Column(String(50))
+
+    created_at = Column(DateTime, default=datetime.now)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+
+    __table_args__ = (
+        UniqueConstraint('code', 'date', name='uix_stock_chip_daily_code_date'),
+        Index('ix_stock_chip_daily_code_date', 'code', 'date'),
+    )
+
+    def __repr__(self):
+        return f"<StockChipDaily(code={self.code}, date={self.date}, avg_cost={self.avg_cost})>"
 
 
 class StockIntradayMinute(Base):
@@ -807,6 +856,7 @@ class DatabaseManager:
         
         # 创建所有表
         Base.metadata.create_all(self._engine)
+        self._ensure_schema_compatibility()
 
         self._initialized = True
         logger.info(f"数据库初始化完成: {db_url}")
@@ -863,6 +913,30 @@ class DatabaseManager:
                 logger.warning("初始化 SQLite PRAGMA 失败: %s", exc)
             finally:
                 cursor.close()
+
+    def _ensure_schema_compatibility(self) -> None:
+        """对既有本地库执行小型增量迁移。"""
+        if not self._is_sqlite_engine:
+            return
+
+        stock_daily_optional_columns = {
+            "turnover_rate": "FLOAT",
+            "pe_ratio": "FLOAT",
+            "total_mv": "FLOAT",
+            "circ_mv": "FLOAT",
+            "total_shares": "FLOAT",
+            "float_shares": "FLOAT",
+        }
+        with self._engine.begin() as connection:
+            existing_columns = {
+                str(row[1])
+                for row in connection.exec_driver_sql("PRAGMA table_info(stock_daily)").fetchall()
+            }
+            for column_name, column_type in stock_daily_optional_columns.items():
+                if column_name not in existing_columns:
+                    connection.exec_driver_sql(
+                        f"ALTER TABLE stock_daily ADD COLUMN {column_name} {column_type}"
+                    )
 
     def _is_file_sqlite_database(self) -> bool:
         database = (self._engine.url.database or "").strip()
@@ -1605,6 +1679,182 @@ class DatabaseManager:
             return list(results)
 
     @staticmethod
+    def _stock_chip_daily_to_dict(row: StockChipDaily) -> Dict[str, Any]:
+        try:
+            distribution = json.loads(row.distribution or "[]")
+        except Exception:
+            distribution = []
+        return {
+            "code": row.code,
+            "date": row.date.isoformat() if isinstance(row.date, date) else str(row.date),
+            "source": row.source,
+            "profit_ratio": row.profit_ratio,
+            "avg_cost": row.avg_cost,
+            "cost_90_low": row.cost_90_low,
+            "cost_90_high": row.cost_90_high,
+            "concentration_90": row.concentration_90,
+            "cost_70_low": row.cost_70_low,
+            "cost_70_high": row.cost_70_high,
+            "concentration_70": row.concentration_70,
+            "distribution": distribution if isinstance(distribution, list) else [],
+            "chip_status": row.chip_status,
+        }
+
+    def get_chip_daily_range(
+        self,
+        code: str,
+        start_date: date,
+        end_date: date,
+    ) -> List[Dict[str, Any]]:
+        """读取指定区间内的筹码峰日缓存，按日期升序返回。"""
+        with self.get_session() as session:
+            rows = session.execute(
+                select(StockChipDaily)
+                .where(
+                    and_(
+                        StockChipDaily.code == code,
+                        StockChipDaily.date >= start_date,
+                        StockChipDaily.date <= end_date,
+                    )
+                )
+                .order_by(StockChipDaily.date)
+            ).scalars().all()
+            return [self._stock_chip_daily_to_dict(row) for row in rows]
+
+    def get_latest_chip_daily(
+        self,
+        code: str,
+        as_of: Optional[date] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """读取 as_of 当天或之前最近一条筹码峰日缓存。"""
+        with self.get_session() as session:
+            conditions = [StockChipDaily.code == code]
+            if as_of is not None:
+                conditions.append(StockChipDaily.date <= as_of)
+            row = session.execute(
+                select(StockChipDaily)
+                .where(and_(*conditions))
+                .order_by(desc(StockChipDaily.date))
+                .limit(1)
+            ).scalars().first()
+            return self._stock_chip_daily_to_dict(row) if row else None
+
+    def save_chip_daily_snapshots(
+        self,
+        code: str,
+        snapshots: List[Dict[str, Any]],
+        data_source: Optional[str] = None,
+    ) -> int:
+        """批量 upsert 每日筹码峰快照，返回本次新增条数。"""
+        if not code or not snapshots:
+            return 0
+
+        now = datetime.now()
+        records_by_date: Dict[date, Dict[str, Any]] = {}
+        for snapshot in snapshots:
+            row_date = self._normalize_daily_date(snapshot.get("date"))
+            if row_date is None:
+                continue
+            distribution = snapshot.get("distribution") or []
+            records_by_date[row_date] = {
+                "code": code,
+                "date": row_date,
+                "source": data_source or snapshot.get("source"),
+                "profit_ratio": self._normalize_sql_value(snapshot.get("profit_ratio")),
+                "avg_cost": self._normalize_sql_value(snapshot.get("avg_cost")),
+                "cost_90_low": self._normalize_sql_value(snapshot.get("cost_90_low")),
+                "cost_90_high": self._normalize_sql_value(snapshot.get("cost_90_high")),
+                "concentration_90": self._normalize_sql_value(snapshot.get("concentration_90")),
+                "cost_70_low": self._normalize_sql_value(snapshot.get("cost_70_low")),
+                "cost_70_high": self._normalize_sql_value(snapshot.get("cost_70_high")),
+                "concentration_70": self._normalize_sql_value(snapshot.get("concentration_70")),
+                "distribution": self._safe_json_dumps(distribution),
+                "chip_status": snapshot.get("chip_status"),
+                "created_at": now,
+                "updated_at": now,
+            }
+
+        if not records_by_date:
+            return 0
+
+        records = list(records_by_date.values())
+        batch_dates = list(records_by_date.keys())
+
+        def _write(session: Session) -> int:
+            existing_dates = set(
+                session.execute(
+                    select(StockChipDaily.date).where(
+                        and_(
+                            StockChipDaily.code == code,
+                            StockChipDaily.date.in_(batch_dates),
+                        )
+                    )
+                ).scalars().all()
+            )
+            new_count = sum(1 for record in records if record["date"] not in existing_dates)
+            if self._is_sqlite_engine:
+                _SQLITE_CHUNK = 50
+                for i in range(0, len(records), _SQLITE_CHUNK):
+                    chunk = records[i : i + _SQLITE_CHUNK]
+                    stmt = sqlite_insert(StockChipDaily).values(chunk)
+                    excluded = stmt.excluded
+                    session.execute(
+                        stmt.on_conflict_do_update(
+                            index_elements=["code", "date"],
+                            set_={
+                                "source": excluded.source,
+                                "profit_ratio": excluded.profit_ratio,
+                                "avg_cost": excluded.avg_cost,
+                                "cost_90_low": excluded.cost_90_low,
+                                "cost_90_high": excluded.cost_90_high,
+                                "concentration_90": excluded.concentration_90,
+                                "cost_70_low": excluded.cost_70_low,
+                                "cost_70_high": excluded.cost_70_high,
+                                "concentration_70": excluded.concentration_70,
+                                "distribution": excluded.distribution,
+                                "chip_status": excluded.chip_status,
+                                "updated_at": excluded.updated_at,
+                            },
+                        )
+                    )
+                return new_count
+
+            existing_rows = {
+                row.date: row
+                for row in session.execute(
+                    select(StockChipDaily).where(
+                        and_(
+                            StockChipDaily.code == code,
+                            StockChipDaily.date.in_(batch_dates),
+                        )
+                    )
+                ).scalars().all()
+            }
+            for record in records:
+                existing = existing_rows.get(record["date"])
+                if existing is None:
+                    session.add(StockChipDaily(**record))
+                    continue
+                existing.source = record["source"]
+                existing.profit_ratio = record["profit_ratio"]
+                existing.avg_cost = record["avg_cost"]
+                existing.cost_90_low = record["cost_90_low"]
+                existing.cost_90_high = record["cost_90_high"]
+                existing.concentration_90 = record["concentration_90"]
+                existing.cost_70_low = record["cost_70_low"]
+                existing.cost_70_high = record["cost_70_high"]
+                existing.concentration_70 = record["concentration_70"]
+                existing.distribution = record["distribution"]
+                existing.chip_status = record["chip_status"]
+                existing.updated_at = record["updated_at"]
+            return new_count
+
+        return self._run_write_transaction(
+            f"save_chip_daily_snapshots[{code}]",
+            _write,
+        )
+
+    @staticmethod
     def _normalize_minute_ts(value: Any) -> datetime:
         if isinstance(value, pd.Timestamp):
             value = value.to_pydatetime()
@@ -2064,6 +2314,7 @@ class DatabaseManager:
                 "volume": volume_total,
                 "amount": sum((row.amount or 0) for row in stock_rows),
                 "pct_chg": pct_chg,
+                "turnover_rate": last.turnover_rate,
             }])
             saved_total += self.save_daily_data(df, stock_code, data_source="intraday_hot_table")
         return saved_total
@@ -2078,7 +2329,126 @@ class DatabaseManager:
                 .distinct()
                 .order_by(StockIntradayMinute.code)
             ).scalars().all()
-        return [str(code) for code in rows if code]
+            return [str(code) for code in rows if code]
+
+    def get_daily_codes_missing_valuation(
+        self,
+        *,
+        trade_date: Optional[date] = None,
+        data_source: Optional[str] = None,
+    ) -> List[str]:
+        """Return daily rows that still need quote-derived valuation metrics."""
+        target_date = trade_date or date.today()
+        conditions = [
+            StockDaily.date == target_date,
+            or_(
+                StockDaily.pe_ratio.is_(None),
+                StockDaily.total_mv.is_(None),
+                StockDaily.circ_mv.is_(None),
+                StockDaily.total_shares.is_(None),
+                StockDaily.float_shares.is_(None),
+            ),
+        ]
+        if data_source:
+            conditions.append(StockDaily.data_source == data_source)
+
+        with self.get_session() as session:
+            rows = session.execute(
+                select(StockDaily.code)
+                .where(and_(*conditions))
+                .distinct()
+                .order_by(StockDaily.code)
+            ).scalars().all()
+            return [str(code) for code in rows if code]
+
+    def get_daily_codes_missing_chip_snapshot(
+        self,
+        *,
+        trade_date: Optional[date] = None,
+        data_source: Optional[str] = None,
+    ) -> List[str]:
+        """Return stock_daily codes whose same-date stock_chip_daily row is missing."""
+        target_date = trade_date or date.today()
+        daily_conditions = [StockDaily.date == target_date]
+        if data_source:
+            daily_conditions.append(StockDaily.data_source == data_source)
+
+        with self.get_session() as session:
+            daily_codes = set(
+                session.execute(
+                    select(StockDaily.code)
+                    .where(and_(*daily_conditions))
+                    .distinct()
+                ).scalars().all()
+            )
+            chip_codes = set(
+                session.execute(
+                    select(StockChipDaily.code)
+                    .where(StockChipDaily.date == target_date)
+                    .distinct()
+                ).scalars().all()
+            )
+            missing = sorted(str(code) for code in daily_codes - chip_codes if code)
+            return missing
+
+    def get_completed_daily_archive_codes(
+        self,
+        *,
+        trade_date: Optional[date] = None,
+        codes: Optional[List[str]] = None,
+    ) -> List[str]:
+        """Return codes whose same-day stock_daily and stock_chip_daily rows are complete."""
+        target_date = trade_date or date.today()
+        normalized_codes = {
+            self._normalize_stock_code(code)
+            for code in (codes or [])
+            if str(code or "").strip()
+        }
+        normalized_codes.discard("")
+        if codes is not None and not normalized_codes:
+            return []
+
+        daily_conditions = [
+            StockDaily.date == target_date,
+            StockDaily.open.is_not(None),
+            StockDaily.high.is_not(None),
+            StockDaily.low.is_not(None),
+            StockDaily.close.is_not(None),
+            StockDaily.volume.is_not(None),
+            StockDaily.amount.is_not(None),
+            StockDaily.pe_ratio.is_not(None),
+            StockDaily.total_mv.is_not(None),
+            StockDaily.circ_mv.is_not(None),
+            StockDaily.total_shares.is_not(None),
+            StockDaily.float_shares.is_not(None),
+        ]
+        if normalized_codes:
+            daily_conditions.append(StockDaily.code.in_(normalized_codes))
+
+        with self.get_session() as session:
+            daily_codes = set(
+                session.execute(
+                    select(StockDaily.code)
+                    .where(and_(*daily_conditions))
+                    .distinct()
+                ).scalars().all()
+            )
+            if not daily_codes:
+                return []
+
+            chip_codes = set(
+                session.execute(
+                    select(StockChipDaily.code)
+                    .where(
+                        and_(
+                            StockChipDaily.date == target_date,
+                            StockChipDaily.code.in_(daily_codes),
+                        )
+                    )
+                    .distinct()
+                ).scalars().all()
+            )
+            return sorted(str(code) for code in daily_codes & chip_codes if code)
 
     def purge_intraday_minutes_for_date(
         self,
@@ -2157,6 +2527,12 @@ class DatabaseManager:
                 'volume': self._normalize_sql_value(row.get('volume')),
                 'amount': self._normalize_sql_value(row.get('amount')),
                 'pct_chg': self._normalize_sql_value(row.get('pct_chg')),
+                'turnover_rate': self._normalize_sql_value(row.get('turnover_rate')),
+                'pe_ratio': self._normalize_sql_value(row.get('pe_ratio')),
+                'total_mv': self._normalize_sql_value(row.get('total_mv')),
+                'circ_mv': self._normalize_sql_value(row.get('circ_mv')),
+                'total_shares': self._normalize_sql_value(row.get('total_shares')),
+                'float_shares': self._normalize_sql_value(row.get('float_shares')),
                 'ma5': self._normalize_sql_value(row.get('ma5')),
                 'ma10': self._normalize_sql_value(row.get('ma10')),
                 'ma20': self._normalize_sql_value(row.get('ma20')),
@@ -2214,6 +2590,12 @@ class DatabaseManager:
                                 'volume': excluded.volume,
                                 'amount': excluded.amount,
                                 'pct_chg': excluded.pct_chg,
+                                'turnover_rate': func.coalesce(excluded.turnover_rate, StockDaily.turnover_rate),
+                                'pe_ratio': func.coalesce(excluded.pe_ratio, StockDaily.pe_ratio),
+                                'total_mv': func.coalesce(excluded.total_mv, StockDaily.total_mv),
+                                'circ_mv': func.coalesce(excluded.circ_mv, StockDaily.circ_mv),
+                                'total_shares': func.coalesce(excluded.total_shares, StockDaily.total_shares),
+                                'float_shares': func.coalesce(excluded.float_shares, StockDaily.float_shares),
                                 'ma5': excluded.ma5,
                                 'ma10': excluded.ma10,
                                 'ma20': excluded.ma20,
@@ -2250,6 +2632,16 @@ class DatabaseManager:
                     existing.volume = record['volume']
                     existing.amount = record['amount']
                     existing.pct_chg = record['pct_chg']
+                    for optional_field in (
+                        'turnover_rate',
+                        'pe_ratio',
+                        'total_mv',
+                        'circ_mv',
+                        'total_shares',
+                        'float_shares',
+                    ):
+                        if record[optional_field] is not None:
+                            setattr(existing, optional_field, record[optional_field])
                     existing.ma5 = record['ma5']
                     existing.ma10 = record['ma10']
                     existing.ma20 = record['ma20']

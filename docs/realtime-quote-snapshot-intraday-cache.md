@@ -17,7 +17,7 @@
 
 ## 预热快照
 
-`RealtimeQuoteCacheWarmer` 保持默认每 60 秒执行一次，股票范围来自 `apps/dsa-web/public/stocks.index.json` 中活跃 A 股和北交所股票。
+`RealtimeQuoteCacheWarmer` 在 A 股交易时段（交易日 09:30-11:30、13:00-15:00，上海时间）默认每 60 秒执行一次，休市时跳过刷新；股票范围来自 `apps/dsa-web/public/stocks.index.json` 中活跃 A 股和北交所股票。
 
 每轮预热产出最新快照：
 
@@ -67,6 +67,7 @@ FastAPI/Web 服务启动和 `python main.py --schedule` 定时模式都会注册
 实测页：
 
 - 每轮请求携带 `dataPolicy: snapshot_only`。
+- 只在 A 股交易时段触发；休市、午休、周末或节假日不再按旧快照重复扫描。
 - 最多允许 2 个实测 cycle 并发。
 - 结果按 `snapshot_id` 去重；旧快照结果不会覆盖更新快照的摘要。
 

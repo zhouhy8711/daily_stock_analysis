@@ -314,6 +314,8 @@
   --indicator-chart-orange: hsl(17 92% 53%);
   --indicator-chart-green: hsl(143 72% 39%);
   --indicator-chart-blue: hsl(224 86% 54%);
+  --indicator-chart-candle-up: hsl(0 82% 52%);
+  --indicator-chart-candle-down: hsl(210 90% 46%);
   --indicator-chart-yellow: hsl(57 72% 34%);
   --indicator-chart-purple: hsl(286 78% 50%);
   --indicator-chart-contrast: hsl(220 24% 34%);
@@ -396,6 +398,8 @@
   --indicator-chart-orange: #ff7b55;
   --indicator-chart-green: #23ff37;
   --indicator-chart-blue: #2348ff;
+  --indicator-chart-candle-up: #ff3b4f;
+  --indicator-chart-candle-down: #1689ff;
   --indicator-chart-yellow: #f6ff6b;
   --indicator-chart-purple: #d45cff;
   --indicator-chart-contrast: #eef8ff;

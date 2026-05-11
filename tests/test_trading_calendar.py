@@ -19,6 +19,8 @@ class _FakeCalendar:
         self._tz_name = tz_name
 
     def is_session(self, check_date: date) -> bool:
+        if isinstance(check_date, datetime):
+            check_date = check_date.date()
         return check_date in self._sessions
 
     def date_to_session(self, check_date: date, direction: str = "previous") -> pd.Timestamp:
@@ -140,6 +142,38 @@ class EffectiveTradingDateTestCase(unittest.TestCase):
             result = trading_calendar.get_effective_trading_date("us", current_time=current_time)
 
         self.assertEqual(result, date(2026, 3, 27))
+
+    def test_a_share_live_session_only_covers_regular_intraday_windows(self):
+        fake_calendar = _FakeCalendar(
+            sessions=[date(2026, 5, 11)],
+            close_hour=15,
+            tz_name="Asia/Shanghai",
+        )
+
+        with patch.object(trading_calendar, "_XCALS_AVAILABLE", True), patch.object(
+            trading_calendar,
+            "xcals",
+            SimpleNamespace(get_calendar=lambda _ex: fake_calendar),
+            create=True,
+        ):
+            self.assertTrue(
+                trading_calendar.is_market_live_session_open(
+                    "cn",
+                    current_time=datetime(2026, 5, 11, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+                )
+            )
+            self.assertFalse(
+                trading_calendar.is_market_live_session_open(
+                    "cn",
+                    current_time=datetime(2026, 5, 11, 12, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+                )
+            )
+            self.assertFalse(
+                trading_calendar.is_market_live_session_open(
+                    "cn",
+                    current_time=datetime(2026, 5, 11, 21, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+                )
+            )
 
     def test_market_timezone_controls_cross_timezone_resolution(self):
         fake_calendar = _FakeCalendar(

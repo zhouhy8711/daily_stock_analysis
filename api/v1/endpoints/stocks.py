@@ -480,7 +480,12 @@ def get_stock_quote(
     summary="获取指标分析扩展数据",
     description="获取筹码分布、筹码成本与主力/机构持仓名称等指标分析补充数据"
 )
-def get_stock_indicator_metrics(stock_code: str) -> StockIndicatorMetricsResponse:
+def get_stock_indicator_metrics(
+    stock_code: str,
+    data_policy: str = Query("default", description="数据策略: default/cache_only/snapshot_only/db_only"),
+    trade_date: Optional[str] = Query(None, description="历史指标参考日，YYYY-MM-DD"),
+    days: int = Query(365, ge=1, le=730, description="筹码峰快照回看天数"),
+) -> StockIndicatorMetricsResponse:
     """
     获取指标分析扩展数据。
 
@@ -489,7 +494,12 @@ def get_stock_indicator_metrics(stock_code: str) -> StockIndicatorMetricsRespons
     """
     try:
         service = StockService()
-        result = service.get_indicator_metrics(stock_code)
+        result = service.get_indicator_metrics(
+            stock_code,
+            data_policy=data_policy,
+            trade_date=trade_date,
+            days=days,
+        )
         return StockIndicatorMetricsResponse(**result)
     except Exception as e:
         logger.error(f"获取指标扩展数据失败: {e}", exc_info=True)
@@ -560,7 +570,13 @@ def get_stock_history(
                 ),
                 amount=item.get("amount"),
                 change_percent=item.get("change_percent"),
+                volume_ratio=item.get("volume_ratio"),
                 turnover_rate=item.get("turnover_rate"),
+                pe_ratio=item.get("pe_ratio"),
+                total_mv=item.get("total_mv"),
+                circ_mv=item.get("circ_mv"),
+                total_shares=item.get("total_shares"),
+                float_shares=item.get("float_shares"),
                 data_source=item.get("data_source"),
                 snapshot_id=item.get("snapshot_id"),
                 snapshot_time=item.get("snapshot_time"),

@@ -33,6 +33,7 @@ class PipelineFetchErrorTestCase(unittest.TestCase):
         pipeline.db = MagicMock()
         pipeline.fetcher_manager.get_stock_name.return_value = "贵州茅台"
         pipeline.db.has_today_data.return_value = True
+        pipeline._ensure_chip_daily_cache_for_target = MagicMock()
         current_time = datetime(2026, 3, 28, 1, 0, tzinfo=timezone.utc)
 
         success, error = StockAnalysisPipeline.fetch_and_save_stock_data(
@@ -45,6 +46,7 @@ class PipelineFetchErrorTestCase(unittest.TestCase):
         self.assertIsNone(error)
         _mock_target.assert_called_once_with("600519", current_time=current_time)
         pipeline.db.has_today_data.assert_called_once_with("600519", date(2026, 3, 27))
+        pipeline._ensure_chip_daily_cache_for_target.assert_called_once_with("600519", date(2026, 3, 27))
         pipeline.fetcher_manager.get_daily_data.assert_not_called()
 
     def test_resolve_resume_target_date_normalizes_supported_a_share_formats(self):

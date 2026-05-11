@@ -60,6 +60,7 @@ type IndicatorAnalysisModalProps = {
   reportChangePct?: number;
   initialDate?: string;
   initialHistoryDays?: number;
+  dataMode?: IndicatorAnalysisDataMode;
   onClose: () => void;
 };
 
@@ -70,9 +71,12 @@ type IndicatorAnalysisViewProps = {
   reportChangePct?: number;
   initialDate?: string;
   initialHistoryDays?: number;
+  dataMode?: IndicatorAnalysisDataMode;
   onClose?: () => void;
   variant?: 'page' | 'modal';
 };
+
+type IndicatorAnalysisDataMode = 'realtime' | 'historical';
 
 type ChartPoint = KLineData & {
   averagePrice?: number;
@@ -203,6 +207,7 @@ const KLINE_PERIOD_OPTIONS: KLinePeriodOption[] = [
 const MAX_VISIBLE_KLINE_POINTS = 80;
 const MIN_VISIBLE_KLINE_POINTS = 24;
 const MAX_EXPANDED_KLINE_POINTS = 160;
+const CHART_RIGHT_DATA_GAP = 32;
 const ONE_MINUTE_REFRESH_MS = 10_000;
 const TIMESHARE_START_MINUTE = (9 * 60) + 30;
 const TIMESHARE_END_MINUTE = 15 * 60;
@@ -239,6 +244,8 @@ const TERMINAL_COLORS = {
   orange: 'var(--indicator-chart-orange)',
   green: 'var(--indicator-chart-green)',
   blue: 'var(--indicator-chart-blue)',
+  candleUp: 'var(--indicator-chart-candle-up)',
+  candleDown: 'var(--indicator-chart-candle-down)',
   yellow: 'var(--indicator-chart-yellow)',
   purple: 'var(--indicator-chart-purple)',
   white: 'var(--indicator-chart-contrast)',
@@ -1040,6 +1047,35 @@ async function getHistoryWithCacheWarm(
   return stocksApi.getHistory(stockCode, days, requestPeriod, 'default');
 }
 
+function filterHistoryToCutoffDate(history: KLineData[], cutoffDate?: string | null): KLineData[] {
+  const cutoffDateKey = normalizeDateKey(cutoffDate);
+  if (!cutoffDateKey) {
+    return history;
+  }
+  return history.filter((item) => {
+    const itemDate = normalizeDateKey(item.date);
+    return !itemDate || itemDate <= cutoffDateKey;
+  });
+}
+
+async function getHistoryForDataMode(
+  stockCode: string,
+  days: number,
+  requestPeriod: KLinePeriod,
+  chartPeriod: ChartPeriod,
+  dataMode: IndicatorAnalysisDataMode,
+  cutoffDate?: string | null,
+): Promise<StockHistoryResponse> {
+  if (dataMode !== 'historical') {
+    return getHistoryWithCacheWarm(stockCode, days, requestPeriod, chartPeriod);
+  }
+  const response = await stocksApi.getHistory(stockCode, days, requestPeriod, 'db_only');
+  return {
+    ...response,
+    data: filterHistoryToCutoffDate(response.data, cutoffDate),
+  };
+}
+
 function getMarketKind(stockCode: string): 'cn' | 'hk' | 'us' {
   const code = stockCode.trim().toUpperCase();
   if (code.endsWith('.HK') || code.startsWith('HK') || /^\d{5}$/.test(code)) {
@@ -1158,7 +1194,7 @@ function normalizeHistoryForPeriod(
 }
 
 function getQuoteDateOnly(quote: StockQuote | null): string | null {
-  return getKLineDateOnly(quote?.updateTime);
+  return getKLineDateOnly(quote?.updateTime ?? quote?.quoteTime ?? quote?.snapshotTime);
 }
 
 function syncPointWithRealtimeQuote(
@@ -1186,7 +1222,13 @@ function syncPointWithRealtimeQuote(
       afterHoursVolume: quote.afterHoursVolume ?? point.afterHoursVolume,
       amount: quote.amount ?? point.amount,
       changePercent,
+      volumeRatio: quote.volumeRatio ?? point.volumeRatio,
       turnoverRate: quote.turnoverRate ?? point.turnoverRate,
+      peRatio: quote.peRatio ?? point.peRatio,
+      totalMv: quote.totalMv ?? point.totalMv,
+      circMv: quote.circMv ?? point.circMv,
+      totalShares: quote.totalShares ?? point.totalShares,
+      floatShares: quote.floatShares ?? point.floatShares,
       snapshotId: quote.snapshotId ?? point.snapshotId,
       snapshotTime: quote.snapshotTime ?? point.snapshotTime,
     };
@@ -1201,6 +1243,36 @@ function syncPointWithRealtimeQuote(
     snapshotId: quote.snapshotId ?? point.snapshotId,
     snapshotTime: quote.snapshotTime ?? point.snapshotTime,
   };
+}
+
+function createRealtimeDailyPoint(
+  latest: KLineData,
+  quote: StockQuote,
+  quoteDate: string,
+): KLineData {
+  const price = quote.currentPrice;
+  const fallbackOpen = quote.prevClose ?? latest.close ?? price;
+  const seedPoint: KLineData = {
+    date: quoteDate,
+    open: fallbackOpen,
+    high: price,
+    low: price,
+    close: price,
+    volume: quote.volume,
+    afterHoursVolume: quote.afterHoursVolume,
+    amount: quote.amount,
+    changePercent: quote.changePercent,
+    volumeRatio: quote.volumeRatio,
+    turnoverRate: quote.turnoverRate,
+    peRatio: quote.peRatio,
+    totalMv: quote.totalMv,
+    circMv: quote.circMv,
+    totalShares: quote.totalShares,
+    floatShares: quote.floatShares,
+    snapshotId: quote.snapshotId,
+    snapshotTime: quote.snapshotTime,
+  };
+  return syncPointWithRealtimeQuote(seedPoint, latest, quote, 'daily');
 }
 
 function syncHistoryWithRealtimeQuote(
@@ -1220,6 +1292,9 @@ function syncHistoryWithRealtimeQuote(
   const latestDate = getKLineDateOnly(latest.date);
   const quoteDate = getQuoteDateOnly(quote);
   if (latestDate && quoteDate && latestDate !== quoteDate) {
+    if (period === 'daily' && quoteDate > latestDate) {
+      return [...history, createRealtimeDailyPoint(latest, quote, quoteDate)];
+    }
     return history;
   }
 
@@ -2429,11 +2504,15 @@ const CoreQuoteMetrics: React.FC<{
   const trendColor = getCnTrendColor(toneValue);
   const metricPrice = quote?.currentPrice ?? point?.close ?? referenceQuote?.currentPrice;
   const metricQuote = quote ?? referenceQuote;
-  const totalMv = resolveQuoteMarketValue(metricQuote?.totalMv, referenceQuote?.totalShares, metricPrice);
-  const circMv = resolveQuoteMarketValue(metricQuote?.circMv, referenceQuote?.floatShares, metricPrice);
-  const peRatio = resolvePeRatio(quote, referenceQuote, metricPrice);
-  const coreVolumeRatio = quote?.volumeRatio ?? (point ? getPointVolumeRatio(point) : undefined);
-  const coreTurnoverRate = resolvePointTurnoverRate(point, referenceQuote, points, quote !== null);
+  const totalMv = isValidNumber(point?.totalMv)
+    ? point.totalMv
+    : resolveQuoteMarketValue(metricQuote?.totalMv, point?.totalShares ?? referenceQuote?.totalShares, metricPrice);
+  const circMv = isValidNumber(point?.circMv)
+    ? point.circMv
+    : resolveQuoteMarketValue(metricQuote?.circMv, point?.floatShares ?? referenceQuote?.floatShares, metricPrice);
+  const peRatio = isValidNumber(point?.peRatio) ? point.peRatio : resolvePeRatio(quote, referenceQuote, metricPrice);
+  const coreVolumeRatio = quote?.volumeRatio ?? point?.volumeRatio ?? (point ? getPointVolumeRatio(point) : undefined);
+  const coreTurnoverRate = resolvePointTurnoverRate(point, quote ?? referenceQuote, points, quote !== null);
   const coreRows: CoreMetricItem[] = [
     { label: '最高价', metricKey: 'high', value: formatNumber(quote?.high ?? point?.high), rawValue: quote?.high ?? point?.high, unit: '元', tone: 'up' },
     { label: '总市值', metricKey: 'total_mv', value: formatCompactNumber(totalMv), rawValue: totalMv, unit: '元' },
@@ -2535,10 +2614,10 @@ const ChartLegend: React.FC<{
   onAddRuleMetric?: AddRuleMetricHandler;
 }> = ({ point, previous, periodLabel, isTimeshare = false, latestQuote, metrics, points, showRealtimeMetrics, onAddRuleMetric }) => {
   const [moreOpen, setMoreOpen] = useState(false);
-  const totalMv = latestQuote?.totalMv;
-  const circMv = latestQuote?.circMv;
-  const totalShares = latestQuote?.totalShares ?? deriveShares(totalMv, latestQuote?.currentPrice);
-  const floatShares = latestQuote?.floatShares ?? deriveShares(circMv, latestQuote?.currentPrice);
+  const totalMv = latestQuote?.totalMv ?? point?.totalMv;
+  const circMv = latestQuote?.circMv ?? point?.circMv;
+  const totalShares = latestQuote?.totalShares ?? point?.totalShares ?? deriveShares(totalMv, latestQuote?.currentPrice ?? point?.close);
+  const floatShares = latestQuote?.floatShares ?? point?.floatShares ?? deriveShares(circMv, latestQuote?.currentPrice ?? point?.close);
   const selectedPrice = point?.close ?? latestQuote?.currentPrice;
   const selectedCircMv = resolveQuoteMarketValue(circMv, floatShares, selectedPrice);
   const mainNetInflow = showRealtimeMetrics
@@ -2573,11 +2652,11 @@ const ChartLegend: React.FC<{
         </>
       ) : (
         <>
-          <span className="inline-flex items-center gap-1" style={{ color: TERMINAL_COLORS.cyan }}>
-            <i className="h-2 w-4 border" style={{ borderColor: TERMINAL_COLORS.cyan, backgroundColor: TERMINAL_COLORS.cyan }} />阳线
+          <span className="inline-flex items-center gap-1" style={{ color: TERMINAL_COLORS.candleUp }}>
+            <i className="h-2 w-4 border bg-transparent" style={{ borderColor: TERMINAL_COLORS.candleUp }} />阳线
           </span>
-          <span className="inline-flex items-center gap-1" style={{ color: TERMINAL_COLORS.orange }}>
-            <i className="h-2 w-4 border bg-transparent" style={{ borderColor: TERMINAL_COLORS.orange }} />阴线
+          <span className="inline-flex items-center gap-1" style={{ color: TERMINAL_COLORS.candleDown }}>
+            <i className="h-2 w-4 border" style={{ borderColor: TERMINAL_COLORS.candleDown, backgroundColor: TERMINAL_COLORS.candleDown }} />阴线
           </span>
         </>
       )}
@@ -2592,7 +2671,7 @@ const ChartLegend: React.FC<{
         </>
       ) : (
         <>
-          <span style={{ color: (point?.close ?? 0) >= (point?.open ?? 0) ? TERMINAL_COLORS.cyan : TERMINAL_COLORS.orange }}>
+          <span style={{ color: (point?.close ?? 0) >= (point?.open ?? 0) ? TERMINAL_COLORS.candleUp : TERMINAL_COLORS.candleDown }}>
             {point ? (point.close >= point.open ? '阳线' : '阴线') : '--'}
           </span>
           <MetricInline metricKey="ma5" label="MA5" value={point?.ma5} unit="元" date={point?.date} color={LINE_COLORS.ma5} onAdd={onAddRuleMetric}>MA5:{formatNumber(point?.ma5)}</MetricInline>
@@ -2807,6 +2886,7 @@ const CandlestickChart: React.FC<{
   const width = 1320;
   const axisWidth = 76;
   const plotRight = width - axisWidth;
+  const plotDataRight = isTimesharePeriod ? plotRight : Math.max(1, plotRight - CHART_RIGHT_DATA_GAP);
   const priceTop = 22;
   const priceHeight = isMaximized ? 560 : 390;
   const zeroAxisY = priceTop + priceHeight + 20;
@@ -2831,19 +2911,19 @@ const CandlestickChart: React.FC<{
   const pricePadding = Math.max((maxPrice - minPrice) * 0.08, 0.01);
   const chartMax = maxPrice + pricePadding;
   const chartMin = Math.max(0, minPrice - pricePadding);
-  const step = plotRight / Math.max(visible.length - 1, 1);
+  const step = plotDataRight / Math.max(visible.length - 1, 1);
   const bodyWidth = Math.max(3, Math.min(9, step * 0.55));
   const priceRange = Math.max(chartMax - chartMin, 0.01);
 
   const yForPrice = (value: number) => priceTop + ((chartMax - value) / priceRange) * priceHeight;
 
-  const ma5Path = buildPath(visible, plotRight, priceTop, priceHeight, chartMin, chartMax, (point) => point.ma5);
-  const ma10Path = buildPath(visible, plotRight, priceTop, priceHeight, chartMin, chartMax, (point) => point.ma10);
-  const ma20Path = buildPath(visible, plotRight, priceTop, priceHeight, chartMin, chartMax, (point) => point.ma20);
-  const ma30Path = buildPath(visible, plotRight, priceTop, priceHeight, chartMin, chartMax, (point) => point.ma30);
-  const ma60Path = buildPath(visible, plotRight, priceTop, priceHeight, chartMin, chartMax, (point) => point.ma60);
-  const timeshareClosePath = buildPath(visible, plotRight, priceTop, priceHeight, chartMin, chartMax, (point) => point.close);
-  const timeshareAveragePath = buildPath(visible, plotRight, priceTop, priceHeight, chartMin, chartMax, (point) => point.averagePrice);
+  const ma5Path = buildPath(visible, plotDataRight, priceTop, priceHeight, chartMin, chartMax, (point) => point.ma5);
+  const ma10Path = buildPath(visible, plotDataRight, priceTop, priceHeight, chartMin, chartMax, (point) => point.ma10);
+  const ma20Path = buildPath(visible, plotDataRight, priceTop, priceHeight, chartMin, chartMax, (point) => point.ma20);
+  const ma30Path = buildPath(visible, plotDataRight, priceTop, priceHeight, chartMin, chartMax, (point) => point.ma30);
+  const ma60Path = buildPath(visible, plotDataRight, priceTop, priceHeight, chartMin, chartMax, (point) => point.ma60);
+  const timeshareClosePath = buildPath(visible, plotDataRight, priceTop, priceHeight, chartMin, chartMax, (point) => point.close);
+  const timeshareAveragePath = buildPath(visible, plotDataRight, priceTop, priceHeight, chartMin, chartMax, (point) => point.averagePrice);
   const timeshareAreaPath = timeshareClosePath && visible.length > 0
     ? `${timeshareClosePath} L${((visible.length - 1) * step).toFixed(2)},${(priceTop + priceHeight).toFixed(2)} L0,${(priceTop + priceHeight).toFixed(2)} Z`
     : '';
@@ -3069,16 +3149,16 @@ const CandlestickChart: React.FC<{
           {[0.2, 0.4, 0.6, 0.8].map((ratio) => (
             <line
               key={`vertical-grid-${ratio}`}
-              x1={plotRight * ratio}
+              x1={plotDataRight * ratio}
               y1={priceTop}
-              x2={plotRight * ratio}
+              x2={plotDataRight * ratio}
               y2={priceTop + priceHeight}
               stroke={TERMINAL_COLORS.redGridSoft}
               strokeDasharray="2 6"
               opacity="0.5"
             />
           ))}
-          <line x1={plotRight} y1="0" x2={plotRight} y2={chartBottom} stroke={TERMINAL_COLORS.axis} strokeWidth="1.2" />
+          <line data-testid="indicator-kline-right-axis" x1={plotRight} y1="0" x2={plotRight} y2={chartBottom} stroke={TERMINAL_COLORS.axis} strokeWidth="1.2" />
           <line x1="0" y1={priceTop + priceHeight} x2={plotRight} y2={priceTop + priceHeight} stroke={TERMINAL_COLORS.axis} strokeWidth="1" />
           <path
             d={`M${plotRight + 6} ${priceTop + priceHeight + 5} l10 6 l-10 6 l10 6`}
@@ -3153,7 +3233,7 @@ const CandlestickChart: React.FC<{
                 <text
                   key={`timeshare-empty-axis-${item.label}`}
                   data-testid="indicator-kline-x-axis-label"
-                  x={clamp(plotRight * item.ratio, 28, plotRight - 28)}
+                  x={clamp(plotDataRight * item.ratio, 28, plotRight - 28)}
                   y={xAxisLabelY}
                   textAnchor="middle"
                   fill={TERMINAL_COLORS.axisText}
@@ -3168,7 +3248,7 @@ const CandlestickChart: React.FC<{
               {visible.map((point, index) => {
                 const x = index * step;
                 const isUp = point.close >= point.open;
-                const candleColor = isUp ? TERMINAL_COLORS.cyan : TERMINAL_COLORS.orange;
+                const candleColor = isUp ? TERMINAL_COLORS.candleUp : TERMINAL_COLORS.candleDown;
                 const highY = yForPrice(point.high);
                 const lowY = yForPrice(point.low);
                 const openY = yForPrice(point.open);
@@ -3199,10 +3279,10 @@ const CandlestickChart: React.FC<{
                       y={bodyTop}
                       width={bodyWidth}
                       height={bodyHeight}
-                      fill={isUp ? candleColor : TERMINAL_COLORS.bg}
+                      fill={isUp ? TERMINAL_COLORS.bg : candleColor}
                       stroke={candleColor}
                       strokeWidth="1.4"
-                      opacity={isUp ? 0.92 : 1}
+                      opacity="1"
                     />
                     {index % xAxisLabelStep === 0 || index === visible.length - 1 ? (
                       <text
@@ -3353,6 +3433,7 @@ const VolumeActivityChart: React.FC<{
   const width = 1600;
   const axisWidth = 64;
   const plotRight = width - axisWidth;
+  const plotDataRight = period === 'timeshare' ? plotRight : Math.max(1, plotRight - CHART_RIGHT_DATA_GAP);
   const top = 18;
   const height = 112;
   const bottom = 154;
@@ -3374,12 +3455,12 @@ const VolumeActivityChart: React.FC<{
     return point.volume ?? 0;
   };
   const maxVolume = Math.max(...visible.map((point) => pickBarValue(point)), 1);
-  const step = plotRight / Math.max(visible.length - 1, 1);
+  const step = plotDataRight / Math.max(visible.length - 1, 1);
   const bodyWidth = Math.max(4, Math.min(11, step * 0.62));
   const labelStep = Math.max(Math.floor(visible.length / 7), 1);
   const volumeMa5Path = buildTrendPath(
     visible,
-    plotRight,
+    plotDataRight,
     top,
     height,
     0,
@@ -3388,7 +3469,7 @@ const VolumeActivityChart: React.FC<{
   );
   const volumeMa10Path = buildTrendPath(
     visible,
-    plotRight,
+    plotDataRight,
     top,
     height,
     0,
@@ -3494,9 +3575,9 @@ const VolumeActivityChart: React.FC<{
           {[0.2, 0.4, 0.6, 0.8].map((ratio) => (
             <line
               key={`volume-vertical-grid-${ratio}`}
-              x1={plotRight * ratio}
+              x1={plotDataRight * ratio}
               y1={top}
-              x2={plotRight * ratio}
+              x2={plotDataRight * ratio}
               y2={top + height}
               stroke={TERMINAL_COLORS.redGridSoft}
               strokeDasharray="2 6"
@@ -3511,7 +3592,7 @@ const VolumeActivityChart: React.FC<{
             const volumeHeight = (pickBarValue(point) / maxVolume) * height;
             const y = top + height - volumeHeight;
             const isUp = point.close >= point.open;
-            const barColor = isUp ? TERMINAL_COLORS.cyan : TERMINAL_COLORS.orange;
+            const barColor = isUp ? TERMINAL_COLORS.candleUp : TERMINAL_COLORS.candleDown;
             const isHighlighted = highlightedDateKey !== null && normalizeDateKey(point.date) === highlightedDateKey;
             const highlightWidth = Math.max(bodyWidth + 12, Math.min(step * 0.76, 24));
             return (
@@ -3535,10 +3616,10 @@ const VolumeActivityChart: React.FC<{
                   y={y}
                   width={bodyWidth}
                   height={Math.max(volumeHeight, 1)}
-                  fill={isUp ? barColor : TERMINAL_COLORS.bg}
+                  fill={isUp ? TERMINAL_COLORS.bg : barColor}
                   stroke={barColor}
                   strokeWidth="1.1"
-                  opacity={isUp ? 0.88 : 1}
+                  opacity="1"
                 />
                 {index % labelStep === 0 || index === visible.length - 1 ? (
                   <text x={x} y={bottom - 12} textAnchor="middle" fill={TERMINAL_COLORS.axisText} className="text-[10px]">
@@ -3648,6 +3729,7 @@ const MacdSignalChart: React.FC<{
   const width = 1420;
   const axisWidth = 64;
   const plotRight = width - axisWidth;
+  const plotDataRight = period === 'timeshare' ? plotRight : Math.max(1, plotRight - CHART_RIGHT_DATA_GAP);
   const top = 18;
   const height = 96;
   const bottom = 132;
@@ -3664,7 +3746,7 @@ const MacdSignalChart: React.FC<{
   const maxAbs = activeMode === 'rsi' ? 100 : Math.max(...values.map((value) => Math.abs(value)), 0.01);
   const minValue = activeMode === 'rsi' ? 0 : -maxAbs;
   const maxValue = activeMode === 'rsi' ? 100 : maxAbs;
-  const step = plotRight / Math.max(visible.length - 1, 1);
+  const step = plotDataRight / Math.max(visible.length - 1, 1);
   const bodyWidth = Math.max(3, Math.min(10, step * 0.58));
   const zeroY = top + height / 2;
   const yForValue = (value?: number) => (
@@ -3672,11 +3754,11 @@ const MacdSignalChart: React.FC<{
       ? top + ((maxValue - value) / Math.max(maxValue - minValue, 0.01)) * height
       : zeroY
   );
-  const difPath = buildTrendPath(visible, plotRight, top, height, -maxAbs, maxAbs, (point) => point.dif);
-  const deaPath = buildTrendPath(visible, plotRight, top, height, -maxAbs, maxAbs, (point) => point.dea);
-  const rsi6Path = buildTrendPath(visible, plotRight, top, height, 0, 100, (point) => point.rsi6);
-  const rsi12Path = buildTrendPath(visible, plotRight, top, height, 0, 100, (point) => point.rsi12);
-  const rsi24Path = buildTrendPath(visible, plotRight, top, height, 0, 100, (point) => point.rsi24);
+  const difPath = buildTrendPath(visible, plotDataRight, top, height, -maxAbs, maxAbs, (point) => point.dif);
+  const deaPath = buildTrendPath(visible, plotDataRight, top, height, -maxAbs, maxAbs, (point) => point.dea);
+  const rsi6Path = buildTrendPath(visible, plotDataRight, top, height, 0, 100, (point) => point.rsi6);
+  const rsi12Path = buildTrendPath(visible, plotDataRight, top, height, 0, 100, (point) => point.rsi12);
+  const rsi24Path = buildTrendPath(visible, plotDataRight, top, height, 0, 100, (point) => point.rsi24);
   const labelStep = Math.max(Math.floor(visible.length / 7), 1);
   const latest = visible.at(-1);
   const hoveredVisibleIndex = hoveredIndex !== null && hoveredIndex >= visibleStartIndex && hoveredIndex < visibleStartIndex + visible.length
@@ -3744,9 +3826,9 @@ const MacdSignalChart: React.FC<{
           {[0.2, 0.4, 0.6, 0.8].map((ratio) => (
             <line
               key={`macd-vertical-grid-${ratio}`}
-              x1={plotRight * ratio}
+              x1={plotDataRight * ratio}
               y1={top}
-              x2={plotRight * ratio}
+              x2={plotDataRight * ratio}
               y2={top + height}
               stroke={TERMINAL_COLORS.redGridSoft}
               strokeDasharray="2 6"
@@ -4249,6 +4331,7 @@ const IndicatorSidePanel: React.FC<{
   chip: ChipDistributionMetrics | null;
   mainChip: ChipDistributionMetrics | null;
   quote: StockQuote | null;
+  showRealtimeTab?: boolean;
   onAddRuleMetric?: AddRuleMetricHandler;
 }> = ({
   points,
@@ -4257,23 +4340,29 @@ const IndicatorSidePanel: React.FC<{
   chip,
   mainChip,
   quote,
+  showRealtimeTab = true,
   onAddRuleMetric,
 }) => {
   const [activeTab, setActiveTab] = useState<SidePanelTab>('chip');
+  const tabOptions = useMemo(
+    () => [
+      { value: 'chip' as SidePanelTab, label: '筹码峰', icon: Layers3 },
+      ...(showRealtimeTab ? [{ value: 'flow' as SidePanelTab, label: '实时监控', icon: Radio }] : []),
+    ],
+    [showRealtimeTab],
+  );
+  const selectedTab = showRealtimeTab ? activeTab : 'chip';
 
   return (
     <div className="flex min-h-0 flex-col gap-2" data-testid="indicator-side-panel">
       <div
         role="tablist"
         aria-label="筹码与监控切换"
-        className="grid grid-cols-2 overflow-hidden rounded-md border font-mono text-xs"
+        className={`grid overflow-hidden rounded-md border font-mono text-xs ${showRealtimeTab ? 'grid-cols-2' : 'grid-cols-1'}`}
         style={{ borderColor: TERMINAL_COLORS.redGrid, backgroundColor: TERMINAL_COLORS.panel }}
       >
-        {([
-          { value: 'chip', label: '筹码峰', icon: Layers3 },
-          { value: 'flow', label: '实时监控', icon: Radio },
-        ] as Array<{ value: SidePanelTab; label: string; icon: React.ElementType<{ className?: string }> }>).map((option) => {
-          const selected = activeTab === option.value;
+        {tabOptions.map((option) => {
+          const selected = selectedTab === option.value;
           const Icon = option.icon;
           return (
             <button
@@ -4297,7 +4386,7 @@ const IndicatorSidePanel: React.FC<{
       </div>
 
       <div className="min-h-0 flex-1 overflow-y-auto">
-        {activeTab === 'chip' ? (
+        {selectedTab === 'chip' ? (
           <ChipPeakPanel
             points={chipPoints}
             currentPoint={chipPoint}
@@ -4781,6 +4870,7 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
   stockName,
   initialDate,
   initialHistoryDays,
+  dataMode = 'realtime',
   onClose,
   variant = 'page',
 }) => {
@@ -4801,6 +4891,7 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
   const lastWindowResetKeyRef = useRef<string | null>(null);
   const marketKind = useMemo(() => getMarketKind(stockCode), [stockCode]);
   const initialDateKey = normalizeDateKey(initialDate);
+  const isHistoricalMode = dataMode === 'historical';
   const dailyHistoryDays = Math.max(1, Math.min(365, Math.round(initialHistoryDays ?? 120)));
   const [ruleDraft, setRuleDraft] = useState<RuleMetricDraft | null>(() => readRuleMetricDraftForStock(stockCode));
   const [isRuleDraftEditorOpen, setIsRuleDraftEditorOpen] = useState(false);
@@ -4986,9 +5077,14 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
 
     const loadInitialData = async () => {
       const [historyResult, quoteResult, metricsResult] = await Promise.allSettled([
-        getHistoryWithCacheWarm(stockCode, dailyHistoryDays, 'daily', 'daily'),
-        stocksApi.getQuote(stockCode, 'cache_only'),
-        stocksApi.getIndicatorMetrics(stockCode),
+        getHistoryForDataMode(stockCode, dailyHistoryDays, 'daily', 'daily', dataMode, initialDateKey),
+        isHistoricalMode ? Promise.resolve(null) : stocksApi.getQuote(stockCode, 'cache_only'),
+        isHistoricalMode
+          ? stocksApi.getIndicatorMetrics(
+            stockCode,
+            { dataPolicy: 'db_only', tradeDate: initialDateKey ?? undefined, days: dailyHistoryDays },
+          )
+          : stocksApi.getIndicatorMetrics(stockCode),
       ]);
 
       if (ignore) {
@@ -4998,7 +5094,9 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
       const historyResponse = historyResult.status === 'fulfilled' ? historyResult.value : null;
       const quoteResponse = quoteResult.status === 'fulfilled' ? quoteResult.value : null;
       const metricsResponse = metricsResult.status === 'fulfilled' ? metricsResult.value : null;
-      const dailyHistory = syncHistoryWithRealtimeQuote(historyResponse?.data ?? [], 'daily', quoteResponse);
+      const dailyHistory = isHistoricalMode
+        ? historyResponse?.data ?? []
+        : syncHistoryWithRealtimeQuote(historyResponse?.data ?? [], 'daily', quoteResponse);
       const dailyCutoffDate = getLatestHistoryDate(dailyHistory);
       dailyCutoffDateRef.current = dailyCutoffDate;
       const metricsError = metricsResult.status === 'rejected'
@@ -5042,7 +5140,7 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
     return () => {
       ignore = true;
     };
-  }, [dailyHistoryDays, marketKind, stockCode]);
+  }, [dailyHistoryDays, dataMode, initialDateKey, isHistoricalMode, marketKind, stockCode]);
 
   const selectedCachedState = historyCache[selectedPeriod];
   const dailyCachedState = historyCache.daily;
@@ -5058,7 +5156,7 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
   const isLoading = !displayState || (displayState.isLoading && displayState.history.length === 0);
   const error = displayState?.error ?? null;
   const history = displayState?.history ?? EMPTY_HISTORY;
-  const quote = displayState?.quote ?? dailyCachedState?.quote ?? null;
+  const quote = isHistoricalMode ? null : displayState?.quote ?? dailyCachedState?.quote ?? null;
   const metrics = displayState?.metrics ?? dailyCachedState?.metrics ?? null;
   const metricsError = displayState?.metricsError ?? dailyCachedState?.metricsError ?? null;
   const emptyHistoryCopy = getEmptyHistoryCopy(effectivePeriod, displayState?.dataSource);
@@ -5076,7 +5174,7 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
 
     let ignore = false;
     const selectedMeta = getPeriodMeta(selectedPeriod);
-    getHistoryWithCacheWarm(stockCode, selectedMeta.days, selectedMeta.requestPeriod, selectedPeriod)
+    getHistoryForDataMode(stockCode, selectedMeta.days, selectedMeta.requestPeriod, selectedPeriod, dataMode, initialDateKey)
       .then((periodResponse) => {
         if (ignore) {
           return;
@@ -5093,7 +5191,7 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
             marketKind,
             cutoffDate,
           );
-          const stateQuote = currentState.quote ?? current.daily?.quote ?? null;
+          const stateQuote = isHistoricalMode ? null : currentState.quote ?? current.daily?.quote ?? null;
           return {
             ...current,
             [selectedPeriod]: {
@@ -5102,7 +5200,9 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
               dataSource: periodResponse.dataSource ?? currentState.dataSource ?? null,
               snapshotId: periodResponse.snapshotId ?? currentState.snapshotId ?? stateQuote?.snapshotId ?? null,
               snapshotTime: periodResponse.snapshotTime ?? currentState.snapshotTime ?? stateQuote?.snapshotTime ?? null,
-              history: syncHistoryWithRealtimeQuote(normalizedHistory, selectedPeriod, stateQuote),
+              history: isHistoricalMode
+                ? normalizedHistory
+                : syncHistoryWithRealtimeQuote(normalizedHistory, selectedPeriod, stateQuote),
               isLoading: false,
               error: null,
             },
@@ -5132,10 +5232,12 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
     return () => {
       ignore = true;
     };
-  }, [marketKind, selectedCachedState, selectedPeriod, stockCode]);
+  }, [dataMode, initialDateKey, isHistoricalMode, marketKind, selectedCachedState, selectedPeriod, stockCode]);
 
   useEffect(() => {
     if (
+      isHistoricalMode
+      ||
       (selectedPeriod !== '1m' && selectedPeriod !== 'timeshare')
       || !selectedCachedState
       || selectedCachedState.isLoading
@@ -5154,7 +5256,7 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
       oneMinuteRefreshInFlightRef.current = true;
       try {
         const [historyResult, quoteResult] = await Promise.allSettled([
-          getHistoryWithCacheWarm(stockCode, oneMinuteMeta.days, oneMinuteMeta.requestPeriod, selectedPeriod),
+          getHistoryForDataMode(stockCode, oneMinuteMeta.days, oneMinuteMeta.requestPeriod, selectedPeriod, dataMode, initialDateKey),
           stocksApi.getQuote(stockCode, 'cache_only'),
         ]);
 
@@ -5215,10 +5317,10 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
       oneMinuteRefreshInFlightRef.current = false;
       window.clearInterval(intervalId);
     };
-  }, [marketKind, selectedCachedState, selectedPeriod, stockCode]);
+  }, [dataMode, initialDateKey, isHistoricalMode, marketKind, selectedCachedState, selectedPeriod, stockCode]);
 
   useEffect(() => {
-    if (isLoading || selectedPeriod === '1m' || selectedPeriod === 'timeshare') {
+    if (isHistoricalMode || isLoading || selectedPeriod === '1m' || selectedPeriod === 'timeshare') {
       return undefined;
     }
 
@@ -5245,7 +5347,7 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
       ignore = true;
       window.clearInterval(intervalId);
     };
-  }, [isLoading, selectedPeriod, stockCode]);
+  }, [isHistoricalMode, isLoading, selectedPeriod, stockCode]);
 
   const points = useMemo(() => buildChartPoints(history), [history]);
   const visibleCount = useMemo(() => getVisiblePointCount(points.length, timelineZoom, effectivePeriod), [effectivePeriod, points.length, timelineZoom]);
@@ -5290,7 +5392,7 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
   const corePointIndex = safeHoveredIndex ?? visibleAnchorIndex;
   const corePoint = corePointIndex !== null ? points[corePointIndex] : latest;
   const corePreviousPoint = corePointIndex !== null && corePointIndex > 0 ? points[corePointIndex - 1] : undefined;
-  const coreQuote = corePointIndex !== null && corePointIndex === points.length - 1 ? quote : null;
+  const coreQuote = !isHistoricalMode && corePointIndex !== null && corePointIndex === points.length - 1 ? quote : null;
   const displayVolume = quote?.volume ?? latest?.volume;
   const volumeRatio = displayVolume && latest?.volumeMa5 ? displayVolume / latest.volumeMa5 : undefined;
   const chipPoints = points;
@@ -5480,7 +5582,7 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
               <Badge variant="info" size="sm">{stockCode}</Badge>
               {initialDateKey ? <Badge variant="danger" size="sm">命中日 {initialDateKey}</Badge> : null}
               <span className="truncate text-sm text-secondary-text">{stockName}</span>
-              <CurrentDateTimeClock />
+              {!isHistoricalMode ? <CurrentDateTimeClock /> : null}
             </div>
             {ruleDraftFeedback ? (
               <p className="mt-1 max-w-2xl truncate text-xs text-secondary-text">{ruleDraftFeedback}</p>
@@ -5632,11 +5734,12 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
                     chip={displayChip}
                     mainChip={mainChip}
                     quote={quote}
+                    showRealtimeTab={!isHistoricalMode}
                     onAddRuleMetric={handleAddRuleMetric}
                   />
                   {!modal ? (
                     <RelatedNewsPanel stockCode={stockCode} />
-                  ) : (
+                  ) : isHistoricalMode ? null : (
                     <MarketStructureStrip
                       points={points}
                       quote={quote}

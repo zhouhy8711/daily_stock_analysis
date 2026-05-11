@@ -152,6 +152,7 @@ class TestPrefetchStockNames(unittest.TestCase):
         pipeline.db = MagicMock()
         pipeline.fetcher_manager.get_stock_name.return_value = "贵州茅台"
         pipeline.db.has_today_data.return_value = False
+        pipeline._ensure_chip_daily_cache_for_target = MagicMock()
         pipeline.fetcher_manager.get_daily_data.return_value = (
             pd.DataFrame(
                 [
@@ -176,6 +177,11 @@ class TestPrefetchStockNames(unittest.TestCase):
         self.assertTrue(success)
         self.assertIsNone(error)
         pipeline.fetcher_manager.get_stock_name.assert_called_once_with("600519", allow_realtime=False)
+        pipeline._ensure_chip_daily_cache_for_target.assert_called_once()
+        args, kwargs = pipeline._ensure_chip_daily_cache_for_target.call_args
+        self.assertEqual(args[0], "600519")
+        self.assertEqual(kwargs["history_source"], "dummy")
+        self.assertFalse(kwargs["history_df"].empty)
 
     def test_pytdx_get_stock_name_reads_all_security_list_pages(self):
         fetcher = PytdxFetcher(hosts=[])

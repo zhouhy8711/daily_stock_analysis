@@ -33,7 +33,22 @@ logger = logging.getLogger(__name__)
 
 
 # === 标准化列名定义 ===
-STANDARD_COLUMNS = ['date', 'open', 'high', 'low', 'close', 'volume', 'amount', 'pct_chg', 'turnover_rate']
+STANDARD_COLUMNS = [
+    'date',
+    'open',
+    'high',
+    'low',
+    'close',
+    'volume',
+    'amount',
+    'pct_chg',
+    'turnover_rate',
+    'pe_ratio',
+    'total_mv',
+    'circ_mv',
+    'total_shares',
+    'float_shares',
+]
 INTRADAY_PERIOD_TO_MINUTES = {
     "1m": 1,
     "5m": 5,
@@ -535,7 +550,21 @@ class BaseFetcher(ABC):
             df['date'] = pd.to_datetime(df['date'])
         
         # 数值列类型转换
-        numeric_cols = ['open', 'high', 'low', 'close', 'volume', 'amount', 'pct_chg', 'turnover_rate']
+        numeric_cols = [
+            'open',
+            'high',
+            'low',
+            'close',
+            'volume',
+            'amount',
+            'pct_chg',
+            'turnover_rate',
+            'pe_ratio',
+            'total_mv',
+            'circ_mv',
+            'total_shares',
+            'float_shares',
+        ]
         for col in numeric_cols:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors='coerce')

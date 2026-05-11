@@ -430,11 +430,18 @@ class AkshareFetcher(BaseFetcher):
         3. 最后尝试腾讯财经接口 (ak.stock_zh_a_hist_tx)
         """
         # 尝试列表
-        methods = [
-            (self._fetch_stock_data_em, "东方财富"),
-            (self._fetch_stock_data_sina, "新浪财经"),
-            (self._fetch_stock_data_tx, "腾讯财经"),
-        ]
+        if is_bse_code(stock_code):
+            methods = [
+                (self._fetch_stock_data_sina, "新浪财经"),
+                (self._fetch_stock_data_em, "东方财富"),
+                (self._fetch_stock_data_tx, "腾讯财经"),
+            ]
+        else:
+            methods = [
+                (self._fetch_stock_data_em, "东方财富"),
+                (self._fetch_stock_data_sina, "新浪财经"),
+                (self._fetch_stock_data_tx, "腾讯财经"),
+            ]
 
         last_error = None
 
@@ -535,6 +542,9 @@ class AkshareFetcher(BaseFetcher):
                 if '收盘' in df.columns:
                     df['涨跌幅'] = df['收盘'].pct_change() * 100
                     df['涨跌幅'] = df['涨跌幅'].fillna(0)
+
+                if 'turnover' in df.columns:
+                    df['换手率'] = pd.to_numeric(df['turnover'], errors='coerce') * 100
 
                 return df
             return pd.DataFrame()
@@ -1335,6 +1345,12 @@ class AkshareFetcher(BaseFetcher):
             '成交额': 'amount',
             '涨跌幅': 'pct_chg',
             '换手率': 'turnover_rate',
+            '市盈率': 'pe_ratio',
+            '市盈率-动态': 'pe_ratio',
+            '总市值': 'total_mv',
+            '流通市值': 'circ_mv',
+            '总股本': 'total_shares',
+            '流通股本': 'float_shares',
         }
         
         # 重命名列

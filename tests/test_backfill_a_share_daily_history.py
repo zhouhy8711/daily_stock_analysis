@@ -116,6 +116,8 @@ class BackfillAShareDailyHistoryTestCase(unittest.TestCase):
             [date(2026, 1, 2), date(2026, 1, 5), date(2026, 1, 6)],
             self.db,
             fetcher_factory=lambda: fake_fetcher,
+            backfill_chip=False,
+            enrich_valuation=False,
         )
 
         self.assertEqual(result.status, "fetched")
@@ -139,6 +141,32 @@ class BackfillAShareDailyHistoryTestCase(unittest.TestCase):
         self.assertEqual(by_date[date(2026, 1, 5)], 11.0)
         self.assertEqual(by_date[date(2026, 1, 6)], 12.0)
 
+    def test_backfill_one_stock_refresh_existing_upserts_present_dates(self) -> None:
+        code = "600519"
+        self._save_daily(code, date(2026, 1, 2), 10.0)
+        remote_df = pd.DataFrame(
+            [
+                {"date": "2026-01-02", "open": 20, "high": 22, "low": 19, "close": 21, "volume": 100, "amount": 2100},
+            ]
+        )
+        fake_fetcher = _FakeDailyFetcher(remote_df)
+
+        result = backfill_one_stock(
+            code,
+            [date(2026, 1, 2)],
+            self.db,
+            fetcher_factory=lambda: fake_fetcher,
+            backfill_chip=False,
+            refresh_existing=True,
+            enrich_valuation=False,
+        )
+
+        self.assertEqual(result.status, "fetched")
+        self.assertEqual(result.missing_count, 1)
+        self.assertEqual(result.saved_count, 0)
+        row = self.db.get_data_range(code, date(2026, 1, 2), date(2026, 1, 2))[0]
+        self.assertEqual(row.close, 21)
+
     def test_backfill_one_stock_skips_when_all_dates_exist(self) -> None:
         code = "000001"
         self._save_daily(code, date(2026, 1, 2), 10.0)
@@ -149,11 +177,157 @@ class BackfillAShareDailyHistoryTestCase(unittest.TestCase):
             [date(2026, 1, 2)],
             self.db,
             fetcher_factory=lambda: fake_fetcher,
+            backfill_chip=False,
         )
 
         self.assertEqual(result.status, "skipped")
         self.assertEqual(result.missing_count, 0)
         self.assertEqual(fake_fetcher.calls, [])
+
+    def test_backfill_one_stock_computes_missing_chip_snapshots(self) -> None:
+        code = "600519"
+        expected_dates = [date(2026, 1, 5), date(2026, 1, 6)]
+        for index, item in enumerate(expected_dates):
+            self._save_daily(code, item, 10.0 + index)
+
+        remote_df = pd.DataFrame(
+            [
+                {
+                    "date": "2026-01-02",
+                    "open": 9.0,
+                    "high": 10.5,
+                    "low": 8.8,
+                    "close": 10.0,
+                    "volume": 1000,
+                    "amount": 10000,
+                    "turnover_rate": 1.2,
+                },
+                {
+                    "date": "2026-01-05",
+                    "open": 10.0,
+                    "high": 11.5,
+                    "low": 9.8,
+                    "close": 11.0,
+                    "volume": 1200,
+                    "amount": 13200,
+                    "turnover_rate": 1.6,
+                },
+                {
+                    "date": "2026-01-06",
+                    "open": 11.0,
+                    "high": 12.0,
+                    "low": 10.5,
+                    "close": 11.6,
+                    "volume": 1300,
+                    "amount": 15080,
+                    "turnover_rate": 2.1,
+                },
+            ]
+        )
+        fake_fetcher = _FakeDailyFetcher(remote_df)
+
+        result = backfill_one_stock(
+            code,
+            expected_dates,
+            self.db,
+            fetcher_factory=lambda: fake_fetcher,
+        )
+
+        self.assertEqual(result.status, "chip_fetched")
+        self.assertEqual(result.missing_count, 0)
+        self.assertEqual(result.chip_missing_count, 2)
+        self.assertEqual(result.chip_saved_count, 2)
+        self.assertEqual(len(fake_fetcher.calls), 1)
+
+        rows = self.db.get_chip_daily_range(code, expected_dates[0], expected_dates[-1])
+        self.assertEqual([row["date"] for row in rows], ["2026-01-05", "2026-01-06"])
+        self.assertGreater(rows[-1]["avg_cost"], 0)
+        self.assertGreater(len(rows[-1]["distribution"]), 0)
+
+    def test_backfill_one_stock_skip_daily_does_not_scan_daily_gaps(self) -> None:
+        code = "600519"
+        chip_date = date(2026, 1, 5)
+        self.db.save_chip_daily_snapshots(
+            code,
+            [
+                {
+                    "date": chip_date,
+                    "profit_ratio": 0.5,
+                    "avg_cost": 10.2,
+                    "distribution": [{"price": 10.2, "percent": 1.0}],
+                }
+            ],
+            data_source="unit",
+        )
+        fake_fetcher = _FakeDailyFetcher(pd.DataFrame())
+
+        result = backfill_one_stock(
+            code,
+            [chip_date],
+            self.db,
+            fetcher_factory=lambda: fake_fetcher,
+            backfill_daily=False,
+        )
+
+        self.assertEqual(result.status, "skipped")
+        self.assertEqual(result.missing_count, 0)
+        self.assertEqual(result.chip_missing_count, 0)
+        self.assertEqual(fake_fetcher.calls, [])
+
+    def test_backfill_one_stock_treats_missing_non_trading_chip_day_as_no_data(self) -> None:
+        code = "600519"
+        expected_dates = [date(2026, 1, 5), date(2026, 1, 6)]
+        self.db.save_chip_daily_snapshots(
+            code,
+            [
+                {
+                    "date": expected_dates[0],
+                    "profit_ratio": 0.5,
+                    "avg_cost": 10.2,
+                    "distribution": [{"price": 10.2, "percent": 1.0}],
+                }
+            ],
+            data_source="unit",
+        )
+        remote_df = pd.DataFrame(
+            [
+                {
+                    "date": "2026-01-02",
+                    "open": 9.0,
+                    "high": 10.5,
+                    "low": 8.8,
+                    "close": 10.0,
+                    "volume": 1000,
+                    "amount": 10000,
+                    "turnover_rate": 1.2,
+                },
+                {
+                    "date": "2026-01-05",
+                    "open": 10.0,
+                    "high": 11.5,
+                    "low": 9.8,
+                    "close": 11.0,
+                    "volume": 1200,
+                    "amount": 13200,
+                    "turnover_rate": 1.6,
+                },
+            ]
+        )
+        fake_fetcher = _FakeDailyFetcher(remote_df)
+
+        result = backfill_one_stock(
+            code,
+            expected_dates,
+            self.db,
+            fetcher_factory=lambda: fake_fetcher,
+            backfill_daily=False,
+        )
+
+        self.assertEqual(result.status, "no_data")
+        self.assertEqual(result.chip_missing_count, 1)
+        self.assertEqual(result.chip_saved_count, 0)
+        self.assertEqual(result.errors, [])
+        self.assertEqual(len(fake_fetcher.calls), 1)
 
 
 if __name__ == "__main__":

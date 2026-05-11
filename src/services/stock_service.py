@@ -22,6 +22,7 @@ from typing import Optional, Dict, Any, List, Tuple
 from src.core import trading_calendar
 from src.config import get_config
 from src.repositories.stock_repo import StockRepository
+from src.services.daily_history_enrichment import enrich_daily_history_with_quote_fields
 
 logger = logging.getLogger(__name__)
 
@@ -837,16 +838,115 @@ class StockService:
             }
         return self.warm_realtime_quotes(codes, force_refresh=force_refresh)
 
-    def get_indicator_metrics(self, stock_code: str) -> Dict[str, Any]:
+    @staticmethod
+    def _parse_optional_date(value: Optional[str]) -> Optional[date]:
+        if not value:
+            return None
+        try:
+            return datetime.strptime(str(value)[:10], "%Y-%m-%d").date()
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _empty_indicator_metrics_payload(
+        stock_code: str,
+        stock_name: Optional[str],
+        *,
+        chip_payload: Optional[Dict[str, Any]] = None,
+        source_chain: Optional[List[Dict[str, Any]]] = None,
+        errors: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        return {
+            "stock_code": stock_code,
+            "stock_name": stock_name,
+            "chip_distribution": chip_payload,
+            "capital_flow": None,
+            "major_holders": [],
+            "major_holder_status": "not_supported",
+            "source_chain": source_chain or [],
+            "errors": errors or [],
+            "update_time": datetime.now().isoformat(),
+        }
+
+    def _load_chip_distribution_from_db(
+        self,
+        stock_code: str,
+        *,
+        as_of: Optional[date] = None,
+        days: int = 365,
+    ) -> Optional[Dict[str, Any]]:
+        end_date = as_of or datetime.now().date()
+        requested_days = max(1, min(int(days or 365), 730))
+        start_date = end_date - timedelta(days=int(requested_days * 1.8) + 10)
+
+        for candidate in self._daily_cache_code_candidates(stock_code):
+            rows = self.repo.db.get_chip_daily_range(candidate, start_date, end_date)
+            if not rows:
+                continue
+            latest = rows[-1]
+            payload = dict(latest)
+            payload["snapshots"] = rows
+            return payload
+        return None
+
+    def _save_chip_distribution_payload(self, stock_code: str, chip_payload: Optional[Dict[str, Any]]) -> None:
+        if not chip_payload:
+            return
+        snapshots = chip_payload.get("snapshots") if isinstance(chip_payload, dict) else None
+        if not snapshots and chip_payload.get("date"):
+            snapshots = [chip_payload]
+        if not isinstance(snapshots, list) or not snapshots:
+            return
+        try:
+            from data_provider.base import normalize_stock_code
+
+            normalized_code = normalize_stock_code(stock_code)
+            saved_count = self.repo.db.save_chip_daily_snapshots(
+                normalized_code,
+                [item for item in snapshots if isinstance(item, dict)],
+                data_source=chip_payload.get("source"),
+            )
+            if saved_count:
+                logger.info("已写入 %s 筹码峰日缓存 %s 条", normalized_code, saved_count)
+        except Exception as exc:
+            logger.debug("写入 %s 筹码峰日缓存失败: %s", stock_code, exc)
+
+    def _sync_chip_daily_cache_from_history(
+        self,
+        stock_code: str,
+        history_df,
+        *,
+        data_source: Optional[str] = None,
+    ) -> None:
+        """Persist chip snapshots from the same daily frame just written to stock_daily."""
+        try:
+            from src.services.chip_daily_sync import sync_chip_daily_from_history
+
+            saved_count = sync_chip_daily_from_history(
+                self.repo.db,
+                stock_code,
+                history_df,
+                data_source=data_source,
+            )
+            if saved_count:
+                logger.info("已同步 %s 筹码峰日缓存 %s 条", stock_code, saved_count)
+        except Exception as exc:
+            logger.debug("同步 %s 筹码峰日缓存失败: %s", stock_code, exc)
+
+    def get_indicator_metrics(
+        self,
+        stock_code: str,
+        data_policy: str = "default",
+        trade_date: Optional[str] = None,
+        days: int = 365,
+    ) -> Dict[str, Any]:
         """
         获取指标分析扩展数据：筹码分布与主力/机构持仓名称。
 
         这些数据源均为可选上下文，接口保持 fail-open，失败时返回空结构，
         不影响 K 线与实时行情展示。
         """
-        from data_provider.base import DataFetcherManager
-
-        manager = DataFetcherManager()
+        normalized_policy = str(data_policy or "default").strip().lower()
         stock_name = None
         chip_payload = None
         capital_flow_payload = None
@@ -856,7 +956,33 @@ class StockService:
         errors: List[str] = []
 
         try:
-            stock_name = manager.get_stock_name(stock_code, allow_realtime=False)
+            stock_name = self._get_local_stock_name(stock_code)
+        except Exception as e:
+            logger.debug(f"获取 {stock_code} 本地股票名称失败: {e}")
+
+        if normalized_policy in {"cache_only", "db_only", "snapshot_only"}:
+            as_of = self._parse_optional_date(trade_date)
+            chip_payload = self._load_chip_distribution_from_db(stock_code, as_of=as_of, days=days)
+            source_chain = [{
+                "provider": "stock_chip_daily",
+                "result": "ok" if chip_payload else "miss",
+                "duration_ms": 0,
+            }]
+            errors = [] if chip_payload else ["chip_daily_miss"]
+            return self._empty_indicator_metrics_payload(
+                stock_code,
+                stock_name,
+                chip_payload=chip_payload,
+                source_chain=source_chain,
+                errors=errors,
+            )
+
+        from data_provider.base import DataFetcherManager
+
+        manager = DataFetcherManager()
+
+        try:
+            stock_name = stock_name or manager.get_stock_name(stock_code, allow_realtime=False)
         except Exception as e:
             logger.debug(f"获取 {stock_code} 股票名称失败: {e}")
 
@@ -950,6 +1076,7 @@ class StockService:
                     "snapshots": snapshots,
                     "chip_status": None,
                 }
+                self._save_chip_distribution_payload(stock_code, chip_payload)
         except Exception as e:
             logger.debug(f"获取 {stock_code} 筹码分布失败: {e}")
             errors.append(f"chip_distribution:{type(e).__name__}")
@@ -1122,7 +1249,13 @@ class StockService:
                 "after_hours_volume": _to_optional_float(row.get("after_hours_volume")),
                 "amount": _to_optional_float(row.get("amount")),
                 "change_percent": _to_optional_float(row.get("pct_chg")) or _to_optional_float(row.get("change_percent")),
+                "volume_ratio": _to_optional_float(row.get("volume_ratio")),
                 "turnover_rate": _to_optional_float(row.get("turnover_rate")),
+                "pe_ratio": _to_optional_float(row.get("pe_ratio")),
+                "total_mv": _to_optional_float(row.get("total_mv")),
+                "circ_mv": _to_optional_float(row.get("circ_mv")),
+                "total_shares": _to_optional_float(row.get("total_shares")),
+                "float_shares": _to_optional_float(row.get("float_shares")),
                 "data_source": _to_optional_string(row.get("data_source")),
                 "snapshot_id": _to_optional_string(row.get("snapshot_id")),
                 "snapshot_time": _to_optional_string(row.get("snapshot_time")),
@@ -1146,15 +1279,9 @@ class StockService:
     def _resolve_daily_cache_target_date(stock_code: str) -> date:
         try:
             market = trading_calendar.get_market_for_stock(stock_code)
-            market_today = trading_calendar.get_market_now(market).date()
-            target_date = market_today - timedelta(days=1)
-            for _ in range(10):
-                if trading_calendar.is_market_open(market, target_date):
-                    return target_date
-                target_date -= timedelta(days=1)
-            return market_today - timedelta(days=1)
+            return trading_calendar.get_effective_trading_date(market)
         except Exception as calendar_error:
-            logger.debug("解析 %s 最新已完成交易日失败，按昨天校验日线缓存: %s", stock_code, calendar_error)
+            logger.debug("解析 %s 最新有效交易日失败，按昨天校验日线缓存: %s", stock_code, calendar_error)
             return datetime.now().date() - timedelta(days=1)
 
     def _get_daily_cache_latest_date(self, stock_code: str) -> Optional[date]:
@@ -1599,7 +1726,20 @@ class StockService:
                     if df is not None and not df.empty:
                         if not loaded_from_stale_cache:
                             try:
+                                df = enrich_daily_history_with_quote_fields(
+                                    df,
+                                    stock_code,
+                                    quote_loader=lambda code: manager.get_realtime_quote(
+                                        code,
+                                        log_final_failure=False,
+                                    ),
+                                )
                                 self.repo.save_dataframe(df, stock_code, source)
+                                self._sync_chip_daily_cache_from_history(
+                                    stock_code,
+                                    df,
+                                    data_source=source,
+                                )
                                 refreshed_cache = self._load_daily_history_from_db(stock_code, days)
                                 if refreshed_cache is None:
                                     refreshed_cache = self._load_daily_history_from_db(

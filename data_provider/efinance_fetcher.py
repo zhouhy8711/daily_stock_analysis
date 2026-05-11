@@ -679,6 +679,12 @@ class EfinanceFetcher(BaseFetcher):
             '成交额': 'amount',
             '涨跌幅': 'pct_chg',
             '换手率': 'turnover_rate',
+            '市盈率': 'pe_ratio',
+            '市盈率-动态': 'pe_ratio',
+            '总市值': 'total_mv',
+            '流通市值': 'circ_mv',
+            '总股本': 'total_shares',
+            '流通股本': 'float_shares',
             '股票代码': 'code',
             '股票名称': 'name',
         }

@@ -100,6 +100,60 @@ class TestStorage(unittest.TestCase):
 
         DatabaseManager.reset_instance()
 
+    def test_save_daily_data_persists_optional_market_metrics_and_keeps_existing_on_null_update(self):
+        DatabaseManager.reset_instance()
+        db = DatabaseManager(db_url="sqlite:///:memory:")
+        trade_date = date(2026, 1, 19)
+
+        db.save_daily_data(
+            pd.DataFrame([
+                {
+                    "date": trade_date,
+                    "open": 29.27,
+                    "high": 29.86,
+                    "low": 29.0,
+                    "close": 29.6,
+                    "volume": 10000,
+                    "amount": 29600000,
+                    "pct_chg": 1.13,
+                    "turnover_rate": 5.72,
+                    "pe_ratio": 36.47,
+                    "total_mv": 2_995_100_000,
+                    "circ_mv": 2_862_600_000,
+                    "total_shares": 101_185_810,
+                    "float_shares": 96_709_459,
+                }
+            ]),
+            "002859",
+            data_source="TestFetcher",
+        )
+        db.save_daily_data(
+            pd.DataFrame([
+                {
+                    "date": trade_date,
+                    "open": 29.30,
+                    "high": 30.00,
+                    "low": 29.1,
+                    "close": 29.8,
+                    "volume": 12000,
+                    "amount": 35760000,
+                    "pct_chg": 1.8,
+                }
+            ]),
+            "002859",
+            data_source="NoMetricFetcher",
+        )
+
+        row = db.get_data_range("002859", trade_date, trade_date)[0]
+        self.assertEqual(row.close, 29.8)
+        self.assertEqual(row.turnover_rate, 5.72)
+        self.assertEqual(row.pe_ratio, 36.47)
+        self.assertEqual(row.total_mv, 2_995_100_000)
+        self.assertEqual(row.circ_mv, 2_862_600_000)
+        self.assertEqual(row.total_shares, 101_185_810)
+        self.assertEqual(row.float_shares, 96_709_459)
+        DatabaseManager.reset_instance()
+
     def test_intraday_minute_hot_table_upserts_and_archives_to_daily(self):
         DatabaseManager.reset_instance()
         db = DatabaseManager(db_url="sqlite:///:memory:")
@@ -253,6 +307,55 @@ class TestStorage(unittest.TestCase):
             )
         finally:
             DatabaseManager.reset_instance()
+
+    def test_stock_chip_daily_snapshots_upsert_and_read_range(self):
+        DatabaseManager.reset_instance()
+        db = DatabaseManager(db_url="sqlite:///:memory:")
+
+        first = db.save_chip_daily_snapshots(
+            "600519",
+            [
+                {
+                    "date": "2026-05-07",
+                    "source": "unit",
+                    "profit_ratio": 0.8,
+                    "avg_cost": 10.5,
+                    "cost_90_low": 9.5,
+                    "cost_90_high": 11.5,
+                    "concentration_90": 0.12,
+                    "cost_70_low": 10.0,
+                    "cost_70_high": 11.0,
+                    "concentration_70": 0.08,
+                    "distribution": [{"price": 10.5, "percent": 1.0}],
+                }
+            ],
+            data_source="unit",
+        )
+        second = db.save_chip_daily_snapshots(
+            "600519",
+            [
+                {
+                    "date": "2026-05-07",
+                    "source": "unit_updated",
+                    "profit_ratio": 0.9,
+                    "avg_cost": 10.8,
+                    "distribution": [{"price": 10.8, "percent": 1.0}],
+                }
+            ],
+        )
+
+        rows = db.get_chip_daily_range("600519", date(2026, 5, 1), date(2026, 5, 10))
+        latest = db.get_latest_chip_daily("600519", as_of=date(2026, 5, 8))
+
+        self.assertEqual(first, 1)
+        self.assertEqual(second, 0)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["date"], "2026-05-07")
+        self.assertEqual(rows[0]["avg_cost"], 10.8)
+        self.assertEqual(rows[0]["distribution"], [{"price": 10.8, "percent": 1.0}])
+        self.assertEqual(latest["profit_ratio"], 0.9)
+
+        DatabaseManager.reset_instance()
 
     def test_save_daily_data_sqlite_concurrent_same_code_date_counts_only_new_rows(self):
         DatabaseManager.reset_instance()

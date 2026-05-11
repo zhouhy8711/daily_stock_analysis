@@ -644,7 +644,11 @@ def test_rule_service_latest_mode_uses_realtime_day_against_previous_window():
     ]
     service = RuleService(repo=_FakeRuleRepo(rule), stock_service=_RealtimeRuleStockService())
 
-    result = service.run_rule(1, mode="latest", data_policy="snapshot_only")
+    with mock.patch(
+        "src.services.rule_service.trading_calendar.is_market_live_session_open",
+        return_value=True,
+    ):
+        result = service.run_rule(1, mode="latest", data_policy="snapshot_only")
 
     assert result["event_count"] == 1
     event = result["matches"][0]["matched_events"][0]
@@ -692,12 +696,32 @@ def test_rule_service_run_rules_treats_snapshot_cache_miss_as_empty_result():
     service._resolve_run_workers = lambda target_count: 1
     service._resolve_batch_rule_workers = lambda rule_count: 1
 
-    result = service.run_rules([1, 2], mode="latest", data_policy="snapshot_only")
+    with mock.patch(
+        "src.services.rule_service.trading_calendar.is_market_live_session_open",
+        return_value=True,
+    ):
+        result = service.run_rules([1, 2], mode="latest", data_policy="snapshot_only")
 
     assert result["status"] == "completed"
     assert result["matches"] == []
     assert result["errors"] == []
     assert repo.finished_matches == []
+
+
+def test_rule_service_live_snapshot_a_share_scan_rejects_closed_session():
+    repo = _FakeRuleRepo(_service_rule_for_codes(["600519", "000001"]))
+    service = RuleService(repo=repo, stock_service=_RealtimeRuleStockService())
+
+    with mock.patch(
+        "src.services.rule_service.trading_calendar.is_market_live_session_open",
+        return_value=False,
+    ):
+        try:
+            service.run_rule(1, mode="latest", data_policy="snapshot_only")
+        except RuleValidationError as exc:
+            assert "实时交易时段" in str(exc)
+        else:
+            raise AssertionError("expected RuleValidationError")
 
 
 def test_rule_service_history_mode_uses_default_data_policy_for_backfill():

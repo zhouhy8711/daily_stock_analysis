@@ -40,6 +40,8 @@ const TEXTAREA_CLASS =
 const WATCHLIST_HISTORY_LIMIT = 20;
 const LIVE_TEST_POLL_INTERVAL_MS = 30_000;
 const LIVE_TEST_MAX_CONCURRENT_CYCLES = 2;
+const ASHARE_LIVE_SESSION_TEXT = 'A股实测仅在交易日 09:30-11:30、13:00-15:00 运行';
+const ASHARE_LIVE_SESSION_CLOSED_MESSAGE = `${ASHARE_LIVE_SESSION_TEXT}；当前已休市，未触发实时扫描`;
 const UNCLASSIFIED_INDUSTRY = UNCLASSIFIED_INDUSTRY_LABEL;
 const DEFAULT_INDUSTRY = '半导体';
 
@@ -478,6 +480,33 @@ function formatDateTime(value?: string | null): string {
 
 function formatDateTimeToSecond(value?: string | null): string {
   return formatShanghaiDateTime(value, true);
+}
+
+function getShanghaiClockParts(value = new Date()): { weekday: string; hour: number; minute: number } {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Shanghai',
+    weekday: 'short',
+    hour: '2-digit',
+    minute: '2-digit',
+    hourCycle: 'h23',
+  }).formatToParts(value);
+  const getPart = (type: string) => parts.find((part) => part.type === type)?.value ?? '';
+  return {
+    weekday: getPart('weekday'),
+    hour: Number(getPart('hour')),
+    minute: Number(getPart('minute')),
+  };
+}
+
+function isAshareLiveSessionOpen(value = new Date()): boolean {
+  const { weekday, hour, minute } = getShanghaiClockParts(value);
+  if (weekday === 'Sat' || weekday === 'Sun') return false;
+  if (!Number.isFinite(hour) || !Number.isFinite(minute)) return false;
+  const minuteOfDay = hour * 60 + minute;
+  return (
+    (minuteOfDay >= 9 * 60 + 30 && minuteOfDay <= 11 * 60 + 30)
+    || (minuteOfDay >= 13 * 60 && minuteOfDay <= 15 * 60)
+  );
 }
 
 function formatLogTime(value: string): string {
@@ -1712,7 +1741,9 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
     }));
   }, [setRunProgressById]);
 
-  const stopLiveTest = useCallback((message = '实测已停止') => {
+  const stopLiveTest = useCallback((message = '实测已停止', level: LogLevel = 'info') => {
+    const sessionId = liveTestSessionRef.current;
+    const finishedAt = new Date().toISOString();
     clearLiveTestInterval();
     liveTestSessionRef.current = null;
     liveTestCyclesInFlightRef.current = 0;
@@ -1720,8 +1751,11 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
     liveLatestSnapshotIdRef.current = null;
     setIsRunning(false);
     setRunProgressById({});
-    appendExecutionLog(message, 'info');
-  }, [appendExecutionLog, clearLiveTestInterval, setIsRunning, setRunProgressById]);
+    setSelectedRun((current) => (sessionId != null && current?.id === sessionId
+      ? { ...current, status: 'completed', finishedAt }
+      : current));
+    appendExecutionLog(message, level);
+  }, [appendExecutionLog, clearLiveTestInterval, setIsRunning, setRunProgressById, setSelectedRun]);
 
   const runLiveTestCycle = useCallback(async (
     sessionId: number,
@@ -1730,6 +1764,13 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
     runRuleNames: string[],
   ) => {
     if (liveTestSessionRef.current !== sessionId) return;
+    if (!isAshareLiveSessionOpen()) {
+      setRunError(null);
+      setRunWarning(ASHARE_LIVE_SESSION_CLOSED_MESSAGE);
+      setActiveResultTab('logs');
+      stopLiveTest(ASHARE_LIVE_SESSION_CLOSED_MESSAGE, 'warning');
+      return;
+    }
     if (liveTestCyclesInFlightRef.current >= LIVE_TEST_MAX_CONCURRENT_CYCLES) {
       liveTestPendingCycleRef.current = {
         sessionId,
@@ -1845,6 +1886,14 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
     } catch (err) {
       if (liveTestSessionRef.current !== sessionId) return;
       const parsedError = getParsedApiError(err);
+      if (parsedError.message.includes('实时交易时段') || parsedError.message.includes('实测已暂停')) {
+        updateRunProgress(sessionId, 100, '休市暂停');
+        setRunError(null);
+        setRunWarning(parsedError.message);
+        setActiveResultTab('logs');
+        stopLiveTest(parsedError.message, 'warning');
+        return;
+      }
       updateRunProgress(sessionId, 100, `第 ${cycleIndex} 次触发失败，等待下次刷新`);
       appendExecutionLog(`第 ${cycleIndex} 次实测失败：${parsedError.message}`, 'error');
       setRunError(parsedError);
@@ -1869,6 +1918,7 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
     setRunError,
     setRunWarning,
     setSelectedRun,
+    stopLiveTest,
     targetCodes,
     targetScope,
     updateRunProgress,
@@ -1890,6 +1940,14 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
 
   const startLiveTest = useCallback(() => {
     if (runDisabled || isRunning) return;
+    if (!isAshareLiveSessionOpen()) {
+      setRunError(null);
+      setRunWarning(ASHARE_LIVE_SESSION_CLOSED_MESSAGE);
+      setExecutionLogs([]);
+      setActiveResultTab('logs');
+      appendExecutionLog(ASHARE_LIVE_SESSION_CLOSED_MESSAGE, 'warning');
+      return;
+    }
     const sessionId = -Date.now();
     const runStartedAt = new Date().toISOString();
     const runRuleNames = selectedRuleIds
@@ -2981,6 +3039,7 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
           stockName={indicatorSelection.stockName}
           initialDate={indicatorSelection.eventDate}
           initialHistoryDays={getIndicatorHistoryDays(indicatorSelection.eventDate)}
+          dataMode="historical"
           onClose={() => setIndicatorSelection(null)}
         />
       ) : null}

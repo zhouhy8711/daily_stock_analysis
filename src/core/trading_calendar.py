@@ -13,7 +13,7 @@
 """
 
 import logging
-from datetime import date, datetime
+from datetime import date, datetime, time
 from typing import Optional, Set
 from zoneinfo import ZoneInfo
 
@@ -38,6 +38,15 @@ MARKET_TIMEZONE = {
     "cn": "Asia/Shanghai",
     "hk": "Asia/Hong_Kong",
     "us": "America/New_York",
+}
+
+# Market -> regular intraday sessions in each market's local timezone.
+# This is intentionally separate from is_market_open(), which only answers
+# whether a date is a trading session.
+MARKET_LIVE_SESSIONS = {
+    "cn": ((time(9, 30), time(11, 30)), (time(13, 0), time(15, 0))),
+    "hk": ((time(9, 30), time(12, 0)), (time(13, 0), time(16, 0))),
+    "us": ((time(9, 30), time(16, 0)),),
 }
 
 
@@ -123,6 +132,31 @@ def get_market_now(
     if current_time.tzinfo is None:
         return current_time.replace(tzinfo=tz)
     return current_time.astimezone(tz)
+
+
+def is_market_live_session_open(
+    market: Optional[str], current_time: Optional[datetime] = None
+) -> bool:
+    """
+    Return whether realtime/live scanning should run for a market right now.
+
+    This checks both the trading date and the regular intraday session window.
+    Unknown markets fail open so non-A-share callers are not blocked by an
+    unsupported code format.
+    """
+    sessions = MARKET_LIVE_SESSIONS.get(market or "")
+    if not sessions:
+        return True
+
+    market_now = get_market_now(market, current_time=current_time)
+    local_date = market_now.date()
+    if not _XCALS_AVAILABLE and market_now.weekday() >= 5:
+        return False
+    if not is_market_open(str(market), local_date):
+        return False
+
+    local_time = market_now.time()
+    return any(start <= local_time <= end for start, end in sessions)
 
 
 def get_effective_trading_date(

@@ -808,7 +808,13 @@ def test_history_endpoint_exposes_turnover_rate() -> None:
                 "volume": 1000000,
                 "amount": 123450000,
                 "change_percent": 0.98,
+                "volume_ratio": 1.23,
                 "turnover_rate": 0.86,
+                "pe_ratio": 23.89,
+                "total_mv": 2_200_000_000_000,
+                "circ_mv": 2_180_000_000_000,
+                "total_shares": 1_256_197_800,
+                "float_shares": 1_256_197_800,
                 "data_source": float("nan"),
                 "snapshot_id": float("nan"),
                 "snapshot_time": float("nan"),
@@ -821,6 +827,12 @@ def test_history_endpoint_exposes_turnover_rate() -> None:
         response = get_stock_history("600519", period="daily", days=1)
 
     assert response.data[0].turnover_rate == 0.86
+    assert response.data[0].volume_ratio == 1.23
+    assert response.data[0].pe_ratio == 23.89
+    assert response.data[0].total_mv == 2_200_000_000_000
+    assert response.data[0].circ_mv == 2_180_000_000_000
+    assert response.data[0].total_shares == 1_256_197_800
+    assert response.data[0].float_shares == 1_256_197_800
     assert response.data[0].data_source is None
     assert response.data[0].snapshot_id is None
     assert response.data[0].snapshot_time is None
@@ -894,3 +906,71 @@ def test_related_news_refreshes_public_news_and_saves_to_db() -> None:
     assert saved["dimension"] == "latest_news"
     assert saved["query_context"]["query_source"] == "indicator_page"
     assert result["items"][0]["title"] == "刷新后的贵州茅台资讯"
+
+
+def test_indicator_metrics_db_only_reads_chip_daily_without_fetcher() -> None:
+    DatabaseManager.reset_instance()
+    db = DatabaseManager(db_url="sqlite:///:memory:")
+    try:
+        db.save_chip_daily_snapshots(
+            "600519",
+            [
+                {
+                    "date": "2026-05-06",
+                    "source": "unit",
+                    "profit_ratio": 0.72,
+                    "avg_cost": 10.2,
+                    "distribution": [{"price": 10.2, "percent": 1.0}],
+                },
+                {
+                    "date": "2026-05-07",
+                    "source": "unit",
+                    "profit_ratio": 0.81,
+                    "avg_cost": 10.8,
+                    "distribution": [{"price": 10.8, "percent": 1.0}],
+                },
+            ],
+            data_source="unit",
+        )
+
+        service = StockService()
+        service.repo = StockRepository(db)
+
+        with patch("data_provider.base.DataFetcherManager", side_effect=AssertionError("remote fetch forbidden")):
+            result = service.get_indicator_metrics(
+                "600519",
+                data_policy="db_only",
+                trade_date="2026-05-07",
+                days=30,
+            )
+
+        chip = result["chip_distribution"]
+        assert chip["date"] == "2026-05-07"
+        assert chip["avg_cost"] == 10.8
+        assert len(chip["snapshots"]) == 2
+        assert result["capital_flow"] is None
+        assert result["major_holders"] == []
+        assert result["source_chain"][0]["provider"] == "stock_chip_daily"
+    finally:
+        DatabaseManager.reset_instance()
+
+
+def test_indicator_metrics_db_only_returns_miss_fast_when_chip_absent() -> None:
+    DatabaseManager.reset_instance()
+    db = DatabaseManager(db_url="sqlite:///:memory:")
+    try:
+        service = StockService()
+        service.repo = StockRepository(db)
+
+        with patch("data_provider.base.DataFetcherManager", side_effect=AssertionError("remote fetch forbidden")):
+            result = service.get_indicator_metrics(
+                "600519",
+                data_policy="db_only",
+                trade_date=date(2026, 5, 7).isoformat(),
+                days=30,
+            )
+
+        assert result["chip_distribution"] is None
+        assert result["errors"] == ["chip_daily_miss"]
+    finally:
+        DatabaseManager.reset_instance()

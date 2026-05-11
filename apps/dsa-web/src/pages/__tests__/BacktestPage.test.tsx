@@ -445,9 +445,15 @@ describe('BacktestPage', () => {
     expect(screen.getByRole('button', { name: '运行实测' })).toBeInTheDocument();
     expect(rulesApi.listRuns).not.toHaveBeenCalled();
 
-    fireEvent.click(screen.getByRole('button', { name: '运行实测' }));
-
-    await waitFor(() => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-05-07T02:30:00Z'));
+      fireEvent.click(screen.getByRole('button', { name: '运行实测' }));
+      await act(async () => {
+        await Promise.resolve();
+        await Promise.resolve();
+        await Promise.resolve();
+      });
       expect(rulesApi.runBatch).toHaveBeenCalledWith({
         ruleIds: [7],
         mode: 'latest',
@@ -457,28 +463,51 @@ describe('BacktestPage', () => {
           stockCodes: ['300274.SZ', '688521.SH'],
         },
       });
-    });
-    await waitFor(() => {
       expect(rulesApi.notifyRunMatches).toHaveBeenCalledWith(12, {
         executionTime: expect.any(String),
         ruleIds: [7],
         ruleNames: ['放量观察'],
       });
-    });
-    const executionGroupButton = await screen.findByRole('button', {
-      name: /展开执行时间 \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}，命中 1 条，完成时间 \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/,
-    });
-    expect(within(executionGroupButton).getByText(/完成时间 \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/)).toBeInTheDocument();
-    expect(screen.queryByTestId('live-rule-group-7')).not.toBeInTheDocument();
-    fireEvent.click(executionGroupButton);
+      const executionGroupButton = screen.getByRole('button', {
+        name: /展开执行时间 \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}，命中 1 条，完成时间 \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/,
+      });
+      expect(within(executionGroupButton).getByText(/完成时间 \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/)).toBeInTheDocument();
+      expect(screen.queryByTestId('live-rule-group-7')).not.toBeInTheDocument();
+      fireEvent.click(executionGroupButton);
 
-    const liveRuleGroup = await screen.findByTestId('live-rule-group-7');
-    expect(within(liveRuleGroup).getByText('#7 放量观察')).toBeInTheDocument();
-    expect(within(liveRuleGroup).getByText('300274.SZ')).toBeInTheDocument();
-    expect(within(liveRuleGroup).queryByRole('columnheader', { name: '日期' })).not.toBeInTheDocument();
-    expect(within(liveRuleGroup).getByText(/执行 \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/)).toBeInTheDocument();
+      const liveRuleGroup = screen.getByTestId('live-rule-group-7');
+      expect(within(liveRuleGroup).getByText('#7 放量观察')).toBeInTheDocument();
+      expect(within(liveRuleGroup).getByText('300274.SZ')).toBeInTheDocument();
+      expect(within(liveRuleGroup).queryByRole('columnheader', { name: '日期' })).not.toBeInTheDocument();
+      expect(within(liveRuleGroup).getByText(/执行 \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/)).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole('button', { name: '停止实测' }));
+      fireEvent.click(screen.getByRole('button', { name: '停止实测' }));
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('does not start live test after A-share market closes', async () => {
+    render(<BacktestPage mode="live" />);
+
+    expect(await screen.findByText('实测结果')).toBeInTheDocument();
+
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-05-11T13:05:00Z'));
+      fireEvent.click(screen.getByRole('button', { name: '运行实测' }));
+      await act(async () => {
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+
+    expect(rulesApi.runBatch).not.toHaveBeenCalled();
+    expect(screen.getByRole('button', { name: '运行实测' })).toBeInTheDocument();
+    expect(screen.getByRole('tab', { name: /执行日志/ })).toHaveAttribute('aria-selected', 'true');
+    expect(screen.getByText(/当前已休市，未触发实时扫描/)).toBeInTheDocument();
   });
 
   it('keeps each live test cycle as a collapsed execution group', async () => {
@@ -513,7 +542,7 @@ describe('BacktestPage', () => {
 
     vi.useFakeTimers();
     try {
-      vi.setSystemTime(new Date('2026-05-07T03:55:10Z'));
+      vi.setSystemTime(new Date('2026-05-07T02:55:10Z'));
       fireEvent.click(screen.getByRole('button', { name: '运行实测' }));
       await act(async () => {
         await Promise.resolve();
@@ -521,10 +550,10 @@ describe('BacktestPage', () => {
       });
 
       expect(screen.getByRole('button', {
-        name: '展开执行时间 2026-05-07 11:55:10，命中 1 条，完成时间 2026-05-07 11:55:10',
+        name: '展开执行时间 2026-05-07 10:55:10，命中 1 条，完成时间 2026-05-07 10:55:10',
       })).toBeInTheDocument();
 
-      vi.setSystemTime(new Date('2026-05-07T03:55:40Z'));
+      vi.setSystemTime(new Date('2026-05-07T02:55:40Z'));
       await act(async () => {
         vi.advanceTimersByTime(30_000);
         await Promise.resolve();
@@ -532,7 +561,7 @@ describe('BacktestPage', () => {
       });
 
       expect(screen.getByRole('button', {
-        name: '展开执行时间 2026-05-07 11:56:10，命中 1 条，完成时间 2026-05-07 11:56:10',
+        name: '展开执行时间 2026-05-07 10:56:10，命中 1 条，完成时间 2026-05-07 10:56:10',
       })).toBeInTheDocument();
       expect(screen.getAllByTestId('live-execution-group')).toHaveLength(2);
       expect(screen.queryByTestId('live-rule-group-7')).not.toBeInTheDocument();
@@ -586,6 +615,9 @@ describe('BacktestPage', () => {
     await screen.findByText('回测执行历史');
     fireEvent.click(screen.getByLabelText('选择回测规则'));
     fireEvent.click(screen.getByRole('button', { name: '全选' }));
+    await waitFor(() => {
+      expect(screen.getByText('3 / 3')).toBeInTheDocument();
+    });
     fireEvent.click(screen.getByRole('button', { name: '运行回测' }));
 
     const volumeGroup = await screen.findByTestId('backtest-rule-group-7');
@@ -748,7 +780,12 @@ describe('BacktestPage', () => {
     expect(await screen.findByRole('dialog', { name: '指标分析' })).toBeInTheDocument();
     expect(screen.getByText('命中日 2026-05-01')).toBeInTheDocument();
     expect(screen.getByTestId('indicator-hit-highlight-2026-05-01')).toBeInTheDocument();
-    expect(stocksApi.getHistory).toHaveBeenCalledWith('300274.SZ', expect.any(Number), 'daily', 'cache_only');
+    expect(stocksApi.getHistory).toHaveBeenCalledWith('300274.SZ', expect.any(Number), 'daily', 'db_only');
+    expect(stocksApi.getIndicatorMetrics).toHaveBeenCalledWith(
+      '300274.SZ',
+      expect.objectContaining({ dataPolicy: 'db_only', tradeDate: '2026-05-01' }),
+    );
+    expect(screen.queryByRole('tab', { name: '实时监控' })).not.toBeInTheDocument();
   });
 
   it('runs selected rule with the current stock target override', async () => {

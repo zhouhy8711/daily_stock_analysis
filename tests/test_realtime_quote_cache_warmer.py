@@ -42,6 +42,9 @@ def test_realtime_quote_cache_warmer_runs_one_all_share_pass() -> None:
             enable_realtime_quote=True,
             realtime_cache_ttl=30,
         ),
+    ), patch(
+        "src.services.realtime_quote_cache_warmer.trading_calendar.is_market_live_session_open",
+        return_value=True,
     ):
         result = warmer.run_once(reason="test")
 
@@ -63,6 +66,9 @@ def test_realtime_quote_cache_warmer_background_run_forces_refresh() -> None:
             enable_realtime_quote=True,
             realtime_quote_cache_seconds=30,
         ),
+    ), patch(
+        "src.services.realtime_quote_cache_warmer.trading_calendar.is_market_live_session_open",
+        return_value=True,
     ):
         result = warmer.run_once(reason="background", force_refresh=True)
 
@@ -91,3 +97,25 @@ def test_realtime_quote_cache_warmer_skips_when_prefetch_disabled() -> None:
     assert service.calls == 0
     assert result["status"] == "skipped"
     assert result["reason"] == "PREFETCH_REALTIME_QUOTES=false"
+
+
+def test_realtime_quote_cache_warmer_skips_when_a_share_market_closed() -> None:
+    service = _WarmService()
+    warmer = RealtimeQuoteCacheWarmer(service_factory=lambda: service)
+
+    with patch(
+        "src.services.realtime_quote_cache_warmer.get_config",
+        return_value=SimpleNamespace(
+            prefetch_realtime_quotes=True,
+            enable_realtime_quote=True,
+            realtime_cache_ttl=30,
+        ),
+    ), patch(
+        "src.services.realtime_quote_cache_warmer.trading_calendar.is_market_live_session_open",
+        return_value=False,
+    ):
+        result = warmer.run_once(reason="background", force_refresh=True)
+
+    assert service.calls == 0
+    assert result["status"] == "skipped"
+    assert result["reason"] == "a_share_market_closed"

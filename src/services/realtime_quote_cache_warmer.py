@@ -11,6 +11,7 @@ import time
 from typing import Any, Callable, Dict, Optional
 
 from src.config import get_config
+from src.core import trading_calendar
 from src.services.stock_service import StockService
 
 logger = logging.getLogger(__name__)
@@ -115,6 +116,18 @@ class RealtimeQuoteCacheWarmer:
                 "failed_count": 0,
             }
             self._log_result(result, reason=reason, force=True)
+            return result
+
+        if not trading_calendar.is_market_live_session_open("cn"):
+            result = {
+                "status": "skipped",
+                "reason": "a_share_market_closed",
+                "requested_count": 0,
+                "cached_before": 0,
+                "fetched_count": 0,
+                "failed_count": 0,
+            }
+            self._log_result(result, reason=reason)
             return result
 
         if not self._run_lock.acquire(blocking=False):

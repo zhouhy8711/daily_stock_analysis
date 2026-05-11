@@ -197,6 +197,7 @@ class RuleService:
         run_data_policy = self._normalize_data_policy(data_policy)
         date_from, date_to = self._normalize_date_range(start_date, end_date)
         rule, definition, stock_codes = self._prepare_rule_run(rule_id, target_override)
+        self._validate_live_snapshot_session(run_mode, run_data_policy, stock_codes)
         run_id = self.repo.create_run(rule_id, len(stock_codes))
         started_at = datetime.now()
 
@@ -271,6 +272,11 @@ class RuleService:
         ]
         primary_rule_id = prepared[0][0]
         target_count = len(prepared[0][3])
+        self._validate_live_snapshot_session(
+            run_mode,
+            run_data_policy,
+            self._resolve_batch_stock_codes(prepared),
+        )
         run_id = self.repo.create_run(primary_rule_id, target_count)
         started_at = datetime.now()
         all_matches: List[Dict[str, Any]] = []
@@ -427,6 +433,7 @@ class RuleService:
         primary_rule_id = prepared[0][0]
         rule_names = [str(rule.get("name") or f"规则 {rule_id}") for rule_id, rule, _, _ in prepared]
         stock_codes = self._resolve_batch_stock_codes(prepared)
+        self._validate_live_snapshot_session(run_mode, run_data_policy, stock_codes)
         run_id = self.repo.create_run(
             primary_rule_id,
             len(stock_codes),
@@ -843,6 +850,22 @@ class RuleService:
         if policy not in DATA_POLICIES:
             raise RuleValidationError("数据策略仅支持 default/snapshot_only/cache_only/db_only")
         return policy
+
+    @staticmethod
+    def _validate_live_snapshot_session(run_mode: str, data_policy: str, stock_codes: List[str]) -> None:
+        if run_mode != "latest" or data_policy != "snapshot_only":
+            return
+
+        known_markets = {
+            market
+            for market in (trading_calendar.get_market_for_stock(code) for code in stock_codes)
+            if market
+        }
+        if known_markets != {"cn"}:
+            return
+
+        if not trading_calendar.is_market_live_session_open("cn"):
+            raise RuleValidationError("A股当前不在实时交易时段（09:30-11:30、13:00-15:00），实测已暂停")
 
     def _build_snapshot_run_metadata(self, stock_codes: List[str]) -> Dict[str, Any]:
         snapshot_info_getter = getattr(self.stock_service, "get_realtime_quote_snapshot_info", None)

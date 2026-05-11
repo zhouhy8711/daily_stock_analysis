@@ -358,6 +358,45 @@ describe('IndicatorAnalysisModal', () => {
     unmount();
   });
 
+  it('appends a realtime daily bar when quote date is newer than cached history', async () => {
+    const staleHistory = makeDailyHistory(26, '2026-04-13');
+    const realtimeQuote = makeQuote('688256', {
+      stockName: '寒武纪',
+      currentPrice: 1200,
+      open: 1201,
+      high: 1205.99,
+      low: 1158.03,
+      prevClose: 1182.53,
+      change: 17.47,
+      changePercent: 1.48,
+      volume: 231721.74,
+      amount: 27508750000,
+      volumeRatio: 1.51,
+      turnoverRate: 3.69,
+      updateTime: '2026-05-11T21:38:23+08:00',
+    });
+    vi.mocked(stocksApi.getHistory).mockImplementation(async (stockCode, _days, period = 'daily') => ({
+      stockCode,
+      stockName: '寒武纪',
+      period,
+      data: period === 'daily' ? staleHistory : makeHistory(period),
+      dataSource: 'db_cache',
+    }));
+    vi.mocked(stocksApi.getQuote).mockResolvedValue(realtimeQuote);
+
+    const { unmount } = render(
+      <IndicatorAnalysisModal stockCode="688256" stockName="寒武纪" onClose={vi.fn()} />,
+    );
+    await flushPromises();
+
+    expect(screen.getByTestId('indicator-chart-bar-2026-05-11')).toBeInTheDocument();
+    expect(screen.getByTestId('indicator-volume-bar-2026-05-11')).toBeInTheDocument();
+    expectIndicatorHeadersToShow('2026-05-11');
+    expect(within(screen.getByTestId('indicator-core-metrics')).getByText('1200.00')).toBeInTheDocument();
+
+    unmount();
+  });
+
   it.each([
     ['600519', '贵州茅台'],
     ['BABA', '阿里巴巴'],
@@ -660,7 +699,7 @@ describe('IndicatorAnalysisModal', () => {
 
     fireEvent.mouseEnter(screen.getByTestId('indicator-volume-bar-2026-04-24'));
     expectIndicatorHeadersToShow('2026-04-24');
-    expect(within(screen.getByTestId('indicator-core-metrics')).getByText('132.00')).toBeInTheDocument();
+    expect(within(screen.getByTestId('indicator-core-metrics')).getByText('122.30')).toBeInTheDocument();
 
     unmount();
   });
@@ -1138,6 +1177,10 @@ describe('IndicatorAnalysisModal', () => {
 
     fireEvent.click(within(timeAxis).getByRole('button', { name: '向右平移K线时间' }));
     expect(screen.getByTestId(`indicator-chart-bar-${longHistory.at(-1)?.date}`)).toBeInTheDocument();
+    const lastHitRect = screen.getByTestId(`indicator-chart-bar-${longHistory.at(-1)?.date}`);
+    const rightAxis = screen.getByTestId('indicator-kline-right-axis');
+    const lastHitCenter = Number(lastHitRect.getAttribute('x')) + Number(lastHitRect.getAttribute('width')) / 2;
+    expect(Number(rightAxis.getAttribute('x1'))).toBeGreaterThan(lastHitCenter);
 
     unmount();
   });

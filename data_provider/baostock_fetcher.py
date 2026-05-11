@@ -157,9 +157,9 @@ class BaostockFetcher(BaseFetcher):
                 return f"sz.{code}"
 
         # 根据代码前缀判断市场
-        if code.startswith(('600', '601', '603', '688')):
+        if code.startswith(('600', '601', '603', '605', '688', '689')):
             return f"sh.{code}"
-        elif code.startswith(('000', '002', '300')):
+        elif code.startswith(('000', '001', '002', '003', '300', '301')):
             return f"sz.{code}"
         else:
             logger.warning(f"无法确定股票 {code} 的市场，默认使用深市")
@@ -209,7 +209,7 @@ class BaostockFetcher(BaseFetcher):
                 # adjustflag: 1-后复权，2-前复权，3-不复权
                 rs = bs.query_history_k_data_plus(
                     code=bs_code,
-                    fields="date,open,high,low,close,volume,amount,pctChg",
+                    fields="date,open,high,low,close,volume,amount,pctChg,turn",
                     start_date=start_date,
                     end_date=end_date,
                     frequency="d",  # 日线
@@ -241,22 +241,37 @@ class BaostockFetcher(BaseFetcher):
         标准化 Baostock 数据
         
         Baostock 返回的列名：
-        date, open, high, low, close, volume, amount, pctChg
-        
+        date, open, high, low, close, volume, amount, pctChg, turn
+
         需要映射到标准列名：
-        date, open, high, low, close, volume, amount, pct_chg
+        date, open, high, low, close, volume, amount, pct_chg, turnover_rate
         """
         df = df.copy()
         
         # 列名映射（只需要处理 pctChg）
         column_mapping = {
             'pctChg': 'pct_chg',
+            'turn': 'turnover_rate',
         }
         
         df = df.rename(columns=column_mapping)
         
         # 数值类型转换（Baostock 返回的都是字符串）
-        numeric_cols = ['open', 'high', 'low', 'close', 'volume', 'amount', 'pct_chg']
+        numeric_cols = [
+            'open',
+            'high',
+            'low',
+            'close',
+            'volume',
+            'amount',
+            'pct_chg',
+            'turnover_rate',
+            'pe_ratio',
+            'total_mv',
+            'circ_mv',
+            'total_shares',
+            'float_shares',
+        ]
         for col in numeric_cols:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors='coerce')

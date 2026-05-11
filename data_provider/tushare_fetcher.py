@@ -532,6 +532,10 @@ class TushareFetcher(BaseFetcher):
         column_mapping = {
             'trade_date': 'date',
             'vol': 'volume',
+            'pe': 'pe_ratio',
+            'pe_ttm': 'pe_ratio',
+            'total_share': 'total_shares',
+            'float_share': 'float_shares',
             # open, high, low, close, amount, pct_chg 列名相同
         }
         
@@ -545,6 +549,15 @@ class TushareFetcher(BaseFetcher):
         # 成交量保留 Tushare 返回的「手」口径。
         if 'amount' in df.columns and not is_hk:
             df['amount'] = df['amount'] * 1000
+
+        # daily_basic 口径：市值为万元，股本为万股；统一转为元/股。
+        if not is_hk:
+            for mv_col in ('total_mv', 'circ_mv'):
+                if mv_col in df.columns:
+                    df[mv_col] = df[mv_col] * 10000
+            for share_col in ('total_shares', 'float_shares'):
+                if share_col in df.columns:
+                    df[share_col] = df[share_col] * 10000
         
         # 添加股票代码列
         df['code'] = stock_code

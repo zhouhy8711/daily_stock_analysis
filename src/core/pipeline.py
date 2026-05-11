@@ -37,6 +37,7 @@ from src.report_language import (
 )
 from src.search_service import SearchService
 from src.services.social_sentiment_service import SocialSentimentService
+from src.services.daily_history_enrichment import enrich_daily_history_with_quote_fields
 from src.enums import ReportType
 from src.stock_analyzer import StockTrendAnalyzer, TrendAnalysisResult
 from src.core.trading_calendar import (
@@ -212,6 +213,7 @@ class StockAnalysisPipeline:
                 logger.info(
                     f"{stock_name}({code}) {target_date} 数据已存在，跳过获取（断点续传）"
                 )
+                self._ensure_chip_daily_cache_for_target(code, target_date)
                 return True, None
 
             # 从数据源获取数据
@@ -221,9 +223,24 @@ class StockAnalysisPipeline:
             if df is None or df.empty:
                 return False, "获取数据为空"
 
+            df = enrich_daily_history_with_quote_fields(
+                df,
+                code,
+                quote_loader=lambda stock_code: self.fetcher_manager.get_realtime_quote(
+                    stock_code,
+                    log_final_failure=False,
+                ),
+            )
+
             # 保存到数据库
             saved_count = self.db.save_daily_data(df, code, source_name)
             logger.info(f"{stock_name}({code}) 数据保存成功（来源: {source_name}，新增 {saved_count} 条）")
+            self._ensure_chip_daily_cache_for_target(
+                code,
+                target_date,
+                history_df=df,
+                history_source=source_name,
+            )
 
             return True, None
 
@@ -291,6 +308,7 @@ class StockAnalysisPipeline:
                 if chip_data:
                     logger.info(f"{stock_name}({code}) 筹码分布: 获利比例={chip_data.profit_ratio:.1%}, "
                               f"90%集中度={chip_data.concentration_90:.2%}")
+                    self._save_chip_distribution_daily_cache(code, chip_data)
                 else:
                     logger.debug(f"{stock_name}({code}) 筹码分布获取失败或已禁用")
             except Exception as e:
@@ -753,7 +771,21 @@ class StockAnalysisPipeline:
         try:
             df, source = self.fetcher_manager.get_daily_data(code, days=min_days)
             if df is not None and not df.empty:
+                df = enrich_daily_history_with_quote_fields(
+                    df,
+                    code,
+                    quote_loader=lambda stock_code: self.fetcher_manager.get_realtime_quote(
+                        stock_code,
+                        log_final_failure=False,
+                    ),
+                )
                 self.db.save_daily_data(df, code, source)
+                self._ensure_chip_daily_cache_for_target(
+                    code,
+                    target,
+                    history_df=df,
+                    history_source=source,
+                )
                 logger.info("[%s] Prefetched %d rows of history for agent (source: %s)", code, len(df), source)
         except Exception as e:
             logger.warning("[%s] Agent history prefetch failed: %s", code, e)
@@ -1151,6 +1183,52 @@ class StockAnalysisPipeline:
             except Exception:
                 return None
         return None
+
+    def _save_chip_distribution_daily_cache(self, code: str, chip_data: Optional[ChipDistribution]) -> None:
+        """Persist computed chip snapshots so indicator clicks can read DB-only."""
+        payload = self._safe_to_dict(chip_data)
+        if not payload:
+            return
+        snapshots = payload.get("snapshots") if isinstance(payload, dict) else None
+        if not snapshots and payload.get("date"):
+            snapshots = [payload]
+        if not isinstance(snapshots, list) or not snapshots:
+            return
+        try:
+            saved = self.db.save_chip_daily_snapshots(
+                normalize_stock_code(code),
+                [item for item in snapshots if isinstance(item, dict)],
+                data_source=payload.get("source"),
+            )
+            if saved:
+                logger.info("[%s] 已写入筹码峰日缓存 %s 条", code, saved)
+        except Exception as exc:
+            logger.debug("[%s] 写入筹码峰日缓存失败: %s", code, exc)
+
+    def _ensure_chip_daily_cache_for_target(
+        self,
+        code: str,
+        target_date: date,
+        *,
+        history_df: Optional[pd.DataFrame] = None,
+        history_source: Optional[str] = None,
+    ) -> None:
+        """Best-effort chip cache sync that follows the daily K-line sync path."""
+        try:
+            from src.services.chip_daily_sync import ensure_chip_daily_for_dates
+
+            saved = ensure_chip_daily_for_dates(
+                self.db,
+                self.fetcher_manager,
+                code,
+                [target_date],
+                history_df=history_df,
+                history_source=history_source,
+            )
+            if saved:
+                logger.info("[%s] 已同步筹码峰日缓存 %s 条，目标日=%s", code, saved, target_date)
+        except Exception as exc:
+            logger.debug("[%s] 同步筹码峰日缓存失败，已降级跳过: %s", code, exc)
 
     def _resolve_query_source(self, query_source: Optional[str]) -> str:
         """

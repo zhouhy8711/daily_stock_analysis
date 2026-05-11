@@ -43,6 +43,18 @@ class _FakeDailyHistoryManager:
     def get_stock_name(self, stock_code: str):
         return "贵州茅台"
 
+    def get_realtime_quote(self, stock_code: str, **_kwargs):
+        return SimpleNamespace(
+            code=stock_code,
+            name="贵州茅台",
+            price=123.45,
+            pe_ratio=24.0,
+            total_mv=1_234_500_000,
+            circ_mv=987_600_000,
+            total_shares=10_000_000,
+            float_shares=8_000_000,
+        )
+
 
 class _FakeRealtimeQuoteManager:
     def get_realtime_quote(self, stock_code: str):
@@ -260,6 +272,21 @@ class GetLatestDataTestCase(unittest.TestCase):
         self.assertEqual(len(result["data"]), 1)
         self.assertAlmostEqual(result["data"][0]["close"], 1688.5, places=6)
 
+    def test_daily_cache_target_date_uses_effective_trading_date(self) -> None:
+        effective_date = date(2026, 5, 11)
+
+        with (
+            patch("src.services.stock_service.trading_calendar.get_market_for_stock", return_value="cn"),
+            patch(
+                "src.services.stock_service.trading_calendar.get_effective_trading_date",
+                return_value=effective_date,
+            ) as effective_mock,
+        ):
+            result = StockService._resolve_daily_cache_target_date("688256")
+
+        self.assertEqual(result, effective_date)
+        effective_mock.assert_called_once_with("cn")
+
     def test_history_data_refreshes_stale_daily_db_before_returning(self) -> None:
         stale_date = date.today() - timedelta(days=5)
         target_date = date.today() - timedelta(days=1)
@@ -309,6 +336,10 @@ class GetLatestDataTestCase(unittest.TestCase):
         rows = self.db.get_data_range("600519", target_date, target_date)
         self.assertEqual(len(rows), 1)
         self.assertAlmostEqual(rows[0].close, 123.45, places=6)
+        self.assertAlmostEqual(rows[0].total_mv, 1_234_500_000, places=6)
+        self.assertAlmostEqual(rows[0].circ_mv, 987_600_000, places=6)
+        self.assertAlmostEqual(rows[0].pe_ratio, 24.0, places=6)
+        self.assertAlmostEqual(rows[0].turnover_rate, 12.5, places=6)
         self.assertEqual(rows[0].data_source, "FakeDailyFetcher")
 
     def test_history_data_fetches_full_window_when_daily_db_has_too_few_rows(self) -> None:
@@ -421,6 +452,55 @@ class GetLatestDataTestCase(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertAlmostEqual(rows[0].close, 123.45, places=6)
         self.assertEqual(rows[0].data_source, "FakeDailyFetcher")
+
+    def test_history_data_fetches_and_syncs_chip_cache_from_same_daily_frame(self) -> None:
+        target_date = date.today() - timedelta(days=1)
+        previous_date = target_date - timedelta(days=1)
+        fetched_df = pd.DataFrame([
+            {
+                "date": previous_date,
+                "open": 120.0,
+                "high": 125.0,
+                "low": 119.0,
+                "close": 122.0,
+                "volume": 1000000,
+                "amount": 122000000,
+                "pct_chg": 0.5,
+                "turnover_rate": 1.1,
+            },
+            {
+                "date": target_date,
+                "open": 122.0,
+                "high": 126.0,
+                "low": 121.0,
+                "close": 123.45,
+                "volume": 1100000,
+                "amount": 135795000,
+                "pct_chg": 0.98,
+                "turnover_rate": 1.4,
+            },
+        ])
+        manager = _FakeDailyHistoryManager(fetched_df)
+
+        with (
+            patch("data_provider.base.DataFetcherManager", return_value=manager),
+            patch(
+                "src.services.stock_service.StockService._resolve_daily_cache_target_date",
+                return_value=target_date,
+            ),
+            patch(
+                "src.services.stock_service.StockService._resolve_realtime_daily_date",
+                return_value=None,
+            ),
+        ):
+            StockService().get_history_data("600519", period="daily", days=2)
+
+        rows = self.db.get_chip_daily_range("600519", previous_date, target_date)
+        self.assertEqual([item["date"] for item in rows], [
+            previous_date.isoformat(),
+            target_date.isoformat(),
+        ])
+        self.assertTrue(rows[-1]["source"].startswith("local_chip_model:FakeDailyFetcher"))
 
     def test_daily_history_db_only_uses_partial_merged_db_rows_without_remote(self) -> None:
         first_date = date.today() - timedelta(days=5)
