@@ -4,10 +4,10 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
-from sqlalchemy import delete, desc, func, select
+from sqlalchemy import delete, desc, func, or_, select
 
 from src.storage import DatabaseManager, StockRule, StockRuleMatch, StockRuleRun
 
@@ -143,6 +143,84 @@ class RuleRepository:
             if isinstance(matched_dates, list):
                 total += len(matched_dates)
         return total
+
+    @staticmethod
+    def _snapshot_has_live_metadata(snapshot_json: Optional[str]) -> bool:
+        snapshot = _json_loads(snapshot_json, {}) or {}
+        if not isinstance(snapshot, dict):
+            return False
+        if snapshot.get("snapshot_id") or snapshot.get("snapshot_time"):
+            return True
+        for event in snapshot.get("_matched_events") or []:
+            if not isinstance(event, dict):
+                continue
+            event_snapshot = event.get("snapshot") or {}
+            if isinstance(event_snapshot, dict) and (
+                event_snapshot.get("snapshot_id") or event_snapshot.get("snapshot_time")
+            ):
+                return True
+        return False
+
+    @staticmethod
+    def _normalize_match_signature_rows(rows: List[Tuple[int, str, Optional[str]]]) -> Tuple[Tuple[int, str], ...]:
+        pairs = {
+            (int(rule_id), str(stock_code or "").strip().upper())
+            for rule_id, stock_code, _snapshot_json in rows
+            if rule_id and str(stock_code or "").strip()
+        }
+        return tuple(sorted(pairs))
+
+    def get_previous_live_match_signature(self, run_id: int) -> Optional[Dict[str, Any]]:
+        """Return today's previous live-test rule/stock signature before run_id."""
+        with self.db.get_session() as session:
+            current = session.execute(
+                select(StockRuleRun).where(StockRuleRun.id == run_id).limit(1)
+            ).scalar_one_or_none()
+            if current is None or current.started_at is None:
+                return None
+
+            day_start = current.started_at.replace(hour=0, minute=0, second=0, microsecond=0)
+            next_day_start = day_start + timedelta(days=1)
+            previous_run_ids = session.execute(
+                select(StockRuleRun.id)
+                .where(
+                    StockRuleRun.id != run_id,
+                    StockRuleRun.status.in_(("completed", "partial")),
+                    StockRuleRun.match_count > 0,
+                    StockRuleRun.started_at >= day_start,
+                    StockRuleRun.started_at < next_day_start,
+                    or_(
+                        StockRuleRun.started_at < current.started_at,
+                        (StockRuleRun.started_at == current.started_at) & (StockRuleRun.id < run_id),
+                    ),
+                )
+                .order_by(desc(StockRuleRun.started_at), desc(StockRuleRun.id))
+            ).scalars().all()
+
+            for previous_run_id in previous_run_ids:
+                rows = session.execute(
+                    select(StockRuleMatch.rule_id, StockRuleMatch.stock_code, StockRuleMatch.snapshot_json)
+                    .where(StockRuleMatch.run_id == previous_run_id)
+                    .order_by(StockRuleMatch.id.asc())
+                ).all()
+                row_values = [
+                    (int(rule_id), str(stock_code), snapshot_json)
+                    for rule_id, stock_code, snapshot_json in rows
+                ]
+                if not row_values:
+                    continue
+                if not any(
+                    self._snapshot_has_live_metadata(snapshot_json)
+                    for _rule_id, _stock_code, snapshot_json in row_values
+                ):
+                    continue
+                signature = self._normalize_match_signature_rows(row_values)
+                if signature:
+                    return {
+                        "run_id": int(previous_run_id),
+                        "signature": signature,
+                    }
+        return None
 
     def list_runs(self, limit: int = 30) -> List[Dict[str, Any]]:
         with self.db.get_session() as session:

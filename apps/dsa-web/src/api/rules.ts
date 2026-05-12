@@ -310,6 +310,7 @@ export const rulesApi = {
       message: toString(response.data.message),
       matchCount: toNumber(response.data.match_count ?? response.data.matchCount),
       eventCount: toNumber(response.data.event_count ?? response.data.eventCount),
+      deduplicated: toBoolean(response.data.deduplicated),
     };
   },
 

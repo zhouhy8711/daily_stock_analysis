@@ -88,6 +88,7 @@ class RuleRunNotifyResponse(BaseModel):
     message: str
     match_count: int = 0
     event_count: int = 0
+    deduplicated: bool = False
 
 
 class RuleRunHistoryItem(BaseModel):

@@ -1,3 +1,4 @@
+import json
 import threading
 import time
 from datetime import datetime
@@ -7,6 +8,7 @@ from src.rules.engine import evaluate_rule, evaluate_rule_history
 from src.rules.metrics import build_metric_frame, get_metric_registry
 from src.repositories.rule_repo import RuleRepository
 from src.services.rule_service import RuleService, RuleValidationError
+from src.storage import DatabaseManager, StockRule, StockRuleMatch, StockRuleRun
 
 
 def _history():
@@ -146,6 +148,89 @@ def test_rule_repository_counts_persisted_match_event_rows():
     ])
 
     assert event_count == 4
+
+
+def test_rule_repository_previous_live_match_signature_skips_non_live_runs():
+    DatabaseManager.reset_instance()
+    db = DatabaseManager(db_url="sqlite:///:memory:")
+    try:
+        repo = RuleRepository(db)
+        with db.get_session() as session:
+            rule = StockRule(
+                name="放量观察",
+                period="daily",
+                lookback_days=120,
+                target_scope="custom",
+                target_codes_json="[]",
+                definition_json="{}",
+            )
+            session.add(rule)
+            session.commit()
+            session.refresh(rule)
+
+            live_run = StockRuleRun(
+                rule_id=rule.id,
+                status="completed",
+                target_count=1,
+                match_count=1,
+                started_at=datetime(2026, 5, 8, 10, 0, 0),
+            )
+            non_live_run = StockRuleRun(
+                rule_id=rule.id,
+                status="completed",
+                target_count=1,
+                match_count=1,
+                started_at=datetime(2026, 5, 8, 10, 0, 30),
+            )
+            current_run = StockRuleRun(
+                rule_id=rule.id,
+                status="completed",
+                target_count=1,
+                match_count=1,
+                started_at=datetime(2026, 5, 8, 10, 1, 0),
+            )
+            session.add_all([live_run, non_live_run, current_run])
+            session.commit()
+            session.refresh(live_run)
+            session.refresh(non_live_run)
+            session.refresh(current_run)
+
+            session.add_all([
+                StockRuleMatch(
+                    run_id=live_run.id,
+                    rule_id=rule.id,
+                    stock_code="300274.SZ",
+                    snapshot_json=json.dumps({
+                        "_matched_events": [
+                            {
+                                "snapshot": {
+                                    "snapshot_id": "20260508100000",
+                                    "snapshot_time": "2026-05-08T10:00:00",
+                                }
+                            }
+                        ]
+                    }),
+                ),
+                StockRuleMatch(
+                    run_id=non_live_run.id,
+                    rule_id=rule.id,
+                    stock_code="000001.SZ",
+                    snapshot_json=json.dumps({"_matched_events": [{"date": "2026-04-30"}]}),
+                ),
+            ])
+            session.commit()
+            current_run_id = current_run.id
+            live_run_id = live_run.id
+            rule_id = rule.id
+
+        previous = repo.get_previous_live_match_signature(current_run_id)
+
+        assert previous == {
+            "run_id": live_run_id,
+            "signature": ((rule_id, "300274.SZ"),),
+        }
+    finally:
+        DatabaseManager.reset_instance()
 
 
 def test_metric_frame_maps_chip_ratios_to_percent_values():
@@ -634,11 +719,21 @@ class _PolicyRecordingStockService(_FakeStockService):
 
 
 class _NotifyRuleRepo:
-    def __init__(self, matches):
+    def __init__(self, matches, previous_signature=None, previous_run_id=None):
         self.matches = matches
+        self.previous_signature = previous_signature
+        self.previous_run_id = previous_run_id
 
     def list_matches(self, run_id):
         return self.matches
+
+    def get_previous_live_match_signature(self, run_id):
+        if not self.previous_signature:
+            return None
+        return {
+            "run_id": self.previous_run_id,
+            "signature": self.previous_signature,
+        }
 
 
 class _ConcurrentProbeStockService(_FakeStockService):
@@ -916,6 +1011,52 @@ def test_rule_service_notify_live_matches_sends_configured_notifications():
     assert "#7 放量观察" in message
     assert "阳光电源(300274.SZ)" in message
     assert "成交量: 123,456 > 100,000" in message
+
+
+def test_rule_service_notify_live_matches_skips_duplicate_signature():
+    matches = [
+        {
+            "run_id": 12,
+            "rule_id": 7,
+            "stock_code": "300274.SZ",
+            "stock_name": "阳光电源",
+            "matched_dates": ["2026-05-08"],
+            "matched_events": [
+                {
+                    "date": "2026-05-08",
+                    "snapshot": {
+                        "snapshot_id": "20260508100100",
+                        "snapshot_time": "2026-05-08T10:01:00",
+                    },
+                    "matched_groups": [],
+                }
+            ],
+            "matched_groups": [],
+            "snapshot": {},
+            "explanation": None,
+        }
+    ]
+    repo = _NotifyRuleRepo(
+        matches,
+        previous_signature=((7, "300274.SZ"),),
+        previous_run_id=11,
+    )
+    fake_notifier = mock.Mock()
+    service = RuleService(repo=repo, stock_service=object())
+
+    with mock.patch("src.notification.NotificationService", return_value=fake_notifier):
+        result = service.notify_live_matches(
+            12,
+            execution_time="2026-05-08 10:01:00",
+            rule_ids=[7],
+            rule_names=["放量观察"],
+        )
+
+    assert result["sent"] is False
+    assert result["deduplicated"] is True
+    assert result["event_count"] == 1
+    assert "跳过重复推送" in result["message"]
+    fake_notifier.send.assert_not_called()
 
 
 def test_rule_service_notify_live_matches_skips_empty_result():

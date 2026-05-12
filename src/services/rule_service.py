@@ -1072,6 +1072,43 @@ class RuleService:
             total += len(matched_dates)
         return total
 
+    @staticmethod
+    def _build_live_match_signature(matches: List[Dict[str, Any]]) -> tuple[tuple[int, str], ...]:
+        pairs = {
+            (int(match.get("rule_id") or 0), str(match.get("stock_code") or "").strip().upper())
+            for match in matches
+            if int(match.get("rule_id") or 0) > 0 and str(match.get("stock_code") or "").strip()
+        }
+        return tuple(sorted(pairs))
+
+    def _get_previous_live_match_signature(self, run_id: int) -> Optional[Dict[str, Any]]:
+        getter = getattr(self.repo, "get_previous_live_match_signature", None)
+        if not callable(getter):
+            return None
+        try:
+            previous = getter(run_id)
+        except Exception as exc:
+            logger.warning("读取上一轮实测命中签名失败: run_id=%s, error=%s", run_id, exc)
+            return None
+        if not isinstance(previous, dict):
+            return None
+        raw_signature = previous.get("signature") or []
+        signature = tuple(
+            sorted(
+                {
+                    (int(rule_id), str(stock_code or "").strip().upper())
+                    for rule_id, stock_code in raw_signature
+                    if int(rule_id) > 0 and str(stock_code or "").strip()
+                }
+            )
+        )
+        if not signature:
+            return None
+        return {
+            "run_id": previous.get("run_id"),
+            "signature": signature,
+        }
+
     def notify_live_matches(
         self,
         run_id: int,
@@ -1089,6 +1126,28 @@ class RuleService:
                 "message": "本次实测没有命中结果，未推送通知",
                 "match_count": len(matches),
                 "event_count": 0,
+                "deduplicated": False,
+            }
+
+        current_signature = self._build_live_match_signature(matches)
+        previous = self._get_previous_live_match_signature(run_id)
+        if current_signature and previous and current_signature == previous.get("signature"):
+            previous_run_id = previous.get("run_id")
+            previous_text = f"（上一轮运行 #{previous_run_id}）" if previous_run_id else ""
+            logger.info(
+                "实测命中与今日上一轮一致，跳过重复推送: "
+                "run_id=%s, previous_run_id=%s, signature=%s",
+                run_id,
+                previous_run_id,
+                current_signature,
+            )
+            message = f"本次实测命中与今日上一轮命中完全一致{previous_text}，已跳过重复推送"
+            return {
+                "sent": False,
+                "message": message,
+                "match_count": len(matches),
+                "event_count": event_count,
+                "deduplicated": True,
             }
 
         content = self._build_live_match_notification(
@@ -1110,6 +1169,7 @@ class RuleService:
                     "message": "通知渠道未配置，未推送",
                     "match_count": len(matches),
                     "event_count": event_count,
+                    "deduplicated": False,
                 }
 
             sent = notifier.send(content)
@@ -1118,6 +1178,7 @@ class RuleService:
                 "message": "实测命中通知已发送" if sent else "实测命中通知发送失败",
                 "match_count": len(matches),
                 "event_count": event_count,
+                "deduplicated": False,
             }
         except Exception as exc:
             logger.error("实测命中通知异常: run_id=%s, error=%s", run_id, exc, exc_info=True)
@@ -1126,6 +1187,7 @@ class RuleService:
                 "message": f"实测命中通知异常: {type(exc).__name__}",
                 "match_count": len(matches),
                 "event_count": event_count,
+                "deduplicated": False,
             }
 
     @classmethod

@@ -148,6 +148,7 @@ export type RuleRunNotifyResponse = {
   message: string;
   matchCount: number;
   eventCount: number;
+  deduplicated?: boolean;
 };
 
 export type RuleRunPayload = {

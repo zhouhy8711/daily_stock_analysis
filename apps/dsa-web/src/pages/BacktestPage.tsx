@@ -1866,7 +1866,7 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
             notification.sent
               ? `第 ${cycleIndex} 次实测命中已推送通知：${notification.eventCount} 条`
               : `第 ${cycleIndex} 次实测命中未推送通知：${notification.message}`,
-            notification.sent ? 'success' : 'warning',
+            notification.sent ? 'success' : notification.deduplicated ? 'info' : 'warning',
           );
         }).catch((notifyError) => {
           if (liveTestSessionRef.current !== sessionId) return;
