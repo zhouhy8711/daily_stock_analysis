@@ -920,6 +920,43 @@ describe('IndicatorAnalysisModal', () => {
     unmount();
   });
 
+  it('keeps same-day timeshare empty before market starts even if one-minute rows are returned', async () => {
+    vi.setSystemTime(new Date('2026-05-12T00:52:23.000Z'));
+    vi.mocked(stocksApi.getHistory).mockImplementation(async (stockCode, _days, period = 'daily') => ({
+      stockCode,
+      stockName: '芯原股份',
+      period,
+      data: period === '1m' ? makeTimeshareHistory('2026-05-12') : makeDailyHistory(1, '2026-05-12'),
+      dataSource: period === '1m' ? 'AkshareFetcher' : 'db_cache',
+    }));
+    vi.mocked(stocksApi.getQuote).mockImplementation(async (stockCode) => makeQuote(stockCode, {
+      currentPrice: 268.44,
+      change: 1.59,
+      changePercent: 0.6,
+      updateTime: '2026-05-12T08:52:23+08:00',
+    }));
+
+    const { unmount } = render(
+      <IndicatorAnalysisModal stockCode="688521.SH" stockName="芯原股份" onClose={vi.fn()} />,
+    );
+    await flushPromises();
+
+    fireEvent.click(screen.getByRole('tab', { name: '分时' }));
+    await flushPromises();
+
+    expect(screen.getByRole('tab', { name: '分时' })).toHaveAttribute('aria-selected', 'true');
+    expect(screen.getByRole('img', { name: 'K线图' })).toBeInTheDocument();
+    expect(screen.getByRole('img', { name: '成交量图' })).toBeInTheDocument();
+    expect(screen.getByRole('img', { name: 'MACD指标图' })).toBeInTheDocument();
+    expect(screen.getByText('09:30')).toBeInTheDocument();
+    expect(screen.getByText('15:00')).toBeInTheDocument();
+    expect(screen.queryByTestId('indicator-chart-bar-2026-05-12 09:30')).not.toBeInTheDocument();
+    expect(screen.queryByText('K线源 AkshareFetcher')).not.toBeInTheDocument();
+    expect(within(screen.getByTestId('indicator-price-header')).getByText('现价:--')).toBeInTheDocument();
+
+    unmount();
+  });
+
   it('does not fall back to daily K when timeshare cache warm still returns empty', async () => {
     vi.mocked(stocksApi.getHistory).mockImplementation(async (stockCode, _days, period = 'daily') => ({
       stockCode,

@@ -1445,6 +1445,24 @@ class StockService:
             return datetime.now().date()
 
     @staticmethod
+    def _is_before_intraday_session_start(stock_code: str) -> bool:
+        try:
+            market = trading_calendar.get_market_for_stock(stock_code)
+            sessions = getattr(trading_calendar, "MARKET_LIVE_SESSIONS", {}).get(market or "")
+            if not market or not sessions:
+                return False
+
+            market_now = trading_calendar.get_market_now(market)
+            if not trading_calendar.is_market_open(market, market_now.date()):
+                return False
+
+            first_start = min(start for start, _end in sessions)
+            return market_now.time() < first_start
+        except Exception as calendar_error:
+            logger.debug("解析 %s 分钟开盘时间失败，按已开盘处理: %s", stock_code, calendar_error)
+            return False
+
+    @staticmethod
     def _quote_has_realtime_daily_signal(quote_payload: Optional[Dict[str, Any]]) -> bool:
         if not quote_payload:
             return False
@@ -1760,6 +1778,9 @@ class StockService:
             else:
                 intraday_days = max(1, min(int(days or 1), 30))
                 intraday_trade_date = self._resolve_intraday_cache_target_date(stock_code)
+                if normalized_period == "1m" and intraday_days == 1 and self._is_before_intraday_session_start(stock_code):
+                    logger.info("开盘前跳过当天分时热表与远程回源: %s period=%s", stock_code, normalized_period)
+                    return {"stock_code": stock_code, "period": normalized_period, "data": [], "data_source": "intraday_hot_table_miss"}
                 hot_df = self.repo.db.get_intraday_minute_data(
                     stock_code,
                     days=intraday_days,

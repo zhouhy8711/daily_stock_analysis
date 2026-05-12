@@ -1,5 +1,6 @@
 import threading
 import time
+from datetime import datetime
 from unittest import mock
 
 from src.rules.engine import evaluate_rule, evaluate_rule_history
@@ -572,6 +573,57 @@ class _SnapshotMissingStockService(_FakeStockService):
         return None
 
 
+class _SnapshotMissingWithIntradayHotTableStockService(_FakeStockService):
+    def get_history_data(self, stock_code, period="daily", days=30, data_policy="default"):
+        if period == "1m":
+            return {
+                "stock_code": stock_code,
+                "stock_name": "热表股票",
+                "period": period,
+                "data_source": "intraday_hot_table",
+                "data": [
+                    {
+                        "date": "2026-05-08 09:30",
+                        "open": 10,
+                        "high": 10.5,
+                        "low": 9.8,
+                        "close": 10.2,
+                        "volume": 1000,
+                        "amount": 10200,
+                        "change_percent": 1,
+                        "snapshot_id": "20260508093000",
+                        "snapshot_time": "2026-05-08T09:30:00",
+                        "data_source": "intraday_hot_table",
+                    },
+                    {
+                        "date": "2026-05-08 09:31",
+                        "open": 10.2,
+                        "high": 16.2,
+                        "low": 10.1,
+                        "close": 16,
+                        "volume": 3000,
+                        "amount": 48000,
+                        "change_percent": 60,
+                        "snapshot_id": "20260508093100",
+                        "snapshot_time": "2026-05-08T09:31:00",
+                        "data_source": "intraday_hot_table",
+                    },
+                ],
+            }
+        return {
+            "stock_code": stock_code,
+            "stock_name": "热表股票",
+            "period": period,
+            "data": [
+                {"date": "2026-05-06", "open": 9, "high": 10, "low": 8, "close": 9, "volume": 1000, "amount": 9000, "pct_chg": 0},
+                {"date": "2026-05-07", "open": 9, "high": 10, "low": 8, "close": 9, "volume": 1000, "amount": 9000, "pct_chg": 0},
+            ],
+        }
+
+    def get_realtime_quote(self, stock_code, data_policy="default"):
+        return None
+
+
 class _PolicyRecordingStockService(_FakeStockService):
     def __init__(self):
         self.history_policies = []
@@ -645,7 +697,7 @@ def test_rule_service_latest_mode_uses_realtime_day_against_previous_window():
     service = RuleService(repo=_FakeRuleRepo(rule), stock_service=_RealtimeRuleStockService())
 
     with mock.patch(
-        "src.services.rule_service.trading_calendar.is_market_live_session_open",
+        "src.services.rule_service.RuleService._is_cn_live_test_allowed",
         return_value=True,
     ):
         result = service.run_rule(1, mode="latest", data_policy="snapshot_only")
@@ -697,7 +749,7 @@ def test_rule_service_run_rules_treats_snapshot_cache_miss_as_empty_result():
     service._resolve_batch_rule_workers = lambda rule_count: 1
 
     with mock.patch(
-        "src.services.rule_service.trading_calendar.is_market_live_session_open",
+        "src.services.rule_service.RuleService._is_cn_live_test_allowed",
         return_value=True,
     ):
         result = service.run_rules([1, 2], mode="latest", data_policy="snapshot_only")
@@ -708,20 +760,59 @@ def test_rule_service_run_rules_treats_snapshot_cache_miss_as_empty_result():
     assert repo.finished_matches == []
 
 
+def test_rule_service_latest_snapshot_miss_uses_intraday_hot_table_fallback():
+    rule = _service_rule_for_codes(["600519"])
+    rule["definition"]["groups"][0]["conditions"] = [
+        {
+            "id": "c1",
+            "left": {"metric": "close", "offset": 0},
+            "operator": ">",
+            "right": {"type": "literal", "value": 12},
+        }
+    ]
+    service = RuleService(
+        repo=_FakeRuleRepo(rule),
+        stock_service=_SnapshotMissingWithIntradayHotTableStockService(),
+    )
+
+    with mock.patch(
+        "src.services.rule_service.RuleService._is_cn_live_test_allowed",
+        return_value=True,
+    ):
+        result = service.run_rule(1, mode="latest", data_policy="snapshot_only")
+
+    assert result["event_count"] == 1
+    assert result["snapshot_id"] == "20260508093100"
+    event = result["matches"][0]["matched_events"][0]
+    assert event["date"] == "2026-05-08"
+    assert event["snapshot"]["close"] == 16
+    assert event["snapshot"]["current_price"] == 16
+    assert event["snapshot"]["data_source"] == "intraday_hot_table"
+
+
 def test_rule_service_live_snapshot_a_share_scan_rejects_closed_session():
     repo = _FakeRuleRepo(_service_rule_for_codes(["600519", "000001"]))
     service = RuleService(repo=repo, stock_service=_RealtimeRuleStockService())
 
     with mock.patch(
-        "src.services.rule_service.trading_calendar.is_market_live_session_open",
+        "src.services.rule_service.RuleService._is_cn_live_test_allowed",
         return_value=False,
     ):
         try:
             service.run_rule(1, mode="latest", data_policy="snapshot_only")
         except RuleValidationError as exc:
-            assert "实时交易时段" in str(exc)
+            assert "15:00" in str(exc)
         else:
             raise AssertionError("expected RuleValidationError")
+
+
+def test_rule_service_live_test_window_allows_preopen_and_lunch_before_15():
+    with mock.patch("src.services.rule_service.trading_calendar.is_market_open", return_value=True):
+        assert RuleService._is_cn_live_test_allowed(datetime(2026, 5, 8, 8, 45))
+        assert RuleService._is_cn_live_test_allowed(datetime(2026, 5, 8, 12, 0))
+        assert RuleService._is_cn_live_test_allowed(datetime(2026, 5, 8, 15, 0))
+        assert RuleService._is_cn_live_test_allowed(datetime(2026, 5, 8, 15, 0, 59))
+        assert not RuleService._is_cn_live_test_allowed(datetime(2026, 5, 8, 15, 1))
 
 
 def test_rule_service_history_mode_uses_default_data_policy_for_backfill():

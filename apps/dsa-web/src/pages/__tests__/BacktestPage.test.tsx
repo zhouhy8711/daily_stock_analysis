@@ -447,7 +447,7 @@ describe('BacktestPage', () => {
 
     vi.useFakeTimers();
     try {
-      vi.setSystemTime(new Date('2026-05-07T02:30:00Z'));
+      vi.setSystemTime(new Date('2026-05-07T00:45:00Z'));
       fireEvent.click(screen.getByRole('button', { name: '运行实测' }));
       await act(async () => {
         await Promise.resolve();
@@ -507,7 +507,7 @@ describe('BacktestPage', () => {
     expect(rulesApi.runBatch).not.toHaveBeenCalled();
     expect(screen.getByRole('button', { name: '运行实测' })).toBeInTheDocument();
     expect(screen.getByRole('tab', { name: /执行日志/ })).toHaveAttribute('aria-selected', 'true');
-    expect(screen.getByText(/当前已休市，未触发实时扫描/)).toBeInTheDocument();
+    expect(screen.getByText(/当前已超过实测时间，未触发实时扫描/)).toBeInTheDocument();
   });
 
   it('keeps each live test cycle as a collapsed execution group', async () => {

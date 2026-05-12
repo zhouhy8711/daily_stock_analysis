@@ -236,7 +236,7 @@ class RuleService:
                 "duration_ms": duration_ms,
                 "matches": matches,
                 "errors": errors,
-                **self._build_snapshot_run_metadata(stock_codes),
+                **self._build_snapshot_run_metadata(stock_codes, matches=matches),
             }
         except Exception as exc:
             logger.error("规则 %s 执行失败: %s", rule_id, exc, exc_info=True)
@@ -396,7 +396,7 @@ class RuleService:
                 "duration_ms": duration_ms,
                 "matches": all_matches,
                 "errors": all_errors,
-                **self._build_snapshot_run_metadata(prepared[0][3]),
+                **self._build_snapshot_run_metadata(prepared[0][3], matches=all_matches),
             }
         except Exception as exc:
             logger.error("批量规则回测失败: %s", exc, exc_info=True)
@@ -864,10 +864,25 @@ class RuleService:
         if known_markets != {"cn"}:
             return
 
-        if not trading_calendar.is_market_live_session_open("cn"):
-            raise RuleValidationError("A股当前不在实时交易时段（09:30-11:30、13:00-15:00），实测已暂停")
+        if not RuleService._is_cn_live_test_allowed():
+            raise RuleValidationError("A股实测仅在交易日 15:00 及以前运行，当前已超过实测时间或非交易日，实测已暂停")
 
-    def _build_snapshot_run_metadata(self, stock_codes: List[str]) -> Dict[str, Any]:
+    @staticmethod
+    def _is_cn_live_test_allowed(current_time: Optional[datetime] = None) -> bool:
+        market_now = trading_calendar.get_market_now("cn", current_time=current_time)
+        if market_now.weekday() >= 5:
+            return False
+        if not trading_calendar.is_market_open("cn", market_now.date()):
+            return False
+        minute_of_day = market_now.hour * 60 + market_now.minute
+        return minute_of_day <= 15 * 60
+
+    def _build_snapshot_run_metadata(
+        self,
+        stock_codes: List[str],
+        *,
+        matches: Optional[List[Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
         snapshot_info_getter = getattr(self.stock_service, "get_realtime_quote_snapshot_info", None)
         snapshot_info = snapshot_info_getter() if callable(snapshot_info_getter) else {}
         unique_codes = list(dict.fromkeys(stock_codes))
@@ -877,9 +892,15 @@ class RuleService:
             for code in unique_codes
             if self._get_stock_realtime_quote(code, data_policy="snapshot_only") is not None
         )
+        snapshot_id = snapshot_info.get("snapshot_id")
+        snapshot_time = snapshot_info.get("snapshot_time")
+        if matches and not snapshot_id:
+            snapshot_id = self._first_snapshot_value(matches, "snapshot_id")
+        if matches and not snapshot_time:
+            snapshot_time = self._first_snapshot_value(matches, "snapshot_time")
         return {
-            "snapshot_id": snapshot_info.get("snapshot_id"),
-            "snapshot_time": snapshot_info.get("snapshot_time"),
+            "snapshot_id": snapshot_id,
+            "snapshot_time": snapshot_time,
             "snapshot_age_seconds": snapshot_info.get("snapshot_age_seconds"),
             "quote_hit_count": snapshot_hit_count,
             "quote_miss_count": max(0, requested - snapshot_hit_count),
@@ -919,6 +940,121 @@ class RuleService:
             if "data_policy" not in str(exc):
                 raise
             return getter(stock_code)
+
+    @staticmethod
+    def _to_optional_float(value: Any) -> Optional[float]:
+        if value is None:
+            return None
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return None
+        if pd.isna(number):
+            return None
+        return number
+
+    @classmethod
+    def _last_non_null_value(cls, rows: List[Dict[str, Any]], key: str) -> Any:
+        for row in reversed(rows):
+            value = row.get(key)
+            if value not in (None, ""):
+                return value
+        return None
+
+    def _build_intraday_hot_table_quote(self, stock_code: str) -> Optional[Dict[str, Any]]:
+        """Build a live-test fallback quote from today's local intraday hot table."""
+        try:
+            intraday = self._get_stock_history_data(
+                stock_code,
+                period="1m",
+                days=1,
+                data_policy="snapshot_only",
+            )
+        except Exception as exc:
+            logger.debug("读取 %s 实测分钟热表 fallback 失败: %s", stock_code, exc)
+            return None
+
+        raw_rows = intraday.get("data") or []
+        if not raw_rows:
+            return None
+
+        rows_with_ts: List[tuple[datetime, Dict[str, Any]]] = []
+        for raw_row in raw_rows:
+            if not isinstance(raw_row, dict):
+                continue
+            close_price = self._to_optional_float(raw_row.get("close"))
+            if close_price is None or close_price <= 0:
+                continue
+            parsed = pd.to_datetime(raw_row.get("date"), errors="coerce")
+            if pd.isna(parsed):
+                continue
+            row_time = parsed.to_pydatetime() if hasattr(parsed, "to_pydatetime") else parsed
+            rows_with_ts.append((row_time, dict(raw_row)))
+
+        if not rows_with_ts:
+            return None
+
+        rows_with_ts.sort(key=lambda item: item[0])
+        latest_time = rows_with_ts[-1][0]
+        latest_trade_date = latest_time.date()
+        same_day_rows = [
+            (row_time, row)
+            for row_time, row in rows_with_ts
+            if row_time.date() == latest_trade_date
+        ]
+        if not same_day_rows:
+            return None
+
+        rows = [row for _row_time, row in same_day_rows]
+        first_row = rows[0]
+        last_row = rows[-1]
+
+        open_price = self._to_optional_float(first_row.get("open"))
+        if open_price is None:
+            open_price = self._to_optional_float(first_row.get("close"))
+        close_price = self._to_optional_float(last_row.get("close"))
+        if close_price is None or close_price <= 0:
+            return None
+
+        highs = [
+            value
+            for value in (self._to_optional_float(row.get("high")) for row in rows)
+            if value is not None
+        ]
+        lows = [
+            value
+            for value in (self._to_optional_float(row.get("low")) for row in rows)
+            if value is not None
+        ]
+        volumes = [self._to_optional_float(row.get("volume")) for row in rows]
+        amounts = [self._to_optional_float(row.get("amount")) for row in rows]
+        snapshot_time = self._last_non_null_value(rows, "snapshot_time") or latest_time.isoformat()
+        snapshot_id = self._last_non_null_value(rows, "snapshot_id") or latest_time.strftime("%Y%m%d%H%M%S")
+
+        quote: Dict[str, Any] = {
+            "stock_code": stock_code,
+            "stock_name": intraday.get("stock_name"),
+            "current_price": close_price,
+            "open": open_price or close_price,
+            "high": max(highs) if highs else close_price,
+            "low": min(lows) if lows else close_price,
+            "volume": sum(value or 0 for value in volumes),
+            "amount": sum(value or 0 for value in amounts),
+            "turnover_rate": self._last_non_null_value(rows, "turnover_rate"),
+            "change_percent": self._last_non_null_value(rows, "change_percent"),
+            "quote_time": latest_time.isoformat(),
+            "snapshot_id": str(snapshot_id),
+            "snapshot_time": snapshot_time,
+            "source": "intraday_hot_table",
+        }
+        logger.info(
+            "实测 %s 实时快照未命中，使用分钟热表聚合 fallback: date=%s rows=%s snapshot_id=%s",
+            stock_code,
+            latest_trade_date.isoformat(),
+            len(rows),
+            quote["snapshot_id"],
+        )
+        return quote
 
     @staticmethod
     def _count_match_events(matches: List[Dict[str, Any]]) -> int:
@@ -1172,7 +1308,9 @@ class RuleService:
             else None
         )
         if mode == "latest" and data_policy == "snapshot_only" and quote is None:
-            raise RuleDataUnavailable("quote_snapshot_miss")
+            quote = self._build_intraday_hot_table_quote(stock_code)
+            if quote is None:
+                raise RuleDataUnavailable("quote_snapshot_miss")
         indicator_metrics = self._get_indicator_metrics(stock_code, history_rows, mode, data_policy)
         if mode == "latest" and quote is not None:
             quote = StockService._normalize_quote_payload_units(stock_code, quote) or quote
@@ -1183,6 +1321,8 @@ class RuleService:
 
         if mode == "latest":
             events = self._evaluate_latest_event(definition, metric_frame)
+            if quote is not None:
+                self._attach_live_quote_snapshot_metadata(events, quote)
         else:
             events = self._evaluate_history_events(definition, metric_frame, lookback_days, start_date, end_date)
         if not events:
@@ -1216,6 +1356,24 @@ class RuleService:
             "condition_results": result.get("condition_results") or [],
             "snapshot": result.get("snapshot") or {},
         }]
+
+    @staticmethod
+    def _attach_live_quote_snapshot_metadata(events: List[Dict[str, Any]], quote: Dict[str, Any]) -> None:
+        if not events or not quote:
+            return
+        metadata = {
+            "snapshot_id": quote.get("snapshot_id"),
+            "snapshot_time": quote.get("snapshot_time"),
+            "quote_time": quote.get("quote_time") or quote.get("update_time"),
+            "data_source": quote.get("source") or quote.get("data_source"),
+        }
+        for event in events:
+            snapshot = event.setdefault("snapshot", {})
+            if not isinstance(snapshot, dict):
+                continue
+            for key, value in metadata.items():
+                if value not in (None, ""):
+                    snapshot[key] = value
 
     @staticmethod
     def _coerce_history_date(value: Any) -> Optional[date]:

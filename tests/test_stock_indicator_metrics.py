@@ -435,6 +435,7 @@ def test_intraday_history_cache_only_reads_hot_table_without_remote_fetch() -> N
     with (
         patch("data_provider.base.DataFetcherManager", side_effect=AssertionError("remote fetch forbidden")),
         patch.object(StockService, "_resolve_intraday_cache_target_date", return_value=snapshot_time.date()),
+        patch.object(StockService, "_is_before_intraday_session_start", return_value=False),
     ):
         result = service.get_history_data("600519", period="1m", days=1, data_policy="cache_only")
 
@@ -483,6 +484,7 @@ def test_intraday_history_default_backfills_hot_table_from_remote_without_daily_
     with (
         patch("data_provider.base.DataFetcherManager", return_value=manager),
         patch.object(StockService, "_resolve_intraday_cache_target_date", return_value=date(2026, 5, 7)),
+        patch.object(StockService, "_is_before_intraday_session_start", return_value=False),
         patch("src.services.stock_service.trading_calendar.is_market_open", return_value=True),
         patch.object(service, "get_realtime_quote", return_value=None),
     ):
@@ -497,6 +499,7 @@ def test_intraday_history_default_backfills_hot_table_from_remote_without_daily_
     with (
         patch("data_provider.base.DataFetcherManager", side_effect=AssertionError("remote fetch forbidden")),
         patch.object(StockService, "_resolve_intraday_cache_target_date", return_value=date(2026, 5, 7)),
+        patch.object(StockService, "_is_before_intraday_session_start", return_value=False),
     ):
         cached = service.get_history_data("600519.SH", period="1m", days=1, data_policy="cache_only")
 
@@ -522,6 +525,40 @@ def test_intraday_history_default_discards_single_day_remote_rows_outside_target
     assert result["data_source"] == "intraday_hot_table_miss"
     assert result["data"] == []
     assert db.get_intraday_minute_data("600519", trade_date=date(2026, 5, 7)).empty
+    DatabaseManager.reset_instance()
+
+
+def test_timeshare_history_before_session_start_returns_empty_without_remote_fetch() -> None:
+    DatabaseManager.reset_instance()
+    db = DatabaseManager(db_url="sqlite:///:memory:")
+    service = StockService()
+    service.repo = StockRepository(db)
+    snapshot_time = datetime(2026, 5, 12, 9, 30)
+    db.save_intraday_quote_samples(
+        [
+            {
+                "stock_code": "600519",
+                "stock_name": "贵州茅台",
+                "current_price": 268.44,
+                "volume": 2308,
+                "amount": 61969700,
+                "source": "AkshareFetcher",
+            }
+        ],
+        snapshot_id=snapshot_time.strftime("%Y%m%d%H%M%S"),
+        snapshot_time=snapshot_time,
+    )
+
+    with (
+        patch("data_provider.base.DataFetcherManager", side_effect=AssertionError("remote fetch forbidden")),
+        patch("src.services.stock_service.trading_calendar.get_market_for_stock", return_value="cn"),
+        patch("src.services.stock_service.trading_calendar.get_market_now", return_value=datetime(2026, 5, 12, 8, 52)),
+        patch("src.services.stock_service.trading_calendar.is_market_open", return_value=True),
+    ):
+        result = service.get_history_data("600519.SH", period="1m", days=1, data_policy="default")
+
+    assert result["data_source"] == "intraday_hot_table_miss"
+    assert result["data"] == []
     DatabaseManager.reset_instance()
 
 

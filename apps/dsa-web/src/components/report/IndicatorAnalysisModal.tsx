@@ -177,6 +177,7 @@ type ChipRangeLevel = '90' | '70';
 type SidePanelTab = 'chip' | 'flow';
 type MaximizedChart = 'kline' | 'volume' | 'momentum';
 type ChartPeriod = KLinePeriod | 'timeshare';
+type MarketKind = 'cn' | 'hk' | 'us';
 type KLinePeriodOption = {
   value: ChartPeriod;
   label: string;
@@ -211,6 +212,16 @@ const CHART_RIGHT_DATA_GAP = 32;
 const ONE_MINUTE_REFRESH_MS = 10_000;
 const TIMESHARE_START_MINUTE = (9 * 60) + 30;
 const TIMESHARE_END_MINUTE = 15 * 60;
+const MARKET_TIME_ZONES: Record<MarketKind, string> = {
+  cn: 'Asia/Shanghai',
+  hk: 'Asia/Hong_Kong',
+  us: 'America/New_York',
+};
+const MARKET_TIMESHARE_START_MINUTES: Record<MarketKind, number> = {
+  cn: TIMESHARE_START_MINUTE,
+  hk: TIMESHARE_START_MINUTE,
+  us: TIMESHARE_START_MINUTE,
+};
 const TIMESHARE_EMPTY_AXIS_LABELS = [
   { ratio: 0, label: '09:30' },
   { ratio: 0.2, label: '10:18' },
@@ -1076,7 +1087,7 @@ async function getHistoryForDataMode(
   };
 }
 
-function getMarketKind(stockCode: string): 'cn' | 'hk' | 'us' {
+function getMarketKind(stockCode: string): MarketKind {
   const code = stockCode.trim().toUpperCase();
   if (code.endsWith('.HK') || code.startsWith('HK') || /^\d{5}$/.test(code)) {
     return 'hk';
@@ -1139,7 +1150,51 @@ function getKLineMinuteOfDay(value?: string | null): number | null {
   return (hour * 60) + minute;
 }
 
-function normalizeTimeshareHistory(history: KLineData[], targetDate?: string | null): KLineData[] {
+function getMarketClockParts(market: MarketKind, now = new Date()): { dateKey: string; minuteOfDay: number } | null {
+  try {
+    const parts = new Intl.DateTimeFormat('en-US', {
+      timeZone: MARKET_TIME_ZONES[market],
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      hour12: false,
+    }).formatToParts(now);
+    const getPart = (type: string) => parts.find((part) => part.type === type)?.value;
+    const year = getPart('year');
+    const month = getPart('month');
+    const day = getPart('day');
+    const rawHour = Number(getPart('hour'));
+    const minute = Number(getPart('minute'));
+    if (!year || !month || !day || !Number.isFinite(rawHour) || !Number.isFinite(minute)) {
+      return null;
+    }
+    const hour = rawHour === 24 ? 0 : rawHour;
+    return {
+      dateKey: `${year}-${month}-${day}`,
+      minuteOfDay: (hour * 60) + minute,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function isBeforeTimeshareStartOnTargetDate(targetDate: string | null | undefined, market: MarketKind): boolean {
+  const targetDateKey = normalizeDateKey(targetDate);
+  if (!targetDateKey) {
+    return false;
+  }
+  const marketClock = getMarketClockParts(market);
+  return marketClock !== null
+    && marketClock.dateKey === targetDateKey
+    && marketClock.minuteOfDay < MARKET_TIMESHARE_START_MINUTES[market];
+}
+
+function normalizeTimeshareHistory(history: KLineData[], targetDate: string | null | undefined, market: MarketKind): KLineData[] {
+  if (isBeforeTimeshareStartOnTargetDate(targetDate, market)) {
+    return [];
+  }
   const inSession = history.filter((item) => {
     const minute = getKLineMinuteOfDay(item.date);
     return minute !== null && minute >= TIMESHARE_START_MINUTE && minute <= TIMESHARE_END_MINUTE;
@@ -1165,11 +1220,11 @@ function normalizeTimeshareHistory(history: KLineData[], targetDate?: string | n
 function normalizeHistoryForPeriod(
   history: KLineData[],
   period: ChartPeriod,
-  market: 'cn' | 'hk' | 'us',
+  market: MarketKind,
   dailyCutoffDate?: string | null,
 ): KLineData[] {
   if (period === 'timeshare') {
-    return normalizeTimeshareHistory(history, dailyCutoffDate);
+    return normalizeTimeshareHistory(history, dailyCutoffDate, market);
   }
 
   if (period === 'daily' || market === 'us' || !dailyCutoffDate) {

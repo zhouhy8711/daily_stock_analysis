@@ -40,8 +40,8 @@ const TEXTAREA_CLASS =
 const WATCHLIST_HISTORY_LIMIT = 20;
 const LIVE_TEST_POLL_INTERVAL_MS = 30_000;
 const LIVE_TEST_MAX_CONCURRENT_CYCLES = 2;
-const ASHARE_LIVE_SESSION_TEXT = 'A股实测仅在交易日 09:30-11:30、13:00-15:00 运行';
-const ASHARE_LIVE_SESSION_CLOSED_MESSAGE = `${ASHARE_LIVE_SESSION_TEXT}；当前已休市，未触发实时扫描`;
+const ASHARE_LIVE_TEST_WINDOW_TEXT = 'A股实测仅在交易日 15:00 及以前运行';
+const ASHARE_LIVE_TEST_CLOSED_MESSAGE = `${ASHARE_LIVE_TEST_WINDOW_TEXT}；当前已超过实测时间，未触发实时扫描`;
 const UNCLASSIFIED_INDUSTRY = UNCLASSIFIED_INDUSTRY_LABEL;
 const DEFAULT_INDUSTRY = '半导体';
 
@@ -498,15 +498,12 @@ function getShanghaiClockParts(value = new Date()): { weekday: string; hour: num
   };
 }
 
-function isAshareLiveSessionOpen(value = new Date()): boolean {
+function isAshareLiveTestAllowed(value = new Date()): boolean {
   const { weekday, hour, minute } = getShanghaiClockParts(value);
   if (weekday === 'Sat' || weekday === 'Sun') return false;
   if (!Number.isFinite(hour) || !Number.isFinite(minute)) return false;
   const minuteOfDay = hour * 60 + minute;
-  return (
-    (minuteOfDay >= 9 * 60 + 30 && minuteOfDay <= 11 * 60 + 30)
-    || (minuteOfDay >= 13 * 60 && minuteOfDay <= 15 * 60)
-  );
+  return minuteOfDay <= 15 * 60;
 }
 
 function formatLogTime(value: string): string {
@@ -1764,11 +1761,11 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
     runRuleNames: string[],
   ) => {
     if (liveTestSessionRef.current !== sessionId) return;
-    if (!isAshareLiveSessionOpen()) {
+    if (!isAshareLiveTestAllowed()) {
       setRunError(null);
-      setRunWarning(ASHARE_LIVE_SESSION_CLOSED_MESSAGE);
+      setRunWarning(ASHARE_LIVE_TEST_CLOSED_MESSAGE);
       setActiveResultTab('logs');
-      stopLiveTest(ASHARE_LIVE_SESSION_CLOSED_MESSAGE, 'warning');
+      stopLiveTest(ASHARE_LIVE_TEST_CLOSED_MESSAGE, 'warning');
       return;
     }
     if (liveTestCyclesInFlightRef.current >= LIVE_TEST_MAX_CONCURRENT_CYCLES) {
@@ -1940,12 +1937,12 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
 
   const startLiveTest = useCallback(() => {
     if (runDisabled || isRunning) return;
-    if (!isAshareLiveSessionOpen()) {
+    if (!isAshareLiveTestAllowed()) {
       setRunError(null);
-      setRunWarning(ASHARE_LIVE_SESSION_CLOSED_MESSAGE);
+      setRunWarning(ASHARE_LIVE_TEST_CLOSED_MESSAGE);
       setExecutionLogs([]);
       setActiveResultTab('logs');
-      appendExecutionLog(ASHARE_LIVE_SESSION_CLOSED_MESSAGE, 'warning');
+      appendExecutionLog(ASHARE_LIVE_TEST_CLOSED_MESSAGE, 'warning');
       return;
     }
     const sessionId = -Date.now();
