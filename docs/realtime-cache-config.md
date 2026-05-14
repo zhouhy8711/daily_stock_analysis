@@ -88,7 +88,7 @@ ENABLE_REALTIME_QUOTE=false
 - 修改 `.env` 后需要重启 API 进程，后台预热线程才会按新配置启动。
 - Web 系统设置页目前可编辑 `REALTIME_QUOTE_CACHE_SECONDS`，并显示当前进程内实时行情缓存内存占用。
 - `REALTIME_QUOTE_CACHE_SECONDS` 调大不会改变后台 60 秒预热频率，只会延长请求路径对进程内 quote 和全市场 DataFrame 的复用时间；休市时后台预热不会刷新新快照。
-- 默认 quote 请求顺序为：最新预热快照、短缓存、远程实时源；`snapshot_only`、`cache_only` 和 `db_only` 不会触发远程实时行情请求。
+- 默认 quote 请求顺序为：最新预热快照、短缓存、远程实时源；预热快照读取时会校验 `snapshot_time` 的市场本地日期必须等于当前市场日期，程序跨天运行后不会继续复用昨日快照；`snapshot_only`、`cache_only` 和 `db_only` 不会触发远程实时行情请求。
 - 指标大盘的 1m / 分时 K 线优先读 `stock_intraday_minute`；`cache_only` 缺热表数据时返回空结果，默认策略或页面按需预热会回源拉取同周期分钟 K 并写回热表，不会降级展示日 K。
 
 ## 历史日线与筹码峰补齐

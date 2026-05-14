@@ -141,6 +141,7 @@ export type RuleRunNotifyPayload = {
   executionTime?: string | null;
   ruleIds?: number[];
   ruleNames?: string[];
+  compact?: boolean;
 };
 
 export type RuleRunNotifyResponse = {
@@ -149,6 +150,8 @@ export type RuleRunNotifyResponse = {
   matchCount: number;
   eventCount: number;
   deduplicated?: boolean;
+  compact?: boolean;
+  originalEventCount?: number;
 };
 
 export type RuleRunPayload = {

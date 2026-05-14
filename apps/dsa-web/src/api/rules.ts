@@ -303,6 +303,7 @@ export const rulesApi = {
         execution_time: payload?.executionTime || undefined,
         rule_ids: payload?.ruleIds || undefined,
         rule_names: payload?.ruleNames || undefined,
+        compact: payload?.compact ?? undefined,
       },
     );
     return {
@@ -311,6 +312,8 @@ export const rulesApi = {
       matchCount: toNumber(response.data.match_count ?? response.data.matchCount),
       eventCount: toNumber(response.data.event_count ?? response.data.eventCount),
       deduplicated: toBoolean(response.data.deduplicated),
+      compact: toBoolean(response.data.compact),
+      originalEventCount: toNumber(response.data.original_event_count ?? response.data.originalEventCount),
     };
   },
 

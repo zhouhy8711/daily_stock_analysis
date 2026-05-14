@@ -264,6 +264,7 @@ vi.mock('../../hooks/useStockIndex', () => ({
 describe('BacktestPage', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    window.localStorage.clear();
     stockIndexHookState.current = {
       index: [],
       loading: false,
@@ -467,7 +468,9 @@ describe('BacktestPage', () => {
         executionTime: expect.any(String),
         ruleIds: [7],
         ruleNames: ['放量观察'],
+        compact: true,
       });
+      expect(screen.getByRole('checkbox', { name: /精简模式/ })).toBeChecked();
       const executionGroupButton = screen.getByRole('button', {
         name: /展开执行时间 \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}，命中 1 条，完成时间 \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/,
       });
@@ -565,6 +568,127 @@ describe('BacktestPage', () => {
       })).toBeInTheDocument();
       expect(screen.getAllByTestId('live-execution-group')).toHaveLength(2);
       expect(screen.queryByTestId('live-rule-group-7')).not.toBeInTheDocument();
+
+      fireEvent.click(screen.getByRole('button', { name: '停止实测' }));
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('shows one same-day live row per rule and stock while compact mode is enabled', async () => {
+    render(<BacktestPage mode="live" />);
+
+    await screen.findByText('1 / 1');
+    vi.mocked(rulesApi.runBatch)
+      .mockResolvedValueOnce({
+        runId: 12,
+        ruleId: 7,
+        status: 'completed',
+        targetCount: 2,
+        matchCount: 1,
+        eventCount: 1,
+        mode: 'history',
+        durationMs: 20,
+        matches,
+        errors: [],
+      })
+      .mockResolvedValueOnce({
+        runId: 13,
+        ruleId: 7,
+        status: 'completed',
+        targetCount: 2,
+        matchCount: 1,
+        eventCount: 1,
+        mode: 'history',
+        durationMs: 18,
+        matches,
+        errors: [],
+      });
+
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-05-07T02:55:10Z'));
+      fireEvent.click(screen.getByRole('button', { name: '运行实测' }));
+      await act(async () => {
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+
+      vi.setSystemTime(new Date('2026-05-07T02:55:40Z'));
+      await act(async () => {
+        vi.advanceTimersByTime(30_000);
+        await Promise.resolve();
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+
+      expect(screen.getAllByTestId('live-execution-group')).toHaveLength(1);
+      expect(screen.getByRole('button', {
+        name: '展开执行时间 2026-05-07 10:56:10，命中 1 条，完成时间 2026-05-07 10:56:10',
+      })).toBeInTheDocument();
+      expect(screen.queryByRole('button', {
+        name: '展开执行时间 2026-05-07 10:55:10，命中 1 条，完成时间 2026-05-07 10:55:10',
+      })).not.toBeInTheDocument();
+      expect(rulesApi.notifyRunMatches).toHaveBeenLastCalledWith(13, expect.objectContaining({ compact: true }));
+
+      fireEvent.click(screen.getByRole('button', { name: '停止实测' }));
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('keeps current repeated live rows when compact mode is disabled', async () => {
+    render(<BacktestPage mode="live" />);
+
+    await screen.findByText('1 / 1');
+    fireEvent.click(screen.getByRole('checkbox', { name: /精简模式/ }));
+    expect(screen.getByRole('checkbox', { name: /精简模式/ })).not.toBeChecked();
+
+    vi.mocked(rulesApi.runBatch)
+      .mockResolvedValueOnce({
+        runId: 12,
+        ruleId: 7,
+        status: 'completed',
+        targetCount: 2,
+        matchCount: 1,
+        eventCount: 1,
+        mode: 'history',
+        durationMs: 20,
+        matches,
+        errors: [],
+      })
+      .mockResolvedValueOnce({
+        runId: 13,
+        ruleId: 7,
+        status: 'completed',
+        targetCount: 2,
+        matchCount: 1,
+        eventCount: 1,
+        mode: 'history',
+        durationMs: 18,
+        matches,
+        errors: [],
+      });
+
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-05-07T02:55:10Z'));
+      fireEvent.click(screen.getByRole('button', { name: '运行实测' }));
+      await act(async () => {
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+
+      vi.setSystemTime(new Date('2026-05-07T02:55:40Z'));
+      await act(async () => {
+        vi.advanceTimersByTime(30_000);
+        await Promise.resolve();
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+
+      expect(screen.getAllByTestId('live-execution-group')).toHaveLength(2);
+      expect(rulesApi.notifyRunMatches).toHaveBeenLastCalledWith(13, expect.objectContaining({ compact: false }));
 
       fireEvent.click(screen.getByRole('button', { name: '停止实测' }));
     } finally {

@@ -90,6 +90,7 @@ def notify_rule_run_matches(run_id: int, payload: RuleRunNotifyRequest | None = 
         execution_time=data.execution_time,
         rule_ids=data.rule_ids,
         rule_names=data.rule_names,
+        compact=data.compact,
     )
     return RuleRunNotifyResponse(**result)
 

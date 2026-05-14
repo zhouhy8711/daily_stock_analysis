@@ -114,6 +114,20 @@ function makeRealtimeMismatchIntradayHistory(): KLineData[] {
   });
 }
 
+function makePricedTimeshareHistory(date = '2026-05-13', closes = [240, 241, 246]): KLineData[] {
+  return closes.map((close, index) => ({
+    date: `${date} ${index === 0 ? '09:30' : index === 1 ? '13:00' : '15:00'}`,
+    open: close - 0.1,
+    high: close + 0.2,
+    low: close - 0.2,
+    close,
+    volume: 10000 + index,
+    amount: close * (10000 + index),
+    changePercent: 0.1,
+    turnoverRate: 1 + index * 0.02,
+  }));
+}
+
 function makeChipSnapshot(date: string, avgCost: number, profitRatio: number) {
   return {
     code: '600519',
@@ -306,7 +320,7 @@ describe('IndicatorAnalysisModal', () => {
     unmount();
   });
 
-  it('refreshes quote every 10 seconds and refreshes one-minute history only on 1m period', async () => {
+  it('refreshes quote, one-minute history and same-day chip metrics on 1m period', async () => {
     const { unmount } = render(
       <IndicatorAnalysisModal stockCode="BABA" stockName="阿里巴巴" onClose={vi.fn()} />,
     );
@@ -340,7 +354,12 @@ describe('IndicatorAnalysisModal', () => {
     expect(stocksApi.getHistory).toHaveBeenCalledTimes(historyCallsBeforeRefresh + 1);
     expect(stocksApi.getHistory).toHaveBeenLastCalledWith('BABA', 3, '1m', 'cache_only');
     expect(stocksApi.getQuote).toHaveBeenCalledTimes(quoteCallsBeforeRefresh + 1);
-    expect(stocksApi.getIndicatorMetrics).toHaveBeenCalledTimes(metricsCallsBeforeRefresh);
+    expect(stocksApi.getIndicatorMetrics).toHaveBeenCalledTimes(metricsCallsBeforeRefresh + 1);
+    expect(stocksApi.getIndicatorMetrics).toHaveBeenLastCalledWith('BABA', {
+      dataPolicy: 'db_only',
+      tradeDate: '2026-04-30',
+      days: 120,
+    });
 
     fireEvent.click(screen.getByRole('tab', { name: '5分' }));
     await flushPromises();
@@ -355,6 +374,116 @@ describe('IndicatorAnalysisModal', () => {
 
     expect(stocksApi.getHistory).toHaveBeenCalledTimes(callsAfterFiveMinuteLoad);
     expect(stocksApi.getQuote).toHaveBeenCalledTimes(quoteCallsAfterFiveMinuteLoad + 2);
+    unmount();
+  });
+
+  it('refreshes the timeshare chip peak and metrics for the K-line trade date', async () => {
+    vi.mocked(stocksApi.getHistory).mockImplementation(async (stockCode, _days, period = 'daily') => ({
+      stockCode,
+      stockName: '芯原股份',
+      period,
+      data: period === 'daily'
+        ? makeDailyHistory(3, '2026-05-11')
+        : makePricedTimeshareHistory('2026-05-13', [240, 241, 246]),
+    }));
+    vi.mocked(stocksApi.getQuote).mockImplementation(async (stockCode) => makeQuote(stockCode, {
+      stockName: '芯原股份',
+      currentPrice: 246,
+      updateTime: '2026-05-13T22:10:52+08:00',
+    }));
+    vi.mocked(stocksApi.getIndicatorMetrics).mockImplementation(async (stockCode, options) => ({
+      stockCode,
+      stockName: '芯原股份',
+      chipDistribution: options?.dataPolicy === 'db_only' && options.tradeDate === '2026-05-13'
+        ? makeChipSnapshot('2026-05-13', 242.44, 0.905901)
+        : {
+          ...makeChipSnapshot('2026-05-12', 240.87, 0.838989),
+          snapshots: [makeChipSnapshot('2026-05-12', 240.87, 0.838989)],
+        },
+      majorHolders: [],
+      majorHolderStatus: 'not_supported',
+      sourceChain: [],
+      errors: [],
+      updateTime: '2026-05-13T22:10:52',
+    }));
+
+    const { unmount } = render(
+      <IndicatorAnalysisModal stockCode="688521.SH" stockName="芯原股份" onClose={vi.fn()} />,
+    );
+    await flushPromises();
+    await flushPromises();
+
+    fireEvent.click(screen.getByRole('tab', { name: '分时' }));
+    await flushPromises();
+    await flushPromises();
+
+    const chipPanel = screen.getByTestId('chip-peak-panel');
+    expect(within(chipPanel).getByText('2026-05-13')).toBeInTheDocument();
+    expect(within(chipPanel).getByText('当前获利')).toBeInTheDocument();
+    expect(within(chipPanel).getByText('76.00%')).toBeInTheDocument();
+    expect(within(chipPanel).getByText('24.00%')).toBeInTheDocument();
+    expect(within(chipPanel).getByText('242.44')).toBeInTheDocument();
+    expect(stocksApi.getIndicatorMetrics).toHaveBeenCalledWith('688521.SH', {
+      dataPolicy: 'db_only',
+      tradeDate: '2026-05-13',
+      days: 120,
+    });
+
+    unmount();
+  });
+
+  it('keeps valuation metrics on timeshare from same-day daily data and backfills PE from default quote', async () => {
+    const dailyHistory: KLineData[] = [{
+      ...makeDailyHistory(1, '2026-05-13')[0],
+      close: 100,
+      totalMv: 100_000_000_000,
+      circMv: 80_000_000_000,
+      totalShares: 1_000_000_000,
+      floatShares: 800_000_000,
+      peRatio: null,
+    }];
+    const timeshareHistory = makePricedTimeshareHistory('2026-05-13', [99, 100, 101]);
+    vi.mocked(stocksApi.getHistory).mockImplementation(async (stockCode, _days, period = 'daily') => ({
+      stockCode,
+      stockName: '芯原股份',
+      period,
+      data: period === 'daily' ? dailyHistory : timeshareHistory,
+    }));
+    vi.mocked(stocksApi.getQuote).mockImplementation(async (stockCode, dataPolicy = 'default') => {
+      if (dataPolicy === 'cache_only') {
+        throw new Error('quote cache miss');
+      }
+      return makeQuote(stockCode, {
+        stockName: '芯原股份',
+        currentPrice: 101,
+        peRatio: 25.5,
+        totalMv: null,
+        circMv: null,
+        totalShares: null,
+        floatShares: null,
+        updateTime: '2026-05-13T15:00:00+08:00',
+      });
+    });
+
+    const { unmount } = render(
+      <IndicatorAnalysisModal stockCode="688521.SH" stockName="芯原股份" onClose={vi.fn()} />,
+    );
+    await flushPromises();
+    await flushPromises();
+
+    fireEvent.click(screen.getByRole('tab', { name: '分时' }));
+    await flushPromises();
+    await flushPromises();
+
+    const coreMetrics = screen.getByTestId('indicator-core-metrics');
+    expect(within(coreMetrics).getByText('1000.00亿')).toBeInTheDocument();
+    expect(within(coreMetrics).getByText('800.00亿')).toBeInTheDocument();
+    expect(within(coreMetrics).getByText('25.50')).toBeInTheDocument();
+    expect(within(coreMetrics).getByText('本K成交额')).toBeInTheDocument();
+    expect(within(coreMetrics).getByText('101.02万')).toBeInTheDocument();
+    expect(within(coreMetrics).queryByText('1.32亿')).not.toBeInTheDocument();
+    expect(stocksApi.getQuote).toHaveBeenCalledWith('688521.SH', 'default');
+
     unmount();
   });
 

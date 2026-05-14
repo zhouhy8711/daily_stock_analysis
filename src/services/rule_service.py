@@ -7,7 +7,7 @@ import logging
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import pandas as pd
 
@@ -1081,6 +1081,85 @@ class RuleService:
         }
         return tuple(sorted(pairs))
 
+    @staticmethod
+    def _normalize_live_event_day(value: Any) -> Optional[str]:
+        if value in (None, ""):
+            return None
+        day = str(value).strip()[:10]
+        return day if len(day) == 10 and day[4] == "-" and day[7] == "-" else None
+
+    @staticmethod
+    def _live_match_daily_key(match: Dict[str, Any], day: Optional[str]) -> Optional[Tuple[str, int, str]]:
+        if not day:
+            return None
+        try:
+            rule_id = int(match.get("rule_id") or 0)
+        except (TypeError, ValueError):
+            rule_id = 0
+        stock_code = str(match.get("stock_code") or "").strip().upper()
+        if rule_id <= 0 or not stock_code:
+            return None
+        return (day, rule_id, stock_code)
+
+    @classmethod
+    def _filter_compact_live_matches(
+        cls,
+        matches: List[Dict[str, Any]],
+        previous_keys: Set[Tuple[str, int, str]],
+    ) -> List[Dict[str, Any]]:
+        seen_keys = set(previous_keys)
+        filtered_matches: List[Dict[str, Any]] = []
+
+        for match in matches:
+            matched_events = match.get("matched_events") or []
+            if matched_events:
+                kept_events: List[Dict[str, Any]] = []
+                kept_dates: List[str] = []
+                for event in matched_events:
+                    event_record = event if isinstance(event, dict) else {}
+                    day = cls._normalize_live_event_day(event_record.get("date"))
+                    if not day:
+                        event_snapshot = event_record.get("snapshot") or {}
+                        if isinstance(event_snapshot, dict):
+                            day = cls._normalize_live_event_day(event_snapshot.get("snapshot_time"))
+                    key = cls._live_match_daily_key(match, day)
+                    if key and key in seen_keys:
+                        continue
+                    if key:
+                        seen_keys.add(key)
+                    kept_events.append(event_record)
+                    if day and day not in kept_dates:
+                        kept_dates.append(day)
+                if not kept_events:
+                    continue
+                filtered = dict(match)
+                filtered["matched_events"] = kept_events
+                filtered["matched_dates"] = kept_dates
+                filtered_matches.append(filtered)
+                continue
+
+            matched_dates = match.get("matched_dates") or []
+            if matched_dates:
+                kept_dates = []
+                for matched_date in matched_dates:
+                    day = cls._normalize_live_event_day(matched_date)
+                    key = cls._live_match_daily_key(match, day)
+                    if key and key in seen_keys:
+                        continue
+                    if key:
+                        seen_keys.add(key)
+                    kept_dates.append(str(matched_date))
+                if not kept_dates:
+                    continue
+                filtered = dict(match)
+                filtered["matched_dates"] = kept_dates
+                filtered_matches.append(filtered)
+                continue
+
+            filtered_matches.append(dict(match))
+
+        return filtered_matches
+
     def _get_previous_live_match_signature(self, run_id: int) -> Optional[Dict[str, Any]]:
         getter = getattr(self.repo, "get_previous_live_match_signature", None)
         if not callable(getter):
@@ -1109,6 +1188,31 @@ class RuleService:
             "signature": signature,
         }
 
+    def _get_previous_live_match_keys(self, run_id: int) -> Set[Tuple[str, int, str]]:
+        getter = getattr(self.repo, "get_previous_live_match_keys", None)
+        if not callable(getter):
+            return set()
+        try:
+            previous = getter(run_id)
+        except Exception as exc:
+            logger.warning("读取今日实测命中去重键失败: run_id=%s, error=%s", run_id, exc)
+            return set()
+        if not isinstance(previous, dict):
+            return set()
+
+        keys: Set[Tuple[str, int, str]] = set()
+        for raw_key in previous.get("keys") or []:
+            try:
+                day, rule_id, stock_code = raw_key
+                normalized_day = self._normalize_live_event_day(day)
+                normalized_rule_id = int(rule_id)
+                normalized_stock_code = str(stock_code or "").strip().upper()
+            except (TypeError, ValueError):
+                continue
+            if normalized_day and normalized_rule_id > 0 and normalized_stock_code:
+                keys.add((normalized_day, normalized_rule_id, normalized_stock_code))
+        return keys
+
     def notify_live_matches(
         self,
         run_id: int,
@@ -1116,10 +1220,12 @@ class RuleService:
         execution_time: Optional[str] = None,
         rule_ids: Optional[List[int]] = None,
         rule_names: Optional[List[str]] = None,
+        compact: bool = True,
     ) -> Dict[str, Any]:
         """Push live-test rule matches to every configured notification channel."""
         matches = self.repo.list_matches(run_id)
         event_count = self._count_notification_events(matches)
+        original_event_count = event_count
         if event_count <= 0:
             return {
                 "sent": False,
@@ -1127,11 +1233,37 @@ class RuleService:
                 "match_count": len(matches),
                 "event_count": 0,
                 "deduplicated": False,
+                "compact": compact,
+                "original_event_count": original_event_count,
             }
+
+        deduplicated = False
+        if compact:
+            previous_keys = self._get_previous_live_match_keys(run_id)
+            filtered_matches = self._filter_compact_live_matches(matches, previous_keys)
+            filtered_event_count = self._count_notification_events(filtered_matches)
+            if filtered_event_count <= 0:
+                logger.info(
+                    "实测精简模式跳过今日重复命中推送: run_id=%s, original_event_count=%s",
+                    run_id,
+                    original_event_count,
+                )
+                return {
+                    "sent": False,
+                    "message": "精简模式：今日同一规则、股票和命中日已推送过，已跳过重复通知",
+                    "match_count": 0,
+                    "event_count": 0,
+                    "deduplicated": True,
+                    "compact": True,
+                    "original_event_count": original_event_count,
+                }
+            deduplicated = filtered_event_count < original_event_count
+            matches = filtered_matches
+            event_count = filtered_event_count
 
         current_signature = self._build_live_match_signature(matches)
         previous = self._get_previous_live_match_signature(run_id)
-        if current_signature and previous and current_signature == previous.get("signature"):
+        if not compact and current_signature and previous and current_signature == previous.get("signature"):
             previous_run_id = previous.get("run_id")
             previous_text = f"（上一轮运行 #{previous_run_id}）" if previous_run_id else ""
             logger.info(
@@ -1148,6 +1280,8 @@ class RuleService:
                 "match_count": len(matches),
                 "event_count": event_count,
                 "deduplicated": True,
+                "compact": compact,
+                "original_event_count": original_event_count,
             }
 
         content = self._build_live_match_notification(
@@ -1169,16 +1303,24 @@ class RuleService:
                     "message": "通知渠道未配置，未推送",
                     "match_count": len(matches),
                     "event_count": event_count,
-                    "deduplicated": False,
+                    "deduplicated": deduplicated,
+                    "compact": compact,
+                    "original_event_count": original_event_count,
                 }
 
             sent = notifier.send(content)
+            message = "实测命中通知已发送" if sent else "实测命中通知发送失败"
+            if sent and deduplicated:
+                skipped_count = original_event_count - event_count
+                message = f"{message}，精简模式已过滤 {skipped_count} 条今日重复命中"
             return {
                 "sent": bool(sent),
-                "message": "实测命中通知已发送" if sent else "实测命中通知发送失败",
+                "message": message,
                 "match_count": len(matches),
                 "event_count": event_count,
-                "deduplicated": False,
+                "deduplicated": deduplicated,
+                "compact": compact,
+                "original_event_count": original_event_count,
             }
         except Exception as exc:
             logger.error("实测命中通知异常: run_id=%s, error=%s", run_id, exc, exc_info=True)
@@ -1187,7 +1329,9 @@ class RuleService:
                 "message": f"实测命中通知异常: {type(exc).__name__}",
                 "match_count": len(matches),
                 "event_count": event_count,
-                "deduplicated": False,
+                "deduplicated": deduplicated,
+                "compact": compact,
+                "original_event_count": original_event_count,
             }
 
     @classmethod

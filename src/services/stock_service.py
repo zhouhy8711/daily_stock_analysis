@@ -70,6 +70,10 @@ def _clear_realtime_quote_cache() -> None:
     with _REALTIME_QUOTE_CACHE_LOCK:
         _REALTIME_QUOTE_CACHE.clear()
         _REALTIME_QUOTE_CACHE_BUCKET = None
+    _clear_realtime_quote_snapshot()
+
+
+def _clear_realtime_quote_snapshot() -> None:
     with _REALTIME_QUOTE_SNAPSHOT_LOCK:
         _REALTIME_QUOTE_SNAPSHOT.update({
             "snapshot_id": None,
@@ -102,7 +106,43 @@ def _get_realtime_quote_cache_codes() -> set[str]:
 def _get_snapshot_payload(normalized_code: str) -> Optional[Dict[str, Any]]:
     with _REALTIME_QUOTE_SNAPSHOT_LOCK:
         payload = (_REALTIME_QUOTE_SNAPSHOT.get("items_by_code") or {}).get(normalized_code)
-        return deepcopy(payload) if payload is not None else None
+        payload_copy = deepcopy(payload) if payload is not None else None
+    if payload_copy is None:
+        return None
+    if not _snapshot_payload_matches_market_day(normalized_code, payload_copy):
+        logger.info(
+            "实时行情快照已跨交易日失效，忽略旧快照: code=%s snapshot_time=%s",
+            normalized_code,
+            payload_copy.get("snapshot_time"),
+        )
+        _clear_realtime_quote_snapshot()
+        return None
+    return payload_copy
+
+
+def _coerce_snapshot_datetime(value: Any) -> Optional[datetime]:
+    if isinstance(value, datetime):
+        return value
+    if value in (None, ""):
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+
+
+def _snapshot_payload_matches_market_day(normalized_code: str, payload: Dict[str, Any]) -> bool:
+    market = trading_calendar.get_market_for_stock(normalized_code)
+    if not market:
+        return True
+
+    snapshot_dt = _coerce_snapshot_datetime(payload.get("snapshot_time"))
+    if snapshot_dt is None:
+        return False
+
+    snapshot_date = trading_calendar.get_market_now(market, current_time=snapshot_dt).date()
+    current_date = trading_calendar.get_market_now(market).date()
+    return snapshot_date == current_date
 
 
 def _get_realtime_quote_snapshot_info() -> Dict[str, Any]:

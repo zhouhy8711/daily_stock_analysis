@@ -162,6 +162,47 @@ class RuleRepository:
         return False
 
     @staticmethod
+    def _normalize_event_day(value: Any) -> Optional[str]:
+        if value in (None, ""):
+            return None
+        day = str(value).strip()[:10]
+        return day if len(day) == 10 and day[4] == "-" and day[7] == "-" else None
+
+    @classmethod
+    def _event_days_from_snapshot(cls, snapshot_json: Optional[str]) -> List[str]:
+        snapshot = _json_loads(snapshot_json, {}) or {}
+        if not isinstance(snapshot, dict):
+            return []
+
+        days: List[str] = []
+        matched_events = snapshot.get("_matched_events")
+        if isinstance(matched_events, list):
+            for event in matched_events:
+                if not isinstance(event, dict):
+                    continue
+                day = cls._normalize_event_day(event.get("date"))
+                if not day:
+                    event_snapshot = event.get("snapshot") or {}
+                    if isinstance(event_snapshot, dict):
+                        day = cls._normalize_event_day(event_snapshot.get("snapshot_time"))
+                if day:
+                    days.append(day)
+
+        matched_dates = snapshot.get("_matched_dates")
+        if isinstance(matched_dates, list):
+            for matched_date in matched_dates:
+                day = cls._normalize_event_day(matched_date)
+                if day:
+                    days.append(day)
+
+        if not days:
+            day = cls._normalize_event_day(snapshot.get("snapshot_time"))
+            if day:
+                days.append(day)
+
+        return days
+
+    @staticmethod
     def _normalize_match_signature_rows(rows: List[Tuple[int, str, Optional[str]]]) -> Tuple[Tuple[int, str], ...]:
         pairs = {
             (int(rule_id), str(stock_code or "").strip().upper())
@@ -169,6 +210,20 @@ class RuleRepository:
             if rule_id and str(stock_code or "").strip()
         }
         return tuple(sorted(pairs))
+
+    @classmethod
+    def _normalize_daily_match_key_rows(
+        cls,
+        rows: List[Tuple[int, str, Optional[str]]],
+    ) -> Tuple[Tuple[str, int, str], ...]:
+        keys = set()
+        for rule_id, stock_code, snapshot_json in rows:
+            normalized_stock_code = str(stock_code or "").strip().upper()
+            if not rule_id or not normalized_stock_code:
+                continue
+            for day in cls._event_days_from_snapshot(snapshot_json):
+                keys.add((day, int(rule_id), normalized_stock_code))
+        return tuple(sorted(keys))
 
     def get_previous_live_match_signature(self, run_id: int) -> Optional[Dict[str, Any]]:
         """Return today's previous live-test rule/stock signature before run_id."""
@@ -221,6 +276,64 @@ class RuleRepository:
                         "signature": signature,
                     }
         return None
+
+    def get_previous_live_match_keys(self, run_id: int) -> Optional[Dict[str, Any]]:
+        """Return all same-day previous live-test match keys before run_id."""
+        with self.db.get_session() as session:
+            current = session.execute(
+                select(StockRuleRun).where(StockRuleRun.id == run_id).limit(1)
+            ).scalar_one_or_none()
+            if current is None or current.started_at is None:
+                return None
+
+            day_start = current.started_at.replace(hour=0, minute=0, second=0, microsecond=0)
+            next_day_start = day_start + timedelta(days=1)
+            previous_run_ids = session.execute(
+                select(StockRuleRun.id)
+                .where(
+                    StockRuleRun.id != run_id,
+                    StockRuleRun.status.in_(("completed", "partial")),
+                    StockRuleRun.match_count > 0,
+                    StockRuleRun.started_at >= day_start,
+                    StockRuleRun.started_at < next_day_start,
+                    or_(
+                        StockRuleRun.started_at < current.started_at,
+                        (StockRuleRun.started_at == current.started_at) & (StockRuleRun.id < run_id),
+                    ),
+                )
+                .order_by(desc(StockRuleRun.started_at), desc(StockRuleRun.id))
+            ).scalars().all()
+
+            all_keys = set()
+            live_run_ids: List[int] = []
+            for previous_run_id in previous_run_ids:
+                rows = session.execute(
+                    select(StockRuleMatch.rule_id, StockRuleMatch.stock_code, StockRuleMatch.snapshot_json)
+                    .where(StockRuleMatch.run_id == previous_run_id)
+                    .order_by(StockRuleMatch.id.asc())
+                ).all()
+                row_values = [
+                    (int(rule_id), str(stock_code), snapshot_json)
+                    for rule_id, stock_code, snapshot_json in rows
+                ]
+                if not row_values:
+                    continue
+                if not any(
+                    self._snapshot_has_live_metadata(snapshot_json)
+                    for _rule_id, _stock_code, snapshot_json in row_values
+                ):
+                    continue
+                keys = self._normalize_daily_match_key_rows(row_values)
+                if keys:
+                    live_run_ids.append(int(previous_run_id))
+                    all_keys.update(keys)
+
+            if not all_keys:
+                return None
+            return {
+                "run_ids": live_run_ids,
+                "keys": tuple(sorted(all_keys)),
+            }
 
     def list_runs(self, limit: int = 30) -> List[Dict[str, Any]]:
         with self.db.get_session() as session:

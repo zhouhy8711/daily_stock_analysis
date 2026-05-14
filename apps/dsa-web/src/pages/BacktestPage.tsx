@@ -40,6 +40,7 @@ const TEXTAREA_CLASS =
 const WATCHLIST_HISTORY_LIMIT = 20;
 const LIVE_TEST_POLL_INTERVAL_MS = 30_000;
 const LIVE_TEST_MAX_CONCURRENT_CYCLES = 2;
+const LIVE_COMPACT_MODE_STORAGE_KEY = 'dsa.liveTest.compactMode.v1';
 const ASHARE_LIVE_TEST_WINDOW_TEXT = 'A股实测仅在交易日 15:00 及以前运行';
 const ASHARE_LIVE_TEST_CLOSED_MESSAGE = `${ASHARE_LIVE_TEST_WINDOW_TEXT}；当前已超过实测时间，未触发实时扫描`;
 const UNCLASSIFIED_INDUSTRY = UNCLASSIFIED_INDUSTRY_LABEL;
@@ -589,6 +590,53 @@ function compareResultRows(left: RuleRunEventRow, right: RuleRunEventRow): numbe
 
 function sortResultRows(rows: RuleRunEventRow[]): RuleRunEventRow[] {
   return [...rows].sort(compareResultRows);
+}
+
+function readLiveCompactModePreference(): boolean {
+  if (typeof window === 'undefined') {
+    return true;
+  }
+  try {
+    return window.localStorage.getItem(LIVE_COMPACT_MODE_STORAGE_KEY) !== 'false';
+  } catch {
+    return true;
+  }
+}
+
+function writeLiveCompactModePreference(value: boolean): void {
+  if (typeof window === 'undefined') {
+    return;
+  }
+  try {
+    window.localStorage.setItem(LIVE_COMPACT_MODE_STORAGE_KEY, value ? 'true' : 'false');
+  } catch {
+    // Preference persistence is best-effort; the in-memory switch still works.
+  }
+}
+
+function getLiveCompactRowKey(row: RuleRunEventRow): string | null {
+  const day = row.eventDate.slice(0, 10);
+  const stockCode = row.stockCode.trim().toUpperCase();
+  if (!day || day === '--' || row.ruleId <= 0 || !stockCode) {
+    return null;
+  }
+  return `${day}:${row.ruleId}:${stockCode}`;
+}
+
+function compactLiveResultRows(rows: RuleRunEventRow[]): RuleRunEventRow[] {
+  const seen = new Set<string>();
+  const compactRows: RuleRunEventRow[] = [];
+  for (const row of rows) {
+    const key = getLiveCompactRowKey(row);
+    if (key && seen.has(key)) {
+      continue;
+    }
+    if (key) {
+      seen.add(key);
+    }
+    compactRows.push(row);
+  }
+  return compactRows;
 }
 
 function toDomId(value: string): string {
@@ -1172,6 +1220,9 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
   const [stockListIndustryQuery, setStockListIndustryQuery] = useState('');
   const [selectedStockListIndustries, setSelectedStockListIndustries] = useState<string[]>([]);
   const [expandedResultGroups, setExpandedResultGroups] = useState<Record<string, boolean>>({});
+  const [isLiveCompactMode, setIsLiveCompactMode] = useState(() => (
+    isLiveMode ? readLiveCompactModePreference() : false
+  ));
   const runHeartbeatRef = useRef<number | null>(null);
   const liveTestIntervalRef = useRef<number | null>(null);
   const liveTestSessionRef = useRef<number | null>(null);
@@ -1355,11 +1406,15 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
   const selectedRunIdsForRows = useMemo(() => (
     selectedRun ? new Set(getRunIds(selectedRun)) : null
   ), [selectedRun]);
+  const effectiveDisplayRows = useMemo(
+    () => (isLiveMode && isLiveCompactMode ? compactLiveResultRows(displayRows) : displayRows),
+    [displayRows, isLiveCompactMode, isLiveMode],
+  );
   const runRows = useMemo(() => {
-    if (!selectedRunIdsForRows) return displayRows;
+    if (!selectedRunIdsForRows) return effectiveDisplayRows;
     if (selectedRunIdsForRows.size === 0) return [];
-    return displayRows.filter((row) => row.runId != null && selectedRunIdsForRows.has(row.runId));
-  }, [displayRows, selectedRunIdsForRows]);
+    return effectiveDisplayRows.filter((row) => row.runId != null && selectedRunIdsForRows.has(row.runId));
+  }, [effectiveDisplayRows, selectedRunIdsForRows]);
   const resultRules = useMemo(() => {
     if (selectedRunRuleIds.length > 1) {
       return selectedRunRuleIds
@@ -1715,6 +1770,11 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
     setTargetCodes((current) => current);
   };
 
+  const handleLiveCompactModeChange = (checked: boolean) => {
+    setIsLiveCompactMode(checked);
+    writeLiveCompactModePreference(checked);
+  };
+
   const appendExecutionLog = useCallback((message: string, level: LogLevel = 'info') => {
     const now = new Date().toISOString();
     setExecutionLogs((current) => [
@@ -1860,6 +1920,7 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
           executionTime: cycleExecutionTime,
           ruleIds: resultRuleIds,
           ruleNames: resultRuleNames,
+          compact: isLiveCompactMode,
         }).then((notification) => {
           if (liveTestSessionRef.current !== sessionId) return;
           appendExecutionLog(
@@ -1909,6 +1970,7 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
     }
   }, [
     appendExecutionLog,
+    isLiveCompactMode,
     selectedRuleIds,
     setActiveResultTab,
     setDisplayRows,
@@ -1979,7 +2041,7 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
     setDisplayRows([]);
     setSelectedRun(temporaryRun);
     setActiveResultTab('logs');
-    appendExecutionLog(`开始实测：${selectedRuleIds.length} 条规则，${targetCodes.length} 只股票，实时模式会每 ${LIVE_TEST_POLL_INTERVAL_MS / 1000} 秒重新触发一次`);
+    appendExecutionLog(`开始实测：${selectedRuleIds.length} 条规则，${targetCodes.length} 只股票，${isLiveCompactMode ? '精简模式' : '完整模式'}，实时模式会每 ${LIVE_TEST_POLL_INTERVAL_MS / 1000} 秒重新触发一次`);
 
     let cycleIndex = 0;
     const triggerCycle = () => {
@@ -1992,6 +2054,7 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
     appendExecutionLog,
     clearLiveTestInterval,
     isRunning,
+    isLiveCompactMode,
     rules,
     runDisabled,
     runLiveTestCycle,
@@ -2548,6 +2611,32 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
           </div>
 
           <div className="flex flex-col justify-end gap-2">
+            {isLiveMode ? (
+              <label className="inline-flex h-10 cursor-pointer items-center justify-between gap-3 rounded-xl border border-border/60 bg-elevated/35 px-3 text-xs text-secondary-text transition-all hover:border-primary/40">
+                <span className="whitespace-nowrap font-medium text-foreground">精简模式</span>
+                <input
+                  type="checkbox"
+                  checked={isLiveCompactMode}
+                  onChange={(event) => handleLiveCompactModeChange(event.target.checked)}
+                  aria-label="精简模式，同日同规则同股票仅保留一次"
+                  className="sr-only"
+                />
+                <span
+                  aria-hidden="true"
+                  className={`relative inline-flex h-5 w-9 shrink-0 rounded-full border transition-all ${
+                    isLiveCompactMode
+                      ? 'border-primary/60 bg-primary/75'
+                      : 'border-border/70 bg-surface'
+                  }`}
+                >
+                  <span
+                    className={`absolute top-1/2 h-4 w-4 -translate-y-1/2 rounded-full bg-background shadow-soft-card transition-transform ${
+                      isLiveCompactMode ? 'translate-x-4' : 'translate-x-0.5'
+                    }`}
+                  />
+                </span>
+              </label>
+            ) : null}
             <Button
               variant={isLiveMode && isRunning ? 'danger-subtle' : 'primary'}
               size="md"

@@ -1754,6 +1754,22 @@ function resolvePeRatio(
   return undefined;
 }
 
+function resolvePointPeRatio(
+  point: ChartPoint | null | undefined,
+  price: number | null | undefined,
+): number | undefined {
+  if (
+    isValidNumber(point?.peRatio)
+    && isValidNumber(point?.close)
+    && point.close > 0
+    && isValidNumber(price)
+    && price > 0
+  ) {
+    return point.peRatio * (price / point.close);
+  }
+  return undefined;
+}
+
 function inferVolumeShareMultiplier(points: ChartPoint[], quote: StockQuote | null): number | undefined {
   const latestPointVolume = points.at(-1)?.volume;
   if (!isValidNumber(latestPointVolume) || latestPointVolume <= 0) {
@@ -1941,6 +1957,31 @@ function formatChipRange(chip: ChipDistributionMetrics | null, rangeLevel: ChipR
 
 function getChipConcentration(chip: ChipDistributionMetrics | null, rangeLevel: ChipRangeLevel): number | null | undefined {
   return rangeLevel === '90' ? chip?.concentration90 : chip?.concentration70;
+}
+
+function estimateChipProfitRatioAtPrice(chip: ChipDistributionMetrics | null, price?: number | null): number | undefined {
+  if (!chip || typeof price !== 'number' || !Number.isFinite(price)) {
+    return undefined;
+  }
+  let totalPercent = 0;
+  let profitPercent = 0;
+  (chip.distribution ?? []).forEach((point) => {
+    if (
+      Number.isFinite(point.price)
+      && Number.isFinite(point.percent)
+      && point.price > 0
+      && point.percent > 0
+    ) {
+      totalPercent += point.percent;
+      if (point.price <= price) {
+        profitPercent += point.percent;
+      }
+    }
+  });
+  if (totalPercent <= 0) {
+    return undefined;
+  }
+  return clamp(profitPercent / totalPercent, 0, 1);
 }
 
 function normalizeDateKey(date?: string | null): string | null {
@@ -2545,9 +2586,10 @@ const CoreQuoteMetrics: React.FC<{
   previous?: ChartPoint;
   quote: StockQuote | null;
   referenceQuote: StockQuote | null;
+  referencePoint?: ChartPoint | null;
   points: ChartPoint[];
   onAddRuleMetric?: AddRuleMetricHandler;
-}> = ({ point, previous, quote, referenceQuote, points, onAddRuleMetric }) => {
+}> = ({ point, previous, quote, referenceQuote, referencePoint, points, onAddRuleMetric }) => {
   const close = quote?.currentPrice ?? point?.close;
   const previousClose = quote?.prevClose ?? previous?.close;
   const change = quote?.change
@@ -2561,13 +2603,26 @@ const CoreQuoteMetrics: React.FC<{
   const metricQuote = quote ?? referenceQuote;
   const totalMv = isValidNumber(point?.totalMv)
     ? point.totalMv
-    : resolveQuoteMarketValue(metricQuote?.totalMv, point?.totalShares ?? referenceQuote?.totalShares, metricPrice);
+    : resolveQuoteMarketValue(
+      metricQuote?.totalMv ?? referencePoint?.totalMv,
+      point?.totalShares ?? referencePoint?.totalShares ?? referenceQuote?.totalShares,
+      metricPrice,
+    );
   const circMv = isValidNumber(point?.circMv)
     ? point.circMv
-    : resolveQuoteMarketValue(metricQuote?.circMv, point?.floatShares ?? referenceQuote?.floatShares, metricPrice);
-  const peRatio = isValidNumber(point?.peRatio) ? point.peRatio : resolvePeRatio(quote, referenceQuote, metricPrice);
+    : resolveQuoteMarketValue(
+      metricQuote?.circMv ?? referencePoint?.circMv,
+      point?.floatShares ?? referencePoint?.floatShares ?? referenceQuote?.floatShares,
+      metricPrice,
+    );
+  const peRatio = isValidNumber(point?.peRatio)
+    ? point.peRatio
+    : resolvePeRatio(quote, referenceQuote, metricPrice) ?? resolvePointPeRatio(referencePoint, metricPrice);
   const coreVolumeRatio = quote?.volumeRatio ?? point?.volumeRatio ?? (point ? getPointVolumeRatio(point) : undefined);
   const coreTurnoverRate = resolvePointTurnoverRate(point, quote ?? referenceQuote, points, quote !== null);
+  const isIntradayPoint = getKLineMinuteOfDay(point?.date) !== null;
+  const amountLabel = isIntradayPoint ? '本K成交额' : '成交额';
+  const amountValue = isIntradayPoint ? point?.amount : quote?.amount ?? point?.amount;
   const coreRows: CoreMetricItem[] = [
     { label: '最高价', metricKey: 'high', value: formatNumber(quote?.high ?? point?.high), rawValue: quote?.high ?? point?.high, unit: '元', tone: 'up' },
     { label: '总市值', metricKey: 'total_mv', value: formatCompactNumber(totalMv), rawValue: totalMv, unit: '元' },
@@ -2577,7 +2632,7 @@ const CoreQuoteMetrics: React.FC<{
     { label: '换手率', metricKey: 'turnover_rate', value: formatPlainPct(coreTurnoverRate), rawValue: coreTurnoverRate, unit: '%' },
     { label: '开盘价', metricKey: 'open', value: formatNumber(quote?.open ?? point?.open), rawValue: quote?.open ?? point?.open, unit: '元', tone: 'up' },
     { label: '市盈TTM', metricKey: 'pe_ratio', value: formatNumber(peRatio, 2), rawValue: peRatio },
-    { label: '成交额', metricKey: 'amount', value: formatCompactNumber(quote?.amount ?? point?.amount), rawValue: quote?.amount ?? point?.amount, unit: '元' },
+    { label: amountLabel, metricKey: 'amount', value: formatCompactNumber(amountValue), rawValue: amountValue, unit: '元' },
   ];
 
   const getMetricColor = (item: CoreMetricItem) => {
@@ -4008,8 +4063,9 @@ const ChipPeakPanel: React.FC<{
   currentPoint?: ChartPoint | null;
   chip: ChipDistributionMetrics | null;
   mainChip: ChipDistributionMetrics | null;
+  useCurrentPriceProfitRatio?: boolean;
   onAddRuleMetric?: AddRuleMetricHandler;
-}> = ({ points, currentPoint, chip, mainChip, onAddRuleMetric }) => {
+}> = ({ points, currentPoint, chip, mainChip, useCurrentPriceProfitRatio = false, onAddRuleMetric }) => {
   const [activeScope, setActiveScope] = useState<ChipPanelScope>('all');
   const [activeRange, setActiveRange] = useState<ChipRangeLevel>('90');
   const activeChip = activeScope === 'main' ? mainChip : chip;
@@ -4040,7 +4096,9 @@ const ChipPeakPanel: React.FC<{
   const yForPrice = (price: number) => chartTop + ((priceMax - price) / priceRange) * chartHeight;
   const currentY = typeof latestClose === 'number' ? yForPrice(latestClose) : null;
   const avgCostY = typeof activeChip?.avgCost === 'number' ? yForPrice(activeChip.avgCost) : null;
-  const profitRatio = activeChip?.profitRatio;
+  const profitRatio = useCurrentPriceProfitRatio
+    ? estimateChipProfitRatioAtPrice(activeChip, latestClose) ?? activeChip?.profitRatio
+    : activeChip?.profitRatio;
   const trappedRatio = typeof profitRatio === 'number' ? 1 - profitRatio : undefined;
   const concentration = getChipConcentration(activeChip, activeRange);
   const metricPrefix = activeScope === 'main' ? 'main_' : '';
@@ -4187,13 +4245,13 @@ const ChipPeakPanel: React.FC<{
             <dt className="inline-flex items-center gap-1" style={{ color: TERMINAL_COLORS.orange }}>
               <RuleMetricAddButton
                 metricKey={`${metricPrefix}profit_ratio`}
-                label={`${scopeLabel}收盘获利`}
+                label={`${scopeLabel}${useCurrentPriceProfitRatio ? '当前获利' : '收盘获利'}`}
                 value={normalizeRatioPctValue(profitRatio)}
                 unit="%"
                 date={activeChip?.date}
                 onAdd={onAddRuleMetric}
               />
-              <span>收盘获利</span>
+              <span>{useCurrentPriceProfitRatio ? '当前获利' : '收盘获利'}</span>
             </dt>
             <dd className="font-semibold tabular-nums" style={{ color: TERMINAL_COLORS.orange }}>{formatRatioPct(profitRatio)}</dd>
           </div>
@@ -4387,6 +4445,7 @@ const IndicatorSidePanel: React.FC<{
   mainChip: ChipDistributionMetrics | null;
   quote: StockQuote | null;
   showRealtimeTab?: boolean;
+  useCurrentPriceProfitRatio?: boolean;
   onAddRuleMetric?: AddRuleMetricHandler;
 }> = ({
   points,
@@ -4396,6 +4455,7 @@ const IndicatorSidePanel: React.FC<{
   mainChip,
   quote,
   showRealtimeTab = true,
+  useCurrentPriceProfitRatio = false,
   onAddRuleMetric,
 }) => {
   const [activeTab, setActiveTab] = useState<SidePanelTab>('chip');
@@ -4447,6 +4507,7 @@ const IndicatorSidePanel: React.FC<{
             currentPoint={chipPoint}
             chip={chip}
             mainChip={mainChip}
+            useCurrentPriceProfitRatio={useCurrentPriceProfitRatio}
             onAddRuleMetric={onAddRuleMetric}
           />
         ) : (
@@ -4940,6 +5001,9 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
     daily: createHistoryState(stockCode, 'daily'),
   }));
   const oneMinuteRefreshInFlightRef = useRef(false);
+  const metricsRefreshInFlightRef = useRef<string | null>(null);
+  const metricsRefreshAttemptedKeyRef = useRef<string | null>(null);
+  const defaultQuoteRefreshInFlightRef = useRef<string | null>(null);
   const dailyCutoffDateRef = useRef<string | null>(null);
   const selectedRefreshTokenRef = useRef<string | null>(null);
   const lastChartAnchorIndexRef = useRef<number | null>(null);
@@ -4981,6 +5045,100 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
         }),
       };
     });
+  }, [stockCode]);
+
+  const refreshMetricsForTradeDate = useCallback(async (
+    tradeDate: string | null | undefined,
+    period: ChartPeriod,
+    options: { force?: boolean } = {},
+  ) => {
+    const dateKey = normalizeDateKey(tradeDate);
+    if (!dateKey) {
+      return;
+    }
+
+    const requestKey = `${stockCode}:${dateKey}`;
+    if (!options.force && metricsRefreshAttemptedKeyRef.current === requestKey) {
+      return;
+    }
+    if (metricsRefreshInFlightRef.current === requestKey) {
+      return;
+    }
+    metricsRefreshAttemptedKeyRef.current = requestKey;
+    metricsRefreshInFlightRef.current = requestKey;
+
+    try {
+      const nextMetrics = await stocksApi.getIndicatorMetrics(stockCode, {
+        dataPolicy: 'db_only',
+        tradeDate: dateKey,
+        days: dailyHistoryDays,
+      });
+
+      setHistoryCache((current) => {
+        const updateState = (state: HistoryState | undefined): HistoryState | undefined => {
+          if (!state || state.stockCode !== stockCode) {
+            return state;
+          }
+          return {
+            ...state,
+            metrics: nextMetrics,
+            metricsError: null,
+          };
+        };
+
+        const next: HistoryCache = {
+          ...current,
+          daily: updateState(current.daily),
+        };
+        if (period !== 'daily') {
+          next[period] = updateState(current[period]);
+        }
+        return next;
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : '主力筹码数据刷新失败';
+      setHistoryCache((current) => {
+        const updateState = (state: HistoryState | undefined): HistoryState | undefined => {
+          if (!state || state.stockCode !== stockCode) {
+            return state;
+          }
+          return {
+            ...state,
+            metricsError: message,
+          };
+        };
+
+        const next: HistoryCache = {
+          ...current,
+          daily: updateState(current.daily),
+        };
+        if (period !== 'daily') {
+          next[period] = updateState(current[period]);
+        }
+        return next;
+      });
+    } finally {
+      if (metricsRefreshInFlightRef.current === requestKey) {
+        metricsRefreshInFlightRef.current = null;
+      }
+    }
+  }, [dailyHistoryDays, stockCode]);
+
+  const refreshQuoteWithDefaultPolicy = useCallback(async () => {
+    if (defaultQuoteRefreshInFlightRef.current === stockCode) {
+      return;
+    }
+    defaultQuoteRefreshInFlightRef.current = stockCode;
+    try {
+      const nextQuote = await stocksApi.getQuote(stockCode, 'default');
+      setHistoryCache((current) => syncHistoryCacheWithRealtimeQuote(current, stockCode, nextQuote));
+    } catch {
+      // Keep the minute/daily chart usable when the optional realtime quote fallback is unavailable.
+    } finally {
+      if (defaultQuoteRefreshInFlightRef.current === stockCode) {
+        defaultQuoteRefreshInFlightRef.current = null;
+      }
+    }
   }, [stockCode]);
 
   const handleAddRuleMetric = useCallback((metric: RuleMetricAddPayload) => {
@@ -5177,6 +5335,12 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
       });
 
       setHistoryCache({ daily: dailyState });
+      if (!isHistoricalMode) {
+        if (!quoteResponse) {
+          void refreshQuoteWithDefaultPolicy();
+        }
+        void refreshMetricsForTradeDate(dailyCutoffDate, 'daily');
+      }
 
     };
 
@@ -5195,7 +5359,7 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
     return () => {
       ignore = true;
     };
-  }, [dailyHistoryDays, dataMode, initialDateKey, isHistoricalMode, marketKind, stockCode]);
+  }, [dailyHistoryDays, dataMode, initialDateKey, isHistoricalMode, marketKind, refreshMetricsForTradeDate, refreshQuoteWithDefaultPolicy, stockCode]);
 
   const selectedCachedState = historyCache[selectedPeriod];
   const dailyCachedState = historyCache.daily;
@@ -5234,6 +5398,9 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
         if (ignore) {
           return;
         }
+        const metricsTradeDate = getLatestHistoryDate(
+          normalizeHistoryForPeriod(periodResponse.data, selectedPeriod, marketKind, dailyCutoffDateRef.current),
+        );
         setHistoryCache((current) => {
           const currentState = current[selectedPeriod];
           if (currentState?.stockCode !== stockCode) {
@@ -5263,6 +5430,7 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
             },
           };
         });
+        void refreshMetricsForTradeDate(metricsTradeDate, selectedPeriod);
       })
       .catch((err: unknown) => {
         if (ignore) {
@@ -5287,7 +5455,7 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
     return () => {
       ignore = true;
     };
-  }, [dataMode, initialDateKey, isHistoricalMode, marketKind, selectedCachedState, selectedPeriod, stockCode]);
+  }, [dataMode, initialDateKey, isHistoricalMode, marketKind, refreshMetricsForTradeDate, selectedCachedState, selectedPeriod, stockCode]);
 
   useEffect(() => {
     if (
@@ -5318,6 +5486,12 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
         if (ignore) {
           return;
         }
+
+        const metricsTradeDate = historyResult.status === 'fulfilled'
+          ? getLatestHistoryDate(
+            normalizeHistoryForPeriod(historyResult.value.data, selectedPeriod, marketKind, dailyCutoffDateRef.current),
+          )
+          : null;
 
         setHistoryCache((current) => {
           const currentState = current[selectedPeriod];
@@ -5358,6 +5532,7 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
             },
           }, stockCode, nextQuote);
         });
+        void refreshMetricsForTradeDate(metricsTradeDate, selectedPeriod, { force: true });
       } finally {
         oneMinuteRefreshInFlightRef.current = false;
       }
@@ -5372,7 +5547,7 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
       oneMinuteRefreshInFlightRef.current = false;
       window.clearInterval(intervalId);
     };
-  }, [dataMode, initialDateKey, isHistoricalMode, marketKind, selectedCachedState, selectedPeriod, stockCode]);
+  }, [dataMode, initialDateKey, isHistoricalMode, marketKind, refreshMetricsForTradeDate, selectedCachedState, selectedPeriod, stockCode]);
 
   useEffect(() => {
     if (isHistoricalMode || isLoading || selectedPeriod === '1m' || selectedPeriod === 'timeshare') {
@@ -5448,6 +5623,13 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
   const corePoint = corePointIndex !== null ? points[corePointIndex] : latest;
   const corePreviousPoint = corePointIndex !== null && corePointIndex > 0 ? points[corePointIndex - 1] : undefined;
   const coreQuote = !isHistoricalMode && corePointIndex !== null && corePointIndex === points.length - 1 ? quote : null;
+  const dailyReferencePoint = useMemo(() => {
+    const dateKey = normalizeDateKey(corePoint?.date);
+    if (!dateKey || dailyCachedState?.stockCode !== stockCode) {
+      return null;
+    }
+    return dailyCachedState.history.find((item) => normalizeDateKey(item.date) === dateKey) ?? null;
+  }, [corePoint?.date, dailyCachedState?.history, dailyCachedState?.stockCode, stockCode]);
   const displayVolume = quote?.volume ?? latest?.volume;
   const volumeRatio = displayVolume && latest?.volumeMa5 ? displayVolume / latest.volumeMa5 : undefined;
   const chipPoints = points;
@@ -5471,6 +5653,21 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
   const mainChip: ChipDistributionMetrics | null = null;
   const modal = variant === 'modal';
   const shouldRenderEmptyTimeshareBoard = effectivePeriod === 'timeshare' && points.length === 0;
+
+  useEffect(() => {
+    if (isHistoricalMode || effectivePeriod === 'daily') {
+      return;
+    }
+    const dateKey = normalizeDateKey(selectedPoint?.date);
+    if (!dateKey) {
+      return;
+    }
+    const selectedChip = pickChipSnapshot(baseChip, dateKey);
+    if (isChipForDate(selectedChip, dateKey)) {
+      return;
+    }
+    void refreshMetricsForTradeDate(dateKey, effectivePeriod);
+  }, [baseChip, effectivePeriod, isHistoricalMode, refreshMetricsForTradeDate, selectedPoint?.date]);
 
   useEffect(() => {
     const resetKey = `${stockCode}:${effectivePeriod}:${points.length}`;
@@ -5700,6 +5897,7 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
                     previous={corePreviousPoint}
                     quote={coreQuote}
                     referenceQuote={quote}
+                    referencePoint={dailyReferencePoint}
                     points={points}
                     onAddRuleMetric={handleAddRuleMetric}
                   />
@@ -5790,6 +5988,7 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
                     mainChip={mainChip}
                     quote={quote}
                     showRealtimeTab={!isHistoricalMode}
+                    useCurrentPriceProfitRatio={!isHistoricalMode && effectivePeriod !== 'daily'}
                     onAddRuleMetric={handleAddRuleMetric}
                   />
                   {!modal ? (

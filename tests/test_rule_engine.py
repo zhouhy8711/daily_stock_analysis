@@ -224,10 +224,15 @@ def test_rule_repository_previous_live_match_signature_skips_non_live_runs():
             rule_id = rule.id
 
         previous = repo.get_previous_live_match_signature(current_run_id)
+        previous_keys = repo.get_previous_live_match_keys(current_run_id)
 
         assert previous == {
             "run_id": live_run_id,
             "signature": ((rule_id, "300274.SZ"),),
+        }
+        assert previous_keys == {
+            "run_ids": [live_run_id],
+            "keys": (("2026-05-08", rule_id, "300274.SZ"),),
         }
     finally:
         DatabaseManager.reset_instance()
@@ -719,10 +724,11 @@ class _PolicyRecordingStockService(_FakeStockService):
 
 
 class _NotifyRuleRepo:
-    def __init__(self, matches, previous_signature=None, previous_run_id=None):
+    def __init__(self, matches, previous_signature=None, previous_run_id=None, previous_keys=None):
         self.matches = matches
         self.previous_signature = previous_signature
         self.previous_run_id = previous_run_id
+        self.previous_keys = previous_keys
 
     def list_matches(self, run_id):
         return self.matches
@@ -733,6 +739,14 @@ class _NotifyRuleRepo:
         return {
             "run_id": self.previous_run_id,
             "signature": self.previous_signature,
+        }
+
+    def get_previous_live_match_keys(self, run_id):
+        if not self.previous_keys:
+            return None
+        return {
+            "run_ids": [self.previous_run_id] if self.previous_run_id else [],
+            "keys": self.previous_keys,
         }
 
 
@@ -1050,12 +1064,132 @@ def test_rule_service_notify_live_matches_skips_duplicate_signature():
             execution_time="2026-05-08 10:01:00",
             rule_ids=[7],
             rule_names=["放量观察"],
+            compact=False,
         )
 
     assert result["sent"] is False
     assert result["deduplicated"] is True
     assert result["event_count"] == 1
     assert "跳过重复推送" in result["message"]
+    fake_notifier.send.assert_not_called()
+
+
+def test_rule_service_notify_live_matches_compact_filters_same_day_rule_stock_duplicates():
+    matches = [
+        {
+            "run_id": 12,
+            "rule_id": 7,
+            "stock_code": "300274.SZ",
+            "stock_name": "阳光电源",
+            "matched_dates": ["2026-05-08"],
+            "matched_events": [
+                {
+                    "date": "2026-05-08",
+                    "snapshot": {
+                        "snapshot_id": "20260508100100",
+                        "snapshot_time": "2026-05-08T10:01:00",
+                    },
+                    "matched_groups": [],
+                }
+            ],
+            "matched_groups": [],
+            "snapshot": {},
+            "explanation": None,
+        },
+        {
+            "run_id": 12,
+            "rule_id": 7,
+            "stock_code": "688521.SH",
+            "stock_name": "芯原股份",
+            "matched_dates": ["2026-05-08"],
+            "matched_events": [
+                {
+                    "date": "2026-05-08",
+                    "snapshot": {
+                        "snapshot_id": "20260508100100",
+                        "snapshot_time": "2026-05-08T10:01:00",
+                    },
+                    "matched_groups": [],
+                }
+            ],
+            "matched_groups": [],
+            "snapshot": {},
+            "explanation": None,
+        },
+    ]
+    repo = _NotifyRuleRepo(
+        matches,
+        previous_keys={("2026-05-08", 7, "300274.SZ")},
+        previous_run_id=11,
+    )
+    fake_notifier = mock.Mock()
+    fake_notifier.is_available.return_value = True
+    fake_notifier.send.return_value = True
+    service = RuleService(repo=repo, stock_service=object())
+
+    with mock.patch("src.notification.NotificationService", return_value=fake_notifier):
+        result = service.notify_live_matches(
+            12,
+            execution_time="2026-05-08 10:01:00",
+            rule_ids=[7],
+            rule_names=["放量观察"],
+            compact=True,
+        )
+
+    assert result["sent"] is True
+    assert result["deduplicated"] is True
+    assert result["event_count"] == 1
+    assert result["original_event_count"] == 2
+    message = fake_notifier.send.call_args.args[0]
+    assert "芯原股份(688521.SH)" in message
+    assert "阳光电源(300274.SZ)" not in message
+
+
+def test_rule_service_notify_live_matches_compact_skips_when_all_same_day_keys_seen():
+    matches = [
+        {
+            "run_id": 12,
+            "rule_id": 7,
+            "stock_code": "300274.SZ",
+            "stock_name": "阳光电源",
+            "matched_dates": ["2026-05-08"],
+            "matched_events": [
+                {
+                    "date": "2026-05-08",
+                    "snapshot": {
+                        "snapshot_id": "20260508100100",
+                        "snapshot_time": "2026-05-08T10:01:00",
+                    },
+                    "matched_groups": [],
+                }
+            ],
+            "matched_groups": [],
+            "snapshot": {},
+            "explanation": None,
+        }
+    ]
+    repo = _NotifyRuleRepo(
+        matches,
+        previous_keys={("2026-05-08", 7, "300274.SZ")},
+        previous_run_id=11,
+    )
+    fake_notifier = mock.Mock()
+    service = RuleService(repo=repo, stock_service=object())
+
+    with mock.patch("src.notification.NotificationService", return_value=fake_notifier):
+        result = service.notify_live_matches(
+            12,
+            execution_time="2026-05-08 10:01:00",
+            rule_ids=[7],
+            rule_names=["放量观察"],
+            compact=True,
+        )
+
+    assert result["sent"] is False
+    assert result["deduplicated"] is True
+    assert result["event_count"] == 0
+    assert result["original_event_count"] == 1
+    assert "精简模式" in result["message"]
     fake_notifier.send.assert_not_called()
 
 

@@ -81,6 +81,7 @@ class RuleRunNotifyRequest(BaseModel):
     execution_time: Optional[str] = Field(None, description="Live-test execution time shown in the notification")
     rule_ids: List[int] = Field(default_factory=list, description="Rule IDs included in this run")
     rule_names: List[str] = Field(default_factory=list, description="Rule names included in this run")
+    compact: bool = Field(True, description="Deduplicate same-day live-test notifications by date/rule/stock")
 
 
 class RuleRunNotifyResponse(BaseModel):
@@ -89,6 +90,8 @@ class RuleRunNotifyResponse(BaseModel):
     match_count: int = 0
     event_count: int = 0
     deduplicated: bool = False
+    compact: bool = True
+    original_event_count: int = 0
 
 
 class RuleRunHistoryItem(BaseModel):

@@ -32,7 +32,7 @@
 | 首页 quote 前端缓存 | `apps/dsa-web/src/pages/HomePage.tsx` 的 `quoteCacheRef` | 自选股/全 A 股 quote，TTL 30 秒 | 首页加载自选股行情、切换到全 A 股列表、返回列表时先复用 | 否 | 只对缺失代码调用 `POST /api/v1/stocks/quotes`；返回后重新写入前端缓存 |
 | 指标页 K 线前端缓存 | `IndicatorAnalysisView` 的 `historyCache` | 当前股票按周期分开的 K 线、quote、指标扩展数据 | 打开指标页、切换周期、1m/分时定时刷新 | 否 | 先调后端 `cache_only`；日线返回 `daily_cache_miss` 或分钟返回 `intraday_hot_table_miss` 时，实时模式再调 `default` 回源；历史模式只调 `db_only` |
 | 回测/实测页面运行态缓存 | `BacktestPage.tsx` 的 `backtestRuntimeStates` | 当前页面 tab 的运行状态、结果、轮询信息 | 页面切换或组件重渲染时恢复 UI 状态 | 否 | 重新从 `stock_rule_runs`、`stock_rule_matches` 等 API 读取，或等待新运行返回 |
-| 实时 quote 快照 | `src/services/stock_service.py` 的 `_REALTIME_QUOTE_SNAPSHOT` | 一轮预热产生的全 A 股 quote 快照，含 `snapshot_id` | 实测 `snapshot_only`、首页/指标页 `cache_only` quote、`default` quote 的第一优先级 | 间接同步：生成快照时同批 quote 会写 `stock_intraday_minute` | quote API 的 `snapshot_only/db_only` 直接返回空；规则实测会继续尝试本地分钟热表 fallback；`cache_only` 继续查短缓存；`default` 继续查短缓存和远程数据源 |
+| 实时 quote 快照 | `src/services/stock_service.py` 的 `_REALTIME_QUOTE_SNAPSHOT` | 一轮预热产生的全 A 股 quote 快照，含 `snapshot_id` | 实测 `snapshot_only`、首页/指标页 `cache_only` quote、`default` quote 的第一优先级；读取时校验 `snapshot_time` 的市场本地日期必须等于当前市场日期 | 间接同步：生成快照时同批 quote 会写 `stock_intraday_minute` | quote API 的 `snapshot_only/db_only` 遇到缺失或跨天快照直接返回空；规则实测会继续尝试本地分钟热表 fallback；`cache_only` 继续查短缓存；`default` 继续查短缓存和远程数据源 |
 | 实时 quote 短缓存 | `src/services/stock_service.py` 的 `_REALTIME_QUOTE_CACHE` | 单股 quote payload，按 `REALTIME_QUOTE_CACHE_SECONDS` 时间桶复用 | `get_realtime_quote(s)` 在快照未命中后读取；预热任务也用它判断本轮缺失代码 | 只有 `warm_realtime_quotes()` 会把当前批次 quote 样本写入 `stock_intraday_minute`；普通按需 quote 不直接落库 | `cache_only` 返回空；`default` 调 `DataFetcherManager.get_realtime_quote(s)` 远程回源，成功后写短缓存 |
 | 数据源全市场实时缓存 | `data_provider/efinance_fetcher.py`、`data_provider/akshare_fetcher.py` 的 `_realtime_cache`、`_etf_realtime_cache` | efinance/AkShare 全市场股票或 ETF DataFrame，TTL 同 `REALTIME_QUOTE_CACHE_SECONDS` | 数据源单股实时、批量实时、市场统计都会先查这个 DataFrame | 不直接同步 DB；只有上层 `StockService.warm_realtime_quotes()` 使用这些数据形成 quote payload 后才会写 `stock_intraday_minute` | miss 时在锁内拉全市场接口并更新 DataFrame；AkShare 失败时会缓存空 DataFrame，避免同一 TTL 内反复打接口 |
 | 日线数据库缓存 | `stock_daily` 表 | 日 K、估值、成交额、换手、均线等字段 | 规则实测、规则回测、AI 回测、首页指标日 K 都优先读 | 是，远程日线成功后 upsert；分钟热表收盘归档后也 upsert | `cache_only/snapshot_only` 返回 `daily_cache_miss`；`db_only` 可返回部分历史；`default` 远程回源，失败且有旧缓存时降级用旧 DB 数据 |
@@ -130,7 +130,7 @@ flowchart LR
 点击「运行实测」后：
 
 1. 前端先用上海时间判断 A 股是否仍允许实测：交易日 15:00 及以前可运行，9:30 前和午休不再拦截。
-2. 创建一个临时运行记录，首轮立即触发，之后每 30 秒触发一次。
+2. 创建一个临时运行记录，首轮立即触发，之后每 30 秒触发一次；「精简模式」默认开启。
 3. 最多允许 2 个实测周期并发，超出会排队到下一个 slot。
 4. 每轮调用：
 
@@ -148,7 +148,8 @@ POST /api/v1/rules/run-batch
 ```
 
 5. 返回后前端按 `snapshot_id` 去重；相同快照不重复汇总，旧快照不覆盖新快照。
-6. 若本轮有命中，前端继续调用 `POST /api/v1/rules/runs/{run_id}/notify` 推送通知。
+6. 精简模式开启时，前端结果列表按「命中日 + 规则 + 股票」只保留一条命中；关闭后恢复逐轮累计展示。
+7. 若本轮有命中，前端继续调用 `POST /api/v1/rules/runs/{run_id}/notify` 推送通知，并传入当前精简模式开关。后端在精简模式下会按同一天「命中日 + 规则 + 股票」过滤今日已推送过的命中；关闭后使用原来的上一轮组合完全一致去重逻辑。
 
 ### 后端规则准备
 

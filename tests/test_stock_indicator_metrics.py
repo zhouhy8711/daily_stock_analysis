@@ -383,13 +383,50 @@ def test_realtime_quote_snapshot_only_does_not_call_remote() -> None:
         snapshot_time=datetime(2026, 5, 7, 10, 30, 0),
     )
 
-    with patch("data_provider.base.DataFetcherManager", return_value=manager):
+    with (
+        patch("data_provider.base.DataFetcherManager", return_value=manager),
+        patch(
+            "src.services.stock_service.trading_calendar.get_market_now",
+            return_value=datetime(2026, 5, 7, 10, 31, 0),
+        ),
+    ):
         hit = StockService().get_realtime_quote("600519", data_policy="snapshot_only")
         miss = StockService().get_realtime_quote("000001", data_policy="snapshot_only")
 
     assert hit is not None
     assert hit["snapshot_id"] == "20260507103000"
     assert miss is None
+    assert manager.calls == 0
+
+
+def test_realtime_quote_snapshot_only_ignores_previous_market_day() -> None:
+    manager = _CountingRealtimeManager()
+    _replace_realtime_quote_snapshot(
+        requested_codes=["600519"],
+        items=[{
+            "stock_code": "600519",
+            "stock_name": "贵州茅台",
+            "current_price": 1688.5,
+            "source": "efinance",
+        }],
+        failed_codes=[],
+        snapshot_time=datetime(2026, 5, 7, 14, 59, 0),
+    )
+
+    def fake_market_now(_market, current_time=None):
+        if current_time is not None:
+            return current_time
+        return datetime(2026, 5, 8, 9, 0, 0)
+
+    with (
+        patch("data_provider.base.DataFetcherManager", return_value=manager),
+        patch("src.services.stock_service.trading_calendar.get_market_now", side_effect=fake_market_now),
+    ):
+        hit = StockService().get_realtime_quote("600519", data_policy="snapshot_only")
+
+    stats = get_realtime_quote_cache_stats()
+    assert hit is None
+    assert stats["quote_snapshot_items"] == 0
     assert manager.calls == 0
 
 
