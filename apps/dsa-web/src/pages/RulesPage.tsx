@@ -71,6 +71,8 @@ const OPERATOR_OPTIONS: Array<{ value: RuleOperator; label: string }> = [
   { value: 'new_low', label: 'N 期新低' },
   { value: 'exists', label: '有值' },
   { value: 'not_exists', label: '无值' },
+  { value: 'sandwich_number', label: '夹板数' },
+  { value: 'pair_number', label: '对子数' },
 ];
 const COMPARE_OPTIONS: Array<{ value: RuleCompareOperator; label: string }> = [
   { value: '>', label: '>' },
@@ -313,11 +315,13 @@ function conditionSummary(metrics: RuleMetricItem[], condition: RuleCondition): 
   if (condition.operator === 'new_low') return `${left} 创 ${condition.lookback ?? 20} 期新低`;
   if (condition.operator === 'exists') return `${left} 有值`;
   if (condition.operator === 'not_exists') return `${left} 无值`;
+  if (condition.operator === 'sandwich_number') return `${left} 元角分符合 a.ba 夹板数`;
+  if (condition.operator === 'pair_number') return `${left} 角分符合 .bb 对子数`;
   return `${left} ${condition.operator} ${valueSummary(metrics, condition.right)}`;
 }
 
 function canUseRightValue(operator: RuleOperator): boolean {
-  return !['trend_up', 'trend_down', 'new_high', 'new_low', 'exists', 'not_exists'].includes(operator);
+  return !['trend_up', 'trend_down', 'new_high', 'new_low', 'exists', 'not_exists', 'sandwich_number', 'pair_number'].includes(operator);
 }
 
 function SelectField<T extends string>({

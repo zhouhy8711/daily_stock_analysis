@@ -111,6 +111,114 @@ def test_rule_engine_matches_frequency_condition():
     assert result["matched"] is True
 
 
+def test_rule_engine_matches_sandwich_number_current_price():
+    frame = build_metric_frame(_history(), quote={"current_price": 14.24})
+    definition = {
+        "period": "daily",
+        "lookback_days": 120,
+        "target": {"scope": "custom", "stock_codes": ["600519"]},
+        "groups": [
+            {
+                "id": "g1",
+                "conditions": [
+                    {
+                        "id": "c1",
+                        "left": {"metric": "current_price"},
+                        "operator": "sandwich_number",
+                    }
+                ],
+            }
+        ],
+    }
+
+    result = evaluate_rule(definition, frame)
+
+    assert result["matched"] is True
+    condition = result["matched_groups"][0]["conditions"][0]
+    assert condition["values"]["left"] == 14.24
+    assert condition["values"]["pattern"] == "4.24"
+    assert "夹板数" in condition["explanation"]
+
+
+def test_rule_engine_rejects_repeated_digits_as_sandwich_number():
+    frame = build_metric_frame(_history(), quote={"current_price": 14.44})
+    definition = {
+        "period": "daily",
+        "lookback_days": 120,
+        "target": {"scope": "custom", "stock_codes": ["600519"]},
+        "groups": [
+            {
+                "id": "g1",
+                "conditions": [
+                    {
+                        "id": "c1",
+                        "left": {"metric": "current_price"},
+                        "operator": "sandwich_number",
+                    }
+                ],
+            }
+        ],
+    }
+
+    result = evaluate_rule(definition, frame)
+
+    assert result["matched"] is False
+
+
+def test_rule_engine_matches_pair_number_current_price():
+    frame = build_metric_frame(_history(), quote={"current_price": 14.44})
+    definition = {
+        "period": "daily",
+        "lookback_days": 120,
+        "target": {"scope": "custom", "stock_codes": ["600519"]},
+        "groups": [
+            {
+                "id": "g1",
+                "conditions": [
+                    {
+                        "id": "c1",
+                        "left": {"metric": "current_price"},
+                        "operator": "pair_number",
+                    }
+                ],
+            }
+        ],
+    }
+
+    result = evaluate_rule(definition, frame)
+
+    assert result["matched"] is True
+    condition = result["matched_groups"][0]["conditions"][0]
+    assert condition["values"]["left"] == 14.44
+    assert condition["values"]["pattern"] == ".44"
+    assert "对子数" in condition["explanation"]
+
+
+def test_rule_engine_rejects_non_pair_number_current_price():
+    frame = build_metric_frame(_history(), quote={"current_price": 14.45})
+    definition = {
+        "period": "daily",
+        "lookback_days": 120,
+        "target": {"scope": "custom", "stock_codes": ["600519"]},
+        "groups": [
+            {
+                "id": "g1",
+                "conditions": [
+                    {
+                        "id": "c1",
+                        "left": {"metric": "current_price"},
+                        "operator": "pair_number",
+                    }
+                ],
+            }
+        ],
+    }
+
+    result = evaluate_rule(definition, frame)
+
+    assert result["matched"] is False
+
+
 def test_rule_engine_returns_matched_history_dates():
     frame = build_metric_frame(_history())
     definition = {
@@ -506,6 +614,52 @@ def test_rule_engine_uses_dated_chip_snapshots_for_history_matches():
     assert events[0]["matched_groups"][0]["conditions"][0]["left_metric"] == "profit_ratio"
 
 
+def test_rule_service_accepts_sandwich_number_condition_without_right_value():
+    service = RuleService(repo=mock.Mock(), stock_service=mock.Mock())
+    definition = {
+        "period": "daily",
+        "lookback_days": 120,
+        "target": {"scope": "custom", "stock_codes": ["600519"]},
+        "groups": [
+            {
+                "id": "g1",
+                "conditions": [
+                    {
+                        "id": "c1",
+                        "left": {"metric": "current_price"},
+                        "operator": "sandwich_number",
+                    }
+                ],
+            }
+        ],
+    }
+
+    service.validate_definition(definition)
+
+
+def test_rule_service_accepts_pair_number_condition_without_right_value():
+    service = RuleService(repo=mock.Mock(), stock_service=mock.Mock())
+    definition = {
+        "period": "daily",
+        "lookback_days": 120,
+        "target": {"scope": "custom", "stock_codes": ["600519"]},
+        "groups": [
+            {
+                "id": "g1",
+                "conditions": [
+                    {
+                        "id": "c1",
+                        "left": {"metric": "current_price"},
+                        "operator": "pair_number",
+                    }
+                ],
+            }
+        ],
+    }
+
+    service.validate_definition(definition)
+
+
 class _FakeRuleRepo:
     def __init__(self, rule):
         self.rule = rule
@@ -768,6 +922,20 @@ class _ConcurrentProbeStockService(_FakeStockService):
                 self._active_calls -= 1
 
 
+class _CountingStockService(_FakeStockService):
+    def __init__(self):
+        self.history_calls = []
+        self.indicator_calls = []
+
+    def get_history_data(self, stock_code, period="daily", days=30, data_policy="default"):
+        self.history_calls.append((stock_code, period, days, data_policy))
+        return super().get_history_data(stock_code, period=period, days=days)
+
+    def get_indicator_metrics(self, stock_code):
+        self.indicator_calls.append(stock_code)
+        return {}
+
+
 def test_rule_service_run_modes_separate_latest_from_history():
     repo = _FakeRuleRepo(_service_rule_for_run_mode())
     service = RuleService(repo=repo, stock_service=_FakeStockService())
@@ -966,6 +1134,62 @@ def test_rule_service_async_batch_updates_completed_stock_progress():
     assert [item["completed_count"] for item in repo.progress_updates] == [1, 2]
     assert repo.finished_status == "completed"
     assert len(repo.finished_matches) == 4
+
+
+def test_rule_service_async_batch_reuses_history_and_skips_chip_for_light_rules():
+    first_rule = _service_rule_for_codes(["600519", "000001"])
+    second_rule = {**_service_rule_for_codes(["600519", "000001"]), "id": 2, "name": "第二条规则"}
+    repo = _ProgressRuleRepo([first_rule, second_rule])
+    stock_service = _CountingStockService()
+    service = RuleService(repo=repo, stock_service=stock_service)
+    service._resolve_run_workers = lambda target_count: 1
+    service._build_history_chip_metrics = mock.Mock(return_value={})
+
+    response, context = service.start_run_rules(
+        [1, 2],
+        mode="history",
+        target_override={"scope": "custom", "stock_codes": ["600519", "000001"]},
+    )
+    service.complete_started_run_rules(**context)
+
+    assert response["status"] == "running"
+    assert [call[0] for call in stock_service.history_calls] == ["600519", "000001"]
+    assert stock_service.indicator_calls == []
+    service._build_history_chip_metrics.assert_not_called()
+    assert repo.finished_status == "completed"
+    assert len(repo.finished_matches) == 4
+
+
+def test_rule_service_async_batch_builds_chip_metrics_once_when_needed():
+    first_rule = _service_rule_for_codes(["600519"])
+    chip_rule = _service_rule_for_codes(["600519"])
+    chip_rule = {**chip_rule, "id": 2, "name": "筹码规则"}
+    chip_rule["definition"]["groups"][0]["conditions"] = [
+        {
+            "id": "c1",
+            "left": {"metric": "profit_ratio", "offset": 0},
+            "operator": ">",
+            "right": {"type": "literal", "value": 40},
+        }
+    ]
+    repo = _ProgressRuleRepo([first_rule, chip_rule])
+    service = RuleService(repo=repo, stock_service=_CountingStockService())
+    service._resolve_run_workers = lambda target_count: 1
+    service._build_history_chip_metrics = mock.Mock(return_value={
+        "chip_distribution": {"profit_ratio": 0.82}
+    })
+
+    response, context = service.start_run_rules(
+        [1, 2],
+        mode="history",
+        target_override={"scope": "custom", "stock_codes": ["600519"]},
+    )
+    service.complete_started_run_rules(**context)
+
+    assert response["status"] == "running"
+    service._build_history_chip_metrics.assert_called_once()
+    assert repo.finished_status == "completed"
+    assert [match["rule_id"] for match in repo.finished_matches] == [1, 2]
 
 
 def test_rule_service_notify_live_matches_sends_configured_notifications():

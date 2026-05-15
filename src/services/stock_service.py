@@ -384,6 +384,18 @@ def _derive_market_value(shares: Optional[float], price: Optional[float]) -> Opt
     return market_value if market_value > 0 and math.isfinite(market_value) else None
 
 
+def _derive_turnover_rate(
+    stock_code: str,
+    volume: Optional[float],
+    float_shares: Optional[float],
+) -> Optional[float]:
+    if volume is None or volume <= 0 or float_shares is None or float_shares <= 0:
+        return None
+    traded_shares = volume * 100 if _is_cn_equity_code(stock_code) else volume
+    turnover_rate = (traded_shares / float_shares) * 100
+    return turnover_rate if turnover_rate >= 0 and math.isfinite(turnover_rate) else None
+
+
 def _derive_after_hours_volume(after_hours_amount: Optional[float], price: Optional[float]) -> Optional[float]:
     if after_hours_amount is None or price is None or price <= 0:
         return None
@@ -492,6 +504,9 @@ def _build_quote_payload(quote: Any, fallback_code: str) -> Dict[str, Any]:
     )
     total_mv = total_mv or _derive_market_value(total_shares, price)
     circ_mv = circ_mv or _derive_market_value(float_shares, price)
+    turnover_rate = _to_optional_float(getattr(quote, "turnover_rate", None))
+    if turnover_rate is None or (turnover_rate <= 0 and volume and volume > 0):
+        turnover_rate = _derive_turnover_rate(stock_code, volume, float_shares) or turnover_rate
     limit_up_price = (
         _to_optional_float(getattr(quote, "limit_up_price", None))
         or _infer_limit_price(stock_code, stock_name, prev_close, 1)
@@ -521,7 +536,7 @@ def _build_quote_payload(quote: Any, fallback_code: str) -> Dict[str, Any]:
         "after_hours_volume": after_hours_volume,
         "after_hours_amount": after_hours_amount,
         "volume_ratio": getattr(quote, "volume_ratio", None),
-        "turnover_rate": getattr(quote, "turnover_rate", None),
+        "turnover_rate": turnover_rate,
         "amplitude": getattr(quote, "amplitude", None),
         "pe_ratio": getattr(quote, "pe_ratio", None),
         "total_mv": total_mv,

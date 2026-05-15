@@ -14,7 +14,14 @@ import pandas as pd
 from src.config import get_config
 from src.core import trading_calendar
 from src.repositories.rule_repo import RuleRepository, encode_rule_batch_metadata
-from src.rules.engine import AGGREGATE_METHODS, COMPARE_OPERATORS, evaluate_rule_at_index, evaluate_rule_history
+from src.rules.engine import (
+    AGGREGATE_METHODS,
+    COMPARE_OPERATORS,
+    PAIR_NUMBER_OPERATOR,
+    SANDWICH_NUMBER_OPERATOR,
+    evaluate_rule_at_index,
+    evaluate_rule_history,
+)
 from src.rules.metrics import METRIC_BY_KEY, build_metric_frame, get_metric_registry
 from src.services.stock_service import StockService
 
@@ -37,6 +44,8 @@ ALLOWED_OPERATORS = {
     "new_low",
     "exists",
     "not_exists",
+    SANDWICH_NUMBER_OPERATOR,
+    PAIR_NUMBER_OPERATOR,
 }
 DISABLED_OPERATORS = {"cross_up", "cross_down"}
 MAX_RULE_TARGET_CODES = 10000
@@ -142,7 +151,16 @@ class RuleService:
             self._validate_value_expression(condition.get("right"))
             return
 
-        if operator in {"trend_up", "trend_down", "new_high", "new_low", "exists", "not_exists"}:
+        if operator in {
+            "trend_up",
+            "trend_down",
+            "new_high",
+            "new_low",
+            "exists",
+            "not_exists",
+            SANDWICH_NUMBER_OPERATOR,
+            PAIR_NUMBER_OPERATOR,
+        }:
             return
 
         if operator in {"between", "not_between"}:
@@ -576,6 +594,38 @@ class RuleService:
             for stock_code in stock_codes
         ))
 
+    @classmethod
+    def _value_expression_metric_keys(cls, expression: Any) -> List[str]:
+        if not isinstance(expression, dict):
+            return []
+
+        metric_keys: List[str] = []
+        metric = expression.get("metric")
+        if isinstance(metric, str) and metric:
+            metric_keys.append(metric)
+        for key in ("min", "max", "left", "right"):
+            metric_keys.extend(cls._value_expression_metric_keys(expression.get(key)))
+        return metric_keys
+
+    @classmethod
+    def _definition_metric_keys(cls, definition: Dict[str, Any]) -> List[str]:
+        metric_keys: List[str] = []
+        for group in definition.get("groups") or []:
+            for condition in group.get("conditions") or []:
+                left_metric = ((condition.get("left") or {}).get("metric"))
+                if isinstance(left_metric, str) and left_metric:
+                    metric_keys.append(left_metric)
+                metric_keys.extend(cls._value_expression_metric_keys(condition.get("right")))
+        return metric_keys
+
+    @classmethod
+    def _definition_uses_chip_metrics(cls, definition: Dict[str, Any]) -> bool:
+        for metric_key in cls._definition_metric_keys(definition):
+            metric = METRIC_BY_KEY.get(metric_key)
+            if metric and str(metric.category).startswith("筹码峰-"):
+                return True
+        return False
+
     def _execute_batch_scan_by_stock(
         self,
         run_id: int,
@@ -617,11 +667,45 @@ class RuleService:
         def execute_stock(index: int, stock_code: str) -> tuple[int, List[Dict[str, Any]], List[str]]:
             stock_matches: List[Dict[str, Any]] = []
             stock_errors: List[str] = []
-            for rule_id, rule, definition, _rule_stock_codes in prepared:
-                if stock_code not in rule_stock_sets.get(rule_id, set()):
-                    continue
+            applicable_rules = [
+                (rule_id, rule, definition)
+                for rule_id, rule, definition, _rule_stock_codes in prepared
+                if stock_code in rule_stock_sets.get(rule_id, set())
+            ]
+            if not applicable_rules:
+                return index, stock_matches, stock_errors
+
+            try:
+                context = self._build_stock_rule_context(
+                    applicable_rules,
+                    stock_code,
+                    run_mode,
+                    date_from,
+                    data_policy,
+                )
+            except RuleDataUnavailable as exc:
+                logger.info(
+                    "异步批量规则回测跳过无缓存股票: run_id=%s, stock=%s, reason=%s",
+                    run_id,
+                    stock_code,
+                    exc,
+                )
+                return index, stock_matches, stock_errors
+            except Exception as exc:
+                logger.warning(
+                    "异步批量规则回测单股数据准备失败: run_id=%s, stock=%s, error=%s",
+                    run_id,
+                    stock_code,
+                    exc,
+                )
+                return index, stock_matches, [
+                    f"#{rule_id}:{stock_code}:{type(exc).__name__}"
+                    for rule_id, _rule, _definition in applicable_rules
+                ]
+
+            for rule_id, rule, definition in applicable_rules:
                 try:
-                    match = self._evaluate_stock_for_run(
+                    match = self._evaluate_stock_from_context(
                         rule_id,
                         rule,
                         definition,
@@ -629,9 +713,7 @@ class RuleService:
                         run_mode,
                         date_from,
                         date_to,
-                        data_policy,
-                        index + 1,
-                        len(stock_codes),
+                        context,
                     )
                     if match:
                         match["rule_id"] = rule_id
@@ -1482,17 +1564,19 @@ class RuleService:
             raise RuleValidationError("日期格式需要为 YYYY-MM-DD")
         return parsed.date()
 
-    def _evaluate_stock(
+    def _build_stock_rule_context(
         self,
-        rule: Dict[str, Any],
-        definition: Dict[str, Any],
+        rules: List[tuple[int, Dict[str, Any], Dict[str, Any]]],
         stock_code: str,
         mode: str,
-        start_date: Optional[date] = None,
-        end_date: Optional[date] = None,
-        data_policy: str = "default",
-    ) -> Optional[Dict[str, Any]]:
-        lookback_days = self._resolve_history_fetch_days(definition, rule, start_date)
+        start_date: Optional[date],
+        data_policy: str,
+    ) -> Dict[str, Any]:
+        lookback_days_by_rule = {
+            rule_id: self._resolve_history_fetch_days(definition, rule, start_date)
+            for rule_id, rule, definition in rules
+        }
+        lookback_days = max(lookback_days_by_rule.values()) if lookback_days_by_rule else 120
         history_data_policy = data_policy if data_policy in {"snapshot_only", "cache_only", "db_only"} else "default"
         history = self._get_stock_history_data(
             stock_code,
@@ -1504,24 +1588,101 @@ class RuleService:
         if not history_rows:
             if data_policy in {"snapshot_only", "cache_only", "db_only"}:
                 raise RuleDataUnavailable("history_cache_miss")
+            return {
+                "history": history,
+                "history_rows": history_rows,
+                "quote": None,
+                "metric_frame": pd.DataFrame(),
+                "lookback_days_by_rule": lookback_days_by_rule,
+            }
+
+        quote = self._get_stock_quote_for_rule_run(stock_code, mode, data_policy)
+        require_chip_metrics = any(
+            self._definition_uses_chip_metrics(definition)
+            for _rule_id, _rule, definition in rules
+        )
+        indicator_metrics = self._get_indicator_metrics(
+            stock_code,
+            history_rows,
+            mode,
+            data_policy,
+            require_chip_metrics=require_chip_metrics,
+        )
+        if mode == "latest" and quote is not None:
+            quote = StockService._normalize_quote_payload_units(stock_code, quote) or quote
+            history_rows = self._sync_latest_history_rows_with_quote(stock_code, history_rows, quote)
+
+        return {
+            "history": history,
+            "history_rows": history_rows,
+            "quote": quote,
+            "metric_frame": build_metric_frame(history_rows, quote, indicator_metrics),
+            "lookback_days_by_rule": lookback_days_by_rule,
+        }
+
+    def _get_stock_quote_for_rule_run(
+        self,
+        stock_code: str,
+        mode: str,
+        data_policy: str,
+    ) -> Optional[Dict[str, Any]]:
+        if mode != "latest":
             return None
 
         quote = (
             self._get_stock_realtime_quote(stock_code, data_policy="snapshot_only")
-            if mode == "latest" and data_policy == "snapshot_only"
+            if data_policy == "snapshot_only"
             else self._get_stock_realtime_quote(stock_code)
-            if mode == "latest"
-            else None
         )
-        if mode == "latest" and data_policy == "snapshot_only" and quote is None:
+        if data_policy == "snapshot_only" and quote is None:
             quote = self._build_intraday_hot_table_quote(stock_code)
             if quote is None:
                 raise RuleDataUnavailable("quote_snapshot_miss")
-        indicator_metrics = self._get_indicator_metrics(stock_code, history_rows, mode, data_policy)
-        if mode == "latest" and quote is not None:
-            quote = StockService._normalize_quote_payload_units(stock_code, quote) or quote
-            history_rows = self._sync_latest_history_rows_with_quote(stock_code, history_rows, quote)
-        metric_frame = build_metric_frame(history_rows, quote, indicator_metrics)
+        return quote
+
+    def _evaluate_stock(
+        self,
+        rule: Dict[str, Any],
+        definition: Dict[str, Any],
+        stock_code: str,
+        mode: str,
+        start_date: Optional[date] = None,
+        end_date: Optional[date] = None,
+        data_policy: str = "default",
+    ) -> Optional[Dict[str, Any]]:
+        rule_id = int(rule.get("id") or 0)
+        context = self._build_stock_rule_context(
+            [(rule_id, rule, definition)],
+            stock_code,
+            mode,
+            start_date,
+            data_policy,
+        )
+        return self._evaluate_stock_from_context(
+            rule_id,
+            rule,
+            definition,
+            stock_code,
+            mode,
+            start_date,
+            end_date,
+            context,
+        )
+
+    def _evaluate_stock_from_context(
+        self,
+        rule_id: int,
+        rule: Dict[str, Any],
+        definition: Dict[str, Any],
+        stock_code: str,
+        mode: str,
+        start_date: Optional[date],
+        end_date: Optional[date],
+        context: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        history = context.get("history") or {}
+        quote = context.get("quote")
+        metric_frame = context.get("metric_frame")
         if metric_frame.empty:
             return None
 
@@ -1530,6 +1691,9 @@ class RuleService:
             if quote is not None:
                 self._attach_live_quote_snapshot_metadata(events, quote)
         else:
+            lookback_days = (context.get("lookback_days_by_rule") or {}).get(rule_id)
+            if lookback_days is None:
+                lookback_days = self._resolve_history_fetch_days(definition, rule, start_date)
             events = self._evaluate_history_events(definition, metric_frame, lookback_days, start_date, end_date)
         if not events:
             return None
@@ -1710,7 +1874,11 @@ class RuleService:
         history_rows: List[Dict[str, Any]],
         mode: str,
         data_policy: str = "default",
+        *,
+        require_chip_metrics: bool = True,
     ) -> Dict[str, Any]:
+        if not require_chip_metrics:
+            return {}
         if data_policy == "snapshot_only":
             return self._build_history_chip_metrics(stock_code, history_rows)
         if mode == "history":

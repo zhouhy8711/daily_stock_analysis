@@ -158,6 +158,22 @@ class TestStorage(unittest.TestCase):
         DatabaseManager.reset_instance()
         db = DatabaseManager(db_url="sqlite:///:memory:")
         snapshot_time = datetime(2026, 5, 7, 10, 30, 12)
+        db.save_daily_data(
+            pd.DataFrame([
+                {
+                    "date": date(2026, 5, 6),
+                    "open": 9.4,
+                    "high": 9.6,
+                    "low": 9.3,
+                    "close": 9.5,
+                    "volume": 1000,
+                    "amount": 950000,
+                    "pct_chg": -1.0,
+                }
+            ]),
+            "600519",
+            data_source="PreviousDayFetcher",
+        )
 
         first = db.save_intraday_quote_samples(
             [
@@ -209,6 +225,7 @@ class TestStorage(unittest.TestCase):
         self.assertEqual(len(daily_rows), 1)
         self.assertEqual(daily_rows[0].open, 10.0)
         self.assertEqual(daily_rows[0].close, 12.0)
+        self.assertAlmostEqual(daily_rows[0].pct_chg, (12.0 - 9.5) / 9.5 * 100)
         self.assertEqual(daily_rows[0].data_source, "intraday_hot_table")
 
         DatabaseManager.reset_instance()

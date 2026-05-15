@@ -315,6 +315,8 @@ const RULE_OPERATOR_OPTIONS: Array<{ value: RuleOperator; label: string }> = [
   { value: 'new_low', label: 'N 期新低' },
   { value: 'exists', label: '有值' },
   { value: 'not_exists', label: '无值' },
+  { value: 'sandwich_number', label: '夹板数' },
+  { value: 'pair_number', label: '对子数' },
 ];
 const RULE_COMPARE_OPTIONS: Array<{ value: RuleCompareOperator; label: string }> = [
   { value: '>', label: '>' },
@@ -357,7 +359,7 @@ function createRuleRange(value = 10): RuleValueExpression {
 }
 
 function canUseRuleRightValue(operator: RuleOperator): boolean {
-  return !['trend_up', 'trend_down', 'new_high', 'new_low', 'exists', 'not_exists'].includes(operator);
+  return !['trend_up', 'trend_down', 'new_high', 'new_low', 'exists', 'not_exists', 'sandwich_number', 'pair_number'].includes(operator);
 }
 
 function roundRuleDraftValue(value?: number | null): number {
@@ -433,6 +435,8 @@ function conditionSummary(metrics: RuleMetricItem[], condition: RuleCondition): 
   if (condition.operator === 'new_low') return `${left} 创 ${condition.lookback ?? 20} 期新低`;
   if (condition.operator === 'exists') return `${left} 有值`;
   if (condition.operator === 'not_exists') return `${left} 无值`;
+  if (condition.operator === 'sandwich_number') return `${left} 元角分符合 a.ba 夹板数`;
+  if (condition.operator === 'pair_number') return `${left} 角分符合 .bb 对子数`;
   return `${left} ${condition.operator} ${valueSummary(metrics, condition.right)}`;
 }
 
@@ -1572,6 +1576,38 @@ function movingAverage(data: KLineData[], index: number, period: number, pick: (
   return values.reduce((sum, value) => sum + value, 0) / period;
 }
 
+function inferPriceVolumeMultiplier(data: KLineData[]): number | undefined {
+  const ratios = data
+    .map((point) => {
+      if (
+        !isValidNumber(point.amount)
+        || point.amount <= 0
+        || !isValidNumber(point.volume)
+        || point.volume <= 0
+        || !isValidNumber(point.close)
+        || point.close <= 0
+      ) {
+        return undefined;
+      }
+      return point.amount / (point.volume * point.close);
+    })
+    .filter((value): value is number => isValidNumber(value) && value > 0)
+    .sort((a, b) => a - b);
+
+  if (ratios.length === 0) {
+    return undefined;
+  }
+
+  const median = ratios[Math.floor(ratios.length / 2)];
+  if (median >= 50 && median <= 150) {
+    return 100;
+  }
+  if (median >= 0.5 && median <= 1.5) {
+    return 1;
+  }
+  return undefined;
+}
+
 function relativeStrengthIndex(data: KLineData[], index: number, period: number): number | undefined {
   if (index < period) {
     return undefined;
@@ -1631,10 +1667,26 @@ function buildChartPoints(data: KLineData[]): ChartPoint[] {
   let ema26: number | undefined;
   let dea = 0;
   let closeSum = 0;
+  let cumulativeAmount = 0;
+  let cumulativeVolumeInShares = 0;
+  const priceVolumeMultiplier = inferPriceVolumeMultiplier(data);
 
   return data.map((item, index) => {
     const close = item.close;
     closeSum += close;
+    if (
+      isValidNumber(priceVolumeMultiplier)
+      && isValidNumber(item.amount)
+      && item.amount > 0
+      && isValidNumber(item.volume)
+      && item.volume > 0
+    ) {
+      cumulativeAmount += item.amount;
+      cumulativeVolumeInShares += item.volume * priceVolumeMultiplier;
+    }
+    const weightedAveragePrice = cumulativeVolumeInShares > 0
+      ? cumulativeAmount / cumulativeVolumeInShares
+      : undefined;
     ema12 = typeof ema12 === 'number' ? (close * (2 / 13)) + (ema12 * (11 / 13)) : close;
     ema26 = typeof ema26 === 'number' ? (close * (2 / 27)) + (ema26 * (25 / 27)) : close;
     const dif = ema12 - ema26;
@@ -1642,7 +1694,7 @@ function buildChartPoints(data: KLineData[]): ChartPoint[] {
 
     return {
       ...item,
-      averagePrice: closeSum / (index + 1),
+      averagePrice: weightedAveragePrice ?? closeSum / (index + 1),
       ma5: movingAverage(data, index, 5, (point) => point.close),
       ma10: movingAverage(data, index, 10, (point) => point.close),
       ma20: movingAverage(data, index, 20, (point) => point.close),
@@ -1724,6 +1776,10 @@ function getQuoteFloatShares(quote: StockQuote | null): number | undefined {
     return quote.floatShares;
   }
   return deriveShares(quote?.circMv, quote?.currentPrice);
+}
+
+function getPositiveNumber(value?: number | null): number | undefined {
+  return isValidNumber(value) && value > 0 ? value : undefined;
 }
 
 function resolveQuoteMarketValue(
@@ -1809,16 +1865,20 @@ function resolvePointTurnoverRate(
   preferRealtimeQuote = false,
 ): number | undefined {
   const quoteTurnoverRate = quote?.turnoverRate;
-  if (preferRealtimeQuote && isValidNumber(quoteTurnoverRate)) {
+  const volume = point?.volume;
+  if (
+    preferRealtimeQuote
+    && isValidNumber(quoteTurnoverRate)
+    && (quoteTurnoverRate > 0 || !isValidNumber(volume) || volume <= 0)
+  ) {
     return quoteTurnoverRate;
   }
 
   const pointTurnoverRate = point?.turnoverRate;
-  if (isValidNumber(pointTurnoverRate)) {
+  if (isValidNumber(pointTurnoverRate) && (pointTurnoverRate > 0 || !isValidNumber(volume) || volume <= 0)) {
     return pointTurnoverRate;
   }
 
-  const volume = point?.volume;
   const floatShares = getQuoteFloatShares(quote);
   if (!isValidNumber(volume) || volume <= 0 || !isValidNumber(floatShares) || floatShares <= 0) {
     return undefined;
@@ -1831,6 +1891,143 @@ function resolvePointTurnoverRate(
 
   const turnoverRate = ((volume * volumeShareMultiplier) / floatShares) * 100;
   return Number.isFinite(turnoverRate) && turnoverRate >= 0 ? turnoverRate : undefined;
+}
+
+function getPointIndex(points: ChartPoint[], point: ChartPoint | KLineData | null | undefined): number {
+  if (!point) {
+    return -1;
+  }
+  const byReference = points.findIndex((candidate) => candidate === point);
+  if (byReference >= 0) {
+    return byReference;
+  }
+  return points.findIndex((candidate) => candidate.date === point.date);
+}
+
+function sumPositiveValues(points: ChartPoint[], pick: (point: ChartPoint) => number | null | undefined): number | undefined {
+  const total = points.reduce((sum, point) => {
+    const value = pick(point);
+    return isValidNumber(value) && value > 0 ? sum + value : sum;
+  }, 0);
+  return total > 0 ? total : undefined;
+}
+
+function resolveTimeshareTurnoverRate(
+  sessionPoints: ChartPoint[],
+  volume: number | undefined,
+  latestQuote: StockQuote | null,
+  referenceQuote: StockQuote | null,
+  activeIsLatest: boolean,
+): number | undefined {
+  const latestQuoteTurnoverRate = activeIsLatest ? getPositiveNumber(latestQuote?.turnoverRate) : undefined;
+  if (latestQuoteTurnoverRate !== undefined) {
+    return latestQuoteTurnoverRate;
+  }
+
+  const positiveRates = sessionPoints
+    .map((point) => getPositiveNumber(point.turnoverRate))
+    .filter((value): value is number => value !== undefined);
+  if (positiveRates.length > 0) {
+    const nonDecreasing = positiveRates.every((value, index) => index === 0 || value >= positiveRates[index - 1]);
+    return nonDecreasing ? positiveRates[positiveRates.length - 1] : positiveRates.reduce((sum, value) => sum + value, 0);
+  }
+
+  const floatShares = getQuoteFloatShares(referenceQuote);
+  if (!isValidNumber(volume) || volume <= 0 || !isValidNumber(floatShares) || floatShares <= 0) {
+    return undefined;
+  }
+  const turnoverRate = ((volume * 100) / floatShares) * 100;
+  return Number.isFinite(turnoverRate) && turnoverRate >= 0 ? turnoverRate : undefined;
+}
+
+function getQuoteValueForDate(
+  quote: StockQuote | null,
+  date: string | null,
+  pick: (quote: StockQuote) => number | null | undefined,
+): number | undefined {
+  if (!quote || !date) {
+    return undefined;
+  }
+  const quoteDate = getQuoteDateOnly(quote);
+  if (quoteDate && quoteDate !== date) {
+    return undefined;
+  }
+  return getPositiveNumber(pick(quote));
+}
+
+type TimeshareSessionMetrics = {
+  close?: number;
+  open?: number;
+  high?: number;
+  low?: number;
+  change?: number;
+  changePercent?: number;
+  volume?: number;
+  amount?: number;
+  turnoverRate?: number;
+};
+
+function getTimeshareSessionMetrics(
+  point: ChartPoint | null | undefined,
+  points: ChartPoint[],
+  latestQuote: StockQuote | null,
+  referenceQuote: StockQuote | null,
+  referencePreviousPoint?: Pick<KLineData, 'close'> | null,
+): TimeshareSessionMetrics | null {
+  if (!point || points.length === 0) {
+    return null;
+  }
+
+  const pointIndex = getPointIndex(points, point);
+  const activeIndex = pointIndex >= 0 ? pointIndex : points.length - 1;
+  const sessionPoints = points.slice(0, activeIndex + 1);
+  const firstPoint = sessionPoints[0];
+  if (!firstPoint) {
+    return null;
+  }
+
+  const activeIsLatest = activeIndex === points.length - 1;
+  const quoteDate = getQuoteDateOnly(latestQuote);
+  const activeDate = getKLineDateOnly(point.date);
+  const canUseLatestQuote = activeIsLatest && quoteDate !== null && activeDate !== null && quoteDate === activeDate;
+  const activeLatestQuote = canUseLatestQuote ? latestQuote : null;
+  const close = getPositiveNumber(activeLatestQuote?.currentPrice) ?? getPositiveNumber(point.close);
+  const open = getPositiveNumber(firstPoint.open) ?? getPositiveNumber(firstPoint.close) ?? getPositiveNumber(point.open);
+  const priceValues = sessionPoints.flatMap((item) => [item.open, item.high, item.low, item.close])
+    .filter((value): value is number => isValidNumber(value) && value > 0);
+  if (close !== undefined) {
+    priceValues.push(close);
+  }
+  const high = priceValues.length > 0 ? Math.max(...priceValues) : undefined;
+  const low = priceValues.length > 0 ? Math.min(...priceValues) : undefined;
+  const volume = sumPositiveValues(sessionPoints, (item) => item.volume);
+  const amount = sumPositiveValues(sessionPoints, (item) => item.amount);
+  const previousClose = getQuoteValueForDate(activeLatestQuote, activeDate, (quote) => quote.prevClose)
+    ?? getPositiveNumber(referencePreviousPoint?.close)
+    ?? getQuoteValueForDate(referenceQuote, activeDate, (quote) => quote.prevClose);
+  const change = close !== undefined && previousClose !== undefined ? close - previousClose : undefined;
+  const changePercent = change !== undefined && previousClose !== undefined && previousClose > 0
+    ? (change / previousClose) * 100
+    : undefined;
+  const turnoverRate = resolveTimeshareTurnoverRate(
+    sessionPoints,
+    volume,
+    activeLatestQuote,
+    referenceQuote,
+    activeLatestQuote !== null,
+  );
+
+  return {
+    close,
+    open,
+    high,
+    low,
+    change,
+    changePercent,
+    volume,
+    amount,
+    turnoverRate,
+  };
 }
 
 function deriveAfterHoursVolume(afterHoursAmount?: number | null, price?: number | null): number | undefined {
@@ -2584,23 +2781,30 @@ type CoreMetricItem = {
 const CoreQuoteMetrics: React.FC<{
   point?: ChartPoint;
   previous?: ChartPoint;
+  period: ChartPeriod;
   quote: StockQuote | null;
   referenceQuote: StockQuote | null;
   referencePoint?: ChartPoint | null;
+  referencePreviousPoint?: KLineData | null;
   points: ChartPoint[];
   onAddRuleMetric?: AddRuleMetricHandler;
-}> = ({ point, previous, quote, referenceQuote, referencePoint, points, onAddRuleMetric }) => {
-  const close = quote?.currentPrice ?? point?.close;
+}> = ({ point, previous, period, quote, referenceQuote, referencePoint, referencePreviousPoint, points, onAddRuleMetric }) => {
+  const metricQuote = quote ?? referenceQuote;
+  const timeshareMetrics = period === 'timeshare'
+    ? getTimeshareSessionMetrics(point, points, quote, metricQuote, referencePreviousPoint)
+    : null;
+  const close = timeshareMetrics?.close ?? quote?.currentPrice ?? point?.close;
   const previousClose = quote?.prevClose ?? previous?.close;
-  const change = quote?.change
+  const change = timeshareMetrics?.change
+    ?? quote?.change
     ?? (point && isValidNumber(previousClose) && previousClose !== 0 ? point.close - previousClose : undefined);
-  const changePct = quote?.changePercent
+  const changePct = timeshareMetrics?.changePercent
+    ?? quote?.changePercent
     ?? point?.changePercent
     ?? (point && isValidNumber(previousClose) && previousClose !== 0 ? ((point.close - previousClose) / previousClose) * 100 : undefined);
   const toneValue = isValidNumber(changePct) ? changePct : change;
   const trendColor = getCnTrendColor(toneValue);
-  const metricPrice = quote?.currentPrice ?? point?.close ?? referenceQuote?.currentPrice;
-  const metricQuote = quote ?? referenceQuote;
+  const metricPrice = timeshareMetrics?.close ?? quote?.currentPrice ?? point?.close ?? referenceQuote?.currentPrice;
   const totalMv = isValidNumber(point?.totalMv)
     ? point.totalMv
     : resolveQuoteMarketValue(
@@ -2619,18 +2823,22 @@ const CoreQuoteMetrics: React.FC<{
     ? point.peRatio
     : resolvePeRatio(quote, referenceQuote, metricPrice) ?? resolvePointPeRatio(referencePoint, metricPrice);
   const coreVolumeRatio = quote?.volumeRatio ?? point?.volumeRatio ?? (point ? getPointVolumeRatio(point) : undefined);
-  const coreTurnoverRate = resolvePointTurnoverRate(point, quote ?? referenceQuote, points, quote !== null);
+  const coreTurnoverRate = timeshareMetrics?.turnoverRate
+    ?? resolvePointTurnoverRate(point, quote ?? referenceQuote, points, quote !== null);
   const isIntradayPoint = getKLineMinuteOfDay(point?.date) !== null;
-  const amountLabel = isIntradayPoint ? '本K成交额' : '成交额';
-  const amountValue = isIntradayPoint ? point?.amount : quote?.amount ?? point?.amount;
+  const amountLabel = timeshareMetrics ? '成交额' : isIntradayPoint ? '本K成交额' : '成交额';
+  const amountValue = timeshareMetrics?.amount ?? (isIntradayPoint ? point?.amount : quote?.amount ?? point?.amount);
+  const high = timeshareMetrics?.high ?? quote?.high ?? point?.high;
+  const low = timeshareMetrics?.low ?? quote?.low ?? point?.low;
+  const open = timeshareMetrics?.open ?? quote?.open ?? point?.open;
   const coreRows: CoreMetricItem[] = [
-    { label: '最高价', metricKey: 'high', value: formatNumber(quote?.high ?? point?.high), rawValue: quote?.high ?? point?.high, unit: '元', tone: 'up' },
+    { label: '最高价', metricKey: 'high', value: formatNumber(high), rawValue: high, unit: '元', tone: 'up' },
     { label: '总市值', metricKey: 'total_mv', value: formatCompactNumber(totalMv), rawValue: totalMv, unit: '元' },
     { label: '量比', metricKey: 'volume_ratio', value: formatNumber(coreVolumeRatio, 2), rawValue: coreVolumeRatio, unit: '倍', tone: isValidNumber(coreVolumeRatio) && coreVolumeRatio >= 1 ? 'up' : 'down' },
-    { label: '最低价', metricKey: 'low', value: formatNumber(quote?.low ?? point?.low), rawValue: quote?.low ?? point?.low, unit: '元', tone: 'down' },
+    { label: '最低价', metricKey: 'low', value: formatNumber(low), rawValue: low, unit: '元', tone: 'down' },
     { label: '流通市值', metricKey: 'circ_mv', value: formatCompactNumber(circMv), rawValue: circMv, unit: '元' },
     { label: '换手率', metricKey: 'turnover_rate', value: formatPlainPct(coreTurnoverRate), rawValue: coreTurnoverRate, unit: '%' },
-    { label: '开盘价', metricKey: 'open', value: formatNumber(quote?.open ?? point?.open), rawValue: quote?.open ?? point?.open, unit: '元', tone: 'up' },
+    { label: '开盘价', metricKey: 'open', value: formatNumber(open), rawValue: open, unit: '元', tone: 'up' },
     { label: '市盈TTM', metricKey: 'pe_ratio', value: formatNumber(peRatio, 2), rawValue: peRatio },
     { label: amountLabel, metricKey: 'amount', value: formatCompactNumber(amountValue), rawValue: amountValue, unit: '元' },
   ];
@@ -2718,12 +2926,16 @@ const ChartLegend: React.FC<{
   periodLabel: string;
   isTimeshare?: boolean;
   latestQuote: StockQuote | null;
+  referencePreviousPoint?: KLineData | null;
   metrics: StockIndicatorMetrics | null;
   points: ChartPoint[];
   showRealtimeMetrics: boolean;
   onAddRuleMetric?: AddRuleMetricHandler;
-}> = ({ point, previous, periodLabel, isTimeshare = false, latestQuote, metrics, points, showRealtimeMetrics, onAddRuleMetric }) => {
+}> = ({ point, previous, periodLabel, isTimeshare = false, latestQuote, referencePreviousPoint, metrics, points, showRealtimeMetrics, onAddRuleMetric }) => {
   const [moreOpen, setMoreOpen] = useState(false);
+  const timeshareMetrics = isTimeshare
+    ? getTimeshareSessionMetrics(point, points, showRealtimeMetrics ? latestQuote : null, latestQuote, referencePreviousPoint)
+    : null;
   const totalMv = latestQuote?.totalMv ?? point?.totalMv;
   const circMv = latestQuote?.circMv ?? point?.circMv;
   const totalShares = latestQuote?.totalShares ?? point?.totalShares ?? deriveShares(totalMv, latestQuote?.currentPrice ?? point?.close);
@@ -2775,8 +2987,8 @@ const ChartLegend: React.FC<{
         <>
           <MetricInline metricKey="close" label="分时价" value={point?.close} unit="元" date={point?.date} color={TERMINAL_COLORS.cyan} onAdd={onAddRuleMetric}>现价:{formatNumber(point?.close)}</MetricInline>
           <MetricInline metricKey="average_price" label="分时均价" value={point?.averagePrice} unit="元" date={point?.date} color={TERMINAL_COLORS.yellow}>均价:{formatNumber(point?.averagePrice)}</MetricInline>
-          <MetricInline metricKey="pct_chg" label="分时涨跌幅" value={point ? getPointChangePct(point, previous) : undefined} unit="%" date={point?.date} color={TERMINAL_COLORS.axisText} onAdd={onAddRuleMetric}>
-            涨跌:{formatPct(point ? getPointChangePct(point, previous) : undefined)}
+          <MetricInline metricKey="pct_chg" label="分时涨跌幅" value={timeshareMetrics?.changePercent ?? (point ? getPointChangePct(point, previous) : undefined)} unit="%" date={point?.date} color={TERMINAL_COLORS.axisText} onAdd={onAddRuleMetric}>
+            涨跌:{formatPct(timeshareMetrics?.changePercent ?? (point ? getPointChangePct(point, previous) : undefined))}
           </MetricInline>
         </>
       ) : (
@@ -2961,6 +3173,7 @@ const CandlestickChart: React.FC<{
   onPeriodChange: (period: ChartPeriod) => void;
   highlightedDate?: string;
   quote: StockQuote | null;
+  referencePreviousPoint?: KLineData | null;
   metrics: StockIndicatorMetrics | null;
   isMaximized?: boolean;
   onToggleMaximize?: () => void;
@@ -2988,6 +3201,7 @@ const CandlestickChart: React.FC<{
   onPeriodChange,
   highlightedDate,
   quote,
+  referencePreviousPoint,
   metrics,
   isMaximized = false,
   onToggleMaximize,
@@ -3008,6 +3222,7 @@ const CandlestickChart: React.FC<{
   const priceValues = visible.flatMap((point) => [
     point.high,
     point.low,
+    point.averagePrice,
     point.ma5,
     point.ma10,
     point.ma20,
@@ -3212,6 +3427,7 @@ const CandlestickChart: React.FC<{
             periodLabel={periodLabel}
             isTimeshare={isTimesharePeriod}
             latestQuote={quote}
+            referencePreviousPoint={referencePreviousPoint}
             metrics={metrics}
             points={points}
               showRealtimeMetrics={activeIsLatest}
@@ -5623,13 +5839,19 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
   const corePoint = corePointIndex !== null ? points[corePointIndex] : latest;
   const corePreviousPoint = corePointIndex !== null && corePointIndex > 0 ? points[corePointIndex - 1] : undefined;
   const coreQuote = !isHistoricalMode && corePointIndex !== null && corePointIndex === points.length - 1 ? quote : null;
-  const dailyReferencePoint = useMemo(() => {
+  const dailyReference = useMemo(() => {
     const dateKey = normalizeDateKey(corePoint?.date);
     if (!dateKey || dailyCachedState?.stockCode !== stockCode) {
-      return null;
+      return { point: null, previous: null };
     }
-    return dailyCachedState.history.find((item) => normalizeDateKey(item.date) === dateKey) ?? null;
+    const pointIndex = dailyCachedState.history.findIndex((item) => normalizeDateKey(item.date) === dateKey);
+    return {
+      point: pointIndex >= 0 ? dailyCachedState.history[pointIndex] : null,
+      previous: pointIndex > 0 ? dailyCachedState.history[pointIndex - 1] : null,
+    };
   }, [corePoint?.date, dailyCachedState?.history, dailyCachedState?.stockCode, stockCode]);
+  const dailyReferencePoint = dailyReference.point;
+  const dailyPreviousPoint = dailyReference.previous;
   const displayVolume = quote?.volume ?? latest?.volume;
   const volumeRatio = displayVolume && latest?.volumeMa5 ? displayVolume / latest.volumeMa5 : undefined;
   const chipPoints = points;
@@ -5774,6 +5996,7 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
       onPeriodChange={handlePeriodChange}
       highlightedDate={initialDateKey ?? undefined}
       quote={quote}
+      referencePreviousPoint={dailyPreviousPoint}
       metrics={metrics}
       isMaximized
       onToggleMaximize={() => setMaximizedChart(null)}
@@ -5895,9 +6118,11 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
                   <CoreQuoteMetrics
                     point={corePoint}
                     previous={corePreviousPoint}
+                    period={effectivePeriod}
                     quote={coreQuote}
                     referenceQuote={quote}
                     referencePoint={dailyReferencePoint}
+                    referencePreviousPoint={dailyPreviousPoint}
                     points={points}
                     onAddRuleMetric={handleAddRuleMetric}
                   />
@@ -5930,6 +6155,7 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
                       onPeriodChange={handlePeriodChange}
                       highlightedDate={initialDateKey ?? undefined}
                       quote={quote}
+                      referencePreviousPoint={dailyPreviousPoint}
                       metrics={metrics}
                       onToggleMaximize={() => setMaximizedChart('kline')}
                     />

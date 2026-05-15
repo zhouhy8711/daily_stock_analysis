@@ -19,7 +19,9 @@ export type RuleOperator =
   | 'new_high'
   | 'new_low'
   | 'exists'
-  | 'not_exists';
+  | 'not_exists'
+  | 'sandwich_number'
+  | 'pair_number';
 export type RuleCompareOperator = '>' | '>=' | '<' | '<=' | '=' | '!=';
 
 export type RuleMetricExpression = {

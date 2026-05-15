@@ -302,6 +302,24 @@ def test_realtime_quote_exposes_volume_turnover_and_source_fields() -> None:
     assert result["source"] == "efinance"
 
 
+def test_realtime_quote_derives_turnover_when_provider_reports_zero() -> None:
+    manager = _FakeManager()
+    manager.quote.turnover_rate = 0
+    manager.quote.volume = 200_000
+    manager.quote.amount = 2_468_000
+    manager.quote.price = 12.34
+    manager.quote.circ_mv = 12_340_000_000
+    manager.quote.float_shares = None
+
+    with patch("data_provider.base.DataFetcherManager", return_value=manager):
+        result = StockService().get_realtime_quote("600519")
+
+    assert result is not None
+    assert result["volume"] == 2000
+    assert result["float_shares"] == 1_000_000_000
+    assert result["turnover_rate"] == pytest.approx(0.02)
+
+
 def test_realtime_quote_uses_cache_within_time_bucket() -> None:
     manager = _CountingRealtimeManager()
 

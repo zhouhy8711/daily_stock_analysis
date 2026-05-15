@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import math
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
@@ -12,6 +13,8 @@ from src.rules.metrics import METRIC_DEFINITIONS, metric_label
 
 COMPARE_OPERATORS = {">", ">=", "<", "<=", "=", "!="}
 AGGREGATE_METHODS = {"max", "min", "avg", "sum", "median", "std"}
+SANDWICH_NUMBER_OPERATOR = "sandwich_number"
+PAIR_NUMBER_OPERATOR = "pair_number"
 
 
 def _to_float(value: Any) -> Optional[float]:
@@ -57,12 +60,37 @@ def _compare(left: Optional[float], operator: str, right: Optional[float]) -> bo
 
 
 def _series_value(df: pd.DataFrame, metric: str, index: int, offset: int = 0) -> Optional[float]:
-    if metric not in df.columns:
-        return None
     target_index = index - int(offset or 0)
     if target_index < 0 or target_index >= len(df):
         return None
+    if metric not in df.columns:
+        if metric == "current_price":
+            return _series_value(df, "close", index, offset)
+        return None
     return _to_float(df.iloc[target_index].get(metric))
+
+
+def _price_cent_digits(value: Optional[float]) -> Optional[Dict[str, int]]:
+    """Return yuan/jiao/fen digits for a price rounded to cents."""
+    if value is None:
+        return None
+    try:
+        cents_decimal = (
+            Decimal(str(abs(value)))
+            .quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            * 100
+        )
+        cents = int(cents_decimal.to_integral_value(rounding=ROUND_HALF_UP))
+    except (InvalidOperation, ValueError, TypeError, OverflowError):
+        return None
+    yuan_digit = (cents // 100) % 10
+    jiao_digit = (cents // 10) % 10
+    fen_digit = cents % 10
+    return {
+        "yuan_digit": yuan_digit,
+        "jiao_digit": jiao_digit,
+        "fen_digit": fen_digit,
+    }
 
 
 def _aggregate_value(df: pd.DataFrame, expr: Dict[str, Any], index: int) -> Optional[float]:
@@ -266,6 +294,50 @@ def _evaluate_new_high_low(df: pd.DataFrame, condition: Dict[str, Any], index: i
     }
 
 
+def _evaluate_sandwich_number(df: pd.DataFrame, condition: Dict[str, Any], index: int) -> Tuple[bool, str, Dict[str, Any]]:
+    metric = str((condition.get("left") or {}).get("metric") or "")
+    left_value = _series_value(df, metric, index, int((condition.get("left") or {}).get("offset") or 0))
+    digits = _price_cent_digits(left_value)
+    if digits is None:
+        extra = f"{metric_label(metric)} 无法解析元角分"
+        return False, _condition_explanation(condition, False, left_value, extra=extra), {"left": left_value}
+
+    yuan_digit = digits["yuan_digit"]
+    jiao_digit = digits["jiao_digit"]
+    fen_digit = digits["fen_digit"]
+    matched = yuan_digit == fen_digit and yuan_digit != jiao_digit
+    pattern = f"{yuan_digit}.{jiao_digit}{fen_digit}"
+    extra = f"{metric_label(metric)} {_format_value(left_value)} 元角分为 {pattern}，{'符合' if matched else '不符合'} a.ba 夹板数"
+    return matched, _condition_explanation(condition, matched, left_value, extra=extra), {
+        "left": left_value,
+        **digits,
+        "pattern": pattern,
+    }
+
+
+def _evaluate_pair_number(df: pd.DataFrame, condition: Dict[str, Any], index: int) -> Tuple[bool, str, Dict[str, Any]]:
+    metric = str((condition.get("left") or {}).get("metric") or "")
+    left_value = _series_value(df, metric, index, int((condition.get("left") or {}).get("offset") or 0))
+    if left_value is None or left_value <= 0:
+        extra = f"{metric_label(metric)} 无法解析角分"
+        return False, _condition_explanation(condition, False, left_value, extra=extra), {"left": left_value}
+    digits = _price_cent_digits(left_value)
+    if digits is None:
+        extra = f"{metric_label(metric)} 无法解析角分"
+        return False, _condition_explanation(condition, False, left_value, extra=extra), {"left": left_value}
+
+    jiao_digit = digits["jiao_digit"]
+    fen_digit = digits["fen_digit"]
+    matched = jiao_digit == fen_digit
+    pattern = f".{jiao_digit}{fen_digit}"
+    extra = f"{metric_label(metric)} {_format_value(left_value)} 角分为 {pattern}，{'符合' if matched else '不符合'} .bb 对子数"
+    return matched, _condition_explanation(condition, matched, left_value, extra=extra), {
+        "left": left_value,
+        **digits,
+        "pattern": pattern,
+    }
+
+
 def evaluate_condition(df: pd.DataFrame, condition: Dict[str, Any], index: int) -> Dict[str, Any]:
     left_expr = condition.get("left") or {}
     operator = str(condition.get("operator") or "")
@@ -277,6 +349,10 @@ def evaluate_condition(df: pd.DataFrame, condition: Dict[str, Any], index: int) 
         matched, explanation, values = _evaluate_trend(df, condition, index)
     elif operator in {"new_high", "new_low"}:
         matched, explanation, values = _evaluate_new_high_low(df, condition, index)
+    elif operator == SANDWICH_NUMBER_OPERATOR:
+        matched, explanation, values = _evaluate_sandwich_number(df, condition, index)
+    elif operator == PAIR_NUMBER_OPERATOR:
+        matched, explanation, values = _evaluate_pair_number(df, condition, index)
     else:
         matched, explanation, values = _evaluate_basic(df, condition, index)
     return {

@@ -479,8 +479,8 @@ describe('IndicatorAnalysisModal', () => {
     expect(within(coreMetrics).getByText('1000.00亿')).toBeInTheDocument();
     expect(within(coreMetrics).getByText('800.00亿')).toBeInTheDocument();
     expect(within(coreMetrics).getByText('25.50')).toBeInTheDocument();
-    expect(within(coreMetrics).getByText('本K成交额')).toBeInTheDocument();
-    expect(within(coreMetrics).getByText('101.02万')).toBeInTheDocument();
+    expect(within(coreMetrics).getByText('成交额')).toBeInTheDocument();
+    expect(within(coreMetrics).getByText('300.03万')).toBeInTheDocument();
     expect(within(coreMetrics).queryByText('1.32亿')).not.toBeInTheDocument();
     expect(stocksApi.getQuote).toHaveBeenCalledWith('688521.SH', 'default');
 
@@ -1015,6 +1015,183 @@ describe('IndicatorAnalysisModal', () => {
     expect(priceHeader.getByText('分时')).toBeInTheDocument();
     expect(priceHeader.getByText(/^现价:/)).toBeInTheDocument();
     expect(priceHeader.getByText(/^均价:/)).toBeInTheDocument();
+
+    unmount();
+  });
+
+  it('computes timeshare core metrics from the same-day session instead of the active minute candle', async () => {
+    const dailyHistory: KLineData[] = [{
+      ...makeDailyHistory(1, '2026-05-14')[0],
+      close: 11.06,
+      totalMv: 22_120_000_000,
+      circMv: 1_106_000_000,
+      totalShares: 2_000_000_000,
+      floatShares: 100_000_000,
+      peRatio: 4.99,
+    }];
+    const timeshareHistory: KLineData[] = [
+      {
+        date: '2026-05-14 09:31',
+        open: 11.12,
+        high: 11.13,
+        low: 11.11,
+        close: 11.12,
+        volume: 1000,
+        amount: 1_112_000,
+        changePercent: 0,
+        turnoverRate: 0,
+      },
+      {
+        date: '2026-05-14 10:30',
+        open: 11.13,
+        high: 11.15,
+        low: 11.10,
+        close: 11.14,
+        volume: 2000,
+        amount: 2_228_000,
+        changePercent: 0,
+        turnoverRate: 0,
+      },
+      {
+        date: '2026-05-14 15:00',
+        open: 11.08,
+        high: 11.09,
+        low: 11.05,
+        close: 11.06,
+        volume: 3000,
+        amount: 3_318_000,
+        changePercent: 0,
+        turnoverRate: 0,
+      },
+    ];
+    vi.mocked(stocksApi.getHistory).mockImplementation(async (stockCode, _days, period = 'daily') => ({
+      stockCode,
+      stockName: '平安银行',
+      period,
+      data: period === 'daily' ? dailyHistory : timeshareHistory,
+    }));
+    vi.mocked(stocksApi.getQuote).mockResolvedValue(makeQuote('000001', {
+      stockName: '平安银行',
+      currentPrice: 11.06,
+      change: -0.01,
+      changePercent: -0.09,
+      prevClose: 11.07,
+      open: 11.09,
+      high: 11.10,
+      low: 11.09,
+      volume: undefined,
+      amount: undefined,
+      turnoverRate: 0,
+      totalMv: 22_120_000_000,
+      circMv: 1_106_000_000,
+      totalShares: 2_000_000_000,
+      floatShares: 100_000_000,
+      peRatio: 4.99,
+      updateTime: '2026-05-14T15:00:00+08:00',
+    }));
+
+    const { unmount } = render(
+      <IndicatorAnalysisModal stockCode="000001" stockName="平安银行" onClose={vi.fn()} />,
+    );
+    await flushPromises();
+
+    fireEvent.click(screen.getByRole('tab', { name: '分时' }));
+    await flushPromises();
+    await flushPromises();
+
+    const coreMetrics = within(screen.getByTestId('indicator-core-metrics'));
+    expect(coreMetrics.getByText('11.06')).toBeInTheDocument();
+    expect(coreMetrics.getByText('-0.01')).toBeInTheDocument();
+    expect(coreMetrics.getByText('-0.09%')).toBeInTheDocument();
+    expect(coreMetrics.getByText('11.15')).toBeInTheDocument();
+    expect(coreMetrics.getByText('11.05')).toBeInTheDocument();
+    expect(coreMetrics.getByText('11.12')).toBeInTheDocument();
+    expect(coreMetrics.getByText('0.60%')).toBeInTheDocument();
+    expect(coreMetrics.getByText('665.80万')).toBeInTheDocument();
+    expect(coreMetrics.queryByText('本K成交额')).not.toBeInTheDocument();
+
+    unmount();
+  });
+
+  it('uses VWAP for the timeshare average line and compares timeshare change with previous close', async () => {
+    const dailyHistory: KLineData[] = [
+      {
+        ...makeDailyHistory(1, '2026-05-13')[0],
+        close: 9.65,
+      },
+      {
+        ...makeDailyHistory(1, '2026-05-14')[0],
+        open: 9.66,
+        high: 9.66,
+        low: 9.56,
+        close: 9.56,
+      },
+    ];
+    const timeshareHistory: KLineData[] = [
+      {
+        date: '2026-05-14 09:31',
+        open: 9.66,
+        high: 9.66,
+        low: 9.66,
+        close: 9.66,
+        volume: 100,
+        amount: 96_600,
+        changePercent: 0,
+        turnoverRate: 0,
+      },
+      {
+        date: '2026-05-14 09:32',
+        open: 9.66,
+        high: 9.66,
+        low: 9.56,
+        close: 9.56,
+        volume: 900,
+        amount: 860_400,
+        changePercent: 0,
+        turnoverRate: 0,
+      },
+    ];
+    vi.mocked(stocksApi.getHistory).mockImplementation(async (stockCode, _days, period = 'daily') => ({
+      stockCode,
+      stockName: '杭钢股份',
+      period,
+      data: period === 'daily' ? dailyHistory : timeshareHistory,
+    }));
+    vi.mocked(stocksApi.getQuote).mockResolvedValue(makeQuote('600126.SH', {
+      stockName: '杭钢股份',
+      currentPrice: 9.56,
+      change: -0.09,
+      changePercent: -0.93,
+      prevClose: 9.65,
+      open: 9.66,
+      high: 9.66,
+      low: 9.56,
+      volume: 1000,
+      amount: 957_000,
+      turnoverRate: 0.1,
+      updateTime: '2026-05-14T15:00:00+08:00',
+    }));
+
+    const { unmount } = render(
+      <IndicatorAnalysisModal stockCode="600126.SH" stockName="杭钢股份" onClose={vi.fn()} />,
+    );
+    await flushPromises();
+
+    const dailyCoreMetrics = within(screen.getByTestId('indicator-core-metrics'));
+    expect(dailyCoreMetrics.getByText('-0.09')).toBeInTheDocument();
+    expect(dailyCoreMetrics.getByText('-0.93%')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('tab', { name: '分时' }));
+    await flushPromises();
+    await flushPromises();
+
+    const priceHeader = within(screen.getByTestId('indicator-price-header'));
+    expect(priceHeader.getByText('均价:9.57')).toBeInTheDocument();
+    expect(priceHeader.getByText('涨跌:-0.93%')).toBeInTheDocument();
+
+    const timeshareCoreMetrics = within(screen.getByTestId('indicator-core-metrics'));
+    expect(timeshareCoreMetrics.getByText('-0.09')).toBeInTheDocument();
+    expect(timeshareCoreMetrics.getByText('-0.93%')).toBeInTheDocument();
 
     unmount();
   });

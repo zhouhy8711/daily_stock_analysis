@@ -2285,6 +2285,23 @@ class DatabaseManager:
         for row in rows:
             by_code.setdefault(row.code, []).append(row)
 
+        previous_close_by_code: Dict[str, float] = {}
+        with self.get_session() as session:
+            previous_rows = session.execute(
+                select(StockDaily)
+                .where(
+                    and_(
+                        StockDaily.code.in_(list(by_code.keys())),
+                        StockDaily.date < target_date,
+                        StockDaily.close.is_not(None),
+                    )
+                )
+                .order_by(StockDaily.code, desc(StockDaily.date))
+            ).scalars().all()
+        for row in previous_rows:
+            if row.code not in previous_close_by_code and row.close is not None and row.close > 0:
+                previous_close_by_code[row.code] = row.close
+
         saved_total = 0
         for stock_code, stock_rows in by_code.items():
             first = stock_rows[0]
@@ -2292,8 +2309,11 @@ class DatabaseManager:
             open_price = first.open
             close_price = last.close
             pct_chg = None
-            if open_price not in (None, 0) and close_price is not None:
-                pct_chg = (close_price - open_price) / open_price * 100
+            previous_close = previous_close_by_code.get(stock_code)
+            if previous_close not in (None, 0) and close_price is not None:
+                pct_chg = (close_price - previous_close) / previous_close * 100
+            elif last.change_percent is not None:
+                pct_chg = last.change_percent
             volume_total = sum(
                 (
                     self._normalize_cn_volume_to_lots(
