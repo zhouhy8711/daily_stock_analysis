@@ -1479,9 +1479,17 @@ class StockService:
     def _resolve_realtime_daily_date(stock_code: str) -> Optional[date]:
         try:
             market = trading_calendar.get_market_for_stock(stock_code)
-            market_today = trading_calendar.get_market_now(market).date()
+            market_now = trading_calendar.get_market_now(market)
+            market_today = market_now.date()
             if market and not trading_calendar.is_market_open(market, market_today):
                 return None
+            if market and not getattr(trading_calendar, "_XCALS_AVAILABLE", False) and market_now.weekday() >= 5:
+                return None
+            sessions = getattr(trading_calendar, "MARKET_LIVE_SESSIONS", {}).get(market or "")
+            if market and sessions:
+                first_start = min(start for start, _end in sessions)
+                if market_now.time() < first_start:
+                    return None
             return market_today
         except Exception as calendar_error:
             logger.debug("解析 %s 当天实时渲染日期失败，按本地自然日处理: %s", stock_code, calendar_error)

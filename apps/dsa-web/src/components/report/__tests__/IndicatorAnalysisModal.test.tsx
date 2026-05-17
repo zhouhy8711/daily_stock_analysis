@@ -1013,8 +1013,70 @@ describe('IndicatorAnalysisModal', () => {
 
     const priceHeader = within(screen.getByTestId('indicator-price-header'));
     expect(priceHeader.getByText('分时')).toBeInTheDocument();
-    expect(priceHeader.getByText(/^现价:/)).toBeInTheDocument();
+    expect(priceHeader.getByText(/^最高:/)).toBeInTheDocument();
     expect(priceHeader.getByText(/^均价:/)).toBeInTheDocument();
+
+    unmount();
+  });
+
+  it('shows the hovered one-minute high in the timeshare header', async () => {
+    const timeshareHistory: KLineData[] = [
+      {
+        date: '2026-05-15 09:30',
+        open: 136,
+        high: 136.2,
+        low: 135.8,
+        close: 136.1,
+        volume: 1000,
+        amount: 136_100,
+        changePercent: 0,
+        turnoverRate: 0,
+      },
+      {
+        date: '2026-05-15 13:26',
+        open: 154.8,
+        high: 155.99,
+        low: 154.6,
+        close: 155.44,
+        volume: 2000,
+        amount: 310_880,
+        changePercent: 0,
+        turnoverRate: 0,
+      },
+      {
+        date: '2026-05-15 15:00',
+        open: 153,
+        high: 153.2,
+        low: 152.8,
+        close: 153,
+        volume: 1000,
+        amount: 153_000,
+        changePercent: 0,
+        turnoverRate: 0,
+      },
+    ];
+    vi.mocked(stocksApi.getHistory).mockImplementation(async (stockCode, _days, period = 'daily') => ({
+      stockCode,
+      stockName: '阳光电源',
+      period,
+      data: period === '1m' ? timeshareHistory : makeDailyHistory(1, '2026-05-15'),
+    }));
+
+    const { unmount } = render(
+      <IndicatorAnalysisModal stockCode="300274.SZ" stockName="阳光电源" onClose={vi.fn()} />,
+    );
+    await flushPromises();
+
+    fireEvent.click(screen.getByRole('tab', { name: '分时' }));
+    await flushPromises();
+    fireEvent.mouseEnter(screen.getByTestId('indicator-chart-bar-2026-05-15 13:26'));
+
+    const priceHeader = within(screen.getByTestId('indicator-price-header'));
+    expect(priceHeader.getByText('最高:155.99')).toBeInTheDocument();
+    expect(priceHeader.queryByText('现价:155.44')).not.toBeInTheDocument();
+    const coreMetrics = within(screen.getByTestId('indicator-core-metrics'));
+    expect(coreMetrics.getAllByText('155.99').length).toBeGreaterThanOrEqual(1);
+    expect(coreMetrics.queryByText('155.44')).not.toBeInTheDocument();
 
     unmount();
   });
@@ -1196,6 +1258,93 @@ describe('IndicatorAnalysisModal', () => {
     unmount();
   });
 
+  it('keeps daily K anchored to the latest trading day on weekend quote dates', async () => {
+    vi.setSystemTime(new Date('2026-05-17T17:06:26+08:00'));
+    vi.mocked(stocksApi.getHistory).mockImplementation(async (stockCode, _days, period = 'daily') => ({
+      stockCode,
+      stockName: '阳光电源',
+      period,
+      data: period === 'daily' ? makeDailyHistory(2, '2026-05-14') : makeTimeshareHistory('2026-05-15'),
+    }));
+    vi.mocked(stocksApi.getQuote).mockResolvedValue(makeQuote('300274.SZ', {
+      stockName: '阳光电源',
+      currentPrice: 156.5,
+      updateTime: '2026-05-17T17:06:26+08:00',
+    }));
+
+    const { unmount } = render(
+      <IndicatorAnalysisModal stockCode="300274.SZ" stockName="阳光电源" onClose={vi.fn()} />,
+    );
+    await flushPromises();
+
+    expect(screen.getByTestId('indicator-chart-bar-2026-05-15')).toBeInTheDocument();
+    expect(screen.queryByTestId('indicator-chart-bar-2026-05-17')).not.toBeInTheDocument();
+    expect(within(screen.getByTestId('indicator-price-header')).getByText('2026-05-15')).toBeInTheDocument();
+
+    unmount();
+  });
+
+  it('filters same-day daily K before the opening auction starts', async () => {
+    vi.setSystemTime(new Date('2026-05-18T09:29:00+08:00'));
+    const dailyHistory: KLineData[] = [
+      ...makeDailyHistory(2, '2026-05-14'),
+      {
+        ...makeDailyHistory(1, '2026-05-18')[0],
+        open: 156.5,
+        high: 156.5,
+        low: 156.5,
+        close: 156.5,
+      },
+    ];
+    vi.mocked(stocksApi.getHistory).mockImplementation(async (stockCode, _days, period = 'daily') => ({
+      stockCode,
+      stockName: '阳光电源',
+      period,
+      data: period === 'daily' ? dailyHistory : makeTimeshareHistory('2026-05-18'),
+    }));
+    vi.mocked(stocksApi.getQuote).mockResolvedValue(makeQuote('300274.SZ', {
+      stockName: '阳光电源',
+      currentPrice: 156.5,
+      updateTime: '2026-05-18T09:29:00+08:00',
+    }));
+
+    const { unmount } = render(
+      <IndicatorAnalysisModal stockCode="300274.SZ" stockName="阳光电源" onClose={vi.fn()} />,
+    );
+    await flushPromises();
+
+    expect(screen.getByTestId('indicator-chart-bar-2026-05-15')).toBeInTheDocument();
+    expect(screen.queryByTestId('indicator-chart-bar-2026-05-18')).not.toBeInTheDocument();
+    expect(within(screen.getByTestId('indicator-price-header')).getByText('2026-05-15')).toBeInTheDocument();
+
+    unmount();
+  });
+
+  it('shows same-day daily K once the regular session has started', async () => {
+    vi.setSystemTime(new Date('2026-05-18T09:30:00+08:00'));
+    vi.mocked(stocksApi.getHistory).mockImplementation(async (stockCode, _days, period = 'daily') => ({
+      stockCode,
+      stockName: '阳光电源',
+      period,
+      data: period === 'daily' ? makeDailyHistory(2, '2026-05-14') : makeTimeshareHistory('2026-05-18'),
+    }));
+    vi.mocked(stocksApi.getQuote).mockResolvedValue(makeQuote('300274.SZ', {
+      stockName: '阳光电源',
+      currentPrice: 156.5,
+      updateTime: '2026-05-18T09:30:00+08:00',
+    }));
+
+    const { unmount } = render(
+      <IndicatorAnalysisModal stockCode="300274.SZ" stockName="阳光电源" onClose={vi.fn()} />,
+    );
+    await flushPromises();
+
+    expect(screen.getByTestId('indicator-chart-bar-2026-05-18')).toBeInTheDocument();
+    expect(within(screen.getByTestId('indicator-price-header')).getByText('2026-05-18')).toBeInTheDocument();
+
+    unmount();
+  });
+
   it('hides stale previous-day timeshare when the daily target date has advanced', async () => {
     vi.mocked(stocksApi.getHistory).mockImplementation(async (stockCode, _days, period = 'daily') => ({
       stockCode,
@@ -1258,7 +1407,7 @@ describe('IndicatorAnalysisModal', () => {
     expect(screen.getByText('15:00')).toBeInTheDocument();
     expect(screen.queryByTestId('indicator-chart-bar-2026-05-12 09:30')).not.toBeInTheDocument();
     expect(screen.queryByText('K线源 AkshareFetcher')).not.toBeInTheDocument();
-    expect(within(screen.getByTestId('indicator-price-header')).getByText('现价:--')).toBeInTheDocument();
+    expect(within(screen.getByTestId('indicator-price-header')).getByText('最高:--')).toBeInTheDocument();
 
     unmount();
   });
@@ -1396,7 +1545,7 @@ describe('IndicatorAnalysisModal', () => {
     fireEvent.click(screen.getByRole('tab', { name: '分时' }));
     await flushPromises();
 
-    expect(within(screen.getByTestId('indicator-price-header')).getByText('现价:138.68')).toBeInTheDocument();
+    expect(within(screen.getByTestId('indicator-price-header')).getByText('最高:139.02')).toBeInTheDocument();
     expect(within(screen.getByRole('img', { name: 'K线图' })).getByText('138.68')).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole('tab', { name: '5分' }));

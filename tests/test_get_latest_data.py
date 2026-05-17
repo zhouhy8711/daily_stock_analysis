@@ -13,7 +13,7 @@ get_latest_data 测试
 import os
 import tempfile
 import unittest
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -286,6 +286,37 @@ class GetLatestDataTestCase(unittest.TestCase):
 
         self.assertEqual(result, effective_date)
         effective_mock.assert_called_once_with("cn")
+
+    def test_realtime_daily_date_skips_open_day_before_session_start(self) -> None:
+        with (
+            patch("src.services.stock_service.trading_calendar.get_market_for_stock", return_value="cn"),
+            patch("src.services.stock_service.trading_calendar.get_market_now", return_value=datetime(2026, 5, 18, 9, 29)),
+            patch("src.services.stock_service.trading_calendar.is_market_open", return_value=True),
+        ):
+            result = StockService._resolve_realtime_daily_date("600519")
+
+        self.assertIsNone(result)
+
+    def test_realtime_daily_date_skips_weekend_when_calendar_fails_open(self) -> None:
+        with (
+            patch("src.services.stock_service.trading_calendar.get_market_for_stock", return_value="cn"),
+            patch("src.services.stock_service.trading_calendar.get_market_now", return_value=datetime(2026, 5, 17, 17, 6)),
+            patch("src.services.stock_service.trading_calendar.is_market_open", return_value=True),
+            patch("src.services.stock_service.trading_calendar._XCALS_AVAILABLE", False),
+        ):
+            result = StockService._resolve_realtime_daily_date("600519")
+
+        self.assertIsNone(result)
+
+    def test_realtime_daily_date_uses_today_after_session_start(self) -> None:
+        with (
+            patch("src.services.stock_service.trading_calendar.get_market_for_stock", return_value="cn"),
+            patch("src.services.stock_service.trading_calendar.get_market_now", return_value=datetime(2026, 5, 18, 9, 30)),
+            patch("src.services.stock_service.trading_calendar.is_market_open", return_value=True),
+        ):
+            result = StockService._resolve_realtime_daily_date("600519")
+
+        self.assertEqual(result, date(2026, 5, 18))
 
     def test_history_data_refreshes_stale_daily_db_before_returning(self) -> None:
         stale_date = date.today() - timedelta(days=5)

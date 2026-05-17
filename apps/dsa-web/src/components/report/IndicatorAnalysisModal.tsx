@@ -1184,6 +1184,50 @@ function getMarketClockParts(market: MarketKind, now = new Date()): { dateKey: s
   }
 }
 
+function isWeekendDateKey(dateKey: string): boolean {
+  const timestamp = Date.parse(`${dateKey}T00:00:00Z`);
+  if (!Number.isFinite(timestamp)) {
+    return false;
+  }
+  const day = new Date(timestamp).getUTCDay();
+  return day === 0 || day === 6;
+}
+
+function isDailyDateOpenForDisplay(dateKey: string | null | undefined, market: MarketKind): boolean {
+  const normalizedDateKey = normalizeDateKey(dateKey);
+  if (!normalizedDateKey) {
+    return true;
+  }
+  const marketClock = getMarketClockParts(market);
+  if (!marketClock) {
+    return true;
+  }
+  if (normalizedDateKey < marketClock.dateKey) {
+    return true;
+  }
+  if (normalizedDateKey > marketClock.dateKey) {
+    return false;
+  }
+  if (isWeekendDateKey(normalizedDateKey)) {
+    return false;
+  }
+  return marketClock.minuteOfDay >= MARKET_TIMESHARE_START_MINUTES[market];
+}
+
+function normalizeDailyHistoryForMarketClock(history: KLineData[], market: MarketKind): KLineData[] {
+  const marketClock = getMarketClockParts(market);
+  if (!marketClock) {
+    return history;
+  }
+  return history.filter((item) => {
+    const itemDate = getKLineDateOnly(item.date);
+    if (!itemDate) {
+      return true;
+    }
+    return isDailyDateOpenForDisplay(itemDate, market);
+  });
+}
+
 function isBeforeTimeshareStartOnTargetDate(targetDate: string | null | undefined, market: MarketKind): boolean {
   const targetDateKey = normalizeDateKey(targetDate);
   if (!targetDateKey) {
@@ -1208,6 +1252,9 @@ function normalizeTimeshareHistory(history: KLineData[], targetDate: string | nu
   )).sort();
   const latestDate = dates.at(-1);
   if (!latestDate) {
+    return [];
+  }
+  if (isBeforeTimeshareStartOnTargetDate(targetDate ?? latestDate, market)) {
     return [];
   }
   if (targetDate) {
@@ -1338,6 +1385,7 @@ function syncHistoryWithRealtimeQuote(
   history: KLineData[],
   period: ChartPeriod,
   quote: StockQuote | null,
+  market: MarketKind,
 ): KLineData[] {
   if (!quote || !isValidNumber(quote.currentPrice) || quote.currentPrice <= 0 || history.length === 0) {
     return history;
@@ -1350,6 +1398,9 @@ function syncHistoryWithRealtimeQuote(
 
   const latestDate = getKLineDateOnly(latest.date);
   const quoteDate = getQuoteDateOnly(quote);
+  if (period === 'daily' && quoteDate && !isDailyDateOpenForDisplay(quoteDate, market)) {
+    return history;
+  }
   if (latestDate && quoteDate && latestDate !== quoteDate) {
     if (period === 'daily' && quoteDate > latestDate) {
       return [...history, createRealtimeDailyPoint(latest, quote, quoteDate)];
@@ -1380,6 +1431,7 @@ function syncHistoryCacheWithRealtimeQuote(
   cache: HistoryCache,
   stockCode: string,
   quote: StockQuote | null,
+  market: MarketKind,
 ): HistoryCache {
   if (!quote) {
     return cache;
@@ -1392,7 +1444,7 @@ function syncHistoryCacheWithRealtimeQuote(
     if (!state || state.stockCode !== stockCode) {
       return;
     }
-    const syncedHistory = syncHistoryWithRealtimeQuote(state.history, state.period, quote);
+    const syncedHistory = syncHistoryWithRealtimeQuote(state.history, state.period, quote, market);
     if (state.quote !== quote || syncedHistory !== state.history) {
       next[option.value] = {
         ...state,
@@ -2787,18 +2839,37 @@ const CoreQuoteMetrics: React.FC<{
   referencePoint?: ChartPoint | null;
   referencePreviousPoint?: KLineData | null;
   points: ChartPoint[];
+  preferTimeshareHigh?: boolean;
   onAddRuleMetric?: AddRuleMetricHandler;
-}> = ({ point, previous, period, quote, referenceQuote, referencePoint, referencePreviousPoint, points, onAddRuleMetric }) => {
+}> = ({
+  point,
+  previous,
+  period,
+  quote,
+  referenceQuote,
+  referencePoint,
+  referencePreviousPoint,
+  points,
+  preferTimeshareHigh = false,
+  onAddRuleMetric,
+}) => {
   const metricQuote = quote ?? referenceQuote;
   const timeshareMetrics = period === 'timeshare'
     ? getTimeshareSessionMetrics(point, points, quote, metricQuote, referencePreviousPoint)
     : null;
-  const close = timeshareMetrics?.close ?? quote?.currentPrice ?? point?.close;
-  const previousClose = quote?.prevClose ?? previous?.close;
-  const change = timeshareMetrics?.change
+  const timeshareHighPrice = period === 'timeshare' && preferTimeshareHigh && isValidNumber(point?.high)
+    ? point.high
+    : undefined;
+  const previousClose = quote?.prevClose ?? referencePreviousPoint?.close ?? previous?.close;
+  const close = timeshareHighPrice ?? timeshareMetrics?.close ?? quote?.currentPrice ?? point?.close;
+  const change = timeshareHighPrice !== undefined && isValidNumber(previousClose) && previousClose !== 0
+    ? timeshareHighPrice - previousClose
+    : timeshareMetrics?.change
     ?? quote?.change
     ?? (point && isValidNumber(previousClose) && previousClose !== 0 ? point.close - previousClose : undefined);
-  const changePct = timeshareMetrics?.changePercent
+  const changePct = timeshareHighPrice !== undefined && isValidNumber(previousClose) && previousClose > 0
+    ? ((timeshareHighPrice - previousClose) / previousClose) * 100
+    : timeshareMetrics?.changePercent
     ?? quote?.changePercent
     ?? point?.changePercent
     ?? (point && isValidNumber(previousClose) && previousClose !== 0 ? ((point.close - previousClose) / previousClose) * 100 : undefined);
@@ -2959,6 +3030,7 @@ const ChartLegend: React.FC<{
   const entrustRatio = showRealtimeMetrics && isValidNumber(latestQuote?.entrustRatio)
     ? latestQuote.entrustRatio
     : estimatePointEntrustRatio(point);
+  const timeshareHoverHigh = isValidNumber(point?.high) ? point?.high : point?.close;
 
   return (
     <div data-testid="indicator-price-header" className="flex min-w-0 flex-1 flex-wrap items-center gap-x-2 gap-y-1 font-mono text-[11px] leading-none">
@@ -2985,7 +3057,7 @@ const ChartLegend: React.FC<{
       <span style={{ color: TERMINAL_COLORS.yellow }}>{point?.date ?? '--'}</span>
       {isTimeshare ? (
         <>
-          <MetricInline metricKey="close" label="分时价" value={point?.close} unit="元" date={point?.date} color={TERMINAL_COLORS.cyan} onAdd={onAddRuleMetric}>现价:{formatNumber(point?.close)}</MetricInline>
+          <MetricInline metricKey="high" label="分时最高价" value={timeshareHoverHigh} unit="元" date={point?.date} color={TERMINAL_COLORS.cyan} onAdd={onAddRuleMetric}>最高:{formatNumber(timeshareHoverHigh)}</MetricInline>
           <MetricInline metricKey="average_price" label="分时均价" value={point?.averagePrice} unit="元" date={point?.date} color={TERMINAL_COLORS.yellow}>均价:{formatNumber(point?.averagePrice)}</MetricInline>
           <MetricInline metricKey="pct_chg" label="分时涨跌幅" value={timeshareMetrics?.changePercent ?? (point ? getPointChangePct(point, previous) : undefined)} unit="%" date={point?.date} color={TERMINAL_COLORS.axisText} onAdd={onAddRuleMetric}>
             涨跌:{formatPct(timeshareMetrics?.changePercent ?? (point ? getPointChangePct(point, previous) : undefined))}
@@ -5347,7 +5419,7 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
     defaultQuoteRefreshInFlightRef.current = stockCode;
     try {
       const nextQuote = await stocksApi.getQuote(stockCode, 'default');
-      setHistoryCache((current) => syncHistoryCacheWithRealtimeQuote(current, stockCode, nextQuote));
+      setHistoryCache((current) => syncHistoryCacheWithRealtimeQuote(current, stockCode, nextQuote, marketKind));
     } catch {
       // Keep the minute/daily chart usable when the optional realtime quote fallback is unavailable.
     } finally {
@@ -5355,7 +5427,7 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
         defaultQuoteRefreshInFlightRef.current = null;
       }
     }
-  }, [stockCode]);
+  }, [marketKind, stockCode]);
 
   const handleAddRuleMetric = useCallback((metric: RuleMetricAddPayload) => {
     const currentDraft = readRuleMetricDraftForStock(stockCode);
@@ -5523,9 +5595,10 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
       const historyResponse = historyResult.status === 'fulfilled' ? historyResult.value : null;
       const quoteResponse = quoteResult.status === 'fulfilled' ? quoteResult.value : null;
       const metricsResponse = metricsResult.status === 'fulfilled' ? metricsResult.value : null;
+      const normalizedDailyHistory = normalizeDailyHistoryForMarketClock(historyResponse?.data ?? [], marketKind);
       const dailyHistory = isHistoricalMode
-        ? historyResponse?.data ?? []
-        : syncHistoryWithRealtimeQuote(historyResponse?.data ?? [], 'daily', quoteResponse);
+        ? normalizedDailyHistory
+        : syncHistoryWithRealtimeQuote(normalizedDailyHistory, 'daily', quoteResponse, marketKind);
       const dailyCutoffDate = getLatestHistoryDate(dailyHistory);
       dailyCutoffDateRef.current = dailyCutoffDate;
       const metricsError = metricsResult.status === 'rejected'
@@ -5640,7 +5713,7 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
               snapshotTime: periodResponse.snapshotTime ?? currentState.snapshotTime ?? stateQuote?.snapshotTime ?? null,
               history: isHistoricalMode
                 ? normalizedHistory
-                : syncHistoryWithRealtimeQuote(normalizedHistory, selectedPeriod, stateQuote),
+                : syncHistoryWithRealtimeQuote(normalizedHistory, selectedPeriod, stateQuote, marketKind),
               isLoading: false,
               error: null,
             },
@@ -5722,7 +5795,7 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
           const nextQuote = quoteResult.status === 'fulfilled'
             ? quoteResult.value
             : currentState.quote;
-          const nextHistory = syncHistoryWithRealtimeQuote(normalizedHistory, selectedPeriod, nextQuote);
+          const nextHistory = syncHistoryWithRealtimeQuote(normalizedHistory, selectedPeriod, nextQuote, marketKind);
           const historyError = historyResult.status === 'rejected'
             ? historyResult.reason instanceof Error
               ? historyResult.reason.message
@@ -5746,7 +5819,7 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
                 : nextQuote?.snapshotTime ?? currentState.snapshotTime ?? null,
               error: nextHistory.length > 0 ? null : historyError,
             },
-          }, stockCode, nextQuote);
+          }, stockCode, nextQuote, marketKind);
         });
         void refreshMetricsForTradeDate(metricsTradeDate, selectedPeriod, { force: true });
       } finally {
@@ -5778,7 +5851,7 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
           return;
         }
         setHistoryCache((current) => {
-          return syncHistoryCacheWithRealtimeQuote(current, stockCode, nextQuote);
+          return syncHistoryCacheWithRealtimeQuote(current, stockCode, nextQuote, marketKind);
         });
       } catch {
         // Quote refresh is a soft realtime enhancement; keep the last usable quote.
@@ -5793,7 +5866,7 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
       ignore = true;
       window.clearInterval(intervalId);
     };
-  }, [isHistoricalMode, isLoading, selectedPeriod, stockCode]);
+  }, [isHistoricalMode, isLoading, marketKind, selectedPeriod, stockCode]);
 
   const points = useMemo(() => buildChartPoints(history), [history]);
   const visibleCount = useMemo(() => getVisiblePointCount(points.length, timelineZoom, effectivePeriod), [effectivePeriod, points.length, timelineZoom]);
@@ -6124,6 +6197,7 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
                     referencePoint={dailyReferencePoint}
                     referencePreviousPoint={dailyPreviousPoint}
                     points={points}
+                    preferTimeshareHigh={effectivePeriod === 'timeshare' && safeHoveredIndex !== null}
                     onAddRuleMetric={handleAddRuleMetric}
                   />
 
