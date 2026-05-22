@@ -109,6 +109,12 @@ class RuleRunHistoryItem(BaseModel):
     started_at: Optional[str] = None
     finished_at: Optional[str] = None
     duration_ms: Optional[int] = None
+    snapshot_id: Optional[str] = None
+    snapshot_time: Optional[str] = None
+    snapshot_age_seconds: Optional[int] = None
+    quote_hit_count: int = 0
+    quote_miss_count: int = 0
+    reused_run: bool = False
 
 
 class RuleRunHistoryResponse(BaseModel):
@@ -180,6 +186,7 @@ class RuleRunResponse(BaseModel):
     snapshot_age_seconds: Optional[int] = None
     quote_hit_count: int = 0
     quote_miss_count: int = 0
+    reused_run: bool = False
 
 
 class RuleRunMatchListResponse(BaseModel):

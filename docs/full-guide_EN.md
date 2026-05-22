@@ -823,7 +823,7 @@ Log file locations:
 
 ### SQLite Write Stability
 
-For file-based SQLite databases, the app now enables `WAL` and sets `busy_timeout` on connection startup. `save_daily_data()` also uses a batch atomic upsert on `(code, date)` to reduce lock contention during bulk writes and concurrent callbacks.
+For file-based SQLite databases, the app now enables `WAL` and sets `busy_timeout` on connection startup. `save_daily_data()` also uses a batch atomic upsert on `(code, date)`. Rule live-test/backtest runs first preload the daily history required by the selected rules and stock universe, then reuse the in-memory run-data cache for equivalent short-lived scans instead of querying SQLite stock by stock. Realtime quote warming prioritizes the in-process snapshot; while a large rule live-test is running, low-priority intraday hot-table archival writes are temporarily skipped so they cannot block result persistence. Bulk writes that already use `_run_write_transaction()` now pass through an in-process SQLite writer queue, and async rule-run progress writes skip transient lock conflicts while the scan continues; final result persistence still retries and records explicit failures.
 
 You can tune the behavior in `.env`:
 
@@ -833,6 +833,8 @@ You can tune the behavior in `.env`:
 | `SQLITE_BUSY_TIMEOUT_MS` | `5000` | SQLite lock wait timeout in milliseconds |
 | `SQLITE_WRITE_RETRY_MAX` | `3` | Max retries for `database is locked` / `database table is locked` errors |
 | `SQLITE_WRITE_RETRY_BASE_DELAY` | `0.1` | Base backoff delay in seconds for exponential write retries |
+| `RULE_PROGRESS_BATCH_SIZE` | `500` | Completed-stock step for persisted progress updates in large rule live-test/backtest runs; final completion is always persisted |
+| `RULE_PROGRESS_MIN_INTERVAL_SECONDS` | `5.0` | Minimum interval in seconds between persisted progress updates in large rule live-test/backtest runs |
 
 ---
 

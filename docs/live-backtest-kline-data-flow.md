@@ -12,7 +12,7 @@
 
 | 功能 | 前端入口 | API 入口 | 后端主链路 |
 | --- | --- | --- | --- |
-| 实测 | `apps/dsa-web/src/pages/BacktestPage.tsx`，`mode="live"` | `POST /api/v1/rules/run-batch` | `api/v1/endpoints/rules.py` -> `RuleService.run_rules` |
+| 实测 | `apps/dsa-web/src/pages/BacktestPage.tsx`，`mode="live"` | `POST /api/v1/rules/run-batch/async` | `api/v1/endpoints/rules.py` -> `RuleService.start_run_rules` -> 后台 `complete_started_run_rules` |
 | Web 规则回测 | `apps/dsa-web/src/pages/BacktestPage.tsx`，默认 `mode="backtest"` | `POST /api/v1/rules/run-batch/async` | `api/v1/endpoints/rules.py` -> `RuleService.start_run_rules` -> 后台 `complete_started_run_rules` |
 | AI 分析记录回测 | CLI、每日分析后自动触发、`/api/v1/backtest/*` | `POST /api/v1/backtest/run` | `api/v1/endpoints/backtest.py` -> `BacktestService.run_backtest` |
 | 首页 K 线 | 首页自选列表「指标」按钮 -> `/indicators/:stockCode` | `GET /api/v1/stocks/{code}/history` | `api/v1/endpoints/stocks.py` -> `StockService.get_history_data` |
@@ -98,6 +98,14 @@ flowchart LR
 - quote 快照写库只发生在预热路径；普通单股 quote 请求成功后只写 `_REALTIME_QUOTE_CACHE`，不会直接写 `stock_intraday_minute`。
 - 规则实测使用分钟热表 fallback 时只读 `stock_intraday_minute` 并在内存中聚合，不会把聚合结果写入 `stock_daily`。
 - 日线和分钟 K 的默认回源路径是写穿缓存：远程成功后先写 DB，再从 DB 重读返回。
+
+### SQLite 写入竞争处理
+
+规则实测和实时行情预热都可能在交易时段写入本地 SQLite。已接入 `_run_write_transaction()` 的批量写路径会在进程内串行进入 SQLite 写事务，减少同一 API 进程内的 writer lock 竞争。大规模规则实测的进度写入会按 `RULE_PROGRESS_BATCH_SIZE` 和 `RULE_PROGRESS_MIN_INTERVAL_SECONDS` 降频；如果单次进度刷新遇到临时 `database is locked`，后台扫描会跳过本次进度落库并继续执行，最终 run 结果和命中明细仍按关键写入重试并显式记录状态。
+
+### 规则运行数据预热
+
+异步规则实测/回测启动后，后端会根据选中规则、股票范围和 lookback 天数，一次性从 `stock_daily` 批量读取所需日线窗口并放入进程内短期缓存。扫描阶段优先读这份运行缓存，避免全 A 股任务按 5000+ 只股票逐只查询 SQLite。相同规则数据在短时间内可复用历史缓存；新实时行情快照到来时，只需重新读取内存 quote 快照并计算规则，不必重新冷读整批历史数据。大规模实测运行期间，后台实时行情预热仍会刷新内存快照，但会临时跳过 `stock_intraday_minute` 归档写入，避免归档事务抢占规则结果落库。
 
 ### 数据库表
 

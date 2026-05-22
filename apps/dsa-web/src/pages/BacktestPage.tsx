@@ -23,6 +23,7 @@ import { ApiErrorAlert, Badge, Button, ConfirmDialog, EmptyState, InlineAlert } 
 import { IndicatorAnalysisModal } from '../components/report';
 import { useStockIndex } from '../hooks/useStockIndex';
 import type { RuleItem, RuleMatchItem, RuleMetricItem, RuleRunHistoryItem, RuleTargetScope } from '../types/rules';
+import type { RealtimeCacheStatsResponse } from '../types/systemConfig';
 import type { StockIndexItem } from '../types/stockIndex';
 import { getOneYearAgoInShanghai, getRecentStartDate, getTodayInShanghai } from '../utils/format';
 import { matchesIndustryQuery, normalizeIndustryQuery, UNCLASSIFIED_INDUSTRY_LABEL } from '../utils/industryFilter';
@@ -39,7 +40,6 @@ const TEXTAREA_CLASS =
   'input-surface input-focus-glow min-h-[112px] w-full resize-y rounded-xl border bg-transparent px-3 py-2 text-sm text-foreground transition-all placeholder:text-muted-text focus:outline-none disabled:cursor-not-allowed disabled:opacity-60';
 const WATCHLIST_HISTORY_LIMIT = 20;
 const LIVE_TEST_POLL_INTERVAL_MS = 30_000;
-const LIVE_TEST_MAX_CONCURRENT_CYCLES = 2;
 const LIVE_COMPACT_MODE_STORAGE_KEY = 'dsa.liveTest.compactMode.v1';
 const ASHARE_LIVE_TEST_WINDOW_TEXT = 'A股实测仅在交易日 15:00 及以前运行';
 const ASHARE_LIVE_TEST_CLOSED_MESSAGE = `${ASHARE_LIVE_TEST_WINDOW_TEXT}；当前已超过实测时间，未触发实时扫描`;
@@ -120,13 +120,6 @@ type ExecutionLogEntry = {
   time: string;
   level: LogLevel;
   message: string;
-};
-
-type LiveTestCycleRequest = {
-  sessionId: number;
-  cycleIndex: number;
-  runStartedAt: string;
-  runRuleNames: string[];
 };
 
 type IndicatorAnalysisSelection = {
@@ -1223,12 +1216,20 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
   const [isLiveCompactMode, setIsLiveCompactMode] = useState(() => (
     isLiveMode ? readLiveCompactModePreference() : false
   ));
+  const [liveSnapshotStats, setLiveSnapshotStats] = useState<RealtimeCacheStatsResponse | null>(null);
+  const [isLiveSnapshotStatsLoading, setIsLiveSnapshotStatsLoading] = useState(false);
   const runHeartbeatRef = useRef<number | null>(null);
   const liveTestIntervalRef = useRef<number | null>(null);
   const liveTestSessionRef = useRef<number | null>(null);
   const liveTestCyclesInFlightRef = useRef(0);
-  const liveTestPendingCycleRef = useRef<LiveTestCycleRequest | null>(null);
-  const liveTestCycleRunnerRef = useRef<((request: LiveTestCycleRequest) => void) | null>(null);
+  const liveActiveRunRef = useRef<{
+    runId: number;
+    cycleIndex: number;
+    executionTime: string;
+    runStartedAt: string;
+    runRuleNames: string[];
+    lastCompletedCount: number;
+  } | null>(null);
   const liveLatestSnapshotIdRef = useRef<string | null>(null);
   const liveResultRowsRef = useRef<RuleRunEventRow[]>(displayRows);
   const liveRunIdsRef = useRef<number[]>(selectedRun ? getRunIds(selectedRun) : []);
@@ -1798,13 +1799,28 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
     }));
   }, [setRunProgressById]);
 
+  const refreshLiveSnapshotStats = useCallback(async () => {
+    if (!isLiveMode) return null;
+    setIsLiveSnapshotStatsLoading(true);
+    try {
+      const stats = await systemConfigApi.getRealtimeCacheStats();
+      setLiveSnapshotStats(stats);
+      return stats;
+    } catch {
+      setLiveSnapshotStats(null);
+      return null;
+    } finally {
+      setIsLiveSnapshotStatsLoading(false);
+    }
+  }, [isLiveMode]);
+
   const stopLiveTest = useCallback((message = '实测已停止', level: LogLevel = 'info') => {
     const sessionId = liveTestSessionRef.current;
     const finishedAt = new Date().toISOString();
     clearLiveTestInterval();
     liveTestSessionRef.current = null;
     liveTestCyclesInFlightRef.current = 0;
-    liveTestPendingCycleRef.current = null;
+    liveActiveRunRef.current = null;
     liveLatestSnapshotIdRef.current = null;
     setIsRunning(false);
     setRunProgressById({});
@@ -1828,96 +1844,140 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
       stopLiveTest(ASHARE_LIVE_TEST_CLOSED_MESSAGE, 'warning');
       return;
     }
-    if (liveTestCyclesInFlightRef.current >= LIVE_TEST_MAX_CONCURRENT_CYCLES) {
-      liveTestPendingCycleRef.current = {
-        sessionId,
-        cycleIndex,
-        runStartedAt,
-        runRuleNames,
-      };
-      appendExecutionLog(`第 ${cycleIndex} 次触发排队：已有 ${LIVE_TEST_MAX_CONCURRENT_CYCLES} 个实测周期在执行`, 'warning');
-      return;
-    }
+    if (liveTestCyclesInFlightRef.current > 0) return;
 
-    const cycleExecutionTime = formatDateTimeToSecond(new Date().toISOString());
     liveTestCyclesInFlightRef.current += 1;
-    updateRunProgress(sessionId, 28, `第 ${cycleIndex} 次触发：请求实时行情`);
-    appendExecutionLog(`第 ${cycleIndex} 次触发：扫描 ${targetCodes.length} 只股票，执行 ${selectedRuleIds.length} 条规则`);
 
     try {
-      const result = await rulesApi.runBatch({
-        ruleIds: selectedRuleIds,
-        mode: 'latest',
-        dataPolicy: 'snapshot_only',
-        target: {
-          scope: targetScope === 'industry' ? 'custom' : targetScope,
-          stockCodes: targetCodes,
-        },
-      });
       if (liveTestSessionRef.current !== sessionId) return;
 
-      if (result.snapshotId && liveLatestSnapshotIdRef.current) {
-        if (result.snapshotId === liveLatestSnapshotIdRef.current) {
-          updateRunProgress(sessionId, 100, `第 ${cycleIndex} 次完成：快照未变化，等待下次刷新`);
-          appendExecutionLog(`第 ${cycleIndex} 次实测跳过汇总：快照 ${result.snapshotId} 已处理`, 'info');
-          return;
-        }
-        if (result.snapshotId < liveLatestSnapshotIdRef.current) {
-          appendExecutionLog(`第 ${cycleIndex} 次实测结果已过期：快照 ${result.snapshotId} 早于 ${liveLatestSnapshotIdRef.current}`, 'warning');
-          return;
-        }
-      }
-      if (result.snapshotId) {
-        liveLatestSnapshotIdRef.current = result.snapshotId;
+      let activeRun = liveActiveRunRef.current;
+      if (activeRun == null) {
+        const cycleExecutionTime = formatDateTimeToSecond(new Date().toISOString());
+        updateRunProgress(sessionId, 12, `第 ${cycleIndex} 次触发：请求后台实测任务`);
+        appendExecutionLog(`第 ${cycleIndex} 次触发：启动后台实测，扫描 ${targetCodes.length} 只股票，执行 ${selectedRuleIds.length} 条规则`);
+        const startedRun = await rulesApi.runBatchAsync({
+          ruleIds: selectedRuleIds,
+          mode: 'latest',
+          dataPolicy: 'snapshot_only',
+          target: {
+            scope: targetScope === 'industry' ? 'custom' : targetScope,
+            stockCodes: targetCodes,
+          },
+        });
+        if (liveTestSessionRef.current !== sessionId) return;
+        activeRun = {
+          runId: startedRun.runId,
+          cycleIndex,
+          executionTime: cycleExecutionTime,
+          runStartedAt,
+          runRuleNames,
+          lastCompletedCount: startedRun.completedCount ?? 0,
+        };
+        liveActiveRunRef.current = activeRun;
+        const totalCount = Math.max(0, startedRun.targetCount || targetCodes.length);
+        updateRunProgress(sessionId, startedRun.status === 'running' ? 1 : 100, `#${startedRun.runId} 执行完成 ${startedRun.completedCount ?? 0}/${totalCount}`);
+        appendExecutionLog(
+          startedRun.reusedRun
+            ? `#${startedRun.runId} 已有同快照实测任务，复用当前结果`
+            : `#${startedRun.runId} 后台实测已启动：执行完成 ${startedRun.completedCount ?? 0}/${totalCount}`,
+          startedRun.reusedRun ? 'info' : 'info',
+        );
+        setPageError(null);
       }
 
+      const run = await rulesApi.getRun(activeRun.runId);
+      if (liveTestSessionRef.current !== sessionId) return;
+      const nextTotal = Math.max(0, run.targetCount || targetCodes.length);
+      const completed = Math.min(nextTotal, Math.max(0, run.completedCount || 0));
+      const isStillRunning = run.status === 'running';
+      const progress = nextTotal > 0
+        ? Math.min(isStillRunning ? 99 : 100, Math.round((completed / nextTotal) * 100))
+        : isStillRunning ? 50 : 100;
+      const stage = isStillRunning ? `#${activeRun.runId} 执行完成 ${completed}/${nextTotal}` : `#${activeRun.runId} 执行完成 ${nextTotal}/${nextTotal}`;
+      updateRunProgress(sessionId, progress, stage);
+      if (completed !== activeRun.lastCompletedCount) {
+        activeRun.lastCompletedCount = completed;
+        appendExecutionLog(stage);
+      }
+      if (isStillRunning) return;
+
+      liveActiveRunRef.current = null;
+      if (run.status === 'failed') {
+        const failureMessage = run.error || '实测执行失败';
+        setRunError(getParsedApiError(new Error(failureMessage)));
+        setRunWarning(null);
+        appendExecutionLog(`#${activeRun.runId} 实测失败：${failureMessage}`, 'error');
+        setActiveResultTab('logs');
+        return;
+      }
+
+      if (run.snapshotId && liveLatestSnapshotIdRef.current) {
+        if (run.snapshotId === liveLatestSnapshotIdRef.current) {
+          updateRunProgress(sessionId, 100, `第 ${activeRun.cycleIndex} 次完成：快照未变化，等待下次刷新`);
+          appendExecutionLog(`第 ${activeRun.cycleIndex} 次实测跳过汇总：快照 ${run.snapshotId} 已处理`, 'info');
+          setRunError(null);
+          return;
+        }
+        if (run.snapshotId < liveLatestSnapshotIdRef.current) {
+          appendExecutionLog(`第 ${activeRun.cycleIndex} 次实测结果已过期：快照 ${run.snapshotId} 早于 ${liveLatestSnapshotIdRef.current}`, 'warning');
+          return;
+        }
+      }
+      if (run.snapshotId) {
+        liveLatestSnapshotIdRef.current = run.snapshotId;
+      }
+
+      const matches = await rulesApi.getRunMatches(activeRun.runId);
+      if (liveTestSessionRef.current !== sessionId) return;
       const now = new Date().toISOString();
-      const resultRuleIds = result.ruleIds && result.ruleIds.length > 0 ? result.ruleIds : selectedRuleIds;
-      const resultRuleNames = result.ruleNames && result.ruleNames.length > 0 ? result.ruleNames : runRuleNames;
+      const resultRuleIds = run.ruleIds && run.ruleIds.length > 0 ? run.ruleIds : selectedRuleIds;
+      const resultRuleNames = run.ruleNames && run.ruleNames.length > 0 ? run.ruleNames : activeRun.runRuleNames;
       const resultRuleName = resultRuleIds.length > 1 ? `多规则实测（${resultRuleIds.length} 条）` : resultRuleNames[0] ?? null;
-      const nextRows = flattenMatches(result.matches, {
-        runId: result.runId,
-        ruleId: result.ruleId,
+      const nextRows = flattenMatches(matches, {
+        runId: activeRun.runId,
+        ruleId: run.ruleId,
         ruleName: resultRuleName,
-        executionTime: cycleExecutionTime,
+        executionTime: activeRun.executionTime,
         finishedAt: now,
       });
       const cumulativeRows = [...nextRows, ...liveResultRowsRef.current];
-      const cumulativeRunIds = Array.from(new Set([result.runId, ...liveRunIdsRef.current]));
+      const cumulativeRunIds = Array.from(new Set([activeRun.runId, ...liveRunIdsRef.current]));
       liveResultRowsRef.current = cumulativeRows;
       liveRunIdsRef.current = cumulativeRunIds;
       const runMeta: RuleRunHistoryItem = {
         id: sessionId,
         runIds: cumulativeRunIds,
-        ruleId: result.ruleId,
+        ruleId: run.ruleId,
         ruleIds: resultRuleIds,
         ruleName: resultRuleName,
         ruleNames: resultRuleNames,
-        status: result.status,
-        targetCount: result.targetCount,
-        matchCount: new Set(cumulativeRows.map((row) => row.stockCode)).size || result.matchCount,
+        status: run.status,
+        targetCount: run.targetCount,
+        completedCount: run.completedCount,
+        matchCount: new Set(cumulativeRows.map((row) => row.stockCode)).size || run.matchCount,
         eventCount: cumulativeRows.length,
-        error: result.errors.length > 0 ? result.errors.join('；') : null,
+        error: run.error || null,
         startedAt: runStartedAt,
         finishedAt: now,
-        durationMs: result.durationMs,
+        durationMs: run.durationMs,
       };
 
       setSelectedRun(runMeta);
       setDisplayRows(cumulativeRows);
-      setRunWarning(result.errors.length > 0 ? result.errors.join('；') : null);
+      setRunWarning(run.error || null);
       updateRunProgress(
         sessionId,
         100,
-        `第 ${cycleIndex} 次完成，命中 ${nextRows.length} 条；等待下次刷新`,
+        `第 ${activeRun.cycleIndex} 次完成，命中 ${nextRows.length} 条；等待下次刷新`,
       );
       appendExecutionLog(
-        `第 ${cycleIndex} 次实测完成：快照 ${result.snapshotId ?? 'unknown'}，命中股票 ${result.matchCount} 只，命中记录 ${nextRows.length} 条`,
-        result.errors.length > 0 ? 'warning' : 'success',
+        `第 ${activeRun.cycleIndex} 次实测完成：快照 ${run.snapshotId ?? 'unknown'}，命中股票 ${run.matchCount} 只，命中记录 ${nextRows.length} 条`,
+        run.status === 'partial' || run.error ? 'warning' : 'success',
       );
       if (nextRows.length > 0) {
-        void rulesApi.notifyRunMatches(result.runId, {
-          executionTime: cycleExecutionTime,
+        void rulesApi.notifyRunMatches(activeRun.runId, {
+          executionTime: activeRun.executionTime,
           ruleIds: resultRuleIds,
           ruleNames: resultRuleNames,
           compact: isLiveCompactMode,
@@ -1925,18 +1985,15 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
           if (liveTestSessionRef.current !== sessionId) return;
           appendExecutionLog(
             notification.sent
-              ? `第 ${cycleIndex} 次实测命中已推送通知：${notification.eventCount} 条`
-              : `第 ${cycleIndex} 次实测命中未推送通知：${notification.message}`,
+              ? `第 ${activeRun.cycleIndex} 次实测命中已推送通知：${notification.eventCount} 条`
+              : `第 ${activeRun.cycleIndex} 次实测命中未推送通知：${notification.message}`,
             notification.sent ? 'success' : notification.deduplicated ? 'info' : 'warning',
           );
         }).catch((notifyError) => {
           if (liveTestSessionRef.current !== sessionId) return;
           const parsedNotifyError = getParsedApiError(notifyError);
-          appendExecutionLog(`第 ${cycleIndex} 次实测命中通知推送失败：${parsedNotifyError.message}`, 'warning');
+          appendExecutionLog(`第 ${activeRun.cycleIndex} 次实测命中通知推送失败：${parsedNotifyError.message}`, 'warning');
         });
-      }
-      if (result.errors.length > 0) {
-        appendExecutionLog(`本次实测存在部分错误：${result.errors.join('，')}`, 'warning');
       }
       setRunError(null);
       setActiveResultTab('results');
@@ -1952,21 +2009,21 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
         stopLiveTest(parsedError.message, 'warning');
         return;
       }
+      if (parsedError.message.includes('快照预热') || parsedError.message.includes('快照尚未准备')) {
+        liveActiveRunRef.current = null;
+        updateRunProgress(sessionId, 100, '等待实时行情快照预热');
+        appendExecutionLog(`第 ${cycleIndex} 次实测未启动：${parsedError.message}`, 'warning');
+        setRunWarning(parsedError.message);
+        setRunError(null);
+        setActiveResultTab('logs');
+        return;
+      }
       updateRunProgress(sessionId, 100, `第 ${cycleIndex} 次触发失败，等待下次刷新`);
       appendExecutionLog(`第 ${cycleIndex} 次实测失败：${parsedError.message}`, 'error');
       setRunError(parsedError);
       setActiveResultTab('logs');
     } finally {
       liveTestCyclesInFlightRef.current = Math.max(0, liveTestCyclesInFlightRef.current - 1);
-      const queuedCycle = liveTestPendingCycleRef.current;
-      if (
-        queuedCycle
-        && liveTestSessionRef.current === queuedCycle.sessionId
-        && liveTestCyclesInFlightRef.current < LIVE_TEST_MAX_CONCURRENT_CYCLES
-      ) {
-        liveTestPendingCycleRef.current = null;
-        liveTestCycleRunnerRef.current?.(queuedCycle);
-      }
     }
   }, [
     appendExecutionLog,
@@ -1983,21 +2040,7 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
     updateRunProgress,
   ]);
 
-  useEffect(() => {
-    liveTestCycleRunnerRef.current = (request: LiveTestCycleRequest) => {
-      void runLiveTestCycle(
-        request.sessionId,
-        request.cycleIndex,
-        request.runStartedAt,
-        request.runRuleNames,
-      );
-    };
-    return () => {
-      liveTestCycleRunnerRef.current = null;
-    };
-  }, [runLiveTestCycle]);
-
-  const startLiveTest = useCallback(() => {
+  const startLiveTest = useCallback(async () => {
     if (runDisabled || isRunning) return;
     if (!isAshareLiveTestAllowed()) {
       setRunError(null);
@@ -2029,7 +2072,7 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
     clearLiveTestInterval();
     liveTestSessionRef.current = sessionId;
     liveTestCyclesInFlightRef.current = 0;
-    liveTestPendingCycleRef.current = null;
+    liveActiveRunRef.current = null;
     liveLatestSnapshotIdRef.current = null;
     liveResultRowsRef.current = [];
     liveRunIdsRef.current = [];
@@ -2043,6 +2086,25 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
     setActiveResultTab('logs');
     appendExecutionLog(`开始实测：${selectedRuleIds.length} 条规则，${targetCodes.length} 只股票，${isLiveCompactMode ? '精简模式' : '完整模式'}，实时模式会每 ${LIVE_TEST_POLL_INTERVAL_MS / 1000} 秒重新触发一次`);
 
+    const shouldReportSnapshotStats = targetScope === 'all_a_shares' || targetCodes.length >= 1000;
+    if (shouldReportSnapshotStats) {
+      const snapshotStats = await refreshLiveSnapshotStats();
+      if (liveTestSessionRef.current !== sessionId) return;
+      if (snapshotStats) {
+        const hitCount = snapshotStats.quoteSnapshotItems ?? snapshotStats.snapshotHitCount ?? 0;
+        const ready = Boolean(snapshotStats.snapshotId) && hitCount >= targetCodes.length;
+        appendExecutionLog(
+          `实时行情快照覆盖：${hitCount}/${targetCodes.length}，快照 ${snapshotStats.snapshotId ?? '未就绪'}`,
+          ready ? 'info' : 'warning',
+        );
+        if (!ready) {
+          setRunWarning(`实时行情快照覆盖 ${hitCount}/${targetCodes.length}，等待后端快照预热校验`);
+        }
+      } else {
+        appendExecutionLog('实时行情快照状态读取失败，将交给后端校验', 'warning');
+      }
+    }
+
     let cycleIndex = 0;
     const triggerCycle = () => {
       cycleIndex += 1;
@@ -2053,6 +2115,7 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
   }, [
     appendExecutionLog,
     clearLiveTestInterval,
+    refreshLiveSnapshotStats,
     isRunning,
     isLiveCompactMode,
     rules,
@@ -2068,6 +2131,7 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
     setRunWarning,
     setSelectedRun,
     targetCodes.length,
+    targetScope,
   ]);
 
   const handleBacktestRun = async () => {
@@ -2283,7 +2347,7 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
         stopLiveTest();
         return;
       }
-      startLiveTest();
+      void startLiveTest();
       return;
     }
     void handleBacktestRun();
@@ -2351,6 +2415,13 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
             ? `本次实测 · ${selectedRuleIds.length} 条规则 · ${activeRunEventCount} 条命中记录`
             : `本次回测 · ${activeDateRangeText} · ${selectedRuleIds.length} 条规则 · ${activeRunEventCount} 条命中记录`
           : isLiveMode ? '运行一次规则实测后展示实时命中结果' : '运行一次规则回测后展示本次命中结果';
+  const liveSnapshotStatusText = isLiveMode
+    ? isLiveSnapshotStatsLoading
+      ? '快照读取中'
+      : liveSnapshotStats?.snapshotId
+        ? `快照 ${liveSnapshotStats.snapshotId} · 覆盖 ${liveSnapshotStats.quoteSnapshotItems ?? 0} 只`
+        : '实时快照未就绪'
+    : null;
   const resultSetName = selectedRun && getRuleIdsForRun(selectedRun).length > 1
     ? selectedRun.ruleName || `多规则${pageCopy.action}（${getRuleIdsForRun(selectedRun).length} 条）`
     : selectedRunRule?.name
@@ -2653,6 +2724,11 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
               {['all_a_shares', 'industry'].includes(targetScope) && isLoadingStockIndex ? '，正在加载 A 股列表...' : ''}
               {['all_a_shares', 'industry'].includes(targetScope) && stockIndexError ? '，A 股列表加载失败' : ''}
             </div>
+            {isLiveMode ? (
+              <div className="text-right text-[11px] text-muted-text" aria-label="实时快照状态">
+                {liveSnapshotStatusText}
+              </div>
+            ) : null}
           </div>
         </div>
 

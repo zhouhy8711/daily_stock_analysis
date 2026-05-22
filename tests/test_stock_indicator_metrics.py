@@ -657,6 +657,27 @@ def test_warm_all_a_share_realtime_quotes_fills_missing_current_bucket() -> None
     assert second["fetched_count"] == 0
 
 
+def test_warm_realtime_quotes_skips_intraday_archive_while_paused() -> None:
+    fetcher = _BatchQuoteFetcher()
+    manager = _BatchRealtimeManager(fetcher)
+    service = StockService()
+
+    with (
+        patch("src.data.stock_index_loader.get_all_a_share_stock_codes", return_value=["600519", "000001"]),
+        patch("src.services.stock_service.get_config", return_value=SimpleNamespace(realtime_cache_ttl=30)),
+        patch("src.services.stock_service.time.time", return_value=1000),
+        patch("data_provider.base.DataFetcherManager", return_value=manager),
+        patch.object(service.repo.db, "save_intraday_quote_samples", side_effect=AssertionError("archive write should be paused")),
+        service.pause_realtime_quote_intraday_archive("unit-test"),
+    ):
+        result = service.warm_all_a_share_realtime_quotes(force_refresh=True)
+
+    assert result["status"] == "refreshed"
+    assert result["cached_after"] == 2
+    assert result["intraday_saved_count"] == 0
+    assert result["intraday_archive_skipped_reason"] == "unit-test"
+
+
 def test_data_provider_realtime_cache_seconds_reads_config() -> None:
     from data_provider.akshare_fetcher import (
         _realtime_cache as akshare_cache,

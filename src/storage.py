@@ -18,6 +18,7 @@ import json
 import logging
 import math
 import re
+import threading
 import time
 from datetime import datetime, date, timedelta
 from typing import Optional, List, Dict, Any, TYPE_CHECKING, Tuple, Callable, TypeVar
@@ -828,6 +829,7 @@ class DatabaseManager:
         self._sqlite_busy_timeout_ms = config.sqlite_busy_timeout_ms
         self._sqlite_write_retry_max = config.sqlite_write_retry_max
         self._sqlite_write_retry_base_delay = config.sqlite_write_retry_base_delay
+        self._sqlite_write_lock = threading.RLock()
 
         engine_kwargs = {
             "echo": False,
@@ -943,6 +945,16 @@ class DatabaseManager:
         return bool(database) and database.lower() != ":memory:"
 
     def _run_write_transaction(
+        self,
+        operation_name: str,
+        write_operation: Callable[[Session], T],
+    ) -> T:
+        if self._is_sqlite_engine:
+            with self._sqlite_write_lock:
+                return self._run_write_transaction_with_retries(operation_name, write_operation)
+        return self._run_write_transaction_with_retries(operation_name, write_operation)
+
+    def _run_write_transaction_with_retries(
         self,
         operation_name: str,
         write_operation: Callable[[Session], T],
@@ -1174,6 +1186,41 @@ class DatabaseManager:
             ).scalars().all()
             
             return list(results)
+
+    def get_daily_data_range_by_codes(
+        self,
+        codes: List[str],
+        start_date: date,
+        end_date: date,
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        """Bulk-read daily bars for many codes, grouped by stored code."""
+        normalized_codes = list(dict.fromkeys(
+            str(code or "").strip()
+            for code in codes
+            if str(code or "").strip()
+        ))
+        if not normalized_codes:
+            return {}
+
+        rows_by_code: Dict[str, List[Dict[str, Any]]] = {code: [] for code in normalized_codes}
+        chunk_size = 500
+        with self.get_session() as session:
+            for i in range(0, len(normalized_codes), chunk_size):
+                chunk = normalized_codes[i : i + chunk_size]
+                rows = session.execute(
+                    select(StockDaily)
+                    .where(
+                        and_(
+                            StockDaily.code.in_(chunk),
+                            StockDaily.date >= start_date,
+                            StockDaily.date <= end_date,
+                        )
+                    )
+                    .order_by(StockDaily.code, StockDaily.date)
+                ).scalars().all()
+                for row in rows:
+                    rows_by_code.setdefault(row.code, []).append(row.to_dict())
+        return rows_by_code
 
     def save_news_intel(
         self,
@@ -1927,7 +1974,10 @@ class DatabaseManager:
 
         codes = list(pending.keys())
 
-        def _write(session: Session) -> int:
+        sqlite_chunk_size = 500 if self._is_sqlite_engine else len(pending)
+
+        def _write_chunk(session: Session, chunk_pending: Dict[str, Dict[str, Any]]) -> int:
+            chunk_codes = list(chunk_pending.keys())
             existing_rows = {
                 row.code: row
                 for row in session.execute(
@@ -1935,7 +1985,7 @@ class DatabaseManager:
                         and_(
                             StockIntradayMinute.trade_date == trade_date,
                             StockIntradayMinute.minute_ts == minute_ts,
-                            StockIntradayMinute.code.in_(codes),
+                            StockIntradayMinute.code.in_(chunk_codes),
                         )
                     )
                 ).scalars().all()
@@ -1947,7 +1997,7 @@ class DatabaseManager:
                     and_(
                         StockIntradayMinute.trade_date == trade_date,
                         StockIntradayMinute.minute_ts < minute_ts,
-                        StockIntradayMinute.code.in_(codes),
+                        StockIntradayMinute.code.in_(chunk_codes),
                     )
                 )
                 .order_by(StockIntradayMinute.code, desc(StockIntradayMinute.minute_ts))
@@ -1956,7 +2006,7 @@ class DatabaseManager:
                 previous_by_code.setdefault(row.code, row)
 
             records: List[Dict[str, Any]] = []
-            for code, sample in pending.items():
+            for code, sample in chunk_pending.items():
                 existing = existing_rows.get(code)
                 previous = previous_by_code.get(code)
                 price = sample["price"]
@@ -2034,10 +2084,14 @@ class DatabaseManager:
                             setattr(existing, key, value)
             return len(records)
 
-        saved_count = self._run_write_transaction(
-            f"save_intraday_quote_samples[{snapshot_id}]",
-            _write,
-        )
+        saved_count = 0
+        pending_items = list(pending.items())
+        for i in range(0, len(pending_items), sqlite_chunk_size):
+            chunk_pending = dict(pending_items[i : i + sqlite_chunk_size])
+            saved_count += self._run_write_transaction(
+                f"save_intraday_quote_samples[{snapshot_id}]",
+                lambda session, current_chunk=chunk_pending: _write_chunk(session, current_chunk),
+            )
         return {"saved_count": saved_count, "requested_count": len(items)}
 
     def save_intraday_minute_dataframe(
@@ -2493,19 +2547,19 @@ class DatabaseManager:
         if normalized_codes is not None:
             conditions.append(StockIntradayMinute.code.in_(normalized_codes))
 
-        with self.session_scope() as session:
-            result = session.execute(
-                delete(StockIntradayMinute).where(and_(*conditions))
-            )
+        def _write(session: Session) -> int:
+            result = session.execute(delete(StockIntradayMinute).where(and_(*conditions)))
             return int(result.rowcount or 0)
+
+        return self._run_write_transaction("purge_intraday_minutes_for_date", _write)
 
     def purge_intraday_minutes_older_than(self, retention_days: int = 3) -> int:
         cutoff = date.today() - timedelta(days=max(0, int(retention_days)))
-        with self.session_scope() as session:
-            result = session.execute(
-                delete(StockIntradayMinute).where(StockIntradayMinute.trade_date < cutoff)
-            )
+        def _write(session: Session) -> int:
+            result = session.execute(delete(StockIntradayMinute).where(StockIntradayMinute.trade_date < cutoff))
             return int(result.rowcount or 0)
+
+        return self._run_write_transaction("purge_intraday_minutes_older_than", _write)
     
     def save_daily_data(
         self, 

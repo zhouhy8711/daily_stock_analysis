@@ -10,6 +10,7 @@
 """
 
 import logging
+from contextlib import contextmanager
 from copy import deepcopy
 from datetime import date, datetime, timedelta
 import math
@@ -39,6 +40,9 @@ _REALTIME_QUOTE_SNAPSHOT: Dict[str, Any] = {
     "hit_count": 0,
     "miss_count": 0,
 }
+_REALTIME_QUOTE_INTRADAY_ARCHIVE_LOCK = RLock()
+_REALTIME_QUOTE_INTRADAY_ARCHIVE_PAUSE_DEPTH = 0
+_REALTIME_QUOTE_INTRADAY_ARCHIVE_PAUSE_REASON: Optional[str] = None
 
 
 def _get_realtime_cache_ttl() -> int:
@@ -83,6 +87,33 @@ def _clear_realtime_quote_snapshot() -> None:
             "hit_count": 0,
             "miss_count": 0,
         })
+
+
+@contextmanager
+def pause_realtime_quote_intraday_archive(reason: str = "rule_run"):
+    """Temporarily skip low-priority intraday hot-table archival writes."""
+    global _REALTIME_QUOTE_INTRADAY_ARCHIVE_PAUSE_DEPTH
+    global _REALTIME_QUOTE_INTRADAY_ARCHIVE_PAUSE_REASON
+    with _REALTIME_QUOTE_INTRADAY_ARCHIVE_LOCK:
+        _REALTIME_QUOTE_INTRADAY_ARCHIVE_PAUSE_DEPTH += 1
+        _REALTIME_QUOTE_INTRADAY_ARCHIVE_PAUSE_REASON = reason
+    try:
+        yield
+    finally:
+        with _REALTIME_QUOTE_INTRADAY_ARCHIVE_LOCK:
+            _REALTIME_QUOTE_INTRADAY_ARCHIVE_PAUSE_DEPTH = max(
+                0,
+                _REALTIME_QUOTE_INTRADAY_ARCHIVE_PAUSE_DEPTH - 1,
+            )
+            if _REALTIME_QUOTE_INTRADAY_ARCHIVE_PAUSE_DEPTH == 0:
+                _REALTIME_QUOTE_INTRADAY_ARCHIVE_PAUSE_REASON = None
+
+
+def _realtime_quote_intraday_archive_pause_reason() -> Optional[str]:
+    with _REALTIME_QUOTE_INTRADAY_ARCHIVE_LOCK:
+        if _REALTIME_QUOTE_INTRADAY_ARCHIVE_PAUSE_DEPTH <= 0:
+            return None
+        return _REALTIME_QUOTE_INTRADAY_ARCHIVE_PAUSE_REASON or "paused"
 
 
 def _realtime_quote_cache_size() -> int:
@@ -566,6 +597,10 @@ class StockService:
     def get_realtime_quote_snapshot_info(self) -> Dict[str, Any]:
         """Return metadata for the latest warmed realtime quote snapshot."""
         return _get_realtime_quote_snapshot_info()
+
+    @staticmethod
+    def pause_realtime_quote_intraday_archive(reason: str = "rule_run"):
+        return pause_realtime_quote_intraday_archive(reason)
     
     def get_realtime_quote(
         self,
@@ -758,7 +793,13 @@ class StockService:
                 "update_time": datetime.now().isoformat(),
             }
 
-    def warm_realtime_quotes(self, stock_codes: List[str], *, force_refresh: bool = False) -> Dict[str, Any]:
+    def warm_realtime_quotes(
+        self,
+        stock_codes: List[str],
+        *,
+        force_refresh: bool = False,
+        archive_intraday: bool = True,
+    ) -> Dict[str, Any]:
         """
         Preload realtime quote payloads into the process cache.
 
@@ -822,11 +863,14 @@ class StockService:
                 failed_codes=[],
                 snapshot_time=snapshot_time,
             )
-            intraday_saved = self.repo.db.save_intraday_quote_samples(
-                snapshot_items,
-                snapshot_id=str(snapshot_info.get("snapshot_id") or ""),
-                snapshot_time=snapshot_time,
-            )
+            pause_reason = _realtime_quote_intraday_archive_pause_reason()
+            intraday_saved = {"saved_count": 0, "requested_count": len(snapshot_items)}
+            if archive_intraday and pause_reason is None:
+                intraday_saved = self.repo.db.save_intraday_quote_samples(
+                    snapshot_items,
+                    snapshot_id=str(snapshot_info.get("snapshot_id") or ""),
+                    snapshot_time=snapshot_time,
+                )
             return {
                 "status": "cache_hit",
                 "requested_count": len(normalized_codes),
@@ -835,6 +879,7 @@ class StockService:
                 "failed_count": 0,
                 "cached_after": cached_before,
                 "intraday_saved_count": intraday_saved.get("saved_count", 0),
+                "intraday_archive_skipped_reason": pause_reason if archive_intraday else "disabled",
                 **snapshot_info,
             }
 
@@ -855,15 +900,18 @@ class StockService:
             failed_codes=response.get("failed_codes", []),
             snapshot_time=snapshot_time,
         )
-        intraday_saved = self.repo.db.save_intraday_quote_samples(
-            snapshot_items,
-            snapshot_id=str(snapshot_info.get("snapshot_id") or ""),
-            snapshot_time=snapshot_time,
-        )
-        try:
-            self.repo.db.purge_intraday_minutes_older_than(3)
-        except Exception as exc:
-            logger.debug("清理分钟热表旧数据失败: %s", exc)
+        pause_reason = _realtime_quote_intraday_archive_pause_reason()
+        intraday_saved = {"saved_count": 0, "requested_count": len(snapshot_items)}
+        if archive_intraday and pause_reason is None:
+            intraday_saved = self.repo.db.save_intraday_quote_samples(
+                snapshot_items,
+                snapshot_id=str(snapshot_info.get("snapshot_id") or ""),
+                snapshot_time=snapshot_time,
+            )
+            try:
+                self.repo.db.purge_intraday_minutes_older_than(3)
+            except Exception as exc:
+                logger.debug("清理分钟热表旧数据失败: %s", exc)
         return {
             "status": "refreshed" if fetched_count > 0 else "miss",
             "requested_count": len(normalized_codes),
@@ -874,10 +922,16 @@ class StockService:
             "cached_after": cached_after,
             "update_time": response.get("update_time"),
             "intraday_saved_count": intraday_saved.get("saved_count", 0),
+            "intraday_archive_skipped_reason": pause_reason if archive_intraday else "disabled",
             **snapshot_info,
         }
 
-    def warm_all_a_share_realtime_quotes(self, *, force_refresh: bool = False) -> Dict[str, Any]:
+    def warm_all_a_share_realtime_quotes(
+        self,
+        *,
+        force_refresh: bool = False,
+        archive_intraday: bool = True,
+    ) -> Dict[str, Any]:
         """Preload realtime quote payloads for all active A-share stocks."""
         from src.data.stock_index_loader import get_all_a_share_stock_codes
 
@@ -891,7 +945,136 @@ class StockService:
                 "fetched_count": 0,
                 "failed_count": 0,
             }
-        return self.warm_realtime_quotes(codes, force_refresh=force_refresh)
+        return self.warm_realtime_quotes(
+            codes,
+            force_refresh=force_refresh,
+            archive_intraday=archive_intraday,
+        )
+
+    def get_daily_history_cache_batch(
+        self,
+        stock_codes: List[str],
+        days_by_code: Dict[str, int],
+        *,
+        data_policy: str = "snapshot_only",
+    ) -> Dict[str, Dict[str, Any]]:
+        """Bulk-load local daily history windows for rule execution."""
+        unique_codes = list(dict.fromkeys(
+            str(code or "").strip().upper()
+            for code in stock_codes
+            if str(code or "").strip()
+        ))
+        if not unique_codes:
+            return {}
+
+        normalized_policy = str(data_policy or "default").strip().lower()
+        db_only = normalized_policy == "db_only"
+        require_fresh = not db_only
+        allow_partial = db_only
+        requested_days_by_code = {
+            code: max(1, int(days_by_code.get(code) or days_by_code.get(code.upper()) or 1))
+            for code in unique_codes
+        }
+        target_date_by_code = {
+            code: (
+                self._resolve_daily_cache_target_date(code)
+                if require_fresh
+                else datetime.now().date()
+            )
+            for code in unique_codes
+        }
+        start_date_by_code = {
+            code: target_date_by_code[code] - timedelta(
+                days=int(requested_days_by_code[code] * 1.8) + 10
+            )
+            for code in unique_codes
+        }
+        candidate_by_code = {
+            code: self._daily_cache_code_candidates(code)
+            for code in unique_codes
+        }
+        all_candidates = list(dict.fromkeys(
+            candidate
+            for candidates in candidate_by_code.values()
+            for candidate in candidates
+        ))
+        if not all_candidates:
+            return {}
+
+        rows_by_candidate = self.repo.db.get_daily_data_range_by_codes(
+            all_candidates,
+            min(start_date_by_code.values()),
+            max(target_date_by_code.values()),
+        )
+        histories: Dict[str, Dict[str, Any]] = {}
+        for stock_code in unique_codes:
+            requested_days = requested_days_by_code[stock_code]
+            target_date = target_date_by_code[stock_code]
+            start_date = start_date_by_code[stock_code]
+            required_rows = requested_days if require_fresh else 1
+
+            def row_date(row: Dict[str, Any]) -> Optional[date]:
+                return self._normalize_daily_cache_date(row.get("date"))
+
+            if allow_partial:
+                merged_bars: Dict[date, Dict[str, Any]] = {}
+                for candidate in candidate_by_code.get(stock_code, []):
+                    for row in rows_by_candidate.get(candidate, []):
+                        current_date = row_date(row)
+                        if not current_date or current_date < start_date or current_date > target_date:
+                            continue
+                        if current_date not in merged_bars or candidate == stock_code:
+                            merged_bars[current_date] = row
+                selected_rows = [
+                    merged_bars[current_date]
+                    for current_date in sorted(merged_bars.keys())[-requested_days:]
+                ]
+                if selected_rows:
+                    histories[stock_code] = self._build_daily_history_cache_payload(
+                        stock_code,
+                        selected_rows,
+                    )
+                continue
+
+            for candidate in candidate_by_code.get(stock_code, []):
+                rows = [
+                    row
+                    for row in rows_by_candidate.get(candidate, [])
+                    for current_date in [row_date(row)]
+                    if current_date and start_date <= current_date <= target_date
+                ]
+                if len(rows) < required_rows:
+                    continue
+                selected_rows = rows[-requested_days:]
+                latest_date = row_date(selected_rows[-1]) if selected_rows else None
+                if require_fresh and latest_date and latest_date < target_date:
+                    continue
+                histories[stock_code] = self._build_daily_history_cache_payload(
+                    stock_code,
+                    selected_rows,
+                )
+                break
+        return histories
+
+    def _build_daily_history_cache_payload(
+        self,
+        stock_code: str,
+        rows: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        return {
+            "stock_code": stock_code,
+            "stock_name": self._get_local_stock_name(stock_code),
+            "period": "daily",
+            "data": [
+                {
+                    **row,
+                    "date": row["date"].isoformat() if isinstance(row.get("date"), date) else row.get("date"),
+                }
+                for row in rows
+            ],
+            "data_source": "db_cache",
+            **_get_realtime_quote_snapshot_info(),
+        }
 
     @staticmethod
     def _parse_optional_date(value: Optional[str]) -> Optional[date]:

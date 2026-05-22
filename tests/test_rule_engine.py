@@ -1,12 +1,16 @@
 import json
+import sqlite3
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from unittest import mock
 
+from sqlalchemy.exc import OperationalError
+
+import src.services.rule_service as rule_service_module
 from src.rules.engine import evaluate_rule, evaluate_rule_history
 from src.rules.metrics import build_metric_frame, get_metric_registry
-from src.repositories.rule_repo import RuleRepository
+from src.repositories.rule_repo import RuleRepository, encode_rule_batch_metadata
 from src.services.rule_service import RuleService, RuleValidationError
 from src.storage import DatabaseManager, StockRule, StockRuleMatch, StockRuleRun
 
@@ -342,6 +346,91 @@ def test_rule_repository_previous_live_match_signature_skips_non_live_runs():
             "run_ids": [live_run_id],
             "keys": (("2026-05-08", rule_id, "300274.SZ"),),
         }
+    finally:
+        DatabaseManager.reset_instance()
+
+
+def test_rule_repository_uses_database_retry_runner_for_run_writes():
+    db = mock.Mock()
+    db._run_write_transaction.return_value = 42
+    repo = RuleRepository(db)
+
+    def write_operation(_session):
+        return 0
+
+    result = repo._run_write_transaction("stock_rule_run.test", write_operation)
+
+    assert result == 42
+    db._run_write_transaction.assert_called_once_with("stock_rule_run.test", write_operation)
+
+
+def test_rule_repository_fail_stale_running_runs_marks_only_old_running_runs():
+    DatabaseManager.reset_instance()
+    db = DatabaseManager(db_url="sqlite:///:memory:")
+    now = datetime(2026, 5, 8, 15, 0, 0)
+    try:
+        repo = RuleRepository(db)
+        with db.get_session() as session:
+            rule = StockRule(
+                name="放量观察",
+                period="daily",
+                lookback_days=120,
+                target_scope="custom",
+                target_codes_json="[]",
+                definition_json="{}",
+            )
+            session.add(rule)
+            session.commit()
+            session.refresh(rule)
+
+            old_run = StockRuleRun(
+                rule_id=rule.id,
+                status="running",
+                target_count=120,
+                match_count=0,
+                started_at=now - timedelta(hours=7),
+                error=encode_rule_batch_metadata(
+                    [rule.id],
+                    ["放量观察"],
+                    [],
+                    completed_count=80,
+                    run_key="same-snapshot",
+                ),
+            )
+            recent_run = StockRuleRun(
+                rule_id=rule.id,
+                status="running",
+                target_count=120,
+                match_count=0,
+                started_at=now - timedelta(minutes=30),
+            )
+            completed_run = StockRuleRun(
+                rule_id=rule.id,
+                status="completed",
+                target_count=120,
+                match_count=0,
+                started_at=now - timedelta(hours=8),
+            )
+            session.add_all([old_run, recent_run, completed_run])
+            session.commit()
+            session.refresh(old_run)
+            session.refresh(recent_run)
+            session.refresh(completed_run)
+            old_run_id = old_run.id
+            recent_run_id = recent_run.id
+            completed_run_id = completed_run.id
+
+        cleaned = repo.fail_stale_running_runs(now=now, stale_after=timedelta(hours=6))
+
+        assert cleaned == 1
+        old_item = repo.get_run(old_run_id)
+        recent_item = repo.get_run(recent_run_id)
+        completed_item = repo.get_run(completed_run_id)
+        assert old_item["status"] == "failed"
+        assert old_item["completed_count"] == 80
+        assert "运行超时" in old_item["error"]
+        assert recent_item["status"] == "running"
+        assert completed_item["status"] == "completed"
     finally:
         DatabaseManager.reset_instance()
 
@@ -936,6 +1025,37 @@ class _CountingStockService(_FakeStockService):
         return {}
 
 
+class _BatchHistoryOnlyStockService(_FakeStockService):
+    def __init__(self):
+        self.batch_history_calls = []
+        self.per_stock_history_calls = []
+
+    def get_daily_history_cache_batch(self, stock_codes, days_by_code, *, data_policy="snapshot_only"):
+        self.batch_history_calls.append({
+            "stock_codes": list(stock_codes),
+            "days_by_code": dict(days_by_code),
+            "data_policy": data_policy,
+        })
+        return {
+            code: {
+                "stock_code": code,
+                "stock_name": "测试股票",
+                "period": "daily",
+                "data": [
+                    {"date": "2026-04-01", "open": 10, "high": 11, "low": 9, "close": 10, "volume": 1000, "amount": 10000, "pct_chg": 0},
+                    {"date": "2026-04-02", "open": 10, "high": 16, "low": 10, "close": 15, "volume": 3000, "amount": 45000, "pct_chg": 50},
+                    {"date": "2026-04-03", "open": 15, "high": 15, "low": 9, "close": 10, "volume": 1200, "amount": 12000, "pct_chg": -33.33},
+                ],
+                "data_source": "db_cache",
+            }
+            for code in stock_codes
+        }
+
+    def get_history_data(self, stock_code, period="daily", days=30, data_policy="default"):
+        self.per_stock_history_calls.append((stock_code, period, days, data_policy))
+        raise AssertionError("rule scan should use preloaded batch history")
+
+
 def test_rule_service_run_modes_separate_latest_from_history():
     repo = _FakeRuleRepo(_service_rule_for_run_mode())
     service = RuleService(repo=repo, stock_service=_FakeStockService())
@@ -1134,6 +1254,133 @@ def test_rule_service_async_batch_updates_completed_stock_progress():
     assert [item["completed_count"] for item in repo.progress_updates] == [1, 2]
     assert repo.finished_status == "completed"
     assert len(repo.finished_matches) == 4
+
+
+def test_rule_service_async_batch_skips_locked_progress_and_finishes_run():
+    class LockedOnceProgressRepo(_ProgressRuleRepo):
+        def __init__(self, rules):
+            super().__init__(rules)
+            self.progress_attempts = 0
+
+        def update_run_progress(self, **kwargs):
+            self.progress_attempts += 1
+            if self.progress_attempts == 1:
+                raise OperationalError(
+                    "BEGIN IMMEDIATE",
+                    None,
+                    sqlite3.OperationalError("database is locked"),
+                )
+            super().update_run_progress(**kwargs)
+
+    rule = _service_rule_for_codes(["600519", "000001"])
+    repo = LockedOnceProgressRepo([rule])
+    service = RuleService(repo=repo, stock_service=_FakeStockService())
+    service._resolve_run_workers = lambda target_count: 1
+
+    _response, context = service.start_run_rules(
+        [1],
+        mode="history",
+        target_override={"scope": "custom", "stock_codes": ["600519", "000001"]},
+    )
+    service.complete_started_run_rules(**context)
+
+    assert repo.progress_attempts == 2
+    assert [item["completed_count"] for item in repo.progress_updates] == [2]
+    assert repo.finished_status == "completed"
+    assert len(repo.finished_matches) == 2
+
+
+def test_rule_service_async_batch_cleans_stale_runs_before_starting_new_run():
+    class CleanupRuleRepo(_ProgressRuleRepo):
+        def __init__(self, rules):
+            super().__init__(rules)
+            self.cleaned_stale_runs = False
+
+        def fail_stale_running_runs(self):
+            self.cleaned_stale_runs = True
+            return 1
+
+    rule = _service_rule_for_codes(["600519"])
+    repo = CleanupRuleRepo([rule])
+    service = RuleService(repo=repo, stock_service=_FakeStockService())
+
+    response, context = service.start_run_rules(
+        [1],
+        mode="history",
+        target_override={"scope": "custom", "stock_codes": ["600519"]},
+    )
+
+    assert response["status"] == "running"
+    assert context is not None
+    assert repo.cleaned_stale_runs is True
+
+
+def test_rule_service_async_batch_throttles_large_progress_and_keeps_run_metadata():
+    codes = [f"600{index:03d}" for index in range(120)]
+    rule = _service_rule_for_codes(codes)
+    repo = _ProgressRuleRepo([rule])
+    service = RuleService(repo=repo, stock_service=_FakeStockService())
+    service._resolve_run_workers = lambda target_count: 1
+
+    response, context = service.start_run_rules(
+        [1],
+        mode="history",
+        target_override={"scope": "custom", "stock_codes": codes},
+    )
+    service.complete_started_run_rules(**context)
+
+    assert response["status"] == "running"
+    assert [item["completed_count"] for item in repo.progress_updates] == [100, 120]
+    assert all((item.get("metadata") or {}).get("run_key") for item in repo.progress_updates)
+    assert repo.finished_status == "completed"
+    assert len(repo.finished_matches) == 120
+
+
+def test_rule_service_async_batch_uses_larger_progress_step_for_full_market_like_runs():
+    codes = [f"600{index:03d}" for index in range(600)]
+    rule = _service_rule_for_codes(codes)
+    repo = _ProgressRuleRepo([rule])
+    service = RuleService(repo=repo, stock_service=_FakeStockService())
+    service._resolve_run_workers = lambda target_count: 1
+    service._resolve_progress_min_interval_seconds = lambda target_count, batch_size: 0.0
+
+    _response, context = service.start_run_rules(
+        [1],
+        mode="history",
+        target_override={"scope": "custom", "stock_codes": codes},
+    )
+    service.complete_started_run_rules(**context)
+
+    assert [item["completed_count"] for item in repo.progress_updates] == [500, 600]
+    assert repo.finished_status == "completed"
+    assert len(repo.finished_matches) == 600
+
+
+def test_rule_service_async_batch_reuses_preloaded_history_cache():
+    rule_service_module._RULE_RUN_HISTORY_CACHE.clear()
+    try:
+        codes = ["600519", "000001"]
+        rule = _service_rule_for_codes(codes)
+        repo = _ProgressRuleRepo([rule])
+        stock_service = _BatchHistoryOnlyStockService()
+        service = RuleService(repo=repo, stock_service=stock_service)
+        service._resolve_run_workers = lambda target_count: 1
+
+        for _ in range(2):
+            _response, context = service.start_run_rules(
+                [1],
+                mode="history",
+                target_override={"scope": "custom", "stock_codes": codes},
+                data_policy="snapshot_only",
+            )
+            service.complete_started_run_rules(**context)
+
+        assert len(stock_service.batch_history_calls) == 1
+        assert stock_service.per_stock_history_calls == []
+        assert repo.finished_status == "completed"
+        assert len(repo.finished_matches) == 2
+    finally:
+        rule_service_module._RULE_RUN_HISTORY_CACHE.clear()
 
 
 def test_rule_service_async_batch_reuses_history_and_skips_chip_for_light_rules():

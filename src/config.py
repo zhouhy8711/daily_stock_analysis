@@ -668,6 +668,8 @@ class Config:
     sqlite_busy_timeout_ms: int = 5000
     sqlite_write_retry_max: int = 3
     sqlite_write_retry_base_delay: float = 0.1
+    rule_progress_batch_size: int = 500
+    rule_progress_min_interval_seconds: float = 5.0
 
     # 是否保存分析上下文快照（用于历史回溯）
     save_context_snapshot: bool = True
@@ -1379,6 +1381,18 @@ class Config:
                 os.getenv('SQLITE_WRITE_RETRY_BASE_DELAY'),
                 0.1,
                 field_name='SQLITE_WRITE_RETRY_BASE_DELAY',
+                minimum=0.0,
+            ),
+            rule_progress_batch_size=parse_env_int(
+                os.getenv('RULE_PROGRESS_BATCH_SIZE'),
+                500,
+                field_name='RULE_PROGRESS_BATCH_SIZE',
+                minimum=1,
+            ),
+            rule_progress_min_interval_seconds=parse_env_float(
+                os.getenv('RULE_PROGRESS_MIN_INTERVAL_SECONDS'),
+                5.0,
+                field_name='RULE_PROGRESS_MIN_INTERVAL_SECONDS',
                 minimum=0.0,
             ),
             save_context_snapshot=os.getenv('SAVE_CONTEXT_SNAPSHOT', 'true').lower() == 'true',

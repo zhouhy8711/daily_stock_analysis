@@ -4,12 +4,17 @@
 from __future__ import annotations
 
 import logging
+import hashlib
+import json
+import threading
 import time
+from contextlib import nullcontext
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import pandas as pd
+from sqlalchemy.exc import OperationalError
 
 from src.config import get_config
 from src.core import trading_calendar
@@ -52,6 +57,15 @@ MAX_RULE_TARGET_CODES = 10000
 RUN_MODES = {"latest", "history"}
 DATA_POLICIES = {"default", "snapshot_only", "cache_only", "db_only"}
 DEFAULT_RULE_RUN_WORKERS = 3
+LIVE_SNAPSHOT_READY_TARGET_THRESHOLD = 1000
+RULE_PROGRESS_EVERY_STOCK_LIMIT = 50
+RULE_PROGRESS_BATCH_SIZE = 500
+RULE_PROGRESS_MEDIUM_BATCH_SIZE = 100
+RULE_PROGRESS_MIN_INTERVAL_SECONDS = 5.0
+RULE_RUN_HISTORY_CACHE_TTL_SECONDS = 15 * 60
+RULE_RUN_HISTORY_CACHE_MAX_ENTRIES = 8
+_RULE_RUN_HISTORY_CACHE_LOCK = threading.RLock()
+_RULE_RUN_HISTORY_CACHE: Dict[str, Dict[str, Any]] = {}
 
 
 def _model_to_dict(value: Any) -> Dict[str, Any]:
@@ -436,7 +450,7 @@ class RuleService:
         start_date: Any = None,
         end_date: Any = None,
         data_policy: str = "default",
-    ) -> tuple[Dict[str, Any], Dict[str, Any]]:
+    ) -> tuple[Dict[str, Any], Optional[Dict[str, Any]]]:
         normalized_rule_ids = [int(rule_id) for rule_id in rule_ids if int(rule_id) > 0]
         if not normalized_rule_ids:
             raise RuleValidationError("至少选择一条规则")
@@ -444,6 +458,7 @@ class RuleService:
         run_mode = self._normalize_run_mode(mode)
         run_data_policy = self._normalize_data_policy(data_policy)
         date_from, date_to = self._normalize_date_range(start_date, end_date)
+        self._cleanup_stale_running_runs()
         prepared = [
             (rule_id, *self._prepare_rule_run(rule_id, target_override))
             for rule_id in normalized_rule_ids
@@ -451,7 +466,58 @@ class RuleService:
         primary_rule_id = prepared[0][0]
         rule_names = [str(rule.get("name") or f"规则 {rule_id}") for rule_id, rule, _, _ in prepared]
         stock_codes = self._resolve_batch_stock_codes(prepared)
-        self._validate_live_snapshot_session(run_mode, run_data_policy, stock_codes)
+        require_snapshot_ready = self._requires_live_snapshot_ready(prepared, run_mode, run_data_policy)
+        snapshot_metadata = self._validate_live_snapshot_session(
+            run_mode,
+            run_data_policy,
+            stock_codes,
+            require_snapshot_ready=require_snapshot_ready,
+        )
+        run_key = self._build_batch_run_key(
+            normalized_rule_ids,
+            run_mode,
+            run_data_policy,
+            date_from,
+            date_to,
+            stock_codes,
+            snapshot_metadata.get("snapshot_id"),
+        )
+        reusable_run_getter = getattr(self.repo, "find_reusable_run_by_key", None)
+        reusable_run = reusable_run_getter(run_key) if callable(reusable_run_getter) else None
+        if reusable_run is not None:
+            response = {
+                "run_id": reusable_run["id"],
+                "rule_id": reusable_run["rule_id"],
+                "rule_ids": reusable_run.get("rule_ids") or normalized_rule_ids,
+                "rule_names": reusable_run.get("rule_names") or rule_names,
+                "status": reusable_run["status"],
+                "target_count": reusable_run.get("target_count", len(stock_codes)),
+                "completed_count": reusable_run.get("completed_count", 0),
+                "match_count": reusable_run.get("match_count", 0),
+                "event_count": reusable_run.get("event_count", 0),
+                "mode": run_mode,
+                "duration_ms": reusable_run.get("duration_ms") or 0,
+                "matches": [],
+                "errors": [reusable_run["error"]] if reusable_run.get("error") else [],
+                "reused_run": True,
+                **snapshot_metadata,
+            }
+            logger.info(
+                "异步批量规则回测复用已有任务: run_id=%s, status=%s, rules=%s, target_count=%s, mode=%s",
+                response["run_id"],
+                response["status"],
+                normalized_rule_ids,
+                len(stock_codes),
+                run_mode,
+            )
+            return response, None
+
+        batch_metadata = {
+            "run_key": run_key,
+            "mode": run_mode,
+            "data_policy": run_data_policy,
+            **snapshot_metadata,
+        }
         run_id = self.repo.create_run(
             primary_rule_id,
             len(stock_codes),
@@ -460,6 +526,7 @@ class RuleService:
                 rule_names,
                 [],
                 completed_count=0,
+                **batch_metadata,
             ),
         )
         started_at = datetime.now()
@@ -484,6 +551,8 @@ class RuleService:
             "duration_ms": 0,
             "matches": [],
             "errors": [],
+            "reused_run": False,
+            **snapshot_metadata,
         }
         context = {
             "run_id": run_id,
@@ -497,8 +566,21 @@ class RuleService:
             "date_to": date_to,
             "data_policy": run_data_policy,
             "started_at": started_at,
+            "batch_metadata": batch_metadata,
         }
         return response, context
+
+    def _cleanup_stale_running_runs(self) -> None:
+        cleanup = getattr(self.repo, "fail_stale_running_runs", None)
+        if not callable(cleanup):
+            return
+        try:
+            cleaned = int(cleanup() or 0)
+        except Exception as exc:
+            logger.warning("清理超时规则实测任务失败: %s", exc)
+            return
+        if cleaned:
+            logger.info("已清理超时规则实测任务: count=%s", cleaned)
 
     def complete_started_run_rules(
         self,
@@ -514,56 +596,61 @@ class RuleService:
         date_to: Optional[date],
         data_policy: str,
         started_at: datetime,
+        batch_metadata: Optional[Dict[str, Any]] = None,
     ) -> None:
-        try:
-            all_matches, all_errors = self._execute_batch_scan_by_stock(
-                run_id,
-                prepared,
-                stock_codes,
-                run_mode,
-                date_from,
-                date_to,
-                data_policy,
-                rule_ids,
-                rule_names,
-            )
-            status = "completed" if not all_errors else "partial"
-            self.repo.finish_run(
-                run_id=run_id,
-                rule_id=primary_rule_id,
-                status=status,
-                started_at=started_at,
-                matches=all_matches,
-                error=encode_rule_batch_metadata(
+        with self._maybe_pause_realtime_quote_archive(run_mode, data_policy, stock_codes):
+            try:
+                all_matches, all_errors = self._execute_batch_scan_by_stock(
+                    run_id,
+                    prepared,
+                    stock_codes,
+                    run_mode,
+                    date_from,
+                    date_to,
+                    data_policy,
                     rule_ids,
                     rule_names,
-                    all_errors,
-                    completed_count=len(stock_codes),
-                ),
-            )
-            logger.info(
-                "异步批量规则回测完成: run_id=%s, status=%s, matched_stocks=%s, matched_events=%s, errors=%s",
-                run_id,
-                status,
-                len(all_matches),
-                self._count_match_events(all_matches),
-                len(all_errors),
-            )
-        except Exception as exc:
-            logger.error("异步批量规则回测失败: run_id=%s, error=%s", run_id, exc, exc_info=True)
-            self.repo.finish_run(
-                run_id=run_id,
-                rule_id=primary_rule_id,
-                status="failed",
-                started_at=started_at,
-                matches=[],
-                error=encode_rule_batch_metadata(
-                    rule_ids,
-                    rule_names,
-                    [type(exc).__name__],
-                    completed_count=0,
-                ),
-            )
+                    batch_metadata,
+                )
+                status = "completed" if not all_errors else "partial"
+                self.repo.finish_run(
+                    run_id=run_id,
+                    rule_id=primary_rule_id,
+                    status=status,
+                    started_at=started_at,
+                    matches=all_matches,
+                    error=encode_rule_batch_metadata(
+                        rule_ids,
+                        rule_names,
+                        all_errors,
+                        completed_count=len(stock_codes),
+                        **(batch_metadata or {}),
+                    ),
+                )
+                logger.info(
+                    "异步批量规则回测完成: run_id=%s, status=%s, matched_stocks=%s, matched_events=%s, errors=%s",
+                    run_id,
+                    status,
+                    len(all_matches),
+                    self._count_match_events(all_matches),
+                    len(all_errors),
+                )
+            except Exception as exc:
+                logger.error("异步批量规则回测失败: run_id=%s, error=%s", run_id, exc, exc_info=True)
+                self.repo.finish_run(
+                    run_id=run_id,
+                    rule_id=primary_rule_id,
+                    status="failed",
+                    started_at=started_at,
+                    matches=[],
+                    error=encode_rule_batch_metadata(
+                        rule_ids,
+                        rule_names,
+                        [type(exc).__name__],
+                        completed_count=0,
+                        **(batch_metadata or {}),
+                    ),
+                )
 
     def _prepare_rule_run(
         self,
@@ -637,15 +724,29 @@ class RuleService:
         data_policy: str,
         rule_ids: List[int],
         rule_names: List[str],
+        batch_metadata: Optional[Dict[str, Any]] = None,
     ) -> tuple[List[Dict[str, Any]], List[str]]:
         worker_count = self._resolve_run_workers(len(stock_codes))
         rule_stock_sets = {
             rule_id: set(rule_stock_codes)
             for rule_id, _rule, _definition, rule_stock_codes in prepared
         }
+        scan_cache = self._prepare_batch_scan_cache(
+            prepared,
+            stock_codes,
+            rule_stock_sets,
+            run_mode,
+            date_from,
+            data_policy,
+        )
         ordered_matches: List[List[Dict[str, Any]]] = [[] for _ in stock_codes]
         ordered_errors: List[List[str]] = [[] for _ in stock_codes]
         completed_count = 0
+        target_count = len(stock_codes)
+        progress_batch_size = self._resolve_progress_batch_size(target_count)
+        progress_min_interval_seconds = self._resolve_progress_min_interval_seconds(target_count, progress_batch_size)
+        last_progress_count = 0
+        last_progress_update_at = time.monotonic()
 
         logger.info(
             "异步批量规则回测后台执行: run_id=%s, rules=%s, target_count=%s, workers=%s",
@@ -656,13 +757,48 @@ class RuleService:
         )
 
         if not stock_codes:
-            self.repo.update_run_progress(
+            self._update_run_progress_best_effort(
                 run_id=run_id,
                 rule_ids=rule_ids,
                 rule_names=rule_names,
                 completed_count=0,
+                target_count=0,
+                metadata=batch_metadata,
             )
             return [], []
+
+        def should_update_progress(count: int) -> bool:
+            if progress_batch_size <= 1 or count >= target_count:
+                return True
+            elapsed_seconds = time.monotonic() - last_progress_update_at
+            if progress_min_interval_seconds > 0 and elapsed_seconds < progress_min_interval_seconds:
+                return False
+            if count - last_progress_count >= progress_batch_size:
+                return True
+            return (
+                progress_min_interval_seconds > 0
+                and count > last_progress_count
+                and elapsed_seconds >= progress_min_interval_seconds
+            )
+
+        def update_progress(count: int) -> None:
+            nonlocal last_progress_count, last_progress_update_at
+            current_errors = [
+                error
+                for stock_errors in ordered_errors
+                for error in stock_errors
+            ]
+            self._update_run_progress_best_effort(
+                run_id=run_id,
+                rule_ids=rule_ids,
+                rule_names=rule_names,
+                completed_count=count,
+                target_count=target_count,
+                errors=current_errors,
+                metadata=batch_metadata,
+            )
+            last_progress_count = count
+            last_progress_update_at = time.monotonic()
 
         def execute_stock(index: int, stock_code: str) -> tuple[int, List[Dict[str, Any]], List[str]]:
             stock_matches: List[Dict[str, Any]] = []
@@ -682,6 +818,7 @@ class RuleService:
                     run_mode,
                     date_from,
                     data_policy,
+                    scan_cache=scan_cache,
                 )
             except RuleDataUnavailable as exc:
                 logger.info(
@@ -754,23 +891,200 @@ class RuleService:
                     )
                     ordered_errors[index] = [f"{stock_code}:{type(exc).__name__}"]
                 completed_count += 1
-                current_errors = [
-                    error
-                    for stock_errors in ordered_errors
-                    for error in stock_errors
-                ]
-                self.repo.update_run_progress(
-                    run_id=run_id,
-                    rule_ids=rule_ids,
-                    rule_names=rule_names,
-                    completed_count=completed_count,
-                    errors=current_errors,
-                )
+                if should_update_progress(completed_count):
+                    update_progress(completed_count)
 
         return (
             [match for stock_matches in ordered_matches for match in stock_matches],
             [error for stock_errors in ordered_errors for error in stock_errors],
         )
+
+    def _maybe_pause_realtime_quote_archive(
+        self,
+        run_mode: str,
+        data_policy: str,
+        stock_codes: List[str],
+    ):
+        if (
+            run_mode != "latest"
+            or data_policy != "snapshot_only"
+            or len(stock_codes) < LIVE_SNAPSHOT_READY_TARGET_THRESHOLD
+        ):
+            return nullcontext()
+        pauser = getattr(self.stock_service, "pause_realtime_quote_intraday_archive", None)
+        if not callable(pauser):
+            return nullcontext()
+        return pauser("rule_live_scan")
+
+    def _prepare_batch_scan_cache(
+        self,
+        prepared: List[tuple[int, Dict[str, Any], Dict[str, Any], List[str]]],
+        stock_codes: List[str],
+        rule_stock_sets: Dict[int, Set[str]],
+        run_mode: str,
+        start_date: Optional[date],
+        data_policy: str,
+    ) -> Dict[str, Any]:
+        if not stock_codes:
+            return {}
+        days_by_code = self._resolve_batch_history_days_by_stock(
+            prepared,
+            stock_codes,
+            rule_stock_sets,
+            start_date,
+        )
+        history_data_policy = data_policy if data_policy in {"snapshot_only", "cache_only", "db_only"} else "default"
+        history_by_code = self._get_or_load_rule_history_cache(
+            stock_codes,
+            days_by_code,
+            history_data_policy,
+        )
+        quote_by_code = (
+            self._load_batch_quote_cache(stock_codes, data_policy)
+            if run_mode == "latest"
+            else {}
+        )
+        logger.info(
+            "规则实测数据预热完成: stocks=%s history_hit=%s quote_hit=%s mode=%s policy=%s",
+            len(stock_codes),
+            len(history_by_code),
+            len(quote_by_code),
+            run_mode,
+            data_policy,
+        )
+        return {
+            "history_by_code": history_by_code,
+            "quote_by_code": quote_by_code,
+            "indicator_metrics_by_code": {},
+            "days_by_code": days_by_code,
+        }
+
+    def _resolve_batch_history_days_by_stock(
+        self,
+        prepared: List[tuple[int, Dict[str, Any], Dict[str, Any], List[str]]],
+        stock_codes: List[str],
+        rule_stock_sets: Dict[int, Set[str]],
+        start_date: Optional[date],
+    ) -> Dict[str, int]:
+        days_by_code: Dict[str, int] = {}
+        for stock_code in stock_codes:
+            lookback_days = 1
+            for rule_id, rule, definition, _rule_stock_codes in prepared:
+                if stock_code not in rule_stock_sets.get(rule_id, set()):
+                    continue
+                lookback_days = max(
+                    lookback_days,
+                    self._resolve_history_fetch_days(definition, rule, start_date),
+                )
+            days_by_code[stock_code] = lookback_days
+        return days_by_code
+
+    def _get_or_load_rule_history_cache(
+        self,
+        stock_codes: List[str],
+        days_by_code: Dict[str, int],
+        data_policy: str,
+    ) -> Dict[str, Dict[str, Any]]:
+        loader = getattr(self.stock_service, "get_daily_history_cache_batch", None)
+        if not callable(loader):
+            return {}
+        if data_policy not in {"snapshot_only", "cache_only", "db_only"}:
+            history_by_code = loader(stock_codes, days_by_code, data_policy=data_policy)
+            return self._copy_history_cache({
+                str(code or "").strip().upper(): payload
+                for code, payload in (history_by_code or {}).items()
+                if payload
+            })
+        cache_key = self._build_rule_history_cache_key(stock_codes, days_by_code, data_policy)
+        now = time.monotonic()
+        with _RULE_RUN_HISTORY_CACHE_LOCK:
+            self._prune_rule_history_cache(now)
+            cached = _RULE_RUN_HISTORY_CACHE.get(cache_key)
+            if cached is not None:
+                cached["last_used_at"] = now
+                return self._copy_history_cache(cached.get("history_by_code") or {})
+
+        history_by_code = loader(stock_codes, days_by_code, data_policy=data_policy)
+        normalized_history = {
+            str(code or "").strip().upper(): payload
+            for code, payload in (history_by_code or {}).items()
+            if payload
+        }
+        with _RULE_RUN_HISTORY_CACHE_LOCK:
+            _RULE_RUN_HISTORY_CACHE[cache_key] = {
+                "created_at": now,
+                "last_used_at": now,
+                "history_by_code": self._copy_history_cache(normalized_history),
+            }
+            self._prune_rule_history_cache(now)
+        return self._copy_history_cache(normalized_history)
+
+    @staticmethod
+    def _build_rule_history_cache_key(
+        stock_codes: List[str],
+        days_by_code: Dict[str, int],
+        data_policy: str,
+    ) -> str:
+        normalized_codes = [str(code or "").strip().upper() for code in stock_codes]
+        payload = {
+            "codes": normalized_codes,
+            "days": {code: int(days_by_code.get(code) or 0) for code in normalized_codes},
+            "data_policy": data_policy,
+        }
+        raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _prune_rule_history_cache(now: Optional[float] = None) -> None:
+        current = time.monotonic() if now is None else now
+        expired_keys = [
+            key
+            for key, entry in _RULE_RUN_HISTORY_CACHE.items()
+            if current - float(entry.get("created_at") or 0) > RULE_RUN_HISTORY_CACHE_TTL_SECONDS
+        ]
+        for key in expired_keys:
+            _RULE_RUN_HISTORY_CACHE.pop(key, None)
+        while len(_RULE_RUN_HISTORY_CACHE) > RULE_RUN_HISTORY_CACHE_MAX_ENTRIES:
+            oldest_key = min(
+                _RULE_RUN_HISTORY_CACHE,
+                key=lambda item: float(_RULE_RUN_HISTORY_CACHE[item].get("last_used_at") or 0),
+            )
+            _RULE_RUN_HISTORY_CACHE.pop(oldest_key, None)
+
+    @staticmethod
+    def _copy_history_cache(history_by_code: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+        copied: Dict[str, Dict[str, Any]] = {}
+        for code, payload in history_by_code.items():
+            data_rows = payload.get("data") or []
+            copied[code] = {
+                **payload,
+                "data": [dict(row) for row in data_rows if isinstance(row, dict)],
+            }
+        return copied
+
+    def _load_batch_quote_cache(
+        self,
+        stock_codes: List[str],
+        data_policy: str,
+    ) -> Dict[str, Dict[str, Any]]:
+        getter = getattr(self.stock_service, "get_realtime_quotes", None)
+        if not callable(getter):
+            return {}
+        try:
+            response = getter(stock_codes, data_policy=data_policy)
+        except TypeError as exc:
+            if "data_policy" not in str(exc):
+                raise
+            response = getter(stock_codes)
+        items = response.get("items") if isinstance(response, dict) else []
+        quote_by_code: Dict[str, Dict[str, Any]] = {}
+        for item in items or []:
+            if not isinstance(item, dict):
+                continue
+            code = str(item.get("stock_code") or item.get("code") or "").strip().upper()
+            if code:
+                quote_by_code[code] = dict(item)
+        return quote_by_code
 
     def _execute_rule_scan(
         self,
@@ -836,6 +1150,85 @@ class RuleService:
         return (
             [match for match in ordered_matches if match],
             [error for error in ordered_errors if error],
+        )
+
+    @staticmethod
+    def _resolve_progress_batch_size(target_count: int) -> int:
+        if target_count <= 0:
+            return 1
+        if target_count <= RULE_PROGRESS_EVERY_STOCK_LIMIT:
+            return 1
+        try:
+            configured_batch_size = int(
+                getattr(get_config(), "rule_progress_batch_size", RULE_PROGRESS_BATCH_SIZE)
+                or RULE_PROGRESS_BATCH_SIZE
+            )
+        except Exception:
+            configured_batch_size = RULE_PROGRESS_BATCH_SIZE
+        configured_batch_size = max(1, configured_batch_size)
+        if target_count <= configured_batch_size:
+            return min(RULE_PROGRESS_MEDIUM_BATCH_SIZE, target_count)
+        return min(configured_batch_size, target_count)
+
+    @staticmethod
+    def _resolve_progress_min_interval_seconds(target_count: int, batch_size: int) -> float:
+        if (
+            target_count <= RULE_PROGRESS_EVERY_STOCK_LIMIT
+            or target_count <= batch_size
+            or target_count <= RULE_PROGRESS_BATCH_SIZE
+        ):
+            return 0.0
+        try:
+            return max(0.0, float(
+                getattr(get_config(), "rule_progress_min_interval_seconds", RULE_PROGRESS_MIN_INTERVAL_SECONDS)
+                or 0.0
+            ))
+        except Exception:
+            return RULE_PROGRESS_MIN_INTERVAL_SECONDS
+
+    def _update_run_progress_best_effort(
+        self,
+        *,
+        run_id: int,
+        rule_ids: List[int],
+        rule_names: List[str],
+        completed_count: int,
+        target_count: int,
+        errors: Optional[List[str]] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        try:
+            self.repo.update_run_progress(
+                run_id=run_id,
+                rule_ids=rule_ids,
+                rule_names=rule_names,
+                completed_count=completed_count,
+                errors=errors,
+                metadata=metadata,
+            )
+        except OperationalError as exc:
+            if self._is_sqlite_locked_error(exc):
+                logger.warning(
+                    "规则实测进度写入遇到 SQLite 写锁，跳过本次刷新: run_id=%s completed=%s/%s",
+                    run_id,
+                    completed_count,
+                    target_count,
+                )
+                return
+            raise
+
+    def _is_sqlite_locked_error(self, exc: OperationalError) -> bool:
+        checker = getattr(getattr(self.repo, "db", None), "_is_sqlite_locked_error", None)
+        if callable(checker):
+            return bool(checker(exc))
+        err_text = str(getattr(exc, "orig", exc)).lower()
+        return any(
+            token in err_text
+            for token in (
+                "database is locked",
+                "database schema is locked",
+                "database table is locked",
+            )
         )
 
     @staticmethod
@@ -933,10 +1326,16 @@ class RuleService:
             raise RuleValidationError("数据策略仅支持 default/snapshot_only/cache_only/db_only")
         return policy
 
-    @staticmethod
-    def _validate_live_snapshot_session(run_mode: str, data_policy: str, stock_codes: List[str]) -> None:
+    def _validate_live_snapshot_session(
+        self,
+        run_mode: str,
+        data_policy: str,
+        stock_codes: List[str],
+        *,
+        require_snapshot_ready: bool = False,
+    ) -> Dict[str, Any]:
         if run_mode != "latest" or data_policy != "snapshot_only":
-            return
+            return {}
 
         known_markets = {
             market
@@ -944,10 +1343,24 @@ class RuleService:
             if market
         }
         if known_markets != {"cn"}:
-            return
+            return {}
 
         if not RuleService._is_cn_live_test_allowed():
             raise RuleValidationError("A股实测仅在交易日 15:00 及以前运行，当前已超过实测时间或非交易日，实测已暂停")
+
+        snapshot_metadata = self._build_snapshot_run_metadata(stock_codes)
+        if require_snapshot_ready and (
+            not snapshot_metadata.get("snapshot_id")
+            or int(snapshot_metadata.get("quote_miss_count") or 0) > 0
+        ):
+            hit_count = int(snapshot_metadata.get("quote_hit_count") or 0)
+            miss_count = int(snapshot_metadata.get("quote_miss_count") or 0)
+            requested = hit_count + miss_count
+            raise RuleValidationError(
+                "A股全市场实测需要先完成实时行情快照预热，"
+                f"当前覆盖 {hit_count}/{requested}，请等待 09:30 后快照预热完成再运行。"
+            )
+        return snapshot_metadata
 
     @staticmethod
     def _is_cn_live_test_allowed(current_time: Optional[datetime] = None) -> bool:
@@ -959,6 +1372,44 @@ class RuleService:
         minute_of_day = market_now.hour * 60 + market_now.minute
         return minute_of_day <= 15 * 60
 
+    @staticmethod
+    def _build_batch_run_key(
+        rule_ids: List[int],
+        run_mode: str,
+        data_policy: str,
+        start_date: Optional[date],
+        end_date: Optional[date],
+        stock_codes: List[str],
+        snapshot_id: Optional[str],
+    ) -> str:
+        payload = {
+            "rule_ids": [int(rule_id) for rule_id in rule_ids],
+            "mode": run_mode,
+            "data_policy": data_policy,
+            "start_date": start_date.isoformat() if start_date else None,
+            "end_date": end_date.isoformat() if end_date else None,
+            "stock_codes": [str(code or "").strip().upper() for code in stock_codes],
+            "snapshot_id": snapshot_id,
+        }
+        raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _requires_live_snapshot_ready(
+        prepared: List[tuple[int, Dict[str, Any], Dict[str, Any], List[str]]],
+        run_mode: str,
+        data_policy: str,
+    ) -> bool:
+        if run_mode != "latest" or data_policy != "snapshot_only":
+            return False
+        stock_codes = RuleService._resolve_batch_stock_codes(prepared)
+        if len(stock_codes) >= LIVE_SNAPSHOT_READY_TARGET_THRESHOLD:
+            return True
+        return any(
+            ((definition.get("target") or {}).get("scope") == "all_a_shares")
+            for _rule_id, _rule, definition, _stock_codes in prepared
+        )
+
     def _build_snapshot_run_metadata(
         self,
         stock_codes: List[str],
@@ -969,11 +1420,7 @@ class RuleService:
         snapshot_info = snapshot_info_getter() if callable(snapshot_info_getter) else {}
         unique_codes = list(dict.fromkeys(stock_codes))
         requested = len(unique_codes)
-        snapshot_hit_count = sum(
-            1
-            for code in unique_codes
-            if self._get_stock_realtime_quote(code, data_policy="snapshot_only") is not None
-        )
+        snapshot_hit_count = len(self._load_batch_quote_cache(unique_codes, "snapshot_only"))
         snapshot_id = snapshot_info.get("snapshot_id")
         snapshot_time = snapshot_info.get("snapshot_time")
         if matches and not snapshot_id:
@@ -1571,6 +2018,8 @@ class RuleService:
         mode: str,
         start_date: Optional[date],
         data_policy: str,
+        *,
+        scan_cache: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         lookback_days_by_rule = {
             rule_id: self._resolve_history_fetch_days(definition, rule, start_date)
@@ -1578,12 +2027,14 @@ class RuleService:
         }
         lookback_days = max(lookback_days_by_rule.values()) if lookback_days_by_rule else 120
         history_data_policy = data_policy if data_policy in {"snapshot_only", "cache_only", "db_only"} else "default"
-        history = self._get_stock_history_data(
-            stock_code,
-            period="daily",
-            days=lookback_days,
-            data_policy=history_data_policy,
-        )
+        history = self._get_preloaded_history(scan_cache, stock_code, lookback_days)
+        if history is None:
+            history = self._get_stock_history_data(
+                stock_code,
+                period="daily",
+                days=lookback_days,
+                data_policy=history_data_policy,
+            )
         history_rows = history.get("data") or []
         if not history_rows:
             if data_policy in {"snapshot_only", "cache_only", "db_only"}:
@@ -1596,17 +2047,18 @@ class RuleService:
                 "lookback_days_by_rule": lookback_days_by_rule,
             }
 
-        quote = self._get_stock_quote_for_rule_run(stock_code, mode, data_policy)
+        quote = self._get_stock_quote_for_rule_run(stock_code, mode, data_policy, scan_cache=scan_cache)
         require_chip_metrics = any(
             self._definition_uses_chip_metrics(definition)
             for _rule_id, _rule, definition in rules
         )
-        indicator_metrics = self._get_indicator_metrics(
+        indicator_metrics = self._get_indicator_metrics_for_context(
             stock_code,
             history_rows,
             mode,
             data_policy,
             require_chip_metrics=require_chip_metrics,
+            scan_cache=scan_cache,
         )
         if mode == "latest" and quote is not None:
             quote = StockService._normalize_quote_payload_units(stock_code, quote) or quote
@@ -1625,20 +2077,51 @@ class RuleService:
         stock_code: str,
         mode: str,
         data_policy: str,
+        *,
+        scan_cache: Optional[Dict[str, Any]] = None,
     ) -> Optional[Dict[str, Any]]:
         if mode != "latest":
             return None
 
-        quote = (
-            self._get_stock_realtime_quote(stock_code, data_policy="snapshot_only")
-            if data_policy == "snapshot_only"
-            else self._get_stock_realtime_quote(stock_code)
-        )
+        quote = self._get_preloaded_quote(scan_cache, stock_code)
+        if quote is None:
+            quote = (
+                self._get_stock_realtime_quote(stock_code, data_policy="snapshot_only")
+                if data_policy == "snapshot_only"
+                else self._get_stock_realtime_quote(stock_code)
+            )
         if data_policy == "snapshot_only" and quote is None:
             quote = self._build_intraday_hot_table_quote(stock_code)
             if quote is None:
                 raise RuleDataUnavailable("quote_snapshot_miss")
         return quote
+
+    @staticmethod
+    def _get_preloaded_history(
+        scan_cache: Optional[Dict[str, Any]],
+        stock_code: str,
+        lookback_days: int,
+    ) -> Optional[Dict[str, Any]]:
+        history_by_code = (scan_cache or {}).get("history_by_code") or {}
+        history = history_by_code.get(str(stock_code or "").strip().upper())
+        if not history:
+            return None
+        rows = [dict(row) for row in (history.get("data") or []) if isinstance(row, dict)]
+        if not rows:
+            return None
+        return {
+            **history,
+            "data": rows[-max(1, int(lookback_days or 1)):],
+        }
+
+    @staticmethod
+    def _get_preloaded_quote(
+        scan_cache: Optional[Dict[str, Any]],
+        stock_code: str,
+    ) -> Optional[Dict[str, Any]]:
+        quote_by_code = (scan_cache or {}).get("quote_by_code") or {}
+        quote = quote_by_code.get(str(stock_code or "").strip().upper())
+        return dict(quote) if isinstance(quote, dict) else None
 
     def _evaluate_stock(
         self,
@@ -1886,6 +2369,34 @@ class RuleService:
             if local_metrics.get("chip_distribution"):
                 return local_metrics
         return self.stock_service.get_indicator_metrics(stock_code)
+
+    def _get_indicator_metrics_for_context(
+        self,
+        stock_code: str,
+        history_rows: List[Dict[str, Any]],
+        mode: str,
+        data_policy: str,
+        *,
+        require_chip_metrics: bool,
+        scan_cache: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        if not require_chip_metrics:
+            return {}
+        cache_key = str(stock_code or "").strip().upper()
+        indicator_cache = (scan_cache or {}).get("indicator_metrics_by_code")
+        if isinstance(indicator_cache, dict) and cache_key in indicator_cache:
+            cached = indicator_cache.get(cache_key)
+            return dict(cached) if isinstance(cached, dict) else {}
+        metrics = self._get_indicator_metrics(
+            stock_code,
+            history_rows,
+            mode,
+            data_policy,
+            require_chip_metrics=True,
+        )
+        if isinstance(indicator_cache, dict):
+            indicator_cache[cache_key] = dict(metrics or {})
+        return metrics
 
     def _build_history_chip_metrics(self, stock_code: str, history_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         if not history_rows:

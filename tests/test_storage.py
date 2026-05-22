@@ -325,6 +325,44 @@ class TestStorage(unittest.TestCase):
         finally:
             DatabaseManager.reset_instance()
 
+    def test_sqlite_write_transactions_use_process_lock(self):
+        DatabaseManager.reset_instance()
+        db = DatabaseManager(db_url="sqlite:///:memory:")
+        session = db.get_session()
+        connection = session.connection()
+
+        class RecordingLock:
+            def __init__(self):
+                self.active = False
+                self.observed_begin_inside_lock = False
+
+            def __enter__(self):
+                self.active = True
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                self.active = False
+                return False
+
+        lock = RecordingLock()
+        db._sqlite_write_lock = lock
+        original_exec = connection.exec_driver_sql
+
+        def exec_driver_sql(statement, *args, **kwargs):
+            if statement == "BEGIN IMMEDIATE":
+                lock.observed_begin_inside_lock = lock.active
+            return original_exec(statement, *args, **kwargs)
+
+        try:
+            with patch.object(db, "get_session", return_value=session):
+                with patch.object(connection, "exec_driver_sql", side_effect=exec_driver_sql):
+                    result = db._run_write_transaction("unit-test", lambda current_session: 9)
+
+            self.assertEqual(result, 9)
+            self.assertTrue(lock.observed_begin_inside_lock)
+        finally:
+            DatabaseManager.reset_instance()
+
     def test_stock_chip_daily_snapshots_upsert_and_read_range(self):
         DatabaseManager.reset_instance()
         db = DatabaseManager(db_url="sqlite:///:memory:")

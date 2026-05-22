@@ -5,13 +5,15 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar
 
-from sqlalchemy import delete, desc, func, or_, select
+from sqlalchemy import delete, desc, func, or_, select, update
 
 from src.storage import DatabaseManager, StockRule, StockRuleMatch, StockRuleRun
 
 RULE_BATCH_META_PREFIX = "__rule_batch_meta__:"
+RULE_STALE_RUNNING_AFTER = timedelta(hours=6)
+T = TypeVar("T")
 
 
 def _json_dumps(value: Any) -> str:
@@ -32,6 +34,7 @@ def encode_rule_batch_metadata(
     rule_names: List[str],
     errors: List[str],
     completed_count: Optional[int] = None,
+    **extra: Any,
 ) -> str:
     payload = {
         "rule_ids": rule_ids,
@@ -40,6 +43,9 @@ def encode_rule_batch_metadata(
     }
     if completed_count is not None:
         payload["completed_count"] = max(0, int(completed_count or 0))
+    for key, value in extra.items():
+        if value is not None:
+            payload[key] = value
     return RULE_BATCH_META_PREFIX + _json_dumps(payload)
 
 
@@ -52,11 +58,34 @@ def _decode_rule_batch_metadata(error: Optional[str]) -> Tuple[Dict[str, Any], O
     return metadata if isinstance(metadata, dict) else {}, public_error or None
 
 
+def _append_run_error(existing_error: Optional[str], message: str) -> str:
+    metadata, public_error = _decode_rule_batch_metadata(existing_error)
+    if metadata:
+        errors = metadata.get("errors") if isinstance(metadata.get("errors"), list) else []
+        next_errors = [str(item) for item in errors if item]
+        if message not in next_errors:
+            next_errors.append(message)
+        metadata["errors"] = next_errors
+        return RULE_BATCH_META_PREFIX + _json_dumps(metadata)
+    if public_error and message not in public_error:
+        return f"{public_error}；{message}"
+    return public_error or message
+
+
 class RuleRepository:
     """DB access layer for the stock rule domain."""
 
     def __init__(self, db_manager: Optional[DatabaseManager] = None):
         self.db = db_manager or DatabaseManager.get_instance()
+
+    def _run_write_transaction(self, operation_name: str, write_operation: Callable[[Any], T]) -> T:
+        runner = getattr(self.db, "_run_write_transaction", None)
+        if callable(runner):
+            return runner(operation_name, write_operation)
+        with self.db.get_session() as session:
+            result = write_operation(session)
+            session.commit()
+            return result
 
     @staticmethod
     def rule_to_dict(row: StockRule) -> Dict[str, Any]:
@@ -126,7 +155,33 @@ class RuleRepository:
             "started_at": row.started_at.isoformat() if row.started_at else None,
             "finished_at": row.finished_at.isoformat() if row.finished_at else None,
             "duration_ms": row.duration_ms,
+            "snapshot_id": batch_metadata.get("snapshot_id"),
+            "snapshot_time": batch_metadata.get("snapshot_time"),
+            "snapshot_age_seconds": batch_metadata.get("snapshot_age_seconds"),
+            "quote_hit_count": int(batch_metadata.get("quote_hit_count") or 0),
+            "quote_miss_count": int(batch_metadata.get("quote_miss_count") or 0),
+            "reused_run": bool(batch_metadata.get("reused_run") or False),
         }
+
+    def find_reusable_run_by_key(self, run_key: str) -> Optional[Dict[str, Any]]:
+        """Return a running or completed batch run for the same live snapshot key."""
+        if not run_key:
+            return None
+        with self.db.get_session() as session:
+            rows = session.execute(
+                select(StockRuleRun, StockRule.name)
+                .join(StockRule, StockRule.id == StockRuleRun.rule_id)
+                .where(StockRuleRun.status.in_(("running", "completed", "partial")))
+                .order_by(desc(StockRuleRun.started_at), desc(StockRuleRun.id))
+                .limit(100)
+            ).all()
+            for row, rule_name in rows:
+                metadata, _public_error = _decode_rule_batch_metadata(row.error)
+                if metadata.get("run_key") == run_key:
+                    item = self.run_to_dict(row, rule_name)
+                    item["reused_run"] = True
+                    return item
+        return None
 
     @staticmethod
     def _count_event_rows_from_snapshots(snapshot_json_values: List[Optional[str]]) -> int:
@@ -456,12 +511,13 @@ class RuleRepository:
             return True
 
     def create_run(self, rule_id: int, target_count: int, error: Optional[str] = None) -> int:
-        with self.db.get_session() as session:
+        def write(session) -> int:
             row = StockRuleRun(rule_id=rule_id, target_count=target_count, status="running", error=error)
             session.add(row)
-            session.commit()
-            session.refresh(row)
+            session.flush()
             return int(row.id)
+
+        return self._run_write_transaction("stock_rule_run.create", write)
 
     def update_run_progress(
         self,
@@ -471,18 +527,38 @@ class RuleRepository:
         rule_names: List[str],
         completed_count: int,
         errors: Optional[List[str]] = None,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> None:
-        with self.db.get_session() as session:
-            run = session.execute(select(StockRuleRun).where(StockRuleRun.id == run_id).limit(1)).scalar_one_or_none()
-            if run is None or run.status != "running":
-                return
-            run.error = encode_rule_batch_metadata(
-                rule_ids,
-                rule_names,
-                errors or [],
-                completed_count=completed_count,
+        def write(session) -> None:
+            session.execute(
+                update(StockRuleRun)
+                .where(StockRuleRun.id == run_id, StockRuleRun.status == "running")
+                .values(error=encode_rule_batch_metadata(
+                    rule_ids,
+                    rule_names,
+                    errors or [],
+                    completed_count=completed_count,
+                    **(metadata or {}),
+                ))
             )
-            session.commit()
+
+        self._run_write_transaction("stock_rule_run.progress", write)
+
+    @staticmethod
+    def _build_match_row(run_id: int, rule_id: int, match: Dict[str, Any], created_at: datetime) -> StockRuleMatch:
+        snapshot = dict(match.get("snapshot") or {})
+        snapshot["_matched_dates"] = match.get("matched_dates") or []
+        snapshot["_matched_events"] = match.get("matched_events") or []
+        return StockRuleMatch(
+            run_id=run_id,
+            rule_id=int(match.get("rule_id") or rule_id),
+            stock_code=match["stock_code"],
+            stock_name=match.get("stock_name"),
+            matched_groups_json=_json_dumps(match.get("matched_groups") or []),
+            snapshot_json=_json_dumps(snapshot),
+            explanation=match.get("explanation"),
+            created_at=created_at,
+        )
 
     def finish_run(
         self,
@@ -496,32 +572,57 @@ class RuleRepository:
     ) -> Tuple[int, int]:
         finished_at = datetime.now()
         duration_ms = int((finished_at - started_at).total_seconds() * 1000)
-        with self.db.get_session() as session:
-            run = session.execute(select(StockRuleRun).where(StockRuleRun.id == run_id).limit(1)).scalar_one_or_none()
-            if run is None:
-                return (0, 0)
-            run.status = status
-            run.match_count = len(matches)
-            run.error = error
-            run.finished_at = finished_at
-            run.duration_ms = duration_ms
-            for match in matches:
-                snapshot = dict(match.get("snapshot") or {})
-                snapshot["_matched_dates"] = match.get("matched_dates") or []
-                snapshot["_matched_events"] = match.get("matched_events") or []
-                session.add(
-                    StockRuleMatch(
-                        run_id=run_id,
-                        rule_id=int(match.get("rule_id") or rule_id),
-                        stock_code=match["stock_code"],
-                        stock_name=match.get("stock_name"),
-                        matched_groups_json=_json_dumps(match.get("matched_groups") or []),
-                        snapshot_json=_json_dumps(snapshot),
-                        explanation=match.get("explanation"),
-                    )
+
+        def write(session) -> Tuple[int, int]:
+            result = session.execute(
+                update(StockRuleRun)
+                .where(StockRuleRun.id == run_id)
+                .values(
+                    status=status,
+                    match_count=len(matches),
+                    error=error,
+                    finished_at=finished_at,
+                    duration_ms=duration_ms,
                 )
-            session.commit()
+            )
+            if result.rowcount == 0:
+                return (0, 0)
+
+            rows = [
+                self._build_match_row(run_id, rule_id, match, finished_at)
+                for match in matches
+            ]
+            if rows:
+                session.bulk_save_objects(rows)
             return (len(matches), duration_ms)
+
+        return self._run_write_transaction("stock_rule_run.finish", write)
+
+    def fail_stale_running_runs(
+        self,
+        *,
+        now: Optional[datetime] = None,
+        stale_after: timedelta = RULE_STALE_RUNNING_AFTER,
+    ) -> int:
+        current_time = now or datetime.now()
+        cutoff = current_time - stale_after
+        stale_message = "运行超时，已在启动新实测前自动标记失败"
+
+        def write(session) -> int:
+            rows = session.execute(
+                select(StockRuleRun).where(
+                    StockRuleRun.status == "running",
+                    StockRuleRun.started_at < cutoff,
+                )
+            ).scalars().all()
+            for row in rows:
+                row.status = "failed"
+                row.finished_at = current_time
+                row.duration_ms = int((current_time - row.started_at).total_seconds() * 1000) if row.started_at else None
+                row.error = _append_run_error(row.error, stale_message)
+            return len(rows)
+
+        return self._run_write_transaction("stock_rule_run.fail_stale", write)
 
     def list_matches(self, run_id: int) -> List[Dict[str, Any]]:
         with self.db.get_session() as session:

@@ -232,6 +232,14 @@ function normalizeRunHistory(raw: Record<string, unknown>): RuleRunHistoryItem {
     startedAt: toNullableString(raw.started_at ?? raw.startedAt),
     finishedAt: toNullableString(raw.finished_at ?? raw.finishedAt),
     durationMs: raw.duration_ms == null && raw.durationMs == null ? null : toNumber(raw.duration_ms ?? raw.durationMs),
+    snapshotId: toNullableString(raw.snapshot_id ?? raw.snapshotId),
+    snapshotTime: toNullableString(raw.snapshot_time ?? raw.snapshotTime),
+    snapshotAgeSeconds: raw.snapshot_age_seconds == null && raw.snapshotAgeSeconds == null
+      ? null
+      : toNumber(raw.snapshot_age_seconds ?? raw.snapshotAgeSeconds),
+    quoteHitCount: toNumber(raw.quote_hit_count ?? raw.quoteHitCount),
+    quoteMissCount: toNumber(raw.quote_miss_count ?? raw.quoteMissCount),
+    reusedRun: toBoolean(raw.reused_run ?? raw.reusedRun),
   };
 }
 
@@ -355,6 +363,7 @@ export const rulesApi = {
         : toNumber(response.data.snapshot_age_seconds ?? response.data.snapshotAgeSeconds),
       quoteHitCount: toNumber(response.data.quote_hit_count ?? response.data.quoteHitCount),
       quoteMissCount: toNumber(response.data.quote_miss_count ?? response.data.quoteMissCount),
+      reusedRun: toBoolean(response.data.reused_run ?? response.data.reusedRun),
     };
   },
 
@@ -394,6 +403,7 @@ export const rulesApi = {
         : toNumber(response.data.snapshot_age_seconds ?? response.data.snapshotAgeSeconds),
       quoteHitCount: toNumber(response.data.quote_hit_count ?? response.data.quoteHitCount),
       quoteMissCount: toNumber(response.data.quote_miss_count ?? response.data.quoteMissCount),
+      reusedRun: toBoolean(response.data.reused_run ?? response.data.reusedRun),
     };
   },
 
@@ -433,6 +443,7 @@ export const rulesApi = {
         : toNumber(response.data.snapshot_age_seconds ?? response.data.snapshotAgeSeconds),
       quoteHitCount: toNumber(response.data.quote_hit_count ?? response.data.quoteHitCount),
       quoteMissCount: toNumber(response.data.quote_miss_count ?? response.data.quoteMissCount),
+      reusedRun: toBoolean(response.data.reused_run ?? response.data.reusedRun),
     };
   },
 };

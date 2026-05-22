@@ -989,7 +989,7 @@ python main.py --debug
 
 ### SQLite 写入稳态配置
 
-默认文件型 SQLite 会在连接建立时启用 `WAL` 并设置 `busy_timeout`，`save_daily_data()` 也已改为按 `(code, date)` 批量原子 upsert，以降低批量更新和并发回写时的锁竞争。
+默认文件型 SQLite 会在连接建立时启用 `WAL` 并设置 `busy_timeout`，`save_daily_data()` 也已改为按 `(code, date)` 批量原子 upsert。规则实测会先按规则所需 lookback 和股票范围一次性预热日线缓存，短时间内相同规则数据直接复用内存缓存，避免全 A 股扫描时按股票反复查 DB。实时行情预热优先更新进程内快照；规则实测运行期间会临时跳过分钟热表归档写入，避免低优先级归档抢占结果落库。已接入 `_run_write_transaction()` 的批量写路径会在进程内串行进入 SQLite 写事务，实测进度写入遇到临时锁竞争时会跳过本次进度刷新并继续扫描，最终结果落库仍保持重试和失败显式记录。
 
 如需调整，可在 `.env` 中设置：
 
@@ -999,6 +999,8 @@ python main.py --debug
 | `SQLITE_BUSY_TIMEOUT_MS` | `5000` | SQLite 等锁超时（毫秒） |
 | `SQLITE_WRITE_RETRY_MAX` | `3` | 遇到 `database is locked` / `database table is locked` 时的最大重试次数 |
 | `SQLITE_WRITE_RETRY_BASE_DELAY` | `0.1` | 写入重试基础退避时间（秒，按指数退避递增） |
+| `RULE_PROGRESS_BATCH_SIZE` | `500` | 大规模规则实测/回测进度写库步长；最终完成进度必写 |
+| `RULE_PROGRESS_MIN_INTERVAL_SECONDS` | `5.0` | 大规模规则实测/回测进度写库最小间隔（秒） |
 
 ---
 

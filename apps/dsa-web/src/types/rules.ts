@@ -137,6 +137,7 @@ export type RuleRunResponse = {
   snapshotAgeSeconds?: number | null;
   quoteHitCount?: number;
   quoteMissCount?: number;
+  reusedRun?: boolean;
 };
 
 export type RuleRunNotifyPayload = {
@@ -187,6 +188,12 @@ export type RuleRunHistoryItem = {
   startedAt?: string | null;
   finishedAt?: string | null;
   durationMs?: number | null;
+  snapshotId?: string | null;
+  snapshotTime?: string | null;
+  snapshotAgeSeconds?: number | null;
+  quoteHitCount?: number;
+  quoteMissCount?: number;
+  reusedRun?: boolean;
 };
 
 export type RuleCreatePayload = {

@@ -246,6 +246,7 @@ vi.mock('../../api/history', () => ({
 vi.mock('../../api/systemConfig', () => ({
   systemConfigApi: {
     getConfig: vi.fn(),
+    getRealtimeCacheStats: vi.fn(),
   },
 }));
 
@@ -396,6 +397,24 @@ describe('BacktestPage', () => {
       maskToken: '******',
       items: [{ key: 'STOCK_LIST', value: '300274.SZ,688521.SH', rawValueExists: true, isMasked: false }],
     });
+    vi.mocked(systemConfigApi.getRealtimeCacheStats).mockResolvedValue({
+      totalMemoryBytes: 0,
+      totalMemoryMb: 0,
+      quoteCacheItems: 0,
+      quoteCacheMemoryBytes: 0,
+      quoteCacheMemoryMb: 0,
+      providerCacheMemoryBytes: 0,
+      providerCacheMemoryMb: 0,
+      bucketStart: null,
+      snapshotId: '20260507104500',
+      snapshotTime: '2026-05-07T10:45:00',
+      snapshotAgeSeconds: 0,
+      quoteSnapshotItems: 2,
+      snapshotRequestedCount: 2,
+      snapshotHitCount: 2,
+      snapshotMissCount: 0,
+      providerBreakdown: [],
+    });
     vi.mocked(historyApi.getList).mockResolvedValue({
       total: 2,
       page: 1,
@@ -455,7 +474,7 @@ describe('BacktestPage', () => {
         await Promise.resolve();
         await Promise.resolve();
       });
-      expect(rulesApi.runBatch).toHaveBeenCalledWith({
+      expect(rulesApi.runBatchAsync).toHaveBeenCalledWith({
         ruleIds: [7],
         mode: 'latest',
         dataPolicy: 'snapshot_only',
@@ -490,6 +509,87 @@ describe('BacktestPage', () => {
     }
   });
 
+  it('logs realtime snapshot coverage before full-market live test starts', async () => {
+    stockIndexHookState.current = {
+      index: [
+        {
+          canonicalCode: '300274.SZ',
+          displayCode: '300274.SZ',
+          nameZh: '阳光电源',
+          market: 'CN',
+          assetType: 'stock',
+          active: true,
+          industry: '电力设备',
+        },
+        {
+          canonicalCode: '688521.SH',
+          displayCode: '688521.SH',
+          nameZh: '芯原股份',
+          market: 'CN',
+          assetType: 'stock',
+          active: true,
+          industry: '半导体',
+        },
+      ],
+      loading: false,
+      error: null,
+      fallback: false,
+      loaded: true,
+    };
+    vi.mocked(systemConfigApi.getRealtimeCacheStats).mockResolvedValueOnce({
+      totalMemoryBytes: 0,
+      totalMemoryMb: 0,
+      quoteCacheItems: 0,
+      quoteCacheMemoryBytes: 0,
+      quoteCacheMemoryMb: 0,
+      providerCacheMemoryBytes: 0,
+      providerCacheMemoryMb: 0,
+      bucketStart: null,
+      snapshotId: null,
+      snapshotTime: null,
+      snapshotAgeSeconds: null,
+      quoteSnapshotItems: 1,
+      snapshotRequestedCount: 2,
+      snapshotHitCount: 1,
+      snapshotMissCount: 1,
+      providerBreakdown: [],
+    });
+
+    render(<BacktestPage mode="live" />);
+
+    expect(await screen.findByText('实测结果')).toBeInTheDocument();
+    await screen.findByText('1 / 1');
+    fireEvent.change(screen.getByLabelText('股票范围'), { target: { value: 'all_a_shares' } });
+    expect(screen.getAllByText(/2 只股票/).length).toBeGreaterThan(0);
+
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-05-07T02:45:00Z'));
+      fireEvent.click(screen.getByRole('button', { name: '运行实测' }));
+
+      await act(async () => {
+        await Promise.resolve();
+        await Promise.resolve();
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+
+      expect(systemConfigApi.getRealtimeCacheStats).toHaveBeenCalledTimes(1);
+      fireEvent.click(screen.getByRole('tab', { name: /执行日志/ }));
+      expect(screen.getByText(/实时行情快照覆盖：1\/2，快照 未就绪/)).toBeInTheDocument();
+      expect(rulesApi.runBatchAsync).toHaveBeenCalledWith(expect.objectContaining({
+        target: {
+          scope: 'all_a_shares',
+          stockCodes: ['300274.SZ', '688521.SH'],
+        },
+      }));
+
+      fireEvent.click(screen.getByRole('button', { name: '停止实测' }));
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('does not start live test after A-share market closes', async () => {
     render(<BacktestPage mode="live" />);
 
@@ -507,9 +607,11 @@ describe('BacktestPage', () => {
       vi.useRealTimers();
     }
 
-    expect(rulesApi.runBatch).not.toHaveBeenCalled();
+    expect(rulesApi.runBatchAsync).not.toHaveBeenCalled();
     expect(screen.getByRole('button', { name: '运行实测' })).toBeInTheDocument();
-    expect(screen.getByRole('tab', { name: /执行日志/ })).toHaveAttribute('aria-selected', 'true');
+    await waitFor(() => {
+      expect(screen.getByRole('tab', { name: /执行日志/ })).toHaveAttribute('aria-selected', 'true');
+    });
     expect(screen.getByText(/当前已超过实测时间，未触发实时扫描/)).toBeInTheDocument();
   });
 
@@ -517,31 +619,75 @@ describe('BacktestPage', () => {
     render(<BacktestPage mode="live" />);
 
     await screen.findByText('1 / 1');
-    vi.mocked(rulesApi.runBatch)
+    vi.mocked(rulesApi.runBatchAsync)
       .mockResolvedValueOnce({
         runId: 12,
         ruleId: 7,
-        status: 'completed',
+        ruleIds: [7],
+        ruleNames: ['放量观察'],
+        status: 'running',
         targetCount: 2,
-        matchCount: 1,
-        eventCount: 1,
-        mode: 'history',
-        durationMs: 20,
-        matches,
+        completedCount: 0,
+        matchCount: 0,
+        eventCount: 0,
+        mode: 'latest',
+        durationMs: 0,
+        matches: [],
         errors: [],
       })
       .mockResolvedValueOnce({
         runId: 13,
         ruleId: 7,
-        status: 'completed',
+        ruleIds: [7],
+        ruleNames: ['放量观察'],
+        status: 'running',
         targetCount: 2,
-        matchCount: 1,
-        eventCount: 1,
-        mode: 'history',
-        durationMs: 18,
-        matches: secondMatches,
+        completedCount: 0,
+        matchCount: 0,
+        eventCount: 0,
+        mode: 'latest',
+        durationMs: 0,
+        matches: [],
         errors: [],
       });
+    vi.mocked(rulesApi.getRun)
+      .mockResolvedValueOnce({
+        id: 12,
+        runIds: [12],
+        ruleId: 7,
+        ruleIds: [7],
+        ruleName: '放量观察',
+        ruleNames: ['放量观察'],
+        status: 'completed',
+        targetCount: 2,
+        completedCount: 2,
+        matchCount: 1,
+        eventCount: 1,
+        snapshotId: '20260507105510',
+        startedAt: '2026-05-07T02:55:10Z',
+        finishedAt: '2026-05-07T02:55:10Z',
+        durationMs: 20,
+      })
+      .mockResolvedValueOnce({
+        id: 13,
+        runIds: [13],
+        ruleId: 7,
+        ruleIds: [7],
+        ruleName: '放量观察',
+        ruleNames: ['放量观察'],
+        status: 'completed',
+        targetCount: 2,
+        completedCount: 2,
+        matchCount: 1,
+        eventCount: 1,
+        snapshotId: '20260507105610',
+        startedAt: '2026-05-07T02:56:10Z',
+        finishedAt: '2026-05-07T02:56:10Z',
+        durationMs: 18,
+      });
+    vi.mocked(rulesApi.getRunMatches)
+      .mockResolvedValueOnce(matches)
+      .mockResolvedValueOnce(secondMatches);
 
     vi.useFakeTimers();
     try {
@@ -579,31 +725,75 @@ describe('BacktestPage', () => {
     render(<BacktestPage mode="live" />);
 
     await screen.findByText('1 / 1');
-    vi.mocked(rulesApi.runBatch)
+    vi.mocked(rulesApi.runBatchAsync)
       .mockResolvedValueOnce({
         runId: 12,
         ruleId: 7,
-        status: 'completed',
+        ruleIds: [7],
+        ruleNames: ['放量观察'],
+        status: 'running',
         targetCount: 2,
-        matchCount: 1,
-        eventCount: 1,
-        mode: 'history',
-        durationMs: 20,
-        matches,
+        completedCount: 0,
+        matchCount: 0,
+        eventCount: 0,
+        mode: 'latest',
+        durationMs: 0,
+        matches: [],
         errors: [],
       })
       .mockResolvedValueOnce({
         runId: 13,
         ruleId: 7,
-        status: 'completed',
+        ruleIds: [7],
+        ruleNames: ['放量观察'],
+        status: 'running',
         targetCount: 2,
-        matchCount: 1,
-        eventCount: 1,
-        mode: 'history',
-        durationMs: 18,
-        matches,
+        completedCount: 0,
+        matchCount: 0,
+        eventCount: 0,
+        mode: 'latest',
+        durationMs: 0,
+        matches: [],
         errors: [],
       });
+    vi.mocked(rulesApi.getRun)
+      .mockResolvedValueOnce({
+        id: 12,
+        runIds: [12],
+        ruleId: 7,
+        ruleIds: [7],
+        ruleName: '放量观察',
+        ruleNames: ['放量观察'],
+        status: 'completed',
+        targetCount: 2,
+        completedCount: 2,
+        matchCount: 1,
+        eventCount: 1,
+        snapshotId: '20260507105510',
+        startedAt: '2026-05-07T02:55:10Z',
+        finishedAt: '2026-05-07T02:55:10Z',
+        durationMs: 20,
+      })
+      .mockResolvedValueOnce({
+        id: 13,
+        runIds: [13],
+        ruleId: 7,
+        ruleIds: [7],
+        ruleName: '放量观察',
+        ruleNames: ['放量观察'],
+        status: 'completed',
+        targetCount: 2,
+        completedCount: 2,
+        matchCount: 1,
+        eventCount: 1,
+        snapshotId: '20260507105610',
+        startedAt: '2026-05-07T02:56:10Z',
+        finishedAt: '2026-05-07T02:56:10Z',
+        durationMs: 18,
+      });
+    vi.mocked(rulesApi.getRunMatches)
+      .mockResolvedValueOnce(matches)
+      .mockResolvedValueOnce(matches);
 
     vi.useFakeTimers();
     try {
@@ -644,31 +834,75 @@ describe('BacktestPage', () => {
     fireEvent.click(screen.getByRole('checkbox', { name: /精简模式/ }));
     expect(screen.getByRole('checkbox', { name: /精简模式/ })).not.toBeChecked();
 
-    vi.mocked(rulesApi.runBatch)
+    vi.mocked(rulesApi.runBatchAsync)
       .mockResolvedValueOnce({
         runId: 12,
         ruleId: 7,
-        status: 'completed',
+        ruleIds: [7],
+        ruleNames: ['放量观察'],
+        status: 'running',
         targetCount: 2,
-        matchCount: 1,
-        eventCount: 1,
-        mode: 'history',
-        durationMs: 20,
-        matches,
+        completedCount: 0,
+        matchCount: 0,
+        eventCount: 0,
+        mode: 'latest',
+        durationMs: 0,
+        matches: [],
         errors: [],
       })
       .mockResolvedValueOnce({
         runId: 13,
         ruleId: 7,
-        status: 'completed',
+        ruleIds: [7],
+        ruleNames: ['放量观察'],
+        status: 'running',
         targetCount: 2,
-        matchCount: 1,
-        eventCount: 1,
-        mode: 'history',
-        durationMs: 18,
-        matches,
+        completedCount: 0,
+        matchCount: 0,
+        eventCount: 0,
+        mode: 'latest',
+        durationMs: 0,
+        matches: [],
         errors: [],
       });
+    vi.mocked(rulesApi.getRun)
+      .mockResolvedValueOnce({
+        id: 12,
+        runIds: [12],
+        ruleId: 7,
+        ruleIds: [7],
+        ruleName: '放量观察',
+        ruleNames: ['放量观察'],
+        status: 'completed',
+        targetCount: 2,
+        completedCount: 2,
+        matchCount: 1,
+        eventCount: 1,
+        snapshotId: '20260507105510',
+        startedAt: '2026-05-07T02:55:10Z',
+        finishedAt: '2026-05-07T02:55:10Z',
+        durationMs: 20,
+      })
+      .mockResolvedValueOnce({
+        id: 13,
+        runIds: [13],
+        ruleId: 7,
+        ruleIds: [7],
+        ruleName: '放量观察',
+        ruleNames: ['放量观察'],
+        status: 'completed',
+        targetCount: 2,
+        completedCount: 2,
+        matchCount: 1,
+        eventCount: 1,
+        snapshotId: '20260507105610',
+        startedAt: '2026-05-07T02:56:10Z',
+        finishedAt: '2026-05-07T02:56:10Z',
+        durationMs: 18,
+      });
+    vi.mocked(rulesApi.getRunMatches)
+      .mockResolvedValueOnce(matches)
+      .mockResolvedValueOnce(matches);
 
     vi.useFakeTimers();
     try {

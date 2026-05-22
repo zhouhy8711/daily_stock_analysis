@@ -189,7 +189,8 @@ def start_async_rule_run(payload: RuleBatchRunRequest, background_tasks: Backgro
             end_date=payload.end_date,
             data_policy=payload.data_policy,
         )
-        background_tasks.add_task(_complete_async_rule_batch, context)
+        if context is not None:
+            background_tasks.add_task(_complete_async_rule_batch, context)
         return RuleRunResponse(**response)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail={"error": "not_found", "message": "规则不存在"}) from exc
