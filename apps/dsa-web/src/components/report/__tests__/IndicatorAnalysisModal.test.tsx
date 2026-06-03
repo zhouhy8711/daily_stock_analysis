@@ -535,7 +535,7 @@ describe('IndicatorAnalysisModal', () => {
     );
     await flushPromises();
 
-    expect(stocksApi.getHistory).toHaveBeenCalledWith(stockCode, 120, 'daily', 'cache_only');
+    expect(stocksApi.getHistory).toHaveBeenCalledWith(stockCode, 365, 'daily', 'cache_only');
     expect(stocksApi.getQuote).toHaveBeenCalledWith(stockCode, 'cache_only');
     expect(stocksApi.getIndicatorMetrics).toHaveBeenCalledWith(stockCode);
 
@@ -758,8 +758,8 @@ describe('IndicatorAnalysisModal', () => {
     );
     await flushPromises();
 
-    expect(stocksApi.getHistory).toHaveBeenCalledWith('600519', 120, 'daily', 'cache_only');
-    expect(stocksApi.getHistory).toHaveBeenCalledWith('600519', 120, 'daily', 'default');
+    expect(stocksApi.getHistory).toHaveBeenCalledWith('600519', 365, 'daily', 'cache_only');
+    expect(stocksApi.getHistory).toHaveBeenCalledWith('600519', 365, 'daily', 'default');
     expect(screen.getByRole('img', { name: 'K线图' })).toBeInTheDocument();
     expect(screen.getByTestId('indicator-chart-bar-2026-04-24')).toBeInTheDocument();
 
@@ -789,6 +789,33 @@ describe('IndicatorAnalysisModal', () => {
     unmount();
   });
 
+  it('keeps daily MA warm-up data while showing the default 120-day window', async () => {
+    const warmupHistory = makeDailyHistory(365, '2025-01-01');
+    vi.mocked(stocksApi.getHistory).mockImplementation(async (stockCode, _days, period = 'daily', dataPolicy = 'cache_only') => ({
+      stockCode,
+      stockName: '贵州茅台',
+      period,
+      data: period === 'daily' ? warmupHistory : makeHistory(period),
+      dataSource: dataPolicy === 'db_only' ? 'db_cache' : 'cache',
+    }));
+
+    const { unmount } = render(
+      <IndicatorAnalysisView stockCode="600519" stockName="贵州茅台" dataMode="historical" onClose={vi.fn()} />,
+    );
+    await flushPromises();
+
+    expect(stocksApi.getHistory).toHaveBeenCalledWith('600519', 365, 'daily', 'db_only');
+    const firstVisibleWithWarmup = warmupHistory[285];
+    fireEvent.mouseEnter(screen.getByTestId(`indicator-chart-bar-${firstVisibleWithWarmup.date}`));
+
+    const priceHeader = within(screen.getByTestId('indicator-price-header'));
+    expect(priceHeader.getByText('MA60:145.55')).toBeInTheDocument();
+    expect(priceHeader.queryByText('MA60:--')).not.toBeInTheDocument();
+    expect(screen.queryByTestId(`indicator-chart-bar-${warmupHistory[244].date}`)).not.toBeInTheDocument();
+
+    unmount();
+  });
+
   it('keeps indicator headers live when the selected candle changes by mouse', async () => {
     const { unmount } = render(
       <IndicatorAnalysisModal stockCode="600519" stockName="贵州茅台" onClose={vi.fn()} />,
@@ -810,20 +837,16 @@ describe('IndicatorAnalysisModal', () => {
     const historicalPriceHeaderText = screen.getByRole('dialog', { name: '更多K线指标' }).textContent ?? '';
     expect(historicalPriceHeaderText).toContain('流通股本:16.00亿股');
     expect(historicalPriceHeaderText).toContain('总股本:20.00亿股');
-    expect(historicalPriceHeaderText).toMatch(/涨幅限价:\d/);
-    expect(historicalPriceHeaderText).toMatch(/跌幅限价:\d/);
-    expect(historicalPriceHeaderText).toContain('涨速:+0.10%');
+    expect(historicalPriceHeaderText).toContain('涨幅限价:--');
+    expect(historicalPriceHeaderText).toContain('跌幅限价:--');
+    expect(historicalPriceHeaderText).toContain('涨速:--');
     expect(historicalPriceHeaderText).toMatch(/主力净量:[+-]?\d/);
     expect(historicalPriceHeaderText).toMatch(/主力净流入:[+-]?\d/);
-    expect(historicalPriceHeaderText).toMatch(/委比:[+-]?\d/);
+    expect(historicalPriceHeaderText).toContain('委比:--');
     expect(historicalPriceHeaderText).not.toContain('流通股本:--');
     expect(historicalPriceHeaderText).not.toContain('总股本:--');
-    expect(historicalPriceHeaderText).not.toContain('涨幅限价:--');
-    expect(historicalPriceHeaderText).not.toContain('跌幅限价:--');
-    expect(historicalPriceHeaderText).not.toContain('涨速:--');
     expect(historicalPriceHeaderText).not.toContain('主力净量:--');
     expect(historicalPriceHeaderText).not.toContain('主力净流入:--');
-    expect(historicalPriceHeaderText).not.toContain('委比:--');
     fireEvent.click(within(historicalPriceHeader).getByRole('button', { name: '更多K线指标' }));
 
     fireEvent.mouseEnter(screen.getByTestId('indicator-volume-bar-2026-04-24'));
@@ -958,7 +981,7 @@ describe('IndicatorAnalysisModal', () => {
     );
     await flushPromises();
 
-    expect(stocksApi.getHistory).toHaveBeenCalledWith('600519', 120, 'daily', 'cache_only');
+    expect(stocksApi.getHistory).toHaveBeenCalledWith('600519', 365, 'daily', 'cache_only');
     expect(stocksApi.getHistory).not.toHaveBeenCalledWith('600519', 1, '1m', 'cache_only');
     expect(stocksApi.getHistory).not.toHaveBeenCalledWith('600519', 3, '1m', 'cache_only');
     expect(stocksApi.getHistory).not.toHaveBeenCalledWith('600519', 3, '5m', 'cache_only');

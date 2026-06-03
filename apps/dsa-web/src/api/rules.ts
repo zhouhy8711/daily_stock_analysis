@@ -168,6 +168,7 @@ function normalizeRule(raw: Record<string, unknown>): RuleItem {
     name: toString(raw.name),
     description: toNullableString(raw.description),
     isActive: toBoolean(raw.is_active ?? raw.isActive),
+    isDisable: toBoolean(raw.is_disable ?? raw.isDisable),
     period: toString(raw.period || 'daily'),
     lookbackDays: toNumber(raw.lookback_days ?? raw.lookbackDays, 120),
     targetScope: toString(raw.target_scope ?? raw.targetScope ?? 'watchlist'),
@@ -185,6 +186,7 @@ function serializePayload(payload: RuleCreatePayload | RuleUpdatePayload): Recor
     name: payload.name,
     description: payload.description,
     is_active: payload.isActive,
+    is_disable: payload.isDisable,
     definition: payload.definition ? serializeDefinition(payload.definition) : undefined,
   };
 }
@@ -240,6 +242,9 @@ function normalizeRunHistory(raw: Record<string, unknown>): RuleRunHistoryItem {
     quoteHitCount: toNumber(raw.quote_hit_count ?? raw.quoteHitCount),
     quoteMissCount: toNumber(raw.quote_miss_count ?? raw.quoteMissCount),
     reusedRun: toBoolean(raw.reused_run ?? raw.reusedRun),
+    prewarmOnly: toBoolean(raw.prewarm_only ?? raw.prewarmOnly),
+    prewarmHitCount: toNumber(raw.prewarm_hit_count ?? raw.prewarmHitCount),
+    prewarmMissCount: toNumber(raw.prewarm_miss_count ?? raw.prewarmMissCount),
   };
 }
 
@@ -364,6 +369,9 @@ export const rulesApi = {
       quoteHitCount: toNumber(response.data.quote_hit_count ?? response.data.quoteHitCount),
       quoteMissCount: toNumber(response.data.quote_miss_count ?? response.data.quoteMissCount),
       reusedRun: toBoolean(response.data.reused_run ?? response.data.reusedRun),
+      prewarmOnly: toBoolean(response.data.prewarm_only ?? response.data.prewarmOnly),
+      prewarmHitCount: toNumber(response.data.prewarm_hit_count ?? response.data.prewarmHitCount),
+      prewarmMissCount: toNumber(response.data.prewarm_miss_count ?? response.data.prewarmMissCount),
     };
   },
 
@@ -375,6 +383,7 @@ export const rulesApi = {
       target: payload.target ? serializeRunTarget(payload.target) : undefined,
       start_date: payload.startDate || undefined,
       end_date: payload.endDate || undefined,
+      live_cache_key: payload.liveCacheKey || undefined,
     };
     const response = await apiClient.post<Record<string, unknown>>(
       '/api/v1/rules/run-batch',
@@ -404,6 +413,9 @@ export const rulesApi = {
       quoteHitCount: toNumber(response.data.quote_hit_count ?? response.data.quoteHitCount),
       quoteMissCount: toNumber(response.data.quote_miss_count ?? response.data.quoteMissCount),
       reusedRun: toBoolean(response.data.reused_run ?? response.data.reusedRun),
+      prewarmOnly: toBoolean(response.data.prewarm_only ?? response.data.prewarmOnly),
+      prewarmHitCount: toNumber(response.data.prewarm_hit_count ?? response.data.prewarmHitCount),
+      prewarmMissCount: toNumber(response.data.prewarm_miss_count ?? response.data.prewarmMissCount),
     };
   },
 
@@ -415,6 +427,7 @@ export const rulesApi = {
       target: payload.target ? serializeRunTarget(payload.target) : undefined,
       start_date: payload.startDate || undefined,
       end_date: payload.endDate || undefined,
+      live_cache_key: payload.liveCacheKey || undefined,
     };
     const response = await apiClient.post<Record<string, unknown>>(
       '/api/v1/rules/run-batch/async',
@@ -444,6 +457,13 @@ export const rulesApi = {
       quoteHitCount: toNumber(response.data.quote_hit_count ?? response.data.quoteHitCount),
       quoteMissCount: toNumber(response.data.quote_miss_count ?? response.data.quoteMissCount),
       reusedRun: toBoolean(response.data.reused_run ?? response.data.reusedRun),
+      prewarmOnly: toBoolean(response.data.prewarm_only ?? response.data.prewarmOnly),
+      prewarmHitCount: toNumber(response.data.prewarm_hit_count ?? response.data.prewarmHitCount),
+      prewarmMissCount: toNumber(response.data.prewarm_miss_count ?? response.data.prewarmMissCount),
     };
+  },
+
+  async clearLiveCache(liveCacheKey: string): Promise<void> {
+    await apiClient.delete(`/api/v1/rules/live-cache/${encodeURIComponent(liveCacheKey)}`);
   },
 };

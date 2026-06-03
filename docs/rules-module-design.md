@@ -15,7 +15,7 @@
 - 支持前 N 个周期的最大值、最小值、平均值等历史聚合。
 - 支持连续 N 次满足、近 N 次至少 M 次满足等时序条件。
 - 支持手动运行规则，并区分“最新日扫描”和“历史回测”：前者只判断每只股票最后一个交易日，后者在历史窗口内逐个交易日判断。
-- 运行结果展示命中股票、命中日期、命中条件组、指标快照和解释文本。
+- 运行结果展示命中股票、命中日期、命中条件组、指标快照和解释文本；多条件组规则会按实际命中的条件组拆分结果列，避免用其他条件组的指标列展示为空。
 - 后续可以接入定时运行、通知推送、问股和回测。
 
 ## 非目标
@@ -64,6 +64,7 @@
   "name": "放量突破观察",
   "description": "收盘价创新高且成交量放大",
   "is_active": true,
+  "is_disable": false,
   "period": "daily",
   "lookback_days": 120,
   "target": {
@@ -111,7 +112,7 @@
 }
 ```
 
-`scope=watchlist` 时，Web 页面会按首页自选监控区的同一逻辑生成当前自选列表：优先使用 `STOCK_LIST`，未配置时回退最近历史股票，并在股票清单中展示“代码 + 名称”；`scope=all_a_shares` 时会从前端股票索引读取所有 A 股并填入同一清单；`scope=custom` 保留手工维护列表。股票清单支持最大化查看，并在最大化状态下按代码或名称筛选；每行股票前提供移除按钮，便于整理全量 A 股扫描范围。保存和手动运行规则时仍只从清单中提取股票代码写入 `stock_codes`，后端优先扫描该列表，旧规则未保存列表时才回退读取当前 `STOCK_LIST`。
+`scope=watchlist` 时，Web 页面会按首页自选监控区的同一逻辑生成当前自选列表：优先使用 `STOCK_LIST`，未配置时回退最近历史股票，并在股票清单中展示“代码 + 名称”；`scope=all_a_shares` 时会从前端股票索引读取所有 A 股并填入同一清单，后端在未收到显式 `stock_codes` 时也会读取同一股票索引兜底解析全量 A 股，避免后台任务以空目标运行；`scope=custom` 保留手工维护列表。股票清单支持最大化查看，并在最大化状态下按代码或名称筛选；每行股票前提供移除按钮，便于整理全量 A 股扫描范围。保存和手动运行规则时仍只从清单中提取股票代码写入 `stock_codes`，后端优先扫描该列表，旧规则未保存列表时才回退读取当前 `STOCK_LIST`。
 
 ## 指标 Key
 
@@ -120,14 +121,19 @@
 第一版按指标分析页的大图表区域分组支持，并与指标分析页可点加号加入规则的指标保持同一套 key：
 
 - 核心行情：`current_price`、`change`、`change_percent`、`total_mv`、`circ_mv`、`pe_ratio`
-- K线图：`open`、`high`、`low`、`close`、`prev_close`、`pct_chg`、`amplitude`、`limit_up_price`、`limit_down_price`、`price_speed`、`entrust_ratio`、`ma5`、`ma10`、`ma20`、`ma30`、`ma60`、`volume_ratio`、`total_shares`、`float_shares`
+- K线图：`open`、`high`、`low`、`close`、`prev_close`、`pct_chg`、`amplitude`、`price_range_30d_pct`、`price_range_60d_pct`、`limit_up_price`、`limit_down_price`、`price_speed`、`entrust_ratio`、`ma5`、`ma10`、`ma20`、`ma30`、`ma60`、`volume_ratio`、`total_shares`、`float_shares`
 - 成交量图：`volume`、`after_hours_volume`、`amount`、`after_hours_amount`、`volume_ma5`、`volume_ma10`、`volume_ma20`、`amount_ma5`、`amount_ma10`
 - MACD图：`ema12`、`ema26`、`macd_dif`、`macd_dea`、`macd`
 - RSI图：`rsi6`、`rsi12`、`rsi24`
-- 筹码峰-全部筹码：`profit_ratio`（收盘获利）、`trapped_ratio`（套牢盘）、`profit_trapped_spread`、`avg_cost`、`price_to_avg_cost_pct`、`cost_90_low`、`cost_90_high`、`price_range_90_mid`、`price_range_90_width`、`price_range_90_width_pct`、`chip_concentration_90`、`cost_70_low`、`cost_70_high`、`price_range_70_mid`、`price_range_70_width`、`price_range_70_width_pct`、`chip_concentration_70`、`chip_peak_price`、`chip_peak_percent`、`chip_peak_distance_pct`
+- 筹码峰-全部筹码：`profit_ratio`（收盘获利）、`trapped_ratio`（套牢盘）、`profit_trapped_spread`、`avg_cost`、`price_to_avg_cost_pct`、`cost_90_low`、`cost_90_high`、`price_range_90_mid`、`price_range_90_width`、`price_range_90_width_pct`、`chip_concentration_90`、`chip_concentration_90_avg_30d`、`chip_concentration_90_avg_60d`、`cost_70_low`、`cost_70_high`、`price_range_70_mid`、`price_range_70_width`、`price_range_70_width_pct`、`chip_concentration_70`、`chip_peak_price`、`chip_peak_percent`、`chip_peak_distance_pct`、`chip_peak_count`、`chip_single_peak_signal`、`chip_peak_low_price`、`chip_peak_high_price`、`chip_peak_price_ratio`
 - 筹码峰-主力筹码：`main_profit_ratio`、`main_trapped_ratio`、`main_profit_trapped_spread`、`main_avg_cost`、`main_price_to_avg_cost_pct`、`main_cost_90_low`、`main_cost_90_high`、`main_price_range_90_mid`、`main_price_range_90_width`、`main_price_range_90_width_pct`、`main_chip_concentration_90`、`main_cost_70_low`、`main_cost_70_high`、`main_price_range_70_mid`、`main_price_range_70_width`、`main_price_range_70_width_pct`、`main_chip_concentration_70`、`main_chip_peak_price`、`main_chip_peak_percent`、`main_chip_peak_distance_pct`
 - 实时监控：`turnover_rate`、`main_net_volume_pct`、`main_force_net`、`net_super_large_order`、`net_large_order`、`net_medium_order`、`net_small_order`
+- 财务事件：`deducted_net_profit_yoy_pct`（扣非净利同比）、`deducted_net_profit_qoq_pct`（扣非净利环比）、`announcement_next_day_gap_pct`（公告次日跳空缺口）、`announcement_next_day_volume_ratio`（公告次日量能 / 前 5 日均量）、`announcement_next_day_gap_unfilled`（公告次日缺口未回补，1/0）、`net_profit_gap_signal`（净利润断层信号）
+
+财务事件类指标在规则扫描时会写入 `stock_daily` 对应公告后首个交易日，并同步到本轮规则扫描的 `history_by_code` 与 `earnings_gap_metrics_by_code` 缓存；后续 DB-only 回测和 K 线缓存读取可复用这些指标。
 - 额外：`prev_5d_return_pct`（前5日累计涨幅，不含当前判断日）、`prev_20d_return_pct`（前20日累计涨幅，不含当前判断日）
+
+财务事件指标会在规则扫描时尝试读取公开财务数据源的扣非净利报告事件，并把事件映射到公告后的第一个交易日。以“净利润断层”为例，可配置为：扣非净利同比 `>= 100`、扣非净利环比 `>= 50`、公告次日跳空缺口 `>= 3`、公告次日量能 / 前 5 日均量 `>= 1.5`、公告次日缺口未回补 `= 1`。若数据源缺少公告日期或扣非净利字段，对应股票不会误判命中。
 
 指标分析页点击加号会先把多个指标保存为一个规则草稿，已选指标的按钮会切换为减号，点击可直接从草稿移除。K 线标题栏中的股本、涨跌停、涨速、主力资金和委比等次级指标收纳在“更多”浮层中，浮层内仍保留同样的加号入口。右上角“已选 N”可打开浮窗编辑关系、取值日偏移和值类型等条件配置；跳转到规则页后会生成一条未保存规则，这些指标会放在同一个条件组里，因此默认是「且」关系，用户仍可在规则页继续调整比较关系和阈值后保存。
 
@@ -225,6 +231,7 @@
 建议新增三张表：
 
 - `stock_rules`：规则定义，保存基础信息、股票范围和 JSON DSL。
+  - `is_disable` 默认为 `false`；为 `true` 时规则列表接口不返回该规则，Web 规则页和回测/实测规则选择中不会展示。
 - `stock_rule_runs`：规则运行记录，保存状态、目标数量、命中数量、耗时和错误。
 - `stock_rule_matches`：规则命中结果，保存股票代码、命中日期、命中事件、命中条件组、指标快照和解释文本。历史回测会把同一股票的多个命中交易日保存为 `matched_events`，前端按“股票 + 日期”展开展示。
 
@@ -242,8 +249,8 @@
 - 支持连续 N 次和近 N 次至少 M 次。
 - 支持手动运行并展示命中股票与历史命中日期。
 - 支持“最新日扫描”和“历史回测”两种运行模式，避免只看最新交易日的监控与逐日回测混用同一语义。
-- Web 实测与后端 `latest + snapshot_only` 运行只在 A 股交易时段（交易日 09:30-11:30、13:00-15:00，上海时间）触发，休市后不再用旧实时快照重复生成命中结果。
-- Web 规则历史回测使用异步后台任务执行；执行中持续展示已完成股票数 / 总股票数，全部完成后再加载命中结果。多规则回测按股票共享一次历史行情读取与指标帧构建，未使用筹码类指标时跳过本地筹码计算。日线仍先读 `stock_daily`，窗口不足时按默认数据策略补齐并写回日表。点击命中记录打开指标弹窗时使用历史 DB-only 模式，只读 `stock_daily` 和 `stock_chip_daily`，不触发实时行情、资金流、主力持仓或筹码 HTTP 请求。
+- Web 实测与后端 `latest + db_only` 运行只在 A 股交易日 15:00 及以前触发，休市后不再用旧本地行情重复生成命中结果；每次实测使用独立 `live_cache_key` 建立 live 数据缓存，09:30 前触发时只预热选中规则和股票需要的当天前历史日线缓存，并返回 `prewarm_only`，不读取分钟热表、不评估命中、不通知；9:30 后实测 quote 从 `stock_intraday_minute` 聚合，并持续复用该 live 缓存中的历史、基础筹码分布和财务事件派生数据，当前判断日会先合成实时 K 线并重算当日筹码分布，缺少换手率时才按最新价重估基础获利盘兜底；停止实测时清理对应缓存；实测不读实时快照或远程行情源。
+- Web 规则历史回测使用异步后台任务执行；执行中持续展示已完成股票数 / 总股票数，全部完成后再加载命中结果。多规则回测按股票共享一次历史行情读取与指标帧构建，未使用筹码类指标时跳过筹码计算。规则实测和回测统一强制 `db_only`，只读 `stock_daily`、`stock_intraday_minute`、`stock_chip_daily` 及已落库财务派生字段；缺失数据需通过离线任务或补数据脚本补齐。点击命中记录打开指标弹窗时也使用历史 DB-only 模式，不触发实时行情、资金流、主力持仓或筹码 HTTP 请求。
 
 第二期再做：
 

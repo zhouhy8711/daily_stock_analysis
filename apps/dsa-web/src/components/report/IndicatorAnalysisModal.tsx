@@ -79,6 +79,7 @@ type IndicatorAnalysisViewProps = {
 type IndicatorAnalysisDataMode = 'realtime' | 'historical';
 
 type ChartPoint = KLineData & {
+  previousPoint?: ChartPoint;
   averagePrice?: number;
   ma5?: number;
   ma10?: number;
@@ -205,6 +206,8 @@ const KLINE_PERIOD_OPTIONS: KLinePeriodOption[] = [
   { value: '30m', label: '30分', days: 30, requestPeriod: '30m' },
   { value: '60m', label: '60分', days: 30, requestPeriod: '60m' },
 ];
+const DEFAULT_DAILY_HISTORY_DAYS = 120;
+const MAX_DAILY_HISTORY_DAYS = 365;
 const MAX_VISIBLE_KLINE_POINTS = 80;
 const MIN_VISIBLE_KLINE_POINTS = 24;
 const MAX_EXPANDED_KLINE_POINTS = 160;
@@ -1723,7 +1726,7 @@ function buildChartPoints(data: KLineData[]): ChartPoint[] {
   let cumulativeVolumeInShares = 0;
   const priceVolumeMultiplier = inferPriceVolumeMultiplier(data);
 
-  return data.map((item, index) => {
+  const points: ChartPoint[] = data.map((item, index) => {
     const close = item.close;
     closeSum += close;
     if (
@@ -1768,6 +1771,10 @@ function buildChartPoints(data: KLineData[]): ChartPoint[] {
       prev20dReturnPct: previousWindowCumulativeReturn(data, index, 20),
     };
   });
+  points.forEach((point, index) => {
+    point.previousPoint = index > 0 ? points[index - 1] : undefined;
+  });
+  return points;
 }
 
 function getRecentReturn(points: ChartPoint[], period: number): number | undefined {
@@ -1782,8 +1789,12 @@ function getRecentReturn(points: ChartPoint[], period: number): number | undefin
   return ((latest.close - previous.close) / previous.close) * 100;
 }
 
+function getPointPrevious(point?: ChartPoint | null, previous?: ChartPoint): ChartPoint | undefined {
+  return previous ?? point?.previousPoint;
+}
+
 function getPointAmplitude(point: ChartPoint, previous?: ChartPoint): number | undefined {
-  const base = previous?.close ?? point.open;
+  const base = getPointPrevious(point, previous)?.close ?? point.open;
   if (!base) {
     return undefined;
   }
@@ -1794,10 +1805,11 @@ function getPointChangePct(point: ChartPoint, previous?: ChartPoint): number | u
   if (isValidNumber(point.changePercent)) {
     return point.changePercent;
   }
-  if (!previous?.close) {
+  const resolvedPrevious = getPointPrevious(point, previous);
+  if (!resolvedPrevious?.close) {
     return undefined;
   }
-  return ((point.close - previous.close) / previous.close) * 100;
+  return ((point.close - resolvedPrevious.close) / resolvedPrevious.close) * 100;
 }
 
 function getPointVolumeRatio(point: ChartPoint): number | undefined {
@@ -2098,19 +2110,7 @@ function deriveAfterHoursAmount(afterHoursVolume?: number | null, price?: number
   return Number.isFinite(amount) && amount > 0 ? amount : undefined;
 }
 
-function inferLimitRatio(limitPrice?: number | null, prevClose?: number | null, direction: 1 | -1 = 1): number {
-  if (isValidNumber(limitPrice) && isValidNumber(prevClose) && prevClose > 0) {
-    const ratio = (limitPrice / prevClose) - 1;
-    if (Number.isFinite(ratio) && Math.sign(ratio) === direction) {
-      return ratio;
-    }
-  }
-  return direction * 0.1;
-}
-
-function resolvePointLimitPrice(
-  point: ChartPoint | null | undefined,
-  previous: ChartPoint | undefined,
+function resolveQuoteLimitPrice(
   quote: StockQuote | null,
   showRealtimeMetrics: boolean,
   direction: 1 | -1,
@@ -2119,37 +2119,23 @@ function resolvePointLimitPrice(
   if (showRealtimeMetrics && isValidNumber(quoteLimit)) {
     return quoteLimit;
   }
-  const basePrice = previous?.close ?? point?.open ?? quote?.prevClose;
-  if (!isValidNumber(basePrice) || basePrice <= 0) {
-    return isValidNumber(quoteLimit) ? quoteLimit : undefined;
-  }
-  const ratio = inferLimitRatio(quoteLimit, quote?.prevClose, direction);
-  return Math.round(basePrice * (1 + ratio) * 100) / 100;
-}
-
-function estimatePointEntrustRatio(point?: ChartPoint | null): number | undefined {
-  if (!point || !isValidNumber(point.high) || !isValidNumber(point.low) || point.high <= point.low) {
-    return undefined;
-  }
-  const ratio = ((point.close - point.open) / (point.high - point.low)) * 100;
-  return clamp(ratio, -100, 100);
+  return undefined;
 }
 
 function estimatePointMainNetInflow(point?: ChartPoint | null, previous?: ChartPoint): number | undefined {
   if (!point) {
     return undefined;
   }
-  const amount = point.amount ?? (isValidNumber(point.volume) ? point.close * point.volume * 100 : undefined);
+  const amount = point.amount ?? (isValidNumber(point.volume) ? point.close * point.volume : undefined);
   if (!isValidNumber(amount)) {
     return undefined;
   }
   const changePct = getPointChangePct(point, previous) ?? 0;
-  const amplitude = getPointAmplitude(point, previous) ?? 0;
-  const volumeRatio = getPointVolumeRatio(point) ?? 1;
-  const direction = changePct >= 0 ? 1 : -1;
+  const return5 = point.prev5dReturnPct ?? 0;
+  const volumeRatio = isValidNumber(point.volumeRatio) ? point.volumeRatio : getPointVolumeRatio(point) ?? 1;
   const flowRatio = clamp(
     (changePct / 100) * 0.9
-      + direction * (amplitude / 100) * 0.08
+      + (return5 / 100) * 0.32
       + (volumeRatio - 1) * 0.055,
     -0.26,
     0.26,
@@ -3022,14 +3008,14 @@ const ChartLegend: React.FC<{
     : isValidNumber(mainNetInflow) && isValidNumber(selectedCircMv) && selectedCircMv > 0
       ? (mainNetInflow / selectedCircMv) * 100
       : getMainNetVolumePct(points, latestQuote, showRealtimeMetrics ? metrics : null);
-  const limitUpPrice = resolvePointLimitPrice(point, previous, latestQuote, showRealtimeMetrics, 1);
-  const limitDownPrice = resolvePointLimitPrice(point, previous, latestQuote, showRealtimeMetrics, -1);
+  const limitUpPrice = resolveQuoteLimitPrice(latestQuote, showRealtimeMetrics, 1);
+  const limitDownPrice = resolveQuoteLimitPrice(latestQuote, showRealtimeMetrics, -1);
   const priceSpeed = showRealtimeMetrics && isValidNumber(latestQuote?.priceSpeed)
     ? latestQuote.priceSpeed
-    : point ? getPointChangePct(point, previous) : undefined;
+    : undefined;
   const entrustRatio = showRealtimeMetrics && isValidNumber(latestQuote?.entrustRatio)
     ? latestQuote.entrustRatio
-    : estimatePointEntrustRatio(point);
+    : undefined;
   const timeshareHoverHigh = isValidNumber(point?.high) ? point?.high : point?.close;
 
   return (
@@ -3329,7 +3315,7 @@ const CandlestickChart: React.FC<{
     ? hoveredIndex - visibleStartIndex
     : null;
   const hoveredPoint = hoveredVisibleIndex === null ? null : visible[hoveredVisibleIndex];
-  const hoveredPrevious = hoveredIndex === null ? undefined : points[hoveredIndex - 1];
+  const hoveredPrevious = hoveredIndex === null ? undefined : getPointPrevious(points[hoveredIndex], points[hoveredIndex - 1]);
   const hoveredX = hoveredVisibleIndex === null ? 0 : hoveredVisibleIndex * step;
   const activePoint = hoveredPoint ?? visibleLast;
   const activePointIndex = hoveredPoint
@@ -3337,7 +3323,7 @@ const CandlestickChart: React.FC<{
     : visible.length > 0
       ? visibleStartIndex + visible.length - 1
       : null;
-  const activePrevious = hoveredPoint ? hoveredPrevious : activePointIndex === null ? undefined : points[activePointIndex - 1];
+  const activePrevious = hoveredPoint ? hoveredPrevious : activePointIndex === null ? undefined : getPointPrevious(points[activePointIndex], points[activePointIndex - 1]);
   const activeIsLatest = activePointIndex !== null && activePointIndex === points.length - 1;
   const latestCloseY = typeof visibleLast?.close === 'number' ? yForPrice(visibleLast.close) : null;
   const highlightedDateKey = normalizeDateKey(highlightedDate);
@@ -5299,7 +5285,8 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
   const marketKind = useMemo(() => getMarketKind(stockCode), [stockCode]);
   const initialDateKey = normalizeDateKey(initialDate);
   const isHistoricalMode = dataMode === 'historical';
-  const dailyHistoryDays = Math.max(1, Math.min(365, Math.round(initialHistoryDays ?? 120)));
+  const dailyHistoryDays = Math.max(1, Math.min(MAX_DAILY_HISTORY_DAYS, Math.round(initialHistoryDays ?? DEFAULT_DAILY_HISTORY_DAYS)));
+  const dailyHistoryRequestDays = MAX_DAILY_HISTORY_DAYS;
   const [ruleDraft, setRuleDraft] = useState<RuleMetricDraft | null>(() => readRuleMetricDraftForStock(stockCode));
   const [isRuleDraftEditorOpen, setIsRuleDraftEditorOpen] = useState(false);
   const [ruleMetrics, setRuleMetrics] = useState<RuleMetricItem[]>([]);
@@ -5578,7 +5565,7 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
 
     const loadInitialData = async () => {
       const [historyResult, quoteResult, metricsResult] = await Promise.allSettled([
-        getHistoryForDataMode(stockCode, dailyHistoryDays, 'daily', 'daily', dataMode, initialDateKey),
+        getHistoryForDataMode(stockCode, dailyHistoryRequestDays, 'daily', 'daily', dataMode, initialDateKey),
         isHistoricalMode ? Promise.resolve(null) : stocksApi.getQuote(stockCode, 'cache_only'),
         isHistoricalMode
           ? stocksApi.getIndicatorMetrics(
@@ -5648,7 +5635,7 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
     return () => {
       ignore = true;
     };
-  }, [dailyHistoryDays, dataMode, initialDateKey, isHistoricalMode, marketKind, refreshMetricsForTradeDate, refreshQuoteWithDefaultPolicy, stockCode]);
+  }, [dailyHistoryDays, dailyHistoryRequestDays, dataMode, initialDateKey, isHistoricalMode, marketKind, refreshMetricsForTradeDate, refreshQuoteWithDefaultPolicy, stockCode]);
 
   const selectedCachedState = historyCache[selectedPeriod];
   const dailyCachedState = historyCache.daily;
@@ -5868,7 +5855,11 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
     };
   }, [isHistoricalMode, isLoading, marketKind, selectedPeriod, stockCode]);
 
-  const points = useMemo(() => buildChartPoints(history), [history]);
+  const computedPoints = useMemo(() => buildChartPoints(history), [history]);
+  const points = useMemo(
+    () => (effectivePeriod === 'daily' ? computedPoints.slice(-dailyHistoryDays) : computedPoints),
+    [computedPoints, dailyHistoryDays, effectivePeriod],
+  );
   const visibleCount = useMemo(() => getVisiblePointCount(points.length, timelineZoom, effectivePeriod), [effectivePeriod, points.length, timelineZoom]);
   const maxWindowStart = Math.max(points.length - visibleCount, 0);
   const safeWindowStart = clamp(windowStart, 0, maxWindowStart);
@@ -5910,7 +5901,7 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
   const latest = points.at(-1);
   const corePointIndex = safeHoveredIndex ?? visibleAnchorIndex;
   const corePoint = corePointIndex !== null ? points[corePointIndex] : latest;
-  const corePreviousPoint = corePointIndex !== null && corePointIndex > 0 ? points[corePointIndex - 1] : undefined;
+  const corePreviousPoint = corePointIndex !== null ? getPointPrevious(points[corePointIndex], points[corePointIndex - 1]) : undefined;
   const coreQuote = !isHistoricalMode && corePointIndex !== null && corePointIndex === points.length - 1 ? quote : null;
   const dailyReference = useMemo(() => {
     const dateKey = normalizeDateKey(corePoint?.date);

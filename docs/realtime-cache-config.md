@@ -100,9 +100,12 @@ python tools/backfill_a_share_daily_history.py --start-date 2025-01-01 --end-dat
 python tools/backfill_a_share_daily_history.py --start-date 2025-01-01 --end-date 2025-12-31 --parallelism 20
 python tools/backfill_a_share_daily_history.py --start-date 2025-01-01 --end-date 2025-12-31 --fetcher baostock
 python tools/backfill_a_share_daily_history.py --start-date 2025-01-01 --end-date 2025-12-31 --skip-chip
+python tools/backfill_a_share_daily_history.py --start-date 2025-01-01 --end-date 2025-12-31 --derived-only
 ```
 
 脚本会先读取 A 股交易日历，再按 `stock_daily(code,date)` 判断每只股票在目标交易日内已有的数据；只有缺失的交易日会被合并成连续区间回源拉取，已有日期不会重复写入。`--parallelism` 控制并发抓取股票数，默认 `10`。股票范围默认来自 `stocks.index.json` 中活跃 A 股，也可通过 `--codes 600519,000001` 做小范围补齐。默认 `--fetcher manager` 使用系统数据源 fallback 链；如果当前网络下东方财富类接口不可用，可用 `--fetcher baostock` 直连 Baostock 补数，避免继续探测不适用的兜底源。
+
+日线补齐完成后，脚本默认会基于本地 `stock_daily` 的 OHLCV 窗口重算并回填 `price_range_30d_pct`、`price_range_60d_pct` 等可由历史 K 线派生的指标，避免新增指标后旧缓存行长期为空。`--derived-only` 只重算这些派生指标，不访问远程行情或筹码数据；`--skip-derived-metrics` 可关闭该步骤。估值、股本、换手率等依赖实时 quote 的字段仍使用 `--valuation-only` 或常规补数中的 quote 富化路径；财务事件类指标需要财报事件源，在规则扫描映射到公告后首个交易日时写回 `stock_daily`。
 
 筹码峰补齐会先检查 `stock_chip_daily(code,date)`，只为缺失的交易日回源读取更长窗口的日 K 数据并计算本地筹码模型。`--skip-chip` 可只补 `stock_daily`。正常分析流水线如果已经成功取得筹码分布，也会把返回的交易日快照写入 `stock_chip_daily`，后续回测命中弹窗即可直接按命中日读取 DB，不需要在用户点击时访问外部 HTTP 数据源。
 

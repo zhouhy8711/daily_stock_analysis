@@ -4,7 +4,7 @@ import sys
 import os
 import tempfile
 import threading
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from unittest.mock import patch
 
 import pandas as pd
@@ -122,6 +122,12 @@ class TestStorage(unittest.TestCase):
                     "circ_mv": 2_862_600_000,
                     "total_shares": 101_185_810,
                     "float_shares": 96_709_459,
+                    "deducted_net_profit_yoy_pct": 120.5,
+                    "deducted_net_profit_qoq_pct": 60.2,
+                    "announcement_next_day_gap_pct": 3.5,
+                    "announcement_next_day_volume_ratio": 1.8,
+                    "announcement_next_day_gap_unfilled": 1.0,
+                    "net_profit_gap_signal": 1.0,
                 }
             ]),
             "002859",
@@ -152,7 +158,209 @@ class TestStorage(unittest.TestCase):
         self.assertEqual(row.circ_mv, 2_862_600_000)
         self.assertEqual(row.total_shares, 101_185_810)
         self.assertEqual(row.float_shares, 96_709_459)
+        self.assertEqual(row.deducted_net_profit_yoy_pct, 120.5)
+        self.assertEqual(row.deducted_net_profit_qoq_pct, 60.2)
+        self.assertEqual(row.announcement_next_day_gap_pct, 3.5)
+        self.assertEqual(row.announcement_next_day_volume_ratio, 1.8)
+        self.assertEqual(row.announcement_next_day_gap_unfilled, 1.0)
+        self.assertEqual(row.net_profit_gap_signal, 1.0)
         DatabaseManager.reset_instance()
+
+    def test_update_stock_daily_earnings_gap_metrics_updates_existing_rows_only(self):
+        DatabaseManager.reset_instance()
+        db = DatabaseManager(db_url="sqlite:///:memory:")
+        trade_date = date(2026, 5, 6)
+
+        db.save_daily_data(
+            pd.DataFrame([
+                {
+                    "date": trade_date,
+                    "open": 1196.83,
+                    "high": 1318.46,
+                    "low": 1187.58,
+                    "close": 1223.83,
+                    "volume": 197805,
+                    "amount": 36_853_365_889,
+                }
+            ]),
+            "688256",
+            data_source="TestFetcher",
+        )
+
+        updated = db.update_stock_daily_earnings_gap_metrics(
+            "688256",
+            [
+                {
+                    "date": trade_date,
+                    "deducted_net_profit_yoy_pct": 238.56,
+                    "deducted_net_profit_qoq_pct": 166.15,
+                    "announcement_next_day_gap_pct": 4.99,
+                    "announcement_next_day_volume_ratio": 1.83,
+                    "announcement_next_day_gap_unfilled": 1.0,
+                    "net_profit_gap_signal": 1.0,
+                },
+                {
+                    "date": date(2026, 5, 7),
+                    "deducted_net_profit_yoy_pct": 100.0,
+                },
+            ],
+        )
+
+        rows = db.get_data_range("688256", trade_date, date(2026, 5, 7))
+
+        self.assertEqual(updated, 1)
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual(row.close, 1223.83)
+        self.assertEqual(row.deducted_net_profit_yoy_pct, 238.56)
+        self.assertEqual(row.deducted_net_profit_qoq_pct, 166.15)
+        self.assertEqual(row.announcement_next_day_gap_pct, 4.99)
+        self.assertEqual(row.announcement_next_day_volume_ratio, 1.83)
+        self.assertEqual(row.announcement_next_day_gap_unfilled, 1.0)
+        self.assertEqual(row.net_profit_gap_signal, 1.0)
+        self.assertEqual(row.to_dict()["net_profit_gap_signal"], 1.0)
+        DatabaseManager.reset_instance()
+
+    def test_update_stock_daily_derived_metrics_updates_existing_rows_only(self):
+        DatabaseManager.reset_instance()
+        db = DatabaseManager(db_url="sqlite:///:memory:")
+        trade_date = date(2026, 5, 6)
+
+        db.save_daily_data(
+            pd.DataFrame([
+                {
+                    "date": trade_date,
+                    "open": 10.0,
+                    "high": 12.0,
+                    "low": 9.5,
+                    "close": 11.0,
+                    "volume": 1000,
+                    "amount": 11000,
+                }
+            ]),
+            "600519",
+            data_source="TestFetcher",
+        )
+
+        updated = db.update_stock_daily_derived_metrics(
+            "600519",
+            [
+                {
+                    "date": trade_date,
+                    "price_range_30d_pct": 12.5,
+                    "price_range_60d_pct": 18.5,
+                },
+                {
+                    "date": date(2026, 5, 7),
+                    "price_range_30d_pct": 99.0,
+                },
+            ],
+        )
+
+        rows = db.get_data_range("600519", trade_date, date(2026, 5, 7))
+        self.assertEqual(updated, 1)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].price_range_30d_pct, 12.5)
+        self.assertEqual(rows[0].price_range_60d_pct, 18.5)
+        DatabaseManager.reset_instance()
+
+    def test_existing_sqlite_stock_daily_adds_earnings_gap_metric_columns(self):
+        DatabaseManager.reset_instance()
+        with tempfile.NamedTemporaryFile(suffix=".db") as db_file:
+            db_path = db_file.name
+            import sqlite3
+
+            with sqlite3.connect(db_path) as connection:
+                connection.execute(
+                    """
+                    CREATE TABLE stock_daily (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        code VARCHAR(10) NOT NULL,
+                        date DATE NOT NULL,
+                        open FLOAT,
+                        high FLOAT,
+                        low FLOAT,
+                        close FLOAT,
+                        volume FLOAT,
+                        amount FLOAT,
+                        pct_chg FLOAT,
+                        ma5 FLOAT,
+                        ma10 FLOAT,
+                        ma20 FLOAT,
+                        volume_ratio FLOAT,
+                        data_source VARCHAR(50),
+                        created_at DATETIME,
+                        updated_at DATETIME,
+                        UNIQUE (code, date)
+                    )
+                    """
+                )
+                connection.execute(
+                    """
+                    CREATE TABLE stock_rules (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        name VARCHAR(100) NOT NULL,
+                        description TEXT,
+                        is_active BOOLEAN NOT NULL DEFAULT 1,
+                        period VARCHAR(16) NOT NULL DEFAULT 'daily',
+                        lookback_days INTEGER NOT NULL DEFAULT 120,
+                        target_scope VARCHAR(16) NOT NULL DEFAULT 'watchlist',
+                        target_codes_json TEXT,
+                        definition_json TEXT NOT NULL,
+                        created_at DATETIME,
+                        updated_at DATETIME
+                    )
+                    """
+                )
+                connection.execute(
+                    """
+                    CREATE TABLE stock_chip_daily (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        code VARCHAR(16) NOT NULL,
+                        date DATE NOT NULL,
+                        source VARCHAR(80),
+                        profit_ratio FLOAT,
+                        avg_cost FLOAT,
+                        cost_90_low FLOAT,
+                        cost_90_high FLOAT,
+                        concentration_90 FLOAT,
+                        cost_70_low FLOAT,
+                        cost_70_high FLOAT,
+                        concentration_70 FLOAT,
+                        distribution TEXT,
+                        chip_status VARCHAR(50),
+                        created_at DATETIME,
+                        updated_at DATETIME,
+                        UNIQUE (code, date)
+                    )
+                    """
+                )
+
+            db = DatabaseManager(db_url=f"sqlite:///{db_path}")
+            try:
+                with db._engine.begin() as connection:
+                    columns = {
+                        str(row[1])
+                        for row in connection.exec_driver_sql("PRAGMA table_info(stock_daily)").fetchall()
+                    }
+                    chip_columns = {
+                        str(row[1])
+                        for row in connection.exec_driver_sql("PRAGMA table_info(stock_chip_daily)").fetchall()
+                    }
+
+                self.assertIn("deducted_net_profit_yoy_pct", columns)
+                self.assertIn("deducted_net_profit_qoq_pct", columns)
+                self.assertIn("announcement_next_day_gap_pct", columns)
+                self.assertIn("announcement_next_day_volume_ratio", columns)
+                self.assertIn("announcement_next_day_gap_unfilled", columns)
+                self.assertIn("net_profit_gap_signal", columns)
+                self.assertIn("price_range_30d_pct", columns)
+                self.assertIn("price_range_60d_pct", columns)
+                self.assertIn("chip_peak_low_price", chip_columns)
+                self.assertIn("chip_peak_high_price", chip_columns)
+                self.assertIn("chip_peak_price_ratio", chip_columns)
+            finally:
+                DatabaseManager.reset_instance()
 
     def test_intraday_minute_hot_table_upserts_and_archives_to_daily(self):
         DatabaseManager.reset_instance()
@@ -217,6 +425,10 @@ class TestStorage(unittest.TestCase):
         self.assertEqual(row["low"], 10.0)
         self.assertEqual(row["close"], 12.0)
         self.assertEqual(row["snapshot_id"], "20260507103030")
+        summary = db.get_intraday_minute_snapshot_summary(trade_date=snapshot_time.date())
+        self.assertEqual(summary["codes"], ["600519"])
+        self.assertEqual(summary["snapshot_id"], "20260507103030")
+        self.assertEqual(summary["snapshot_time"], snapshot_time.replace(second=30).isoformat())
 
         archived = db.archive_intraday_minutes_to_daily(trade_date=snapshot_time.date(), codes=["600519"])
         daily_rows = db.get_latest_data("600519", days=1)
@@ -394,6 +606,7 @@ class TestStorage(unittest.TestCase):
                     "source": "unit_updated",
                     "profit_ratio": 0.9,
                     "avg_cost": 10.8,
+                    "chip_peak_price_ratio": None,
                     "distribution": [{"price": 10.8, "percent": 1.0}],
                 }
             ],
@@ -407,8 +620,30 @@ class TestStorage(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["date"], "2026-05-07")
         self.assertEqual(rows[0]["avg_cost"], 10.8)
+        self.assertEqual(rows[0]["chip_peak_count"], 1)
+        self.assertEqual(rows[0]["chip_single_peak_signal"], 1)
+        self.assertEqual(rows[0]["chip_peak_low_price"], 10.8)
+        self.assertEqual(rows[0]["chip_peak_high_price"], 10.8)
+        self.assertEqual(rows[0]["chip_peak_price_ratio"], 1)
         self.assertEqual(rows[0]["distribution"], [{"price": 10.8, "percent": 1.0}])
         self.assertEqual(latest["profit_ratio"], 0.9)
+
+        start = date(2026, 3, 1)
+        db.save_chip_daily_snapshots(
+            "000001",
+            [
+                {
+                    "date": (start + timedelta(days=index)).isoformat(),
+                    "concentration_90": 0.10,
+                    "distribution": [{"price": 10.0, "percent": 1.0}],
+                }
+                for index in range(60)
+            ],
+            data_source="unit",
+        )
+        rolling_latest = db.get_latest_chip_daily("000001", as_of=start + timedelta(days=59))
+        self.assertEqual(rolling_latest["chip_concentration_90_avg_30d"], 10)
+        self.assertEqual(rolling_latest["chip_concentration_90_avg_60d"], 10)
 
         DatabaseManager.reset_instance()
 

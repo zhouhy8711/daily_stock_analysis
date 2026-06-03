@@ -2,7 +2,7 @@
 import os
 import tempfile
 import unittest
-from datetime import date
+from datetime import date, timedelta
 
 import pandas as pd
 
@@ -183,6 +183,29 @@ class BackfillAShareDailyHistoryTestCase(unittest.TestCase):
         self.assertEqual(result.status, "skipped")
         self.assertEqual(result.missing_count, 0)
         self.assertEqual(fake_fetcher.calls, [])
+
+    def test_backfill_one_stock_recomputes_derived_metrics_from_existing_daily_rows(self) -> None:
+        code = "600519"
+        expected_dates = [date(2026, 1, 1) + timedelta(days=index) for index in range(65)]
+        for index, daily_date in enumerate(expected_dates):
+            self._save_daily(code, daily_date, 10.0 + index)
+        fake_fetcher = _FakeDailyFetcher(pd.DataFrame())
+
+        result = backfill_one_stock(
+            code,
+            expected_dates,
+            self.db,
+            fetcher_factory=lambda: fake_fetcher,
+            backfill_chip=False,
+        )
+
+        self.assertEqual(result.status, "fetched")
+        self.assertEqual(result.missing_count, 0)
+        self.assertGreater(result.derived_saved_count, 0)
+        self.assertEqual(fake_fetcher.calls, [])
+        latest = self.db.get_data_range(code, expected_dates[-1], expected_dates[-1])[0]
+        self.assertIsNotNone(latest.price_range_30d_pct)
+        self.assertIsNotNone(latest.price_range_60d_pct)
 
     def test_backfill_one_stock_computes_missing_chip_snapshots(self) -> None:
         code = "600519"

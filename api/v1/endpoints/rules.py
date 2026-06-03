@@ -3,7 +3,7 @@
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException, status
 
-from api.v1.schemas.common import ErrorResponse
+from api.v1.schemas.common import ErrorResponse, SuccessResponse
 from api.v1.schemas.rules import (
     RuleBatchRunRequest,
     RuleCreateRequest,
@@ -188,6 +188,7 @@ def start_async_rule_run(payload: RuleBatchRunRequest, background_tasks: Backgro
             start_date=payload.start_date,
             end_date=payload.end_date,
             data_policy=payload.data_policy,
+            live_cache_key=payload.live_cache_key,
         )
         if context is not None:
             background_tasks.add_task(_complete_async_rule_batch, context)
@@ -196,6 +197,17 @@ def start_async_rule_run(payload: RuleBatchRunRequest, background_tasks: Backgro
         raise HTTPException(status_code=404, detail={"error": "not_found", "message": "规则不存在"}) from exc
     except RuleValidationError as exc:
         raise HTTPException(status_code=400, detail={"error": "invalid_rule", "message": str(exc)}) from exc
+
+
+@router.delete(
+    "/live-cache/{live_cache_key}",
+    response_model=SuccessResponse,
+    summary="清理规则实测数据缓存",
+)
+def clear_live_rule_history_cache(live_cache_key: str) -> SuccessResponse:
+    service = RuleService()
+    result = service.clear_live_rule_history_cache(live_cache_key)
+    return SuccessResponse(success=True, message="规则实测数据缓存已清理", data=result)
 
 
 @router.post(

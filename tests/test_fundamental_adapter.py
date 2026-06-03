@@ -16,6 +16,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 from data_provider.fundamental_adapter import (
     AkshareFundamentalAdapter,
     _build_dividend_payload,
+    _build_deducted_profit_growth_events,
     _extract_latest_row,
     _parse_dividend_plan_to_per_share,
 )
@@ -169,6 +170,89 @@ class TestFundamentalAdapter(unittest.TestCase):
         payload = _build_dividend_payload(df, stock_code="600519")
         self.assertEqual(payload.get("ttm_event_count"), 1)
         self.assertAlmostEqual(payload.get("ttm_cash_dividend_per_share"), 0.3, places=6)
+
+    def test_build_deducted_profit_growth_events_derives_single_quarter_growth(self) -> None:
+        df = pd.DataFrame(
+            {
+                "股票代码": ["600519"] * 5,
+                "报告期": [
+                    "2025-03-31",
+                    "2025-06-30",
+                    "2025-09-30",
+                    "2025-12-31",
+                    "2026-03-31",
+                ],
+                "公告日期": [
+                    "2025-04-20",
+                    "2025-08-20",
+                    "2025-10-25",
+                    "2026-03-30",
+                    "2026-04-20",
+                ],
+                "扣除非经常性损益后的净利润": [100.0, 160.0, 200.0, 240.0, 250.0],
+            }
+        )
+
+        events = _build_deducted_profit_growth_events(df, stock_code="600519")
+        latest = events[-1]
+
+        self.assertEqual(latest["report_date"], "2026-03-31")
+        self.assertEqual(latest["announcement_date"], "2026-04-20")
+        self.assertEqual(latest["single_quarter_deducted_net_profit"], 250.0)
+        self.assertAlmostEqual(latest["deducted_net_profit_yoy_pct"], 150.0, places=6)
+        self.assertAlmostEqual(latest["deducted_net_profit_qoq_pct"], 525.0, places=6)
+
+    def test_build_deducted_profit_growth_events_supports_eastmoney_indicator_columns(self) -> None:
+        df = pd.DataFrame(
+            {
+                "SECURITY_CODE": ["600519", "600519"],
+                "SECUCODE": ["600519.SH", "600519.SH"],
+                "REPORT_DATE": ["2025-12-31 00:00:00", "2026-03-31 00:00:00"],
+                "NOTICE_DATE": ["2026-04-17 00:00:00", "2026-04-25 00:00:00"],
+                "KCFJCXSYJLR": [100.0, 250.0],
+                "DJD_DEDUCTDPNP_YOY": [20.0, 120.0],
+                "DJD_DEDUCTDPNP_QOQ": [30.0, 80.0],
+                "KCFJCXSYJLRTZ": [15.0, 110.0],
+            }
+        )
+
+        events = _build_deducted_profit_growth_events(df, stock_code="600519")
+        latest = events[-1]
+
+        self.assertEqual(latest["report_date"], "2026-03-31")
+        self.assertEqual(latest["announcement_date"], "2026-04-25")
+        self.assertEqual(latest["deducted_net_profit"], 250.0)
+        self.assertEqual(latest["deducted_net_profit_yoy_pct"], 120.0)
+        self.assertEqual(latest["deducted_net_profit_qoq_pct"], 80.0)
+
+    def test_deducted_profit_growth_events_prefers_eastmoney_indicator_source(self) -> None:
+        adapter = AkshareFundamentalAdapter()
+        df = pd.DataFrame(
+            {
+                "SECURITY_CODE": ["600519"],
+                "REPORT_DATE": ["2026-03-31"],
+                "NOTICE_DATE": ["2026-04-25"],
+                "KCFJCXSYJLR": [250.0],
+                "DJD_DEDUCTDPNP_YOY": [120.0],
+                "DJD_DEDUCTDPNP_QOQ": [80.0],
+            }
+        )
+
+        with patch.object(
+            adapter,
+            "_call_df_candidates",
+            return_value=(df, "stock_financial_analysis_indicator_em", []),
+        ) as mocked:
+            result = adapter.get_deducted_profit_growth_events("600519")
+
+        candidates = mocked.call_args.args[0]
+        self.assertEqual(
+            candidates[0],
+            ("stock_financial_analysis_indicator_em", {"symbol": "600519.SH", "indicator": "按报告期"}),
+        )
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["source_chain"], ["deducted_profit_growth:stock_financial_analysis_indicator_em"])
+        self.assertEqual(result["events"][0]["announcement_date"], "2026-04-25")
 
 
 if __name__ == "__main__":

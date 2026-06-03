@@ -8,6 +8,7 @@ export type ApiErrorCategory =
   | 'invalid_tool_call'
   | 'portfolio_oversell'
   | 'portfolio_busy'
+  | 'request_timeout'
   | 'upstream_llm_400'
   | 'upstream_timeout'
   | 'upstream_network'
@@ -392,7 +393,17 @@ export function parseApiError(error: unknown): ParsedApiError {
     });
   }
 
-  if (includesAny(matchText, ['timeout', 'timed out', 'read timeout', 'connect timeout']) || code === 'ECONNABORTED') {
+  if (!response && code === 'ECONNABORTED') {
+    return createParsedApiError({
+      title: '请求本地服务超时',
+      message: '本地服务响应超时，后台任务可能仍在执行，请稍后刷新或检查服务负载。',
+      rawMessage,
+      status,
+      category: 'request_timeout',
+    });
+  }
+
+  if (includesAny(matchText, ['timeout', 'timed out', 'read timeout', 'connect timeout'])) {
     return createParsedApiError({
       title: '连接上游服务超时',
       message: '服务端访问外部依赖时超时，请稍后重试，或检查当前网络与代理设置。',

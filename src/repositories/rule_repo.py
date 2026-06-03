@@ -95,6 +95,7 @@ class RuleRepository:
             "name": row.name,
             "description": row.description,
             "is_active": bool(row.is_active),
+            "is_disable": bool(row.is_disable),
             "period": row.period,
             "lookback_days": row.lookback_days,
             "target_scope": row.target_scope,
@@ -121,7 +122,9 @@ class RuleRepository:
                 .scalar_subquery()
             )
             rows = session.execute(
-                select(StockRule, last_run_at, last_match_count).order_by(desc(StockRule.updated_at), desc(StockRule.id))
+                select(StockRule, last_run_at, last_match_count)
+                .where(StockRule.is_disable.is_(False))
+                .order_by(desc(StockRule.updated_at), desc(StockRule.id))
             ).all()
             items: List[Dict[str, Any]] = []
             for rule, run_at, match_count in rows:
@@ -161,6 +164,9 @@ class RuleRepository:
             "quote_hit_count": int(batch_metadata.get("quote_hit_count") or 0),
             "quote_miss_count": int(batch_metadata.get("quote_miss_count") or 0),
             "reused_run": bool(batch_metadata.get("reused_run") or False),
+            "prewarm_only": bool(batch_metadata.get("prewarm_only") or False),
+            "prewarm_hit_count": int(batch_metadata.get("prewarm_hit_count") or 0),
+            "prewarm_miss_count": int(batch_metadata.get("prewarm_miss_count") or 0),
         }
 
     def find_reusable_run_by_key(self, run_key: str) -> Optional[Dict[str, Any]]:
@@ -453,6 +459,7 @@ class RuleRepository:
                 name=data["name"],
                 description=data.get("description"),
                 is_active=bool(data.get("is_active", True)),
+                is_disable=bool(data.get("is_disable", False)),
                 period=definition.get("period", "daily"),
                 lookback_days=int(definition.get("lookback_days", 120)),
                 target_scope=target.get("scope", "watchlist"),
@@ -476,6 +483,8 @@ class RuleRepository:
                 row.description = data["description"]
             if "is_active" in data and data["is_active"] is not None:
                 row.is_active = bool(data["is_active"])
+            if "is_disable" in data and data["is_disable"] is not None:
+                row.is_disable = bool(data["is_disable"])
             if "definition" in data and data["definition"] is not None:
                 definition = data["definition"]
                 target = definition.get("target") or {}

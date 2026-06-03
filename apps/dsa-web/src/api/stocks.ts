@@ -33,6 +33,14 @@ export type KLineData = {
   circMv?: number | null;
   totalShares?: number | null;
   floatShares?: number | null;
+  priceRange30dPct?: number | null;
+  priceRange60dPct?: number | null;
+  deductedNetProfitYoyPct?: number | null;
+  deductedNetProfitQoqPct?: number | null;
+  announcementNextDayGapPct?: number | null;
+  announcementNextDayVolumeRatio?: number | null;
+  announcementNextDayGapUnfilled?: number | null;
+  netProfitGapSignal?: number | null;
   dataSource?: string | null;
   snapshotId?: string | null;
   snapshotTime?: string | null;
@@ -111,6 +119,13 @@ export type ChipDistributionMetrics = {
   cost70Low?: number | null;
   cost70High?: number | null;
   concentration70?: number | null;
+  chipPeakCount?: number | null;
+  chipSinglePeakSignal?: number | null;
+  chipPeakLowPrice?: number | null;
+  chipPeakHighPrice?: number | null;
+  chipPeakPriceRatio?: number | null;
+  chipConcentration90Avg30d?: number | null;
+  chipConcentration90Avg60d?: number | null;
   distribution: ChipDistributionPoint[];
   snapshots?: ChipDistributionMetrics[];
   chipStatus?: string | null;
@@ -196,6 +211,14 @@ function normalizeKLine(item: Record<string, unknown>): KLineData {
     circMv: toNullableNumber(item.circ_mv ?? item.circMv),
     totalShares: toNullableNumber(item.total_shares ?? item.totalShares),
     floatShares: toNullableNumber(item.float_shares ?? item.floatShares),
+    priceRange30dPct: toNullableNumber(item.price_range_30d_pct ?? item.priceRange30dPct),
+    priceRange60dPct: toNullableNumber(item.price_range_60d_pct ?? item.priceRange60dPct),
+    deductedNetProfitYoyPct: toNullableNumber(item.deducted_net_profit_yoy_pct ?? item.deductedNetProfitYoyPct),
+    deductedNetProfitQoqPct: toNullableNumber(item.deducted_net_profit_qoq_pct ?? item.deductedNetProfitQoqPct),
+    announcementNextDayGapPct: toNullableNumber(item.announcement_next_day_gap_pct ?? item.announcementNextDayGapPct),
+    announcementNextDayVolumeRatio: toNullableNumber(item.announcement_next_day_volume_ratio ?? item.announcementNextDayVolumeRatio),
+    announcementNextDayGapUnfilled: toNullableNumber(item.announcement_next_day_gap_unfilled ?? item.announcementNextDayGapUnfilled),
+    netProfitGapSignal: toNullableNumber(item.net_profit_gap_signal ?? item.netProfitGapSignal),
     dataSource: toNullableString(item.data_source ?? item.dataSource),
     snapshotId: toNullableString(item.snapshot_id ?? item.snapshotId),
     snapshotTime: toNullableString(item.snapshot_time ?? item.snapshotTime),
@@ -273,6 +296,13 @@ function normalizeChipDistribution(item: unknown): ChipDistributionMetrics | nul
     cost70Low: toNullableNumber(data.cost_70_low ?? data.cost70Low),
     cost70High: toNullableNumber(data.cost_70_high ?? data.cost70High),
     concentration70: toNullableNumber(data.concentration_70 ?? data.concentration70),
+    chipPeakCount: toNullableNumber(data.chip_peak_count ?? data.chipPeakCount),
+    chipSinglePeakSignal: toNullableNumber(data.chip_single_peak_signal ?? data.chipSinglePeakSignal),
+    chipPeakLowPrice: toNullableNumber(data.chip_peak_low_price ?? data.chipPeakLowPrice),
+    chipPeakHighPrice: toNullableNumber(data.chip_peak_high_price ?? data.chipPeakHighPrice),
+    chipPeakPriceRatio: toNullableNumber(data.chip_peak_price_ratio ?? data.chipPeakPriceRatio),
+    chipConcentration90Avg30d: toNullableNumber(data.chip_concentration_90_avg_30d ?? data.chipConcentration90Avg30d),
+    chipConcentration90Avg60d: toNullableNumber(data.chip_concentration_90_avg_60d ?? data.chipConcentration90Avg60d),
     distribution,
     chipStatus: toNullableString(data.chip_status ?? data.chipStatus),
   };

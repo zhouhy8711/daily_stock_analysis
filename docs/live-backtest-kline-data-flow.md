@@ -32,11 +32,11 @@
 | 首页 quote 前端缓存 | `apps/dsa-web/src/pages/HomePage.tsx` 的 `quoteCacheRef` | 自选股/全 A 股 quote，TTL 30 秒 | 首页加载自选股行情、切换到全 A 股列表、返回列表时先复用 | 否 | 只对缺失代码调用 `POST /api/v1/stocks/quotes`；返回后重新写入前端缓存 |
 | 指标页 K 线前端缓存 | `IndicatorAnalysisView` 的 `historyCache` | 当前股票按周期分开的 K 线、quote、指标扩展数据 | 打开指标页、切换周期、1m/分时定时刷新 | 否 | 先调后端 `cache_only`；日线返回 `daily_cache_miss` 或分钟返回 `intraday_hot_table_miss` 时，实时模式再调 `default` 回源；历史模式只调 `db_only` |
 | 回测/实测页面运行态缓存 | `BacktestPage.tsx` 的 `backtestRuntimeStates` | 当前页面 tab 的运行状态、结果、轮询信息 | 页面切换或组件重渲染时恢复 UI 状态 | 否 | 重新从 `stock_rule_runs`、`stock_rule_matches` 等 API 读取，或等待新运行返回 |
-| 实时 quote 快照 | `src/services/stock_service.py` 的 `_REALTIME_QUOTE_SNAPSHOT` | 一轮预热产生的全 A 股 quote 快照，含 `snapshot_id` | 实测 `snapshot_only`、首页/指标页 `cache_only` quote、`default` quote 的第一优先级；读取时校验 `snapshot_time` 的市场本地日期必须等于当前市场日期 | 间接同步：生成快照时同批 quote 会写 `stock_intraday_minute` | quote API 的 `snapshot_only/db_only` 遇到缺失或跨天快照直接返回空；规则实测会继续尝试本地分钟热表 fallback；`cache_only` 继续查短缓存；`default` 继续查短缓存和远程数据源 |
+| 实时 quote 快照 | `src/services/stock_service.py` 的 `_REALTIME_QUOTE_SNAPSHOT` | 一轮预热产生的全 A 股 quote 快照，含 `snapshot_id` | 首页/指标页 `cache_only` quote、`default` quote 的第一优先级；读取时校验 `snapshot_time` 的市场本地日期必须等于当前市场日期；规则实测不直接读取该进程内快照 | 间接同步：生成快照时同批 quote 会写 `stock_intraday_minute` | quote API 的 `snapshot_only` 遇到缺失或跨天快照直接返回空；`db_only` 不读快照；`cache_only` 继续查短缓存；`default` 继续查短缓存和远程数据源 |
 | 实时 quote 短缓存 | `src/services/stock_service.py` 的 `_REALTIME_QUOTE_CACHE` | 单股 quote payload，按 `REALTIME_QUOTE_CACHE_SECONDS` 时间桶复用 | `get_realtime_quote(s)` 在快照未命中后读取；预热任务也用它判断本轮缺失代码 | 只有 `warm_realtime_quotes()` 会把当前批次 quote 样本写入 `stock_intraday_minute`；普通按需 quote 不直接落库 | `cache_only` 返回空；`default` 调 `DataFetcherManager.get_realtime_quote(s)` 远程回源，成功后写短缓存 |
 | 数据源全市场实时缓存 | `data_provider/efinance_fetcher.py`、`data_provider/akshare_fetcher.py` 的 `_realtime_cache`、`_etf_realtime_cache` | efinance/AkShare 全市场股票或 ETF DataFrame，TTL 同 `REALTIME_QUOTE_CACHE_SECONDS` | 数据源单股实时、批量实时、市场统计都会先查这个 DataFrame | 不直接同步 DB；只有上层 `StockService.warm_realtime_quotes()` 使用这些数据形成 quote payload 后才会写 `stock_intraday_minute` | miss 时在锁内拉全市场接口并更新 DataFrame；AkShare 失败时会缓存空 DataFrame，避免同一 TTL 内反复打接口 |
 | 日线数据库缓存 | `stock_daily` 表 | 日 K、估值、成交额、换手、均线等字段 | 规则实测、规则回测、AI 回测、首页指标日 K 都优先读 | 是，远程日线成功后 upsert；分钟热表收盘归档后也 upsert | `cache_only/snapshot_only` 返回 `daily_cache_miss`；`db_only` 可返回部分历史；`default` 远程回源，失败且有旧缓存时降级用旧 DB 数据 |
-| 分钟热表 | `stock_intraday_minute` 表 | 当日或近几日分钟 K/quote 采样，含 `snapshot_id`、`snapshot_time` | 首页指标分钟 K、1m/分时刷新、规则实测快照 miss fallback、收盘归档、诊断接口 | 是，预热 quote 采样和按需分钟 K 回源都会写入；收盘任务再聚合写 `stock_daily` | `cache_only/snapshot_only/db_only` 返回 `intraday_hot_table_miss`；规则实测会把命中的 1m 热表聚合成当日虚拟日 K；`default` 调远程分钟 K，成功后写热表并重读 |
+| 分钟热表 | `stock_intraday_minute` 表 | 当日或近几日分钟 K/quote 采样，含 `snapshot_id`、`snapshot_time` | 首页指标分钟 K、1m/分时刷新、规则实测本地 quote、收盘归档、诊断接口 | 是，预热 quote 采样和按需分钟 K 回源都会写入；收盘任务再聚合写 `stock_daily` | `cache_only/snapshot_only/db_only` 返回 `intraday_hot_table_miss`；规则实测会把命中的 1m 热表聚合成当日虚拟日 K；`default` 调远程分钟 K，成功后写热表并重读 |
 | 筹码日缓存 | `stock_chip_daily` 表 | 筹码峰快照、获利盘、平均成本、集中度、分布 JSON | 指标扩展、规则指标帧、首页指标页 `getIndicatorMetrics` | 是，日线写入后会从历史同步；远程/本地筹码成功后也写入 | `cache_only/db_only/snapshot_only` 返回空指标并带 `chip_daily_miss`；`default` 调筹码数据源或本地模型，成功后写表 |
 | 股票名称缓存 | `DataFetcherManager._stock_name_cache`、部分 fetcher 内部 `_stock_name_cache` | 股票代码到名称 | 报告、规则、指标、历史响应需要展示名称时 | 否 | 先查本地映射和 `stocks.index.json`，再按需查实时 quote 或各 fetcher；都失败返回空字符串 |
 | 股票索引文件缓存 | `src/data/stock_index_loader.py` 的 `_STOCK_INDEX_CACHE`、`_ALL_A_SHARE_CODES_CACHE` | 从 `stocks.index.json` 加载的名称索引和活跃 A 股代码列表 | 后端名称解析、全 A 股预热目标列表 | 否 | 文件不存在或解析失败时缓存空 map/list；预热会因目标为空跳过 |
@@ -49,17 +49,17 @@
 
 | 策略 | quote 行为 | 日线行为 | 分钟 K 行为 | 典型调用 |
 | --- | --- | --- | --- | --- |
-| `default` | 快照 -> 短缓存 -> 远程数据源，成功后写短缓存 | 先读 `stock_daily`；不足或过期时远程拉日线，成功后写 `stock_daily` 并同步 `stock_chip_daily`；远程失败且有旧缓存时用旧缓存兜底 | 先读 `stock_intraday_minute`；miss 后远程拉分钟 K，成功后写热表并重读 | 规则回测、首页指标页实时模式 cache miss 后补齐 |
+| `default` | 快照 -> 短缓存 -> 远程数据源，成功后写短缓存 | 先读 `stock_daily`；不足或过期时远程拉日线，成功后写 `stock_daily` 并同步 `stock_chip_daily`；远程失败且有旧缓存时用旧缓存兜底 | 先读 `stock_intraday_minute`；miss 后远程拉分钟 K，成功后写热表并重读 | 首页指标页实时模式 cache miss 后补齐、离线补数据任务 |
 | `cache_only` | 只读快照和短缓存，不远程 | 只读 `stock_daily`，miss 返回 `daily_cache_miss` | 只读 `stock_intraday_minute`，miss 返回 `intraday_hot_table_miss` | 指标页首次快速加载、首页 quote 轻刷新 |
-| `snapshot_only` | quote API 只读 `_REALTIME_QUOTE_SNAPSHOT`，不读短缓存，不远程；规则实测在 quote miss 时会本地读取 1m 热表聚合 fallback | 只读 `stock_daily`，可用快照 quote 或热表 fallback 生成虚拟当日点 | 只读分钟热表，可用快照 quote 校准最后一根 | 实测固定使用，确保不主动远程回源 |
-| `db_only` | 不读实时缓存，不远程 | 只读 `stock_daily`，允许部分窗口，不追加实时点 | 只读 `stock_intraday_minute`，不追加实时点 | 历史态指标页、需要纯 DB 视角的页面或测试 |
+| `snapshot_only` | quote API 只读 `_REALTIME_QUOTE_SNAPSHOT`，不读短缓存，不远程 | 只读 `stock_daily`，可用快照 quote 生成虚拟当日点 | 只读分钟热表，可用快照 quote 校准最后一根 | 实时行情缓存诊断或兼容调用 |
+| `db_only` | 不读实时缓存，不远程；规则实测从 `stock_intraday_minute` 聚合本地 quote | 只读 `stock_daily`，允许部分窗口，不追加实时点 | 只读 `stock_intraday_minute`，不追加实时点 | 规则实测、规则回测、历史态指标页、需要纯 DB 视角的页面或测试 |
 
 关键结论：
 
 - `cache_only` 和 `snapshot_only` 都不会主动远程回源，也不会补库。
 - `default` 是唯一会在 miss 后主动访问远程行情源的策略。
 - `db_only` 用于“只看已经落库的数据”，不会用实时 quote 修正 K 线。
-- 实测固定使用 `snapshot_only`，不主动远程回源；实时快照缺单股时，规则层允许用本地 `stock_intraday_minute` 聚合成当日虚拟日 K 作为 fallback。
+- 规则实测和规则回测固定强制为 `db_only`；历史日线、分钟热表、筹码日缓存和财务派生指标都必须由离线预热、收盘归档或补数据脚本提前写入数据库。
 
 ### 缓存和数据库同步时机
 
@@ -105,7 +105,7 @@ flowchart LR
 
 ### 规则运行数据预热
 
-异步规则实测/回测启动后，后端会根据选中规则、股票范围和 lookback 天数，一次性从 `stock_daily` 批量读取所需日线窗口并放入进程内短期缓存。扫描阶段优先读这份运行缓存，避免全 A 股任务按 5000+ 只股票逐只查询 SQLite。相同规则数据在短时间内可复用历史缓存；新实时行情快照到来时，只需重新读取内存 quote 快照并计算规则，不必重新冷读整批历史数据。大规模实测运行期间，后台实时行情预热仍会刷新内存快照，但会临时跳过 `stock_intraday_minute` 归档写入，避免归档事务抢占规则结果落库。
+异步规则实测/回测启动后，后端会根据选中规则、股票范围和 lookback 天数，一次性从 `stock_daily` 批量读取所需日线窗口并放入进程内缓存。回测和普通规则运行使用短期通用缓存；Web 实测会额外生成 `live_cache_key`，后端把当天之前的历史日线、基础筹码分布缓存和财务事件派生缓存写入仅实测使用的 live 缓存，不受通用缓存 TTL 影响；每一轮实测都会先用最新分钟热表行情合成当前判断日 K 线，再优先基于该 K 线重算当日筹码分布，缺少换手率等必要字段时才退回到按最新价重估获利盘，避免复用上一轮价格或前一交易日筹码日期。A 股交易日 09:30 前触发实测时只进入 `prewarm_only`：读取当天之前的历史日线并刷新 live 缓存，不读取分钟热表、不评估命中、不推送通知；09:30 后同规则和股票会复用该 live 缓存，再从 `stock_intraday_minute` 聚合实时 quote 做真正实测。用户点击「停止实测」时前端调用 `DELETE /api/v1/rules/live-cache/{live_cache_key}` 清理本次 live 缓存；如果页面异常关闭，组件卸载时也会尽力清理。大规模实测运行期间，后台实时行情预热仍会刷新内存快照，但会临时跳过 `stock_intraday_minute` 归档写入，避免归档事务抢占规则结果落库。
 
 ### 数据库表
 
@@ -137,17 +137,17 @@ flowchart LR
 
 点击「运行实测」后：
 
-1. 前端先用上海时间判断 A 股是否仍允许实测：交易日 15:00 及以前可运行，9:30 前和午休不再拦截。
+1. 前端先用上海时间判断 A 股是否仍允许实测：交易日 15:00 及以前可触发，9:30 前不做真扫描，只请求后端预热历史数据；午休不拦截，仍按最新本地热表运行。
 2. 创建一个临时运行记录，首轮立即触发，之后每 30 秒触发一次；「精简模式」默认开启。
 3. 最多允许 2 个实测周期并发，超出会排队到下一个 slot。
 4. 每轮调用：
 
 ```http
-POST /api/v1/rules/run-batch
+POST /api/v1/rules/run-batch/async
 {
   "rule_ids": [1, 2],
   "mode": "latest",
-  "data_policy": "snapshot_only",
+  "data_policy": "db_only",
   "target": {
     "scope": "custom",
     "stock_codes": ["600519", "300750"]
@@ -155,54 +155,54 @@ POST /api/v1/rules/run-batch
 }
 ```
 
-5. 返回后前端按 `snapshot_id` 去重；相同快照不重复汇总，旧快照不覆盖新快照。
-6. 精简模式开启时，前端结果列表按「命中日 + 规则 + 股票」只保留一条命中；关闭后恢复逐轮累计展示。
-7. 若本轮有命中，前端继续调用 `POST /api/v1/rules/runs/{run_id}/notify` 推送通知，并传入当前精简模式开关。后端在精简模式下会按同一天「命中日 + 规则 + 股票」过滤今日已推送过的命中；关闭后使用原来的上一轮组合完全一致去重逻辑。
+5. 若返回 `prewarm_only=true`，前端只写入预热日志并结束本轮，不轮询命中、不汇总、不通知。
+6. 真扫描返回后前端按 `snapshot_id` 去重；相同快照不重复汇总，旧快照不覆盖新快照。
+7. 精简模式开启时，前端结果列表按「命中日 + 规则 + 股票」只保留一条命中；关闭后恢复逐轮累计展示。
+8. 若本轮有命中，前端继续调用 `POST /api/v1/rules/runs/{run_id}/notify` 推送通知，并传入当前精简模式开关。后端在精简模式下会按同一天「命中日 + 规则 + 股票」过滤今日已推送过的命中；关闭后使用原来的上一轮组合完全一致去重逻辑。
+9. 点击「停止实测」后，前端停止轮询并调用 `DELETE /api/v1/rules/live-cache/{live_cache_key}` 清理本次实测专用数据缓存。
 
 ### 后端规则准备
 
-`api/v1/endpoints/rules.py` 接收请求后进入 `RuleService.run_rules()`：
+`api/v1/endpoints/rules.py` 接收请求后进入 `RuleService.start_run_rules()`：
 
 1. 校验 `mode` 只能是 `latest/history`，实测固定为 `latest`。
-2. 校验 `data_policy`，实测固定为 `snapshot_only`。
+2. 校验 `data_policy`，规则实测和规则回测会在服务端统一强制为 `db_only`。
 3. 通过 `RuleRepository.get_rule()` 从 `stock_rules` 读取规则定义。
 4. `validate_definition()` 校验第一版规则只支持 `daily` 周期、至少一个条件组、目标范围合法、指标 key/operator 合法。
 5. 目标股票优先使用前端传入的 `target.stock_codes`；没有显式代码时，`watchlist` 从 `STOCK_LIST` 取。
-6. `_validate_live_snapshot_session()` 如果目标全部是 A 股，会再次校验实测时间窗口：交易日 15:00 及以前可运行，15:00 之后或非交易日返回错误。
-7. `RuleRepository.create_run()` 写入 `stock_rule_runs`，初始状态为 `running`。
+6. `_validate_live_snapshot_session()` 如果目标全部是 A 股，会再次校验实测时间窗口：交易日 15:00 及以前可触发，15:00 之后或非交易日返回错误。
+7. 09:30 前的 A 股实测写入 `prewarm_only` 运行记录并立即完成，只预热当天之前的规则历史数据缓存。
+8. 09:30 后的真扫描由 `RuleRepository.create_run()` 写入 `stock_rule_runs`，初始状态为 `running`。
 
 ### 单股数据获取
 
 每只股票最终进入 `RuleService._evaluate_stock()`：
 
 1. 计算 `lookback_days`，默认来自规则定义 `lookback_days`，常见为 120。
-2. 调用 `StockService.get_history_data(stock_code, period="daily", days=lookback_days, data_policy="snapshot_only")`。
+2. 调用 `StockService.get_history_data(stock_code, period="daily", days=lookback_days, data_policy="db_only")`。
 3. 日线读取只走 DB：
-   - `_load_daily_history_from_db(require_fresh=True, allow_partial=False)`。
+   - `_load_daily_history_from_db(require_fresh=False, allow_partial=True)`。
    - 读取 `stock_daily`，使用原始代码、标准化代码、带交易所后缀代码等候选 key。
-   - 要求缓存覆盖最新有效交易日，且行数满足请求窗口。
+   - 允许使用数据库中已有的部分窗口，但不会远程补齐缺口。
    - 命中返回 `data_source="db_cache"`。
    - 未命中返回空数组和 `data_source="daily_cache_miss"`，不远程回源。
 4. 如果日线为空，规则层抛出 `RuleDataUnavailable("history_cache_miss")`，外层按“数据暂不可用”记录日志并跳过该股票，不写入命中，也不计入硬错误。
-5. 读取实时 quote：
-   - `StockService.get_realtime_quote(data_policy="snapshot_only")`。
-   - 只查 `_REALTIME_QUOTE_SNAPSHOT.items_by_code`。
-   - 未命中直接返回 `None`，不读短缓存，不访问远程数据源。
-6. 如果 quote 为空，规则层会尝试本地分钟热表 fallback：
-   - 调用 `StockService.get_history_data(stock_code, period="1m", days=1, data_policy="snapshot_only")`。
-   - 只读取 `stock_intraday_minute`，不会远程回源。
+5. 实测读取本地分钟热表 quote：
+   - 调用 `StockService.get_history_data(stock_code, period="1m", days=1, data_policy="db_only")`。
+   - 只读取 `stock_intraday_minute`，不读实时快照、短缓存或远程数据源。
    - 将同一交易日 1m 行聚合为 quote-like payload：`open=第一条 open`、`high=max(high)`、`low=min(low)`、`close/current_price=最后一条 close`、`volume/amount=sum`、`turnover_rate/change_percent=最后一条非空值`。
    - fallback payload 会带 `snapshot_id`、`snapshot_time`、`quote_time` 和 `source="intraday_hot_table"`。
-7. 如果快照和分钟热表都为空，抛出 `RuleDataUnavailable("quote_snapshot_miss")` 并跳过该股票。
-8. 指标扩展：
-   - `data_policy="snapshot_only"` 时，`RuleService._get_indicator_metrics()` 不走远程筹码源。
-   - 它用已取得的日线 `history_rows` 调用本地筹码模型 `compute_chip_distribution_from_history()`，把筹码指标注入规则指标帧。
-9. `_sync_latest_history_rows_with_quote()` 根据 `snapshot_time/quote_time/update_time` 解析判断日，把实时 quote 或分钟热表 fallback 合成为最新日线点：
+6. 如果分钟热表为空，抛出 `RuleDataUnavailable("intraday_hot_table_miss")` 并跳过该股票。
+7. 指标扩展：
+   - `data_policy="db_only"` 时，`RuleService._get_indicator_metrics()` 不走远程筹码源。
+   - 它优先用已取得的日线 `history_rows` 调用本地筹码模型，或读取 `stock_chip_daily` 已落库快照。
+   - 若实测判断日早于收盘归档，后端会先把分钟热表 quote 合成当前判断日 K 线，并用同一 lookback 窗口重算 `profit_ratio`、`chip_single_peak_signal`、`chip_peak_price_ratio` 等筹码规则字段；只有当实时行缺少换手率导致本地筹码模型不可用时，才复用基础筹码分布并按最新价重估获利盘作为兜底。
+8. `_sync_latest_history_rows_with_quote()` 根据 `snapshot_time/quote_time/update_time` 解析判断日，把分钟热表 quote 合成为最新日线点：
    - 若 `stock_daily` 最后一日就是判断日，更新最后一行。
    - 若最后一日早于判断日，追加一条虚拟实时日 K。
    - 虚拟点带 `snapshot_id`、`snapshot_time`、`data_source`；分钟热表 fallback 的 `data_source` 为 `intraday_hot_table`。
-10. `build_metric_frame()` 把日线、quote 和筹码指标合成指标 DataFrame，计算 MA、MACD、RSI、前 N 日收益、成交量均线、资金流估算等规则可用字段。
-11. `evaluate_rule_at_index()` 只评估最后一行。
+9. `build_metric_frame()` 把日线、quote 和筹码指标合成指标 DataFrame，计算 MA、MACD、RSI、前 N 日收益、成交量均线、资金流估算等规则可用字段。
+10. `evaluate_rule_at_index()` 只评估最后一行。
 
 ### 结果落库与展示
 
@@ -271,32 +271,20 @@ POST /api/v1/rules/run-batch/async
 
 ### 历史日线数据获取
 
-每只股票仍进入 `RuleService._evaluate_stock()`，但此时 `mode="history"`、`data_policy="default"`：
+每只股票仍进入 `RuleService._evaluate_stock()`，但此时 `mode="history"`、`data_policy="db_only"`：
 
-1. 先读日线 DB 缓存：
-   - `StockService._load_daily_history_from_db(require_fresh=True)` 读取 `stock_daily`。
-   - 命中且新鲜，直接返回 `data_source="db_cache"`。
-2. 若 DB 不足或过期，允许远程回源：
-   - 如果已有足够旧缓存但缺最新交易日，尝试从 `latest_cached_date + 1` 增量补齐到目标交易日。
-   - 否则按完整窗口拉取。
-3. 远程拉取通过 `DataFetcherManager.get_daily_data()`：
-   - 美股/美股指数走专用路由：`YfinanceFetcher`、`LongbridgeFetcher`，美股个股还可能用 `EfinanceFetcher`、`AkshareFetcher` 兜底。
-   - 其他市场按 fetcher 优先级循环尝试；Tushare 有 token 时可能提前，常见数据源包括 `EfinanceFetcher`、`AkshareFetcher`、`TushareFetcher`、`PytdxFetcher`、`BaostockFetcher`、`YfinanceFetcher`、`LongbridgeFetcher`。
-   - 每个 fetcher 失败会记录错误摘要，然后切换下一个。
-   - 全部失败时抛 `DataFetchError`。
-4. 远程成功后：
-   - `enrich_daily_history_with_quote_fields()` 尝试用实时 quote 补充估值、换手、市值等字段。
-   - `StockRepository.save_dataframe()` -> `DatabaseManager.save_daily_data()` upsert 到 `stock_daily`。
-   - `_sync_chip_daily_cache_from_history()` 根据日线同步 `stock_chip_daily`。
-   - 再从 `stock_daily` 重新读取，保证返回值与 DB 落库口径一致。
-5. 如果远程刷新失败但存在旧 DB 缓存，当前逻辑会降级使用过期 `stock_daily`，并记录 warning。
+1. 只读日线 DB 缓存：
+   - `StockService._load_daily_history_from_db(require_fresh=False, allow_partial=True)` 读取 `stock_daily`。
+   - 命中后直接返回 `data_source="db_cache"`。
+2. 若 DB 不足或为空，返回 `daily_cache_miss` 并跳过该股票。
+3. 规则扫描阶段不会调用 `DataFetcherManager.get_daily_data()`；缺失历史日线必须通过离线补数据脚本或定时任务提前写入 `stock_daily`。
 
 ### 历史指标与规则评估
 
 1. `RuleService._get_indicator_metrics()` 在 `mode="history"` 下先尝试基于历史日线构建本地筹码模型。
 2. 如果本地筹码模型返回 `chip_distribution`，直接用于规则指标，不远程拉筹码。
-3. 如果本地筹码不可用，会调用 `StockService.get_indicator_metrics(default)`：
-   - `DataFetcherManager.get_chip_distribution()` 按筹码数据源优先级尝试，带熔断器。
+3. 如果本地筹码不可用，会调用 `StockService.get_indicator_metrics(db_only)` 读取 `stock_chip_daily`。
+4. 财务事件派生指标只读取 `stock_daily` 已落库字段；规则扫描不再调用财务 HTTP 适配器补事件。
    - 成功后 `_save_chip_distribution_payload()` 写 `stock_chip_daily`。
    - 资金流、主力/机构持仓也会尝试获取，但规则指标帧主要消费筹码分布与日线/quote 衍生字段。
 4. `build_metric_frame()` 生成指标帧。
@@ -501,8 +489,8 @@ GET /api/v1/stocks/{code}/history?period=daily&days=120&data_policy=default
 | 场景 | 行为 |
 | --- | --- |
 | 实测日线 DB miss | `history_cache_miss`，该股票跳过，不远程回源。 |
-| 实测 quote 快照 miss | 不读短缓存、不远程回源；改读 `stock_intraday_minute` 当日 1m 热表并聚合成虚拟当日 K。热表也 miss 时才 `quote_snapshot_miss` 跳过。 |
-| Web 规则回测日线 DB stale | 默认允许远程补齐；远程失败但有旧缓存时使用旧缓存兜底。 |
+| 实测分钟热表 miss | 不读快照、短缓存或远程行情源；`stock_intraday_minute` 当日 1m 热表为空时以 `intraday_hot_table_miss` 跳过。 |
+| Web 规则回测日线 DB stale/miss | 只读 `stock_daily`；已有旧数据可参与回测，完全缺失时跳过，不远程回源。 |
 | 首页日 K `cache_only` miss | 返回 `daily_cache_miss`，前端再用 `default` 按需回源。 |
 | 首页分钟 K `cache_only` miss | 返回 `intraday_hot_table_miss`，前端再用同周期 `default` 回源，不降级日 K。 |
 | quote `cache_only` miss | 返回 404 或空 quote，前端保持已有数据。 |
@@ -513,23 +501,21 @@ GET /api/v1/stocks/{code}/history?period=daily&days=120&data_policy=default
 
 ```mermaid
 flowchart TD
-  A["实测 /live-test"] --> B["POST /api/v1/rules/run-batch latest + snapshot_only"]
+  A["实测 /live-test"] --> B["POST /api/v1/rules/run-batch/async latest + db_only"]
   B --> C["stock_rules 读取规则"]
-  C --> D["stock_daily 读取日 K"]
-  D --> E["_REALTIME_QUOTE_SNAPSHOT 读取 quote"]
-  E --> E2{"quote miss?"}
-  E2 -->|是| E3["stock_intraday_minute 聚合当日虚拟日 K"]
-  E2 -->|否| F["本地筹码模型 + build_metric_frame"]
-  E3 --> F
-  F --> G["evaluate_rule_at_index 最新一行"]
-  G --> H["stock_rule_runs / stock_rule_matches"]
+  C --> D{"09:30 前?"}
+  D -->|是| D1["stock_daily 预热当天前日 K 缓存"]
+  D1 --> D2["prewarm_only 完成，不评估命中"]
+  D -->|否| E["stock_daily 读取日 K 缓存"]
+  E --> F["stock_intraday_minute 聚合当日 quote"]
+  F --> G["本地/DB 筹码指标 + build_metric_frame"]
+  G --> H["evaluate_rule_at_index 最新一行"]
+  H --> M["stock_rule_runs / stock_rule_matches"]
 
-  I["规则回测 /backtest"] --> J["POST /api/v1/rules/run-batch/async history"]
+  I["规则回测 /backtest"] --> J["POST /api/v1/rules/run-batch/async history + db_only"]
   J --> K["stock_rules 读取规则"]
-  K --> L["stock_daily 优先"]
-  L --> M["缺失/过期则 DataFetcherManager 远程回源"]
-  M --> N["upsert stock_daily / stock_chip_daily"]
-  N --> O["evaluate_rule_history 全历史窗口"]
+  K --> L["stock_daily 只读"]
+  L --> O["evaluate_rule_history 全历史窗口"]
   O --> P["stock_rule_runs / stock_rule_matches"]
 
   Q["首页指标 K 线"] --> R["GET /api/v1/stocks/{code}/history cache_only"]

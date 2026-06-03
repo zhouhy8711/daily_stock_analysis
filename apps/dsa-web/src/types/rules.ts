@@ -85,6 +85,7 @@ export type RuleItem = {
   name: string;
   description?: string | null;
   isActive: boolean;
+  isDisable?: boolean;
   period: RulePeriod | string;
   lookbackDays: number;
   targetScope: RuleTargetScope | string;
@@ -138,6 +139,9 @@ export type RuleRunResponse = {
   quoteHitCount?: number;
   quoteMissCount?: number;
   reusedRun?: boolean;
+  prewarmOnly?: boolean;
+  prewarmHitCount?: number;
+  prewarmMissCount?: number;
 };
 
 export type RuleRunNotifyPayload = {
@@ -166,6 +170,7 @@ export type RuleRunPayload = {
   };
   startDate?: string;
   endDate?: string;
+  liveCacheKey?: string;
 };
 
 export type RuleBatchRunPayload = RuleRunPayload & {
@@ -194,12 +199,16 @@ export type RuleRunHistoryItem = {
   quoteHitCount?: number;
   quoteMissCount?: number;
   reusedRun?: boolean;
+  prewarmOnly?: boolean;
+  prewarmHitCount?: number;
+  prewarmMissCount?: number;
 };
 
 export type RuleCreatePayload = {
   name: string;
   description?: string | null;
   isActive: boolean;
+  isDisable?: boolean;
   definition: RuleDefinition;
 };
 

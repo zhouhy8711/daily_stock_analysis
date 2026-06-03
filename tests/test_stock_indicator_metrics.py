@@ -417,6 +417,30 @@ def test_realtime_quote_snapshot_only_does_not_call_remote() -> None:
     assert manager.calls == 0
 
 
+def test_realtime_quote_db_only_ignores_snapshot_and_remote() -> None:
+    manager = _CountingRealtimeManager()
+    _replace_realtime_quote_snapshot(
+        requested_codes=["600519"],
+        items=[{
+            "stock_code": "600519",
+            "stock_name": "贵州茅台",
+            "current_price": 1688.5,
+            "source": "efinance",
+        }],
+        failed_codes=[],
+        snapshot_time=datetime(2026, 5, 7, 10, 30, 0),
+    )
+
+    with patch("data_provider.base.DataFetcherManager", return_value=manager):
+        hit = StockService().get_realtime_quote("600519", data_policy="db_only")
+        batch = StockService().get_realtime_quotes(["600519"], data_policy="db_only")
+
+    assert hit is None
+    assert batch["items"] == []
+    assert batch["failed_codes"] == ["600519"]
+    assert manager.calls == 0
+
+
 def test_realtime_quote_snapshot_only_ignores_previous_market_day() -> None:
     manager = _CountingRealtimeManager()
     _replace_realtime_quote_snapshot(
@@ -928,6 +952,14 @@ def test_history_endpoint_exposes_turnover_rate() -> None:
                 "circ_mv": 2_180_000_000_000,
                 "total_shares": 1_256_197_800,
                 "float_shares": 1_256_197_800,
+                "price_range_30d_pct": 18.5,
+                "price_range_60d_pct": 27.5,
+                "deducted_net_profit_yoy_pct": 120.0,
+                "deducted_net_profit_qoq_pct": 80.0,
+                "announcement_next_day_gap_pct": 4.2,
+                "announcement_next_day_volume_ratio": 1.8,
+                "announcement_next_day_gap_unfilled": 1.0,
+                "net_profit_gap_signal": 1.0,
                 "data_source": float("nan"),
                 "snapshot_id": float("nan"),
                 "snapshot_time": float("nan"),
@@ -946,6 +978,14 @@ def test_history_endpoint_exposes_turnover_rate() -> None:
     assert response.data[0].circ_mv == 2_180_000_000_000
     assert response.data[0].total_shares == 1_256_197_800
     assert response.data[0].float_shares == 1_256_197_800
+    assert response.data[0].price_range_30d_pct == 18.5
+    assert response.data[0].price_range_60d_pct == 27.5
+    assert response.data[0].deducted_net_profit_yoy_pct == 120.0
+    assert response.data[0].deducted_net_profit_qoq_pct == 80.0
+    assert response.data[0].announcement_next_day_gap_pct == 4.2
+    assert response.data[0].announcement_next_day_volume_ratio == 1.8
+    assert response.data[0].announcement_next_day_gap_unfilled == 1.0
+    assert response.data[0].net_profit_gap_signal == 1.0
     assert response.data[0].data_source is None
     assert response.data[0].snapshot_id is None
     assert response.data[0].snapshot_time is None

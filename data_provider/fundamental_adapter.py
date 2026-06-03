@@ -43,6 +43,79 @@ _DIVIDEND_KEYWORD_MAP: Dict[str, List[str]] = {
     "report_date": ["报告期", "报告日期", "截止日期", "统计截止日期"],
 }
 
+_EARNINGS_GROWTH_KEYWORD_MAP: Dict[str, List[str]] = {
+    "announcement_date": [
+        "公告日期",
+        "公告日",
+        "披露日期",
+        "发布日期",
+        "最新公告日期",
+        "NOTICE_DATE",
+        "ANN_DATE",
+        "UPDATE_DATE",
+    ],
+    "report_date": [
+        *_DIVIDEND_KEYWORD_MAP["report_date"],
+        "REPORT_DATE",
+        "END_DATE",
+    ],
+    "deducted_net_profit": [
+        "扣除非经常性损益后的净利润",
+        "扣除非经常性损益净利润",
+        "扣非净利润",
+        "扣非后净利润",
+        "扣非净利",
+        "DEDUCT_PARENT_NETPROFIT",
+        "KCFJCXSYJLR",
+    ],
+    "deducted_net_profit_yoy": [
+        "DJD_DEDUCTDPNP_YOY",
+        "扣除非经常性损益后的净利润同比",
+        "扣除非经常性损益净利润同比",
+        "扣非净利润同比增长率",
+        "扣非净利润同比",
+        "扣非净利同比",
+        "扣非同比",
+        "KCFJCXSYJLRTZ",
+    ],
+    "deducted_net_profit_qoq": [
+        "DJD_DEDUCTDPNP_QOQ",
+        "DJD_DPNP_QOQ",
+        "DEDUCT_PARENT_NETPROFIT_QOQ",
+        "扣除非经常性损益后的净利润环比",
+        "扣除非经常性损益净利润环比",
+        "扣非净利润环比增长率",
+        "扣非净利润环比",
+        "扣非净利环比",
+        "扣非环比",
+    ],
+}
+
+_GROWTH_FIELD_EXCLUDES = [
+    "同比",
+    "环比",
+    "增长",
+    "增速",
+    "增长率",
+    "变动",
+    "率",
+    "YOY",
+    "QOQ",
+    "TZ",
+    "HB",
+    "RATIO",
+    "RATE",
+    "GROWTH",
+]
+
+_EARNINGS_GROWTH_EXACT_COLUMNS: Dict[str, List[str]] = {
+    "announcement_date": ["NOTICE_DATE", "ANN_DATE", "UPDATE_DATE"],
+    "report_date": ["REPORT_DATE", "END_DATE"],
+    "deducted_net_profit": ["KCFJCXSYJLR", "DEDUCT_PARENT_NETPROFIT"],
+    "deducted_net_profit_yoy": ["DJD_DEDUCTDPNP_YOY", "KCFJCXSYJLRTZ"],
+    "deducted_net_profit_qoq": ["DJD_DEDUCTDPNP_QOQ", "DJD_DPNP_QOQ", "DEDUCT_PARENT_NETPROFIT_QOQ"],
+}
+
 
 def _safe_float(value: Any) -> Optional[float]:
     """Best-effort float conversion."""
@@ -104,6 +177,19 @@ def _pick_by_keywords(row: pd.Series, keywords: List[str]) -> Optional[Any]:
     return None
 
 
+def _pick_by_exact_columns(row: pd.Series, columns: List[str]) -> Optional[Any]:
+    """Return first non-empty row value whose column name exactly matches a candidate."""
+    column_by_upper = {str(col).upper(): col for col in row.index}
+    for column in columns:
+        actual = column_by_upper.get(str(column).upper())
+        if actual is None:
+            continue
+        val = row.get(actual)
+        if val is not None and str(val).strip() not in ("", "-", "nan", "None"):
+            return val
+    return None
+
+
 def _pick_by_keywords_excluding(row: pd.Series, keywords: List[str], excludes: List[str]) -> Optional[Any]:
     """Return first non-empty value matching keywords while excluding noisy columns."""
     for col in row.index:
@@ -157,7 +243,11 @@ def _extract_cash_dividend_per_share(row: pd.Series) -> Optional[float]:
 def _filter_rows_by_code(df: pd.DataFrame, stock_code: str) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame()
-    code_cols = [c for c in df.columns if any(k in str(c) for k in ("代码", "股票代码", "证券代码", "symbol", "ts_code"))]
+    code_cols = [
+        c
+        for c in df.columns
+        if any(k in str(c) for k in ("代码", "股票代码", "证券代码", "symbol", "ts_code", "SECURITY_CODE", "SECUCODE"))
+    ]
     if not code_cols:
         return df
 
@@ -176,6 +266,115 @@ def _filter_rows_by_code(df: pd.DataFrame, stock_code: str) -> pd.DataFrame:
 def _normalize_report_date(value: Any) -> Optional[str]:
     parsed = _safe_datetime(value)
     return parsed.date().isoformat() if parsed else None
+
+
+def _quarter_key(value: Any) -> Optional[Tuple[int, int]]:
+    parsed = _safe_datetime(value)
+    if parsed is None:
+        return None
+    quarter = ((parsed.month - 1) // 3) + 1
+    return parsed.year, quarter
+
+
+def _previous_quarter_key(key: Tuple[int, int]) -> Tuple[int, int]:
+    year, quarter = key
+    if quarter <= 1:
+        return year - 1, 4
+    return year, quarter - 1
+
+
+def _growth_pct(current: Optional[float], previous: Optional[float]) -> Optional[float]:
+    if current is None or previous is None or previous <= 0:
+        return None
+    return (current - previous) / previous * 100
+
+
+def _pick_earnings_value(row: pd.Series, field: str, *, exclude_growth: bool = False) -> Optional[Any]:
+    exact_value = _pick_by_exact_columns(row, _EARNINGS_GROWTH_EXACT_COLUMNS.get(field, []))
+    if exact_value is not None:
+        return exact_value
+    keywords = _EARNINGS_GROWTH_KEYWORD_MAP.get(field, [])
+    if exclude_growth:
+        return _pick_by_keywords_excluding(row, keywords, _GROWTH_FIELD_EXCLUDES)
+    return _pick_by_keywords(row, keywords)
+
+
+def _build_deducted_profit_growth_events(financial_df: pd.DataFrame, stock_code: str) -> List[Dict[str, Any]]:
+    """Build report events carrying deducted-net-profit YoY and QoQ growth."""
+    work_df = _filter_rows_by_code(financial_df, stock_code)
+    if work_df.empty:
+        return []
+
+    events_by_report_date: Dict[str, Dict[str, Any]] = {}
+    for _, row in work_df.iterrows():
+        if not isinstance(row, pd.Series):
+            continue
+
+        report_date = _normalize_report_date(_pick_earnings_value(row, "report_date"))
+        if not report_date:
+            continue
+
+        deducted_profit = _safe_float(_pick_earnings_value(row, "deducted_net_profit", exclude_growth=True))
+        yoy_pct = _safe_float(_pick_earnings_value(row, "deducted_net_profit_yoy"))
+        qoq_pct = _safe_float(_pick_earnings_value(row, "deducted_net_profit_qoq"))
+        announcement_date = _normalize_report_date(_pick_earnings_value(row, "announcement_date"))
+
+        if deducted_profit is None and yoy_pct is None and qoq_pct is None:
+            continue
+
+        events_by_report_date[report_date] = {
+            "report_date": report_date,
+            "announcement_date": announcement_date,
+            "deducted_net_profit": deducted_profit,
+            "deducted_net_profit_yoy_pct": yoy_pct,
+            "deducted_net_profit_qoq_pct": qoq_pct,
+        }
+
+    events = sorted(events_by_report_date.values(), key=lambda item: item["report_date"])
+    if not events:
+        return []
+
+    cumulative_profit_by_quarter: Dict[Tuple[int, int], float] = {}
+    for event in events:
+        key = _quarter_key(event.get("report_date"))
+        profit = _safe_float(event.get("deducted_net_profit"))
+        if key is not None and profit is not None:
+            cumulative_profit_by_quarter[key] = profit
+
+    single_profit_by_quarter: Dict[Tuple[int, int], float] = {}
+    for event in events:
+        key = _quarter_key(event.get("report_date"))
+        if key is None:
+            continue
+        current_cumulative = _safe_float(event.get("deducted_net_profit"))
+        if current_cumulative is None:
+            continue
+        year, quarter = key
+        if quarter == 1:
+            single_profit_by_quarter[key] = current_cumulative
+            continue
+        previous_cumulative = cumulative_profit_by_quarter.get((year, quarter - 1))
+        if previous_cumulative is not None:
+            single_profit_by_quarter[key] = current_cumulative - previous_cumulative
+
+    enriched_events: List[Dict[str, Any]] = []
+    for event in events:
+        key = _quarter_key(event.get("report_date"))
+        single_profit = single_profit_by_quarter.get(key) if key is not None else None
+        yoy_pct = _safe_float(event.get("deducted_net_profit_yoy_pct"))
+        qoq_pct = _safe_float(event.get("deducted_net_profit_qoq_pct"))
+        if key is not None and single_profit is not None:
+            previous_year_single = single_profit_by_quarter.get((key[0] - 1, key[1]))
+            previous_quarter_single = single_profit_by_quarter.get(_previous_quarter_key(key))
+            yoy_pct = yoy_pct if yoy_pct is not None else _growth_pct(single_profit, previous_year_single)
+            qoq_pct = qoq_pct if qoq_pct is not None else _growth_pct(single_profit, previous_quarter_single)
+
+        enriched = dict(event)
+        enriched["single_quarter_deducted_net_profit"] = single_profit
+        enriched["deducted_net_profit_yoy_pct"] = yoy_pct
+        enriched["deducted_net_profit_qoq_pct"] = qoq_pct
+        enriched_events.append(enriched)
+    return enriched_events
 
 
 def _build_dividend_payload(
@@ -410,6 +609,17 @@ def _eastmoney_symbol(stock_code: str) -> str:
     return code
 
 
+def _eastmoney_security_code(stock_code: str) -> str:
+    code = _normalize_code(stock_code)
+    if code.startswith(("6", "9")):
+        return f"{code}.SH"
+    if code.startswith(("0", "2", "3")):
+        return f"{code}.SZ"
+    if code.startswith(("4", "8")):
+        return f"{code}.BJ"
+    return code
+
+
 def _recent_report_dates(max_count: int = 8) -> List[str]:
     now = datetime.now()
     quarter_ends = [(12, 31), (9, 30), (6, 30), (3, 31)]
@@ -574,6 +784,39 @@ class AkshareFundamentalAdapter:
 
         has_content = bool(result["growth"] or result["earnings"] or result["institution"])
         result["status"] = "partial" if has_content else "not_supported"
+        return result
+
+    def get_deducted_profit_growth_events(self, stock_code: str) -> Dict[str, Any]:
+        """Return report events with deducted-net-profit YoY/QoQ growth."""
+        result: Dict[str, Any] = {
+            "status": "not_supported",
+            "events": [],
+            "source_chain": [],
+            "errors": [],
+        }
+        normalized_code = _normalize_code(stock_code)
+        em_security_code = _eastmoney_security_code(normalized_code)
+        em_market_symbol = _eastmoney_symbol(normalized_code).upper()
+        fin_df, fin_source, fin_errors = self._call_df_candidates([
+            ("stock_financial_analysis_indicator_em", {"symbol": em_security_code, "indicator": "按报告期"}),
+            ("stock_profit_sheet_by_report_em", {"symbol": em_market_symbol}),
+            ("stock_financial_abstract_ths", {"symbol": normalized_code, "indicator": "按报告期"}),
+            ("stock_financial_abstract", {"symbol": stock_code}),
+            ("stock_financial_analysis_indicator", {"symbol": stock_code}),
+            ("stock_financial_analysis_indicator", {}),
+        ])
+        result["errors"].extend(fin_errors)
+        if fin_df is None:
+            return result
+
+        events = _build_deducted_profit_growth_events(fin_df, stock_code)
+        if events:
+            result["status"] = "ok"
+            result["events"] = events
+            result["source_chain"].append(f"deducted_profit_growth:{fin_source}")
+        else:
+            result["status"] = "partial"
+            result["source_chain"].append(f"deducted_profit_growth:{fin_source}")
         return result
 
     def get_major_holders(self, stock_code: str, top_n: int = 20) -> Dict[str, Any]:

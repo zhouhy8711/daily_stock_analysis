@@ -31,12 +31,13 @@ from src.services.daily_history_enrichment import (  # noqa: E402
     OPTIONAL_DAILY_METRIC_COLUMNS,
     enrich_daily_history_with_quote_fields,
 )
-from src.storage import DatabaseManager, StockDaily  # noqa: E402
+from src.storage import DAILY_DERIVED_METRIC_COLUMNS, DatabaseManager, StockDaily  # noqa: E402
 
 
 logger = logging.getLogger(__name__)
 _THREAD_LOCAL = threading.local()
 FETCHER_CHOICES = ("manager", "akshare", "baostock")
+DERIVED_METRIC_WARMUP_CALENDAR_DAYS = 140
 T = TypeVar("T")
 
 
@@ -61,6 +62,7 @@ class BackfillResult:
     requested_segments: int = 0
     fetched_rows: int = 0
     saved_count: int = 0
+    derived_saved_count: int = 0
     source_counts: Counter[str] = field(default_factory=Counter)
     chip_expected_count: int = 0
     chip_existing_count: int = 0
@@ -338,6 +340,7 @@ def backfill_one_stock(
     refresh_existing: bool = False,
     enrich_valuation: bool = True,
     quote_lookup: Mapping[str, Any] | None = None,
+    refresh_derived_metrics: bool = True,
 ) -> BackfillResult:
     start_date = expected_dates[0]
     end_date = expected_dates[-1]
@@ -360,7 +363,7 @@ def backfill_one_stock(
     if not backfill_daily and not backfill_chip:
         result.status = "skipped"
         return result
-    if not segments and not backfill_chip:
+    if not segments and not backfill_chip and not refresh_derived_metrics:
         return result
 
     if backfill_daily and segments:
@@ -400,6 +403,17 @@ def backfill_one_stock(
                 result.errors.append(message)
                 logger.warning("%s 补齐区间失败: %s", code, message)
 
+    if backfill_daily and refresh_derived_metrics:
+        try:
+            derived_result = refresh_stock_daily_derived_metrics_from_db(code, expected_dates, db)
+            result.derived_saved_count = derived_result.derived_saved_count
+            if derived_result.errors:
+                result.errors.extend(f"derived:{error}" for error in derived_result.errors)
+        except Exception as exc:
+            message = f"derived:{exc}"
+            result.errors.append(message)
+            logger.warning("%s 刷新日线派生指标失败: %s", code, exc)
+
     if backfill_chip:
         (
             result.chip_existing_count,
@@ -416,18 +430,18 @@ def backfill_one_stock(
             result.errors.append(message)
             logger.warning("%s 补齐筹码峰失败: %s", code, chip_error)
 
-    has_saved_rows = result.saved_count > 0 or result.chip_saved_count > 0
+    has_saved_rows = result.saved_count > 0 or result.chip_saved_count > 0 or result.derived_saved_count > 0
     if result.errors and has_saved_rows:
         result.status = "partial_failed"
     elif result.errors:
         result.status = "failed"
-    elif result.fetched_rows == 0 and result.chip_missing_count == 0:
+    elif result.fetched_rows == 0 and result.chip_missing_count == 0 and result.derived_saved_count == 0:
         result.status = "skipped"
-    elif result.fetched_rows == 0 and result.chip_saved_count == 0:
+    elif result.fetched_rows == 0 and result.chip_saved_count == 0 and result.derived_saved_count == 0:
         result.status = "no_data"
-    elif result.fetched_rows > 0 and result.saved_count == 0 and result.chip_saved_count == 0:
+    elif result.fetched_rows > 0 and result.saved_count == 0 and result.chip_saved_count == 0 and result.derived_saved_count == 0:
         result.status = "fetched"
-    elif result.saved_count == 0 and result.chip_saved_count > 0:
+    elif result.saved_count == 0 and result.chip_saved_count > 0 and result.derived_saved_count == 0:
         result.status = "chip_fetched"
     else:
         result.status = "fetched"
@@ -519,6 +533,69 @@ def refresh_stock_daily_valuation_from_db(
     return result
 
 
+def refresh_stock_daily_derived_metrics_from_db(
+    code: str,
+    expected_dates: Sequence[date],
+    db: DatabaseManager,
+) -> BackfillResult:
+    """Recompute derived stock_daily metric columns from existing cached OHLCV rows."""
+    start_date = expected_dates[0]
+    end_date = expected_dates[-1]
+    load_start = start_date - timedelta(days=DERIVED_METRIC_WARMUP_CALENDAR_DAYS)
+    result = BackfillResult(
+        code=code,
+        status="pending",
+        expected_count=len(expected_dates),
+        existing_count=0,
+        missing_count=0,
+    )
+
+    bars = db.get_data_range(code, load_start, end_date)
+    if not bars:
+        result.status = "no_data"
+        return result
+
+    target_dates = set(expected_dates)
+    source_rows = [bar.to_dict() for bar in bars]
+    result.existing_count = sum(1 for bar in bars if bar.date in target_dates)
+    if result.existing_count == 0:
+        result.status = "no_data"
+        return result
+
+    try:
+        from src.rules.metrics import build_metric_frame
+
+        metric_frame = build_metric_frame(source_rows)
+    except Exception as exc:
+        result.status = "failed"
+        result.errors.append(str(exc))
+        return result
+
+    if metric_frame is None or metric_frame.empty:
+        result.status = "no_data"
+        return result
+
+    target_rows: list[dict[str, Any]] = []
+    for row in metric_frame.to_dict(orient="records"):
+        row_date = pd.to_datetime(row.get("date"), errors="coerce")
+        if pd.isna(row_date):
+            continue
+        if row_date.date() in target_dates:
+            target_rows.append({
+                "date": row_date.date(),
+                **{column: row.get(column) for column in DAILY_DERIVED_METRIC_COLUMNS},
+            })
+
+    if not target_rows:
+        result.status = "no_data"
+        return result
+
+    result.fetched_rows = len(target_rows)
+    result.derived_saved_count = db.update_stock_daily_derived_metrics(code, target_rows)
+    result.status = "fetched" if result.derived_saved_count > 0 else "skipped"
+    return result
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Backfill active A-share daily history into the stock_daily table."
@@ -568,6 +645,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Only refresh valuation/share columns on existing stock_daily rows from a batch quote snapshot",
     )
     parser.add_argument(
+        "--derived-only",
+        action="store_true",
+        help="Only recompute stock_daily derived metric columns from existing cached daily rows",
+    )
+    parser.add_argument(
+        "--skip-derived-metrics",
+        action="store_true",
+        help="Do not recompute derived stock_daily metric columns after daily backfill",
+    )
+    parser.add_argument(
         "--stock-timeout-seconds",
         type=int,
         default=60,
@@ -609,6 +696,7 @@ def print_result(index: int, total: int, result: BackfillResult) -> None:
         f"expected={result.expected_count} existing={result.existing_count} "
         f"missing={result.missing_count} segments={result.requested_segments} "
         f"fetched={result.fetched_rows} saved={result.saved_count} "
+        f"derived_saved={result.derived_saved_count} "
         f"sources={result.source_summary()} "
         f"chip_missing={result.chip_missing_count} chip_fetched={result.chip_fetched_rows} "
         f"chip_saved={result.chip_saved_count} chip_sources={result.chip_source_summary()} "
@@ -628,7 +716,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error("--parallelism must be at least 1")
     if args.valuation_only and args.skip_valuation:
         parser.error("--valuation-only cannot be used with --skip-valuation")
-    if not args.valuation_only and args.skip_daily and args.skip_chip:
+    if args.derived_only and args.valuation_only:
+        parser.error("--derived-only cannot be used with --valuation-only")
+    if args.derived_only and args.skip_derived_metrics:
+        parser.error("--derived-only cannot be used with --skip-derived-metrics")
+    if not args.valuation_only and not args.derived_only and args.skip_daily and args.skip_chip:
         parser.error("--skip-daily and --skip-chip cannot both be set")
     if args.stock_timeout_seconds < 0:
         parser.error("--stock-timeout-seconds must be non-negative")
@@ -652,19 +744,39 @@ def main(argv: Sequence[str] | None = None) -> int:
         f"fetcher={args.fetcher} daily={'off' if args.skip_daily else 'on'} "
         f"chip={'off' if args.skip_chip else 'on'} "
         f"refresh_existing={args.refresh_existing} "
-        f"valuation={'only' if args.valuation_only else 'off' if args.skip_valuation else 'on'}",
+        f"valuation={'only' if args.valuation_only else 'off' if args.skip_valuation else 'on'} "
+        f"derived={'only' if args.derived_only else 'off' if args.skip_derived_metrics else 'on'}",
         flush=True,
     )
 
     results: list[BackfillResult] = []
     fetcher_factory = build_fetcher_factory(args.fetcher)
     quote_lookup: dict[str, Any] | None = None
-    if not args.skip_daily and not args.skip_valuation:
+    if not args.derived_only and not args.skip_daily and not args.skip_valuation:
         print("批量预取估值 quote 快照...", flush=True)
         quote_lookup = prefetch_valuation_quotes(codes)
         print(f"估值 quote 快照: {len(quote_lookup)}/{total}", flush=True)
 
-    if args.valuation_only:
+    if args.derived_only:
+        for index, code in enumerate(codes, start=1):
+            try:
+                result = refresh_stock_daily_derived_metrics_from_db(
+                    code,
+                    expected_dates,
+                    db,
+                )
+            except Exception as exc:
+                result = BackfillResult(
+                    code=code,
+                    status="failed",
+                    expected_count=len(expected_dates),
+                    existing_count=0,
+                    missing_count=0,
+                    errors=[str(exc)],
+                )
+            results.append(result)
+            print_result(index, total, result)
+    elif args.valuation_only:
         if quote_lookup is None:
             print("批量预取估值 quote 快照...", flush=True)
             quote_lookup = prefetch_valuation_quotes(codes)
@@ -702,6 +814,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                         args.refresh_existing,
                         not args.skip_valuation,
                         quote_lookup,
+                        not args.skip_derived_metrics,
                     ),
                     args.stock_timeout_seconds,
                 )
@@ -733,6 +846,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     args.refresh_existing,
                     not args.skip_valuation,
                     quote_lookup,
+                    not args.skip_derived_metrics,
                 ): code
                 for code in codes
             }
@@ -756,6 +870,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     status_counts = Counter(result.status for result in results)
     total_saved = sum(result.saved_count for result in results)
     total_fetched = sum(result.fetched_rows for result in results)
+    total_derived_saved = sum(result.derived_saved_count for result in results)
     total_chip_saved = sum(result.chip_saved_count for result in results)
     total_chip_fetched = sum(result.chip_fetched_rows for result in results)
     total_errors = sum(len(result.errors) for result in results)
@@ -766,6 +881,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f"  status        : {dict(status_counts)}")
     print(f"  fetched_rows  : {total_fetched}")
     print(f"  saved_new_rows: {total_saved}")
+    print(f"  derived_saved : {total_derived_saved}")
     print(f"  chip_fetched  : {total_chip_fetched}")
     print(f"  chip_saved    : {total_chip_saved}")
     print(f"  errors        : {total_errors}")

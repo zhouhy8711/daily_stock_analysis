@@ -2,7 +2,7 @@ import json
 import sqlite3
 import threading
 import time
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from unittest import mock
 
 from sqlalchemy.exc import OperationalError
@@ -56,6 +56,36 @@ def test_rule_engine_matches_aggregate_condition():
 
     assert result["matched"] is True
     assert result["matched_groups"][0]["id"] == "g1"
+
+
+def test_rule_engine_does_not_match_missing_metric_value():
+    frame = build_metric_frame(_history())
+    definition = {
+        "period": "daily",
+        "lookback_days": 120,
+        "target": {"scope": "custom", "stock_codes": ["600519"]},
+        "groups": [
+            {
+                "id": "g1",
+                "conditions": [
+                    {
+                        "id": "c1",
+                        "left": {"metric": "not_available_metric"},
+                        "operator": ">",
+                        "right": {"type": "literal", "value": 1},
+                    }
+                ],
+            }
+        ],
+    }
+
+    result = evaluate_rule(definition, frame)
+
+    assert result["matched"] is False
+    assert result["matched_groups"] == []
+    condition = result["condition_results"][0]["conditions"][0]
+    assert condition["matched"] is False
+    assert condition["values"]["left"] is None
 
 
 def test_rule_engine_matches_consecutive_condition():
@@ -260,6 +290,92 @@ def test_rule_repository_counts_persisted_match_event_rows():
     ])
 
     assert event_count == 4
+
+
+def test_database_manager_adds_stock_rule_disable_column_for_existing_sqlite(tmp_path):
+    DatabaseManager.reset_instance()
+    db_file = tmp_path / "legacy_rules.db"
+    with sqlite3.connect(db_file) as connection:
+        connection.execute(
+            """
+            CREATE TABLE stock_rules (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name VARCHAR(100) NOT NULL,
+                description TEXT,
+                is_active BOOLEAN NOT NULL DEFAULT 1,
+                period VARCHAR(16) NOT NULL DEFAULT 'daily',
+                lookback_days INTEGER NOT NULL DEFAULT 120,
+                target_scope VARCHAR(16) NOT NULL DEFAULT 'watchlist',
+                target_codes_json TEXT,
+                definition_json TEXT NOT NULL,
+                created_at DATETIME,
+                updated_at DATETIME
+            )
+            """
+        )
+
+    db = DatabaseManager(db_url=f"sqlite:///{db_file}")
+    try:
+        with db._engine.begin() as connection:
+            columns = {
+                str(row[1]): row
+                for row in connection.exec_driver_sql("PRAGMA table_info(stock_rules)").fetchall()
+            }
+            connection.exec_driver_sql(
+                """
+                INSERT INTO stock_rules (
+                    name,
+                    period,
+                    lookback_days,
+                    target_scope,
+                    target_codes_json,
+                    definition_json
+                )
+                VALUES ('放量观察', 'daily', 120, 'custom', '[]', '{}')
+                """
+            )
+            is_disable = connection.exec_driver_sql("SELECT is_disable FROM stock_rules").scalar_one()
+
+        assert "is_disable" in columns
+        assert int(is_disable) == 0
+    finally:
+        DatabaseManager.reset_instance()
+
+
+def test_rule_repository_list_rules_hides_disabled_rules():
+    DatabaseManager.reset_instance()
+    db = DatabaseManager(db_url="sqlite:///:memory:")
+    try:
+        repo = RuleRepository(db)
+        with db.get_session() as session:
+            visible_rule = StockRule(
+                name="放量观察",
+                period="daily",
+                lookback_days=120,
+                target_scope="custom",
+                target_codes_json="[]",
+                definition_json="{}",
+            )
+            hidden_rule = StockRule(
+                name="隐藏观察",
+                is_disable=True,
+                period="daily",
+                lookback_days=120,
+                target_scope="custom",
+                target_codes_json="[]",
+                definition_json="{}",
+            )
+            session.add_all([visible_rule, hidden_rule])
+            session.commit()
+            session.refresh(hidden_rule)
+            hidden_rule_id = hidden_rule.id
+
+        assert [rule["name"] for rule in repo.list_rules()] == ["放量观察"]
+        hidden = repo.get_rule(hidden_rule_id)
+        assert hidden is not None
+        assert hidden["is_disable"] is True
+    finally:
+        DatabaseManager.reset_instance()
 
 
 def test_rule_repository_previous_live_match_signature_skips_non_live_runs():
@@ -473,6 +589,55 @@ def test_metric_frame_maps_chip_ratios_to_percent_values():
     assert latest["chip_peak_price"] == 12.0
     assert latest["chip_peak_percent"] == 50
     assert round(latest["chip_peak_distance_pct"], 6) == round((14 - 12) / 12 * 100, 6)
+    assert latest["chip_peak_count"] == 1
+    assert latest["chip_single_peak_signal"] == 1
+    assert latest["chip_peak_low_price"] == 10.0
+    assert latest["chip_peak_high_price"] == 12.0
+    assert latest["chip_peak_price_ratio"] == 1.2
+
+
+def test_metric_frame_calculates_rolling_range_and_chip_average_metrics():
+    start = datetime(2026, 1, 1)
+    history = []
+    snapshots = []
+    for index in range(60):
+        day = (start + timedelta(days=index)).strftime("%Y-%m-%d")
+        low = 100 + index
+        history.append({
+            "date": day,
+            "open": low + 1,
+            "high": low + 10,
+            "low": low,
+            "close": low + 5,
+            "volume": 1000 + index,
+            "amount": (low + 5) * (1000 + index),
+            "pct_chg": 0.1,
+        })
+        snapshots.append({
+            "date": day,
+            "concentration_90": 0.10,
+            "distribution": [
+                {"price": 10.0, "percent": 0.15},
+                {"price": 11.0, "percent": 0.50},
+                {"price": 12.0, "percent": 0.15},
+            ],
+        })
+
+    frame = build_metric_frame(
+        history,
+        extra_metrics={"chip_distribution": {"date": history[-1]["date"], "snapshots": snapshots}},
+    )
+    latest = frame.iloc[-1]
+
+    assert round(latest["price_range_30d_pct"], 6) == round((169 - 130) / 130 * 100, 6)
+    assert round(latest["price_range_60d_pct"], 6) == round((169 - 100) / 100 * 100, 6)
+    assert round(latest["chip_concentration_90_avg_30d"], 6) == 10
+    assert round(latest["chip_concentration_90_avg_60d"], 6) == 10
+    assert latest["chip_peak_count"] == 1
+    assert latest["chip_single_peak_signal"] == 1
+    assert latest["chip_peak_low_price"] == 11.0
+    assert latest["chip_peak_high_price"] == 11.0
+    assert latest["chip_peak_price_ratio"] == 1.0
 
 
 def test_metric_registry_groups_indicator_page_metrics_by_chart_area():
@@ -481,6 +646,7 @@ def test_metric_registry_groups_indicator_page_metrics_by_chart_area():
     assert registry["current_price"]["category"] == "核心行情"
     assert registry["total_mv"]["category"] == "核心行情"
     assert registry["close"]["category"] == "K线图"
+    assert registry["price_range_30d_pct"]["category"] == "K线图"
     assert registry["prev_5d_return_pct"]["category"] == "额外"
     assert registry["prev_20d_return_pct"]["category"] == "额外"
     assert registry["limit_up_price"]["category"] == "K线图"
@@ -491,9 +657,15 @@ def test_metric_registry_groups_indicator_page_metrics_by_chart_area():
     assert registry["macd_dif"]["category"] == "MACD图"
     assert registry["rsi24"]["category"] == "RSI图"
     assert registry["trapped_ratio"]["category"] == "筹码峰-全部筹码"
+    assert registry["chip_concentration_90_avg_30d"]["category"] == "筹码峰-全部筹码"
+    assert registry["chip_single_peak_signal"]["category"] == "筹码峰-全部筹码"
+    assert registry["chip_peak_price_ratio"]["unit"] == "倍"
     assert registry["main_profit_ratio"]["category"] == "筹码峰-主力筹码"
     assert registry["main_net_volume_pct"]["category"] == "实时监控"
     assert registry["main_force_net"]["category"] == "实时监控"
+    assert registry["deducted_net_profit_yoy_pct"]["category"] == "财务事件"
+    assert registry["announcement_next_day_gap_pct"]["unit"] == "%"
+    assert registry["announcement_next_day_volume_ratio"]["unit"] == "倍"
 
 
 def test_metric_frame_maps_main_chip_distribution_when_available():
@@ -563,6 +735,178 @@ def test_metric_frame_calculates_previous_window_cumulative_return_metrics():
     latest_20 = frame_20.iloc[-1]
 
     assert round(latest_20["prev_20d_return_pct"], 6) == round((120 / 100 - 1) * 100, 6)
+
+
+def test_rule_service_maps_net_profit_gap_event_to_announcement_next_trading_day():
+    history = [
+        {"date": "2026-04-13", "open": 10, "high": 10.2, "low": 9.8, "close": 10, "volume": 1000, "amount": 10000},
+        {"date": "2026-04-14", "open": 10, "high": 10.2, "low": 9.8, "close": 10, "volume": 1000, "amount": 10000},
+        {"date": "2026-04-15", "open": 10, "high": 10.2, "low": 9.8, "close": 10, "volume": 1000, "amount": 10000},
+        {"date": "2026-04-16", "open": 10, "high": 10.2, "low": 9.8, "close": 10, "volume": 1000, "amount": 10000},
+        {"date": "2026-04-17", "open": 10, "high": 10.2, "low": 9.8, "close": 10, "volume": 1000, "amount": 10000},
+        {"date": "2026-04-20", "open": 10.4, "high": 11, "low": 10.2, "close": 10.8, "volume": 2000, "amount": 21600},
+    ]
+    events = [
+        {
+            "announcement_date": "2026-04-17",
+            "deducted_net_profit_yoy_pct": 120,
+            "deducted_net_profit_qoq_pct": 60,
+        }
+    ]
+    enriched = RuleService._apply_earnings_gap_events_to_history(history, events)
+    frame = build_metric_frame(enriched)
+    definition = {
+        "period": "daily",
+        "lookback_days": 120,
+        "target": {"scope": "custom", "stock_codes": ["600519"]},
+        "groups": [
+            {
+                "id": "net-profit-gap",
+                "conditions": [
+                    {
+                        "id": "c-yoy",
+                        "left": {"metric": "deducted_net_profit_yoy_pct"},
+                        "operator": ">=",
+                        "right": {"type": "literal", "value": 100},
+                    },
+                    {
+                        "id": "c-qoq",
+                        "left": {"metric": "deducted_net_profit_qoq_pct"},
+                        "operator": ">=",
+                        "right": {"type": "literal", "value": 50},
+                    },
+                    {
+                        "id": "c-gap",
+                        "left": {"metric": "announcement_next_day_gap_pct"},
+                        "operator": ">=",
+                        "right": {"type": "literal", "value": 3},
+                    },
+                    {
+                        "id": "c-volume",
+                        "left": {"metric": "announcement_next_day_volume_ratio"},
+                        "operator": ">=",
+                        "right": {"type": "literal", "value": 1.5},
+                    },
+                    {
+                        "id": "c-unfilled",
+                        "left": {"metric": "announcement_next_day_gap_unfilled"},
+                        "operator": "=",
+                        "right": {"type": "literal", "value": 1},
+                    },
+                ],
+            }
+        ],
+    }
+
+    result = evaluate_rule(definition, frame)
+    latest = frame.iloc[-1]
+
+    assert result["matched"] is True
+    assert round(latest["announcement_next_day_gap_pct"], 6) == 4
+    assert latest["announcement_next_day_volume_ratio"] == 2
+    assert latest["announcement_next_day_gap_unfilled"] == 1
+    assert latest["net_profit_gap_signal"] == 1
+
+
+def test_rule_service_syncs_earnings_gap_metrics_to_cache_and_db():
+    class _Db:
+        def __init__(self):
+            self.calls = []
+
+        def update_stock_daily_earnings_gap_metrics(self, stock_code, rows):
+            self.calls.append((stock_code, [dict(row) for row in rows]))
+            return 1
+
+    db = _Db()
+    stock_service = mock.Mock()
+    stock_service.repo.db = db
+    service = RuleService(repo=mock.Mock(), stock_service=stock_service)
+    history = [
+        {"date": "2026-04-13", "open": 10, "high": 10.2, "low": 9.8, "close": 10, "volume": 1000, "amount": 10000},
+        {"date": "2026-04-14", "open": 10, "high": 10.2, "low": 9.8, "close": 10, "volume": 1000, "amount": 10000},
+        {"date": "2026-04-15", "open": 10, "high": 10.2, "low": 9.8, "close": 10, "volume": 1000, "amount": 10000},
+        {"date": "2026-04-16", "open": 10, "high": 10.2, "low": 9.8, "close": 10, "volume": 1000, "amount": 10000},
+        {"date": "2026-04-17", "open": 10, "high": 10.2, "low": 9.8, "close": 10, "volume": 1000, "amount": 10000},
+        {"date": "2026-04-20", "open": 10.4, "high": 11, "low": 10.2, "close": 10.8, "volume": 2000, "amount": 21600},
+    ]
+    scan_cache = {
+        "history_by_code": {
+            "600519": {
+                "data": [dict(row) for row in history],
+            },
+        },
+        "earnings_gap_metrics_by_code": {},
+    }
+    events = [
+        {
+            "announcement_date": "2026-04-17",
+            "deducted_net_profit_yoy_pct": 120,
+            "deducted_net_profit_qoq_pct": 60,
+        }
+    ]
+
+    with mock.patch.object(service, "_get_earnings_gap_events_for_context", return_value=events):
+        enriched = service._enrich_history_rows_with_earnings_gap_metrics(
+            "600519",
+            history,
+            scan_cache=scan_cache,
+        )
+
+    target_row = next(row for row in enriched if row["date"] == "2026-04-20")
+    cached_metrics = scan_cache["earnings_gap_metrics_by_code"]["600519"]["2026-04-20"]
+    cached_history_row = scan_cache["history_by_code"]["600519"]["data"][-1]
+
+    assert target_row["net_profit_gap_signal"] == 1
+    assert cached_metrics["deducted_net_profit_yoy_pct"] == 120.0
+    assert round(cached_metrics["announcement_next_day_gap_pct"], 6) == 4.0
+    assert cached_history_row["net_profit_gap_signal"] == 1.0
+    assert db.calls[0][0] == "600519"
+    assert db.calls[0][1][-1]["net_profit_gap_signal"] == 1.0
+
+
+def test_rule_service_uses_persisted_earnings_gap_metrics_without_fetching_events():
+    class _PersistedEarningsGapStockService(_FakeStockService):
+        def get_history_data(self, stock_code, period="daily", days=30, data_policy="default"):
+            return {
+                "stock_code": stock_code,
+                "stock_name": "测试股票",
+                "period": period,
+                "data": [
+                    {"date": "2026-04-17", "open": 10, "high": 10, "low": 10, "close": 10, "volume": 1000, "amount": 10000},
+                    {
+                        "date": "2026-04-20",
+                        "open": 10.4,
+                        "high": 11,
+                        "low": 10.2,
+                        "close": 10.8,
+                        "volume": 2000,
+                        "amount": 21600,
+                        "net_profit_gap_signal": 1,
+                    },
+                ],
+            }
+
+    rule = _service_rule_for_run_mode()
+    rule["definition"]["groups"][0]["conditions"] = [
+        {
+            "id": "c1",
+            "left": {"metric": "net_profit_gap_signal"},
+            "operator": "=",
+            "right": {"type": "literal", "value": 1},
+        }
+    ]
+    service = RuleService(repo=_FakeRuleRepo(rule), stock_service=_PersistedEarningsGapStockService())
+
+    with mock.patch.object(
+        service,
+        "_get_earnings_gap_events_for_context",
+        side_effect=AssertionError("rule scan must not fetch financial events"),
+    ):
+        result = service.run_rule(1, mode="history")
+
+    assert result["status"] == "completed"
+    assert result["event_count"] == 1
+    assert result["matches"][0]["matched_dates"] == ["2026-04-20"]
 
 
 def test_metric_frame_maps_realtime_quote_metrics_for_rules():
@@ -820,6 +1164,28 @@ class _FakeStockService:
 
 class _RealtimeRuleStockService(_FakeStockService):
     def get_history_data(self, stock_code, period="daily", days=30, data_policy="default"):
+        if period == "1m":
+            return {
+                "stock_code": stock_code,
+                "stock_name": "盛景微",
+                "period": period,
+                "data_source": "intraday_hot_table",
+                "data": [
+                    {
+                        "date": "2026-05-08 09:31",
+                        "open": 39.5,
+                        "high": 39.5,
+                        "low": 39.5,
+                        "close": 39.5,
+                        "volume": 200_000,
+                        "amount": 790_000_000,
+                        "change_percent": 2.73,
+                        "snapshot_id": "20260508093100",
+                        "snapshot_time": "2026-05-08T09:31:00",
+                        "data_source": "intraday_hot_table",
+                    }
+                ],
+            }
         return {
             "stock_code": stock_code,
             "stock_name": "盛景微",
@@ -1056,11 +1422,150 @@ class _BatchHistoryOnlyStockService(_FakeStockService):
         raise AssertionError("rule scan should use preloaded batch history")
 
 
+class _PreopenBatchHistoryStockService(_BatchHistoryOnlyStockService):
+    def get_daily_history_cache_batch(self, stock_codes, days_by_code, *, data_policy="snapshot_only"):
+        payload = super().get_daily_history_cache_batch(
+            stock_codes,
+            days_by_code,
+            data_policy=data_policy,
+        )
+        for item in payload.values():
+            item["data"].append({
+                "date": "2026-05-08",
+                "open": 20,
+                "high": 21,
+                "low": 19,
+                "close": 20,
+                "volume": 2000,
+                "amount": 40000,
+                "pct_chg": 0,
+            })
+        return payload
+
+    def get_history_data(self, stock_code, period="daily", days=30, data_policy="default"):
+        if period == "1m":
+            return {
+                "stock_code": stock_code,
+                "stock_name": "测试股票",
+                "period": period,
+                "data": [],
+                "data_source": "intraday_hot_table",
+            }
+        return super().get_history_data(stock_code, period=period, days=days, data_policy=data_policy)
+
+
+class _FastLatestRuleDb:
+    def __init__(self):
+        self.quote_batch_calls = []
+        self.chip_batch_calls = []
+
+    def get_intraday_minute_snapshot_summary(self, *, trade_date=None):
+        return {
+            "codes": ["600519", "000001"],
+            "snapshot_id": "fast-snapshot",
+            "snapshot_time": "2026-05-08T10:00:00",
+        }
+
+    def get_intraday_minute_latest_quotes_batch(self, codes, *, trade_date=None):
+        self.quote_batch_calls.append((list(codes), trade_date))
+        return {
+            "600519": {
+                "stock_code": "600519",
+                "stock_name": "贵州茅台",
+                "current_price": 15.0,
+                "open": 12.0,
+                "high": 15.2,
+                "low": 11.8,
+                "volume": 1000,
+                "amount": 15000,
+                "change_percent": 25,
+                "quote_time": "2026-05-08T10:00:00",
+                "snapshot_id": "fast-snapshot",
+                "snapshot_time": "2026-05-08T10:00:00",
+                "source": "intraday_hot_table",
+            },
+            "000001": {
+                "stock_code": "000001",
+                "stock_name": "平安银行",
+                "current_price": 8.0,
+                "open": 8.0,
+                "high": 8.1,
+                "low": 7.9,
+                "volume": 1000,
+                "amount": 8000,
+                "change_percent": 0,
+                "quote_time": "2026-05-08T10:00:00",
+                "snapshot_id": "fast-snapshot",
+                "snapshot_time": "2026-05-08T10:00:00",
+                "source": "intraday_hot_table",
+            },
+        }
+
+    def get_latest_chip_daily_batch(self, codes, *, as_of=None):
+        self.chip_batch_calls.append((list(codes), as_of))
+        return {
+            "600519": {
+                "code": "600519",
+                "date": "2026-05-07",
+                "source": "stock_chip_daily",
+                "profit_ratio": 0.1,
+                "distribution": [
+                    {"price": 10.0, "percent": 0.9},
+                    {"price": 20.0, "percent": 0.1},
+                ],
+                "chip_single_peak_signal": 1,
+                "chip_peak_low_price": 10.0,
+                "chip_peak_high_price": 10.0,
+                "chip_peak_price_ratio": 1.0,
+            },
+            "000001": {
+                "code": "000001",
+                "date": "2026-05-07",
+                "source": "stock_chip_daily",
+                "profit_ratio": 0.9,
+                "distribution": [
+                    {"price": 10.0, "percent": 0.9},
+                    {"price": 20.0, "percent": 0.1},
+                ],
+                "chip_single_peak_signal": 1,
+                "chip_peak_low_price": 10.0,
+                "chip_peak_high_price": 10.0,
+                "chip_peak_price_ratio": 1.0,
+            },
+        }
+
+
+class _FastLatestRuleStockRepo:
+    def __init__(self, db):
+        self.db = db
+
+
+class _FastLatestRuleStockService:
+    def __init__(self):
+        self.db = _FastLatestRuleDb()
+        self.repo = _FastLatestRuleStockRepo(self.db)
+        self.batch_history_calls = []
+
+    def get_daily_history_cache_batch(self, stock_codes, days_by_code, *, data_policy="snapshot_only"):
+        self.batch_history_calls.append((list(stock_codes), dict(days_by_code), data_policy))
+        raise AssertionError("fast latest scan should not load daily history")
+
+    def get_history_data(self, stock_code, period="daily", days=30, data_policy="default"):
+        raise AssertionError("fast latest scan should not load per-stock history")
+
+    def get_realtime_quote_snapshot_info(self):
+        return {}
+
+
 def test_rule_service_run_modes_separate_latest_from_history():
     repo = _FakeRuleRepo(_service_rule_for_run_mode())
     service = RuleService(repo=repo, stock_service=_FakeStockService())
 
-    latest_result = service.run_rule(1, mode="latest")
+    with mock.patch(
+        "src.services.rule_service.RuleService._is_cn_live_test_allowed",
+        return_value=True,
+    ):
+        latest_result = service.run_rule(1, mode="latest")
     history_result = service.run_rule(1, mode="history")
 
     assert latest_result["mode"] == "latest"
@@ -1074,7 +1579,7 @@ def test_rule_service_run_modes_separate_latest_from_history():
     assert history_result["matches"][0]["matched_events"][0]["snapshot"]["close"] == 15
 
 
-def test_rule_service_latest_mode_uses_realtime_day_against_previous_window():
+def test_rule_service_latest_mode_uses_db_intraday_day_against_previous_window():
     rule = _service_rule_for_run_mode()
     rule["definition"]["groups"][0]["conditions"] = [
         {
@@ -1106,6 +1611,266 @@ def test_rule_service_latest_mode_uses_realtime_day_against_previous_window():
     assert values["left"] == 200000
     assert values["right"] == 120000
     assert result["matches"][0]["matched_dates"] == ["2026-05-08"]
+
+
+def test_rule_service_latest_mode_reprices_chip_metrics_for_live_row():
+    rule = _service_rule_for_run_mode()
+    rule["definition"]["groups"][0]["conditions"] = [
+        {
+            "id": "c1",
+            "left": {"metric": "profit_ratio", "offset": 0},
+            "operator": ">",
+            "right": {"type": "literal", "value": 80},
+        },
+        {
+            "id": "c2",
+            "left": {"metric": "chip_single_peak_signal", "offset": 0},
+            "operator": "=",
+            "right": {"type": "literal", "value": 1},
+        },
+    ]
+    service = RuleService(repo=_FakeRuleRepo(rule), stock_service=_RealtimeRuleStockService())
+    service._build_history_chip_metrics = mock.Mock(return_value={
+        "chip_distribution": {
+            "date": "2026-05-07",
+            "profit_ratio": 0.2,
+            "source": "stock_chip_daily",
+            "distribution": [
+                {"price": 36.0, "percent": 0.2},
+                {"price": 37.5, "percent": 0.6},
+                {"price": 39.0, "percent": 0.2},
+            ],
+            "snapshots": [
+                {
+                    "date": "2026-05-07",
+                    "profit_ratio": 0.2,
+                    "distribution": [
+                        {"price": 36.0, "percent": 0.2},
+                        {"price": 37.5, "percent": 0.6},
+                        {"price": 39.0, "percent": 0.2},
+                    ],
+                }
+            ],
+        }
+    })
+
+    with mock.patch(
+        "src.services.rule_service.RuleService._is_cn_live_test_allowed",
+        return_value=True,
+    ):
+        result = service.run_rule(1, mode="latest", data_policy="snapshot_only")
+
+    assert result["event_count"] == 1
+    event = result["matches"][0]["matched_events"][0]
+    assert event["date"] == "2026-05-08"
+    snapshot = event["snapshot"]
+    assert snapshot["profit_ratio"] == 100
+    assert snapshot["chip_single_peak_signal"] == 1
+    assert snapshot["data_source"] == "intraday_hot_table"
+    assert service._build_history_chip_metrics.call_count == 2
+
+
+def test_rule_service_latest_mode_recomputes_chip_shape_after_live_row():
+    rule = _service_rule_for_run_mode()
+    rule["definition"]["groups"][0]["conditions"] = [
+        {
+            "id": "c1",
+            "left": {"metric": "profit_ratio", "offset": 0},
+            "operator": ">",
+            "right": {"type": "literal", "value": 80},
+        },
+        {
+            "id": "c2",
+            "left": {"metric": "chip_single_peak_signal", "offset": 0},
+            "operator": "=",
+            "right": {"type": "literal", "value": 1},
+        },
+        {
+            "id": "c3",
+            "left": {"metric": "chip_peak_price_ratio", "offset": 0},
+            "operator": "<=",
+            "right": {"type": "literal", "value": 1.1},
+        },
+    ]
+    service = RuleService(repo=_FakeRuleRepo(rule), stock_service=_RealtimeRuleStockService())
+
+    def _chip_metrics_for_rows(_stock_code, rows):
+        latest_date = rows[-1]["date"]
+        if latest_date == "2026-05-08":
+            return {
+                "chip_distribution": {
+                    "date": "2026-05-08",
+                    "profit_ratio": 1.0,
+                    "source": "local_chip_model:rule_backtest",
+                    "distribution": [
+                        {"price": 38.5, "percent": 0.1},
+                        {"price": 39.0, "percent": 0.8},
+                        {"price": 39.5, "percent": 0.1},
+                    ],
+                }
+            }
+        return {
+            "chip_distribution": {
+                "date": "2026-05-07",
+                "profit_ratio": 0.2,
+                "source": "local_chip_model:rule_backtest",
+                "distribution": [
+                    {"price": 36.0, "percent": 0.45},
+                    {"price": 37.5, "percent": 0.1},
+                    {"price": 39.0, "percent": 0.45},
+                ],
+            }
+        }
+
+    service._build_history_chip_metrics = mock.Mock(side_effect=_chip_metrics_for_rows)
+
+    with mock.patch(
+        "src.services.rule_service.RuleService._is_cn_live_test_allowed",
+        return_value=True,
+    ):
+        result = service.run_rule(1, mode="latest", data_policy="snapshot_only")
+
+    assert result["event_count"] == 1
+    snapshot = result["matches"][0]["matched_events"][0]["snapshot"]
+    assert snapshot["profit_ratio"] == 100
+    assert snapshot["chip_single_peak_signal"] == 1
+    assert snapshot["chip_peak_price_ratio"] == 1
+    assert service._build_history_chip_metrics.call_count == 2
+
+
+def test_rule_service_async_latest_fast_scan_uses_chip_daily_without_history_prewarm():
+    rule = _service_rule_for_codes(["600519", "000001"])
+    rule["id"] = 10
+    rule["name"] = "单峰密集获利盘80"
+    rule["definition"]["groups"][0]["conditions"] = [
+        {
+            "id": "cond-chip-single-peak",
+            "left": {"metric": "chip_single_peak_signal", "offset": 0},
+            "operator": "=",
+            "right": {"type": "literal", "value": 1},
+        },
+        {
+            "id": "cond-profit-ratio-gt-80",
+            "left": {"metric": "profit_ratio", "offset": 0},
+            "operator": ">",
+            "right": {"type": "literal", "value": 80},
+        },
+        {
+            "id": "cond-chip-peak-price-ratio-le-1-5",
+            "left": {"metric": "chip_peak_price_ratio", "offset": 0},
+            "operator": "<=",
+            "right": {"type": "literal", "value": 1.5},
+        },
+    ]
+    repo = _ProgressRuleRepo([rule])
+    stock_service = _FastLatestRuleStockService()
+    service = RuleService(repo=repo, stock_service=stock_service)
+    service._resolve_run_workers = lambda target_count: 1
+    service._build_history_chip_metrics = mock.Mock(side_effect=AssertionError("chip model should be skipped"))
+
+    with mock.patch(
+        "src.services.rule_service.RuleService._is_cn_live_test_allowed",
+        return_value=True,
+    ), mock.patch(
+        "src.services.rule_service.trading_calendar.get_market_now",
+        return_value=datetime(2026, 5, 8, 10, 0),
+    ):
+        response, context = service.start_run_rules(
+            [10],
+            mode="latest",
+            target_override={"scope": "custom", "stock_codes": ["600519", "000001"]},
+            data_policy="default",
+        )
+        service.complete_started_run_rules(**context)
+
+    assert response["status"] == "running"
+    assert stock_service.batch_history_calls == []
+    service._build_history_chip_metrics.assert_not_called()
+    assert stock_service.db.quote_batch_calls == [(["600519", "000001"], date(2026, 5, 8))]
+    assert stock_service.db.chip_batch_calls == [(["600519", "000001"], date(2026, 5, 8))]
+    assert repo.finished_status == "completed"
+    assert [match["stock_code"] for match in repo.finished_matches] == ["600519"]
+    snapshot = repo.finished_matches[0]["snapshot"]
+    assert snapshot["profit_ratio"] == 90
+    assert snapshot["chip_single_peak_signal"] == 1
+    assert snapshot["chip_peak_price_ratio"] == 1
+    assert snapshot["snapshot_id"] == "fast-snapshot"
+
+
+def test_rule_service_fast_latest_scan_refreshes_quotes_between_live_cycles():
+    rule_service_module._LIVE_RULE_RUN_SCAN_CACHE.clear()
+    stock_service = _FastLatestRuleStockService()
+    service = RuleService(repo=object(), stock_service=stock_service)
+    try:
+        with mock.patch(
+            "src.services.rule_service.trading_calendar.get_market_now",
+            return_value=datetime(2026, 5, 8, 10, 0),
+        ):
+            first_cache = service._prepare_fast_latest_scan_cache(
+                ["600519"],
+                "db_only",
+                require_chip_metrics=False,
+                live_cache_key="live-refresh-test",
+            )
+            second_cache = service._prepare_fast_latest_scan_cache(
+                ["600519"],
+                "db_only",
+                require_chip_metrics=False,
+                live_cache_key="live-refresh-test",
+            )
+
+        assert first_cache["quote_by_code"]["600519"]["snapshot_id"] == "fast-snapshot"
+        assert second_cache["quote_by_code"]["600519"]["snapshot_id"] == "fast-snapshot"
+        assert stock_service.db.quote_batch_calls == [
+            (["600519"], date(2026, 5, 8)),
+            (["600519"], date(2026, 5, 8)),
+        ]
+        assert "quote_by_code" not in rule_service_module._LIVE_RULE_RUN_SCAN_CACHE["live-refresh-test"]
+    finally:
+        rule_service_module._LIVE_RULE_RUN_SCAN_CACHE.clear()
+
+
+def test_rule_service_fast_latest_scan_rejects_history_aggregate_rule():
+    rule = _service_rule_for_run_mode()
+    rule["definition"]["groups"][0]["conditions"] = [
+        {
+            "id": "c1",
+            "left": {"metric": "volume", "offset": 0},
+            "operator": ">",
+            "right": {
+                "type": "aggregate",
+                "metric": "volume",
+                "method": "avg",
+                "window": 3,
+                "offset": 1,
+                "multiplier": 2,
+            },
+        }
+    ]
+
+    assert not RuleService._can_use_fast_latest_batch_scan(
+        [(1, rule, rule["definition"], ["600519"])],
+        "latest",
+        "db_only",
+    )
+
+
+def test_rule_service_fast_latest_scan_rejects_history_dependent_latest_metrics():
+    rule = _service_rule_for_run_mode()
+    rule["definition"]["groups"][0]["conditions"] = [
+        {
+            "id": "c1",
+            "left": {"metric": "volume_ratio", "offset": 0},
+            "operator": ">",
+            "right": {"type": "literal", "value": 2},
+        }
+    ]
+
+    assert not RuleService._can_use_fast_latest_batch_scan(
+        [(1, rule, rule["definition"], ["600519"])],
+        "latest",
+        "db_only",
+    )
 
 
 def test_rule_service_history_mode_respects_date_range():
@@ -1212,14 +1977,14 @@ def test_rule_service_live_test_window_allows_preopen_and_lunch_before_15():
         assert not RuleService._is_cn_live_test_allowed(datetime(2026, 5, 8, 15, 1))
 
 
-def test_rule_service_history_mode_uses_default_data_policy_for_backfill():
+def test_rule_service_history_mode_forces_db_only_data_policy():
     stock_service = _PolicyRecordingStockService()
     service = RuleService(repo=_FakeRuleRepo(_service_rule_for_run_mode()), stock_service=stock_service)
 
     result = service.run_rule(1, mode="history")
 
     assert result["status"] == "completed"
-    assert stock_service.history_policies == ["default"]
+    assert stock_service.history_policies == ["db_only"]
 
 
 def test_rule_service_history_db_only_cache_miss_is_empty_result():
@@ -1376,11 +2141,106 @@ def test_rule_service_async_batch_reuses_preloaded_history_cache():
             service.complete_started_run_rules(**context)
 
         assert len(stock_service.batch_history_calls) == 1
+        assert stock_service.batch_history_calls[0]["data_policy"] == "db_only"
         assert stock_service.per_stock_history_calls == []
         assert repo.finished_status == "completed"
         assert len(repo.finished_matches) == 2
     finally:
         rule_service_module._RULE_RUN_HISTORY_CACHE.clear()
+
+
+def test_rule_service_preopen_latest_only_prewarms_history_cache():
+    rule_service_module._RULE_RUN_HISTORY_CACHE.clear()
+    rule_service_module._LIVE_RULE_RUN_HISTORY_CACHE.clear()
+    rule_service_module._LIVE_RULE_RUN_SCAN_CACHE.clear()
+    try:
+        codes = ["600519", "000001"]
+        rule = _service_rule_for_codes(codes)
+        repo = _ProgressRuleRepo([rule])
+        stock_service = _PreopenBatchHistoryStockService()
+        service = RuleService(repo=repo, stock_service=stock_service)
+        live_cache_key = "live-test-session"
+
+        with mock.patch(
+            "src.services.rule_service.trading_calendar.get_market_now",
+            return_value=datetime(2026, 5, 8, 8, 45),
+        ), mock.patch(
+            "src.services.rule_service.trading_calendar.is_market_open",
+            return_value=True,
+        ):
+            response, context = service.start_run_rules(
+                [1],
+                mode="latest",
+                target_override={"scope": "custom", "stock_codes": codes},
+                data_policy="default",
+                live_cache_key=live_cache_key,
+            )
+            assert context is not None
+            assert response["status"] == "running"
+            assert response["prewarm_only"] is True
+            assert response["prewarm_hit_count"] == 0
+            assert response["prewarm_miss_count"] == 0
+            assert response["quote_hit_count"] == 0
+            assert response["quote_miss_count"] == 0
+            assert stock_service.batch_history_calls == []
+            service.complete_started_run_rules(**context)
+
+            second_response, second_context = service.start_run_rules(
+                [1],
+                mode="latest",
+                target_override={"scope": "custom", "stock_codes": codes},
+                data_policy="default",
+                live_cache_key=live_cache_key,
+            )
+            assert second_context is not None
+            assert second_response["status"] == "running"
+            assert second_response["prewarm_only"] is True
+            service.complete_started_run_rules(**second_context)
+
+        assert len(stock_service.batch_history_calls) == 1
+        assert stock_service.batch_history_calls[0]["data_policy"] == "db_only"
+        assert stock_service.per_stock_history_calls == []
+        assert repo.finished_status == "completed"
+        assert repo.finished_matches == []
+        assert live_cache_key in rule_service_module._LIVE_RULE_RUN_HISTORY_CACHE
+        assert live_cache_key in rule_service_module._LIVE_RULE_RUN_SCAN_CACHE
+
+        cached_dates = [
+            row["date"]
+            for entry in rule_service_module._LIVE_RULE_RUN_HISTORY_CACHE[live_cache_key].values()
+            for payload in (entry.get("history_by_code") or {}).values()
+            for row in payload.get("data") or []
+        ]
+        assert "2026-05-08" not in cached_dates
+
+        with mock.patch(
+            "src.services.rule_service.trading_calendar.get_market_now",
+            return_value=datetime(2026, 5, 8, 9, 35),
+        ), mock.patch(
+            "src.services.rule_service.trading_calendar.is_market_open",
+            return_value=True,
+        ):
+            live_response, live_context = service.start_run_rules(
+                [1],
+                mode="latest",
+                target_override={"scope": "custom", "stock_codes": codes},
+                data_policy="default",
+                live_cache_key=live_cache_key,
+            )
+            service.complete_started_run_rules(**live_context)
+
+        assert live_response["status"] == "running"
+        assert len(stock_service.batch_history_calls) == 1
+        assert stock_service.per_stock_history_calls == []
+
+        cleared = service.clear_live_rule_history_cache(live_cache_key)
+        assert cleared["cleared_entries"] == 1
+        assert live_cache_key not in rule_service_module._LIVE_RULE_RUN_HISTORY_CACHE
+        assert live_cache_key not in rule_service_module._LIVE_RULE_RUN_SCAN_CACHE
+    finally:
+        rule_service_module._RULE_RUN_HISTORY_CACHE.clear()
+        rule_service_module._LIVE_RULE_RUN_HISTORY_CACHE.clear()
+        rule_service_module._LIVE_RULE_RUN_SCAN_CACHE.clear()
 
 
 def test_rule_service_async_batch_reuses_history_and_skips_chip_for_light_rules():
@@ -1775,3 +2635,27 @@ def test_rule_service_accepts_all_a_shares_scope_with_explicit_codes():
     }
 
     RuleService(repo=object(), stock_service=object()).validate_definition(definition)
+
+
+def test_rule_service_resolves_all_a_shares_scope_from_stock_index():
+    service = RuleService(repo=object(), stock_service=object())
+
+    with mock.patch(
+        "src.data.stock_index_loader.get_all_a_share_stock_codes",
+        return_value=["000001", "600519", "000001"],
+    ):
+        codes = service._resolve_target_codes({"scope": "all_a_shares", "stock_codes": []})
+
+    assert codes == ["000001", "600519"]
+
+
+def test_rule_service_rejects_empty_all_a_shares_stock_index():
+    service = RuleService(repo=object(), stock_service=object())
+
+    with mock.patch("src.data.stock_index_loader.get_all_a_share_stock_codes", return_value=[]):
+        try:
+            service._resolve_target_codes({"scope": "all_a_shares", "stock_codes": []})
+        except RuleValidationError as exc:
+            assert "A 股股票索引为空" in str(exc)
+        else:
+            raise AssertionError("empty all A-share index should be rejected")

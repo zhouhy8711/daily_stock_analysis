@@ -1,5 +1,6 @@
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { createApiError, createParsedApiError } from '../../api/error';
 import { historyApi } from '../../api/history';
 import { rulesApi } from '../../api/rules';
 import { stocksApi, type KLineData, type KLinePeriod } from '../../api/stocks';
@@ -104,6 +105,73 @@ const emptyRule = {
   },
 };
 
+const multiGroupRule = {
+  ...rule,
+  id: 5,
+  name: '缩量后的放倍量',
+  definition: {
+    ...rule.definition,
+    groups: [
+      {
+        id: 'group-volume-after-shrink-with-range-chip-30d',
+        conditions: [
+          {
+            id: 'cond-after-shrink-volume-gt-prev5avg-30d',
+            left: { metric: 'volume', offset: 0 },
+            operator: '>' as const,
+            right: {
+              type: 'aggregate' as const,
+              metric: 'volume',
+              method: 'avg' as const,
+              window: 5,
+              offset: 1,
+              multiplier: 1.2,
+            },
+          },
+          {
+            id: 'cond-price-range-30d-between-20-30',
+            left: { metric: 'price_range_30d_pct', offset: 0 },
+            operator: 'between' as const,
+            right: {
+              type: 'range' as const,
+              min: { type: 'literal' as const, value: 20 },
+              max: { type: 'literal' as const, value: 30 },
+            },
+          },
+        ],
+      },
+      {
+        id: 'group-volume-after-shrink-with-range-chip-60d',
+        conditions: [
+          {
+            id: 'cond-after-shrink-volume-gt-prev5avg-60d',
+            left: { metric: 'volume', offset: 0 },
+            operator: '>' as const,
+            right: {
+              type: 'aggregate' as const,
+              metric: 'volume',
+              method: 'avg' as const,
+              window: 5,
+              offset: 1,
+              multiplier: 1.2,
+            },
+          },
+          {
+            id: 'cond-price-range-60d-between-20-30',
+            left: { metric: 'price_range_60d_pct', offset: 0 },
+            operator: 'between' as const,
+            right: {
+              type: 'range' as const,
+              min: { type: 'literal' as const, value: 20 },
+              max: { type: 'literal' as const, value: 30 },
+            },
+          },
+        ],
+      },
+    ],
+  },
+};
+
 const matches = [{
   stockCode: '300274.SZ',
   stockName: '阳光电源',
@@ -142,6 +210,39 @@ const matches = [{
   matchedGroups: [],
   snapshot: {},
   explanation: '成交量放大',
+}];
+
+const multiGroupMatches = [{
+  stockCode: '600143',
+  stockName: '金发科技',
+  matchedDates: ['2026-05-08'],
+  matchedEvents: [{
+    date: '2026-05-08',
+    snapshot: { volume: 1070148, price_range_60d_pct: 26.5436 },
+    matched_groups: [{
+      id: 'group-volume-after-shrink-with-range-chip-60d',
+      conditions: [
+        {
+          id: 'cond-after-shrink-volume-gt-prev5avg-60d',
+          left_metric: 'volume',
+          operator: '>',
+          values: { left: 1070148, right: 606511.44 },
+          explanation: '命中：成交量 1,070,148 > 606,511.44',
+        },
+        {
+          id: 'cond-price-range-60d-between-20-30',
+          left_metric: 'price_range_60d_pct',
+          operator: 'between',
+          values: { left: 26.5436, min: 20, max: 30 },
+          explanation: '命中：近60日最高最低振幅 26.54 between [20, 30]',
+        },
+      ],
+    }],
+    explanation: '近60日条件组命中',
+  }],
+  matchedGroups: [],
+  snapshot: {},
+  explanation: '近60日条件组命中',
 }];
 
 const multiEventMatches = [{
@@ -202,6 +303,14 @@ function createDeferred<T>() {
   return { promise, resolve, reject };
 }
 
+function createRequestTimeoutError() {
+  return createApiError(createParsedApiError({
+    title: '请求本地服务超时',
+    message: '本地服务响应超时，后台任务可能仍在执行，请稍后刷新或检查服务负载。',
+    category: 'request_timeout',
+  }), { code: 'ECONNABORTED' });
+}
+
 function makeIndicatorHistory(period: KLinePeriod): KLineData[] {
   const length = period === 'daily' ? 31 : 40;
   return Array.from({ length }, (_, index) => {
@@ -234,6 +343,7 @@ vi.mock('../../api/rules', () => ({
     run: vi.fn(),
     runBatch: vi.fn(),
     runBatchAsync: vi.fn(),
+    clearLiveCache: vi.fn(),
   },
 }));
 
@@ -289,6 +399,7 @@ describe('BacktestPage', () => {
       matchCount: 1,
       eventCount: 1,
     });
+    vi.mocked(rulesApi.clearLiveCache).mockResolvedValue(undefined);
     vi.mocked(rulesApi.runBatch).mockResolvedValue({
       runId: 12,
       ruleId: 7,
@@ -427,6 +538,21 @@ describe('BacktestPage', () => {
   });
 
   it('starts without old run history and displays rows after running', async () => {
+    stockIndexHookState.current = {
+      index: [{
+        canonicalCode: '300274.SZ',
+        displayCode: '300274.SZ',
+        nameZh: '阳光电源',
+        market: 'CN',
+        assetType: 'stock',
+        active: true,
+        industry: '电力设备',
+      }],
+      loading: false,
+      error: null,
+      fallback: false,
+      loaded: true,
+    };
     render(<BacktestPage />);
 
     expect(await screen.findByText('回测执行历史')).toBeInTheDocument();
@@ -439,6 +565,8 @@ describe('BacktestPage', () => {
     expect(await screen.findByText('#12 放量观察')).toBeInTheDocument();
     expect(screen.getAllByText('300274.SZ').length).toBeGreaterThan(0);
     expect(screen.getByText('2026-05-01')).toBeInTheDocument();
+    expect(screen.getByRole('columnheader', { name: '行业' })).toBeInTheDocument();
+    expect(screen.getByText('电力设备')).toBeInTheDocument();
     expect(screen.getByRole('columnheader', { name: '成交量 当前值' })).toBeInTheDocument();
     expect(screen.getByRole('columnheader', { name: '成交量 当前值' }).querySelector('span')).toHaveClass('text-danger');
     expect(screen.getByRole('columnheader', { name: '前5期成交量均值*2' })).toBeInTheDocument();
@@ -455,7 +583,42 @@ describe('BacktestPage', () => {
     expect(screen.getAllByText(/成交量/).length).toBeGreaterThan(0);
   });
 
+  it.each([
+    { mode: undefined, action: '回测' },
+    { mode: 'live' as const, action: '实测' },
+  ])('hides inactive rules from the $action rule selector', async ({ mode, action }) => {
+    vi.mocked(rulesApi.list).mockResolvedValue([
+      { ...rule, id: 6, name: '夹板数', isActive: false },
+      { ...secondRule, id: 8, name: '净利润断层', isActive: false },
+      { ...emptyRule, id: 9, name: '启用观察', isActive: true },
+    ]);
+
+    render(<BacktestPage mode={mode} />);
+
+    expect(await screen.findByText('1 / 1')).toBeInTheDocument();
+    fireEvent.click(screen.getByLabelText(`选择${action}规则`));
+
+    expect(screen.getByRole('checkbox', { name: /#9 启用观察/ })).toBeChecked();
+    expect(screen.queryByRole('checkbox', { name: /#6 夹板数/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole('checkbox', { name: /#8 净利润断层/ })).not.toBeInTheDocument();
+  });
+
   it('runs live test without showing backtest run history', async () => {
+    stockIndexHookState.current = {
+      index: [{
+        canonicalCode: '300274.SZ',
+        displayCode: '300274.SZ',
+        nameZh: '阳光电源',
+        market: 'CN',
+        assetType: 'stock',
+        active: true,
+        industry: '电力设备',
+      }],
+      loading: false,
+      error: null,
+      fallback: false,
+      loaded: true,
+    };
     render(<BacktestPage mode="live" />);
 
     expect(await screen.findByText('实测结果')).toBeInTheDocument();
@@ -477,7 +640,8 @@ describe('BacktestPage', () => {
       expect(rulesApi.runBatchAsync).toHaveBeenCalledWith({
         ruleIds: [7],
         mode: 'latest',
-        dataPolicy: 'snapshot_only',
+        dataPolicy: 'db_only',
+        liveCacheKey: expect.stringMatching(/^live-\d+$/),
         target: {
           scope: 'watchlist',
           stockCodes: ['300274.SZ', '688521.SH'],
@@ -500,9 +664,300 @@ describe('BacktestPage', () => {
       const liveRuleGroup = screen.getByTestId('live-rule-group-7');
       expect(within(liveRuleGroup).getByText('#7 放量观察')).toBeInTheDocument();
       expect(within(liveRuleGroup).getByText('300274.SZ')).toBeInTheDocument();
+      expect(within(liveRuleGroup).getByRole('columnheader', { name: '行业' })).toBeInTheDocument();
+      expect(within(liveRuleGroup).getByText('电力设备')).toBeInTheDocument();
       expect(within(liveRuleGroup).queryByRole('columnheader', { name: '日期' })).not.toBeInTheDocument();
       expect(within(liveRuleGroup).getByText(/执行 \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/)).toBeInTheDocument();
 
+      fireEvent.click(screen.getByRole('button', { name: '停止实测' }));
+    } finally {
+      vi.useRealTimers();
+    }
+    await waitFor(() => {
+      expect(rulesApi.clearLiveCache).toHaveBeenCalledWith(expect.stringMatching(/^live-\d+$/));
+    });
+  });
+
+  it('treats preopen live test response as history prewarm only', async () => {
+    vi.mocked(rulesApi.runBatchAsync).mockResolvedValueOnce({
+      runId: 88,
+      ruleId: 7,
+      ruleIds: [7],
+      ruleNames: ['放量观察'],
+      status: 'completed',
+      targetCount: 2,
+      completedCount: 2,
+      matchCount: 0,
+      eventCount: 0,
+      mode: 'latest',
+      durationMs: 12,
+      matches: [],
+      errors: [],
+      prewarmOnly: true,
+      prewarmHitCount: 2,
+      prewarmMissCount: 0,
+    });
+
+    render(<BacktestPage mode="live" />);
+
+    expect(await screen.findByText('实测结果')).toBeInTheDocument();
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-05-07T00:45:00Z'));
+      fireEvent.click(screen.getByRole('button', { name: '运行实测' }));
+      await act(async () => {
+        await Promise.resolve();
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+
+    expect(rulesApi.getRun).not.toHaveBeenCalled();
+    expect(rulesApi.getRunMatches).not.toHaveBeenCalled();
+    expect(rulesApi.notifyRunMatches).not.toHaveBeenCalled();
+    expect(screen.getByText(/09:30 前仅预热历史数据/)).toBeInTheDocument();
+    expect(screen.getByText(/历史缓存命中 2\/2/)).toBeInTheDocument();
+  });
+
+  it('polls async preopen history prewarm until it completes', async () => {
+    vi.mocked(rulesApi.runBatchAsync).mockResolvedValueOnce({
+      runId: 88,
+      ruleId: 7,
+      ruleIds: [7],
+      ruleNames: ['放量观察'],
+      status: 'running',
+      targetCount: 2,
+      completedCount: 0,
+      matchCount: 0,
+      eventCount: 0,
+      mode: 'latest',
+      durationMs: 0,
+      matches: [],
+      errors: [],
+      prewarmOnly: true,
+      prewarmHitCount: 0,
+      prewarmMissCount: 0,
+    });
+    vi.mocked(rulesApi.getRun).mockResolvedValueOnce({
+      id: 88,
+      runIds: [88],
+      ruleId: 7,
+      ruleIds: [7],
+      ruleName: '放量观察',
+      ruleNames: ['放量观察'],
+      status: 'completed',
+      targetCount: 2,
+      completedCount: 2,
+      matchCount: 0,
+      eventCount: 0,
+      startedAt: '2026-05-07T00:45:00Z',
+      finishedAt: '2026-05-07T00:45:20Z',
+      durationMs: 20,
+      prewarmOnly: true,
+      prewarmHitCount: 2,
+      prewarmMissCount: 0,
+    });
+
+    render(<BacktestPage mode="live" />);
+
+    expect(await screen.findByText('实测结果')).toBeInTheDocument();
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-05-07T00:45:00Z'));
+      fireEvent.click(screen.getByRole('button', { name: '运行实测' }));
+      await act(async () => {
+        await Promise.resolve();
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+
+    expect(rulesApi.getRun).toHaveBeenCalledWith(88);
+    expect(rulesApi.getRunMatches).not.toHaveBeenCalled();
+    expect(rulesApi.notifyRunMatches).not.toHaveBeenCalled();
+    expect(screen.getByText(/开盘前历史缓存预热已启动：0\/2/)).toBeInTheDocument();
+    expect(screen.getByText(/历史缓存命中 2\/2/)).toBeInTheDocument();
+  });
+
+  it('keeps an active live run retryable when progress polling times out', async () => {
+    vi.mocked(rulesApi.getRun)
+      .mockRejectedValueOnce(createRequestTimeoutError())
+      .mockResolvedValueOnce({
+        id: 12,
+        runIds: [12],
+        ruleId: 7,
+        ruleIds: [7],
+        ruleName: '放量观察',
+        ruleNames: ['放量观察'],
+        status: 'completed',
+        targetCount: 2,
+        completedCount: 2,
+        matchCount: 1,
+        eventCount: 1,
+        snapshotId: '20260507105510',
+        startedAt: '2026-05-07T02:55:10Z',
+        finishedAt: '2026-05-07T02:55:20Z',
+        durationMs: 20,
+      });
+
+    render(<BacktestPage mode="live" />);
+
+    expect(await screen.findByText('实测结果')).toBeInTheDocument();
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-05-07T02:55:10Z'));
+      fireEvent.click(screen.getByRole('button', { name: '运行实测' }));
+      await act(async () => {
+        await Promise.resolve();
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+
+      expect(screen.getByText(/进度轮询暂时超时/)).toBeInTheDocument();
+      expect(screen.queryByText(/实测失败/)).not.toBeInTheDocument();
+
+      vi.setSystemTime(new Date('2026-05-07T02:55:40Z'));
+      await act(async () => {
+        vi.advanceTimersByTime(30_000);
+        await Promise.resolve();
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+
+      expect(rulesApi.getRun).toHaveBeenCalledTimes(2);
+      expect(rulesApi.getRunMatches).toHaveBeenCalledWith(12);
+      expect(screen.getByRole('tab', { name: /运行结果/ })).toHaveAttribute('aria-selected', 'true');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('keeps a completed live run retryable when match loading times out', async () => {
+    vi.mocked(rulesApi.getRun).mockResolvedValue({
+      id: 12,
+      runIds: [12],
+      ruleId: 7,
+      ruleIds: [7],
+      ruleName: '放量观察',
+      ruleNames: ['放量观察'],
+      status: 'completed',
+      targetCount: 2,
+      completedCount: 2,
+      matchCount: 1,
+      eventCount: 1,
+      snapshotId: '20260507105510',
+      startedAt: '2026-05-07T02:55:10Z',
+      finishedAt: '2026-05-07T02:55:20Z',
+      durationMs: 20,
+    });
+    vi.mocked(rulesApi.getRunMatches)
+      .mockRejectedValueOnce(createRequestTimeoutError())
+      .mockResolvedValueOnce(matches);
+
+    render(<BacktestPage mode="live" />);
+
+    expect(await screen.findByText('实测结果')).toBeInTheDocument();
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-05-07T02:55:10Z'));
+      fireEvent.click(screen.getByRole('button', { name: '运行实测' }));
+      await act(async () => {
+        await Promise.resolve();
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+
+      expect(screen.getByText(/命中明细读取暂时超时/)).toBeInTheDocument();
+      expect(screen.queryByText(/实测失败/)).not.toBeInTheDocument();
+      expect(rulesApi.runBatchAsync).toHaveBeenCalledTimes(1);
+
+      vi.setSystemTime(new Date('2026-05-07T02:55:40Z'));
+      await act(async () => {
+        vi.advanceTimersByTime(30_000);
+        await Promise.resolve();
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+
+      expect(rulesApi.getRunMatches).toHaveBeenCalledTimes(2);
+      expect(rulesApi.runBatchAsync).toHaveBeenCalledTimes(1);
+      expect(screen.getByRole('tab', { name: /运行结果/ })).toHaveAttribute('aria-selected', 'true');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('skips realtime snapshot coverage log before A-share open', async () => {
+    stockIndexHookState.current = {
+      index: [
+        {
+          canonicalCode: '300274.SZ',
+          displayCode: '300274.SZ',
+          nameZh: '阳光电源',
+          market: 'CN',
+          assetType: 'stock',
+          active: true,
+          industry: '电力设备',
+        },
+        {
+          canonicalCode: '688521.SH',
+          displayCode: '688521.SH',
+          nameZh: '芯原股份',
+          market: 'CN',
+          assetType: 'stock',
+          active: true,
+          industry: '半导体',
+        },
+      ],
+      loading: false,
+      error: null,
+      fallback: false,
+      loaded: true,
+    };
+    vi.mocked(rulesApi.runBatchAsync).mockResolvedValueOnce({
+      runId: 88,
+      ruleId: 7,
+      ruleIds: [7],
+      ruleNames: ['放量观察'],
+      status: 'completed',
+      targetCount: 2,
+      completedCount: 2,
+      matchCount: 0,
+      eventCount: 0,
+      mode: 'latest',
+      durationMs: 12,
+      matches: [],
+      errors: [],
+      prewarmOnly: true,
+      prewarmHitCount: 2,
+      prewarmMissCount: 0,
+    });
+
+    render(<BacktestPage mode="live" />);
+
+    expect(await screen.findByText('实测结果')).toBeInTheDocument();
+    await screen.findByText('1 / 1');
+    fireEvent.change(screen.getByLabelText('股票范围'), { target: { value: 'all_a_shares' } });
+
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-05-07T00:45:00Z'));
+      fireEvent.click(screen.getByRole('button', { name: '运行实测' }));
+
+      await act(async () => {
+        await Promise.resolve();
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+
+      expect(systemConfigApi.getRealtimeCacheStats).not.toHaveBeenCalled();
+      fireEvent.click(screen.getByRole('tab', { name: /执行日志/ }));
+      expect(screen.getByText(/开盘前实时行情快照尚未生成/)).toBeInTheDocument();
+      expect(screen.queryByText(/实时行情快照覆盖/)).not.toBeInTheDocument();
       fireEvent.click(screen.getByRole('button', { name: '停止实测' }));
     } finally {
       vi.useRealTimers();
@@ -594,6 +1049,7 @@ describe('BacktestPage', () => {
     render(<BacktestPage mode="live" />);
 
     expect(await screen.findByText('实测结果')).toBeInTheDocument();
+    await screen.findByText('1 / 1');
 
     vi.useFakeTimers();
     try {
@@ -970,7 +1426,7 @@ describe('BacktestPage', () => {
 
     render(<BacktestPage />);
 
-    await screen.findByText('回测执行历史');
+    await screen.findByText('1 / 3');
     fireEvent.click(screen.getByLabelText('选择回测规则'));
     fireEvent.click(screen.getByRole('button', { name: '全选' }));
     await waitFor(() => {
@@ -996,6 +1452,42 @@ describe('BacktestPage', () => {
 
     expect(within(volumeGroup).queryByText('300274.SZ')).not.toBeInTheDocument();
     expect(within(chipGroup).getByText('688521.SH')).toBeInTheDocument();
+  });
+
+  it('uses the matched condition group columns for multi-group rule results', async () => {
+    vi.mocked(rulesApi.getMetrics).mockResolvedValue([
+      { key: 'volume', label: '成交量', category: '成交量图', valueType: 'number', unit: '手', periods: ['daily'] },
+      { key: 'price_range_30d_pct', label: '近30日振幅', category: '价格', valueType: 'number', unit: '%', periods: ['daily'] },
+      { key: 'price_range_60d_pct', label: '近60日振幅', category: '价格', valueType: 'number', unit: '%', periods: ['daily'] },
+    ]);
+    vi.mocked(rulesApi.list).mockResolvedValue([multiGroupRule]);
+    vi.mocked(rulesApi.listRuns).mockResolvedValue([{
+      id: 21,
+      ruleId: 5,
+      ruleName: '缩量后的放倍量',
+      status: 'completed',
+      targetCount: 1,
+      matchCount: 1,
+      eventCount: 1,
+      startedAt: '2026-05-10T08:00:00',
+      finishedAt: '2026-05-10T08:00:10',
+      durationMs: 10,
+    }]);
+    vi.mocked(rulesApi.getRunMatches).mockResolvedValueOnce(multiGroupMatches);
+
+    render(<BacktestPage />);
+
+    const resultGroup = await screen.findByTestId(
+      'backtest-rule-group-5-group-volume-after-shrink-with-range-chip-60d',
+    );
+    expect(within(resultGroup).getByText('#5 缩量后的放倍量 · 近60日条件组')).toBeInTheDocument();
+    expect(within(resultGroup).getByRole('columnheader', { name: '近60日振幅 当前值' })).toBeInTheDocument();
+    expect(within(resultGroup).queryByRole('columnheader', { name: '近30日振幅 当前值' })).not.toBeInTheDocument();
+
+    const dataRow = within(resultGroup).getAllByRole('row')[1];
+    expect(within(dataRow).getByText('600143')).toBeInTheDocument();
+    expect(within(dataRow).getByText('26.54%')).toBeInTheDocument();
+    expect(within(dataRow).queryByText('--')).not.toBeInTheDocument();
   });
 
   it('loads persisted run history and restores the latest run result', async () => {
@@ -1156,6 +1648,7 @@ describe('BacktestPage', () => {
       expect(rulesApi.runBatchAsync).toHaveBeenCalledWith({
         ruleIds: [7],
         mode: 'history',
+        dataPolicy: 'db_only',
         target: {
           scope: 'watchlist',
           stockCodes: ['300274.SZ', '688521.SH'],
@@ -1239,7 +1732,7 @@ describe('BacktestPage', () => {
     expect(screen.getByText('2026-05-01')).toBeInTheDocument();
   });
 
-  it('can run an industry backtest with explicit semiconductor stock codes', async () => {
+  it('can run an industry backtest with multiple selected industries', async () => {
     stockIndexHookState.current = {
       index: [
         {
@@ -1280,7 +1773,12 @@ describe('BacktestPage', () => {
     await screen.findByText('回测执行历史');
     expect(screen.queryByLabelText('行业')).not.toBeInTheDocument();
     fireEvent.change(screen.getByLabelText('股票范围'), { target: { value: 'industry' } });
-    expect(screen.getByLabelText('行业')).toBeInTheDocument();
+    const industryButton = screen.getByLabelText('行业');
+    expect(industryButton).toHaveTextContent('半导体');
+    fireEvent.click(industryButton);
+    expect(screen.getByLabelText('选择行业 半导体')).toBeChecked();
+    fireEvent.click(screen.getByLabelText('选择行业 银行'));
+    expect(industryButton).toHaveTextContent('2 个行业');
     fireEvent.click(screen.getByRole('button', { name: '运行回测' }));
 
     await waitFor(() => {
@@ -1288,7 +1786,7 @@ describe('BacktestPage', () => {
         ruleIds: [7],
         target: {
           scope: 'custom',
-          stockCodes: ['603375.SH', '688521.SH'],
+          stockCodes: ['000001.SZ', '603375.SH', '688521.SH'],
         },
       }));
     });

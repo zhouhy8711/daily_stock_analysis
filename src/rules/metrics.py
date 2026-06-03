@@ -34,6 +34,20 @@ METRIC_DEFINITIONS: List[MetricDefinition] = [
     MetricDefinition("prev_close", "昨收价", "K线图", unit="元"),
     MetricDefinition("pct_chg", "涨跌幅", "K线图", unit="%"),
     MetricDefinition(
+        "price_range_30d_pct",
+        "近30日最高最低振幅",
+        "K线图",
+        unit="%",
+        description="近 30 个交易日最高价与最低价的区间宽度，相对区间最低价计算",
+    ),
+    MetricDefinition(
+        "price_range_60d_pct",
+        "近60日最高最低振幅",
+        "K线图",
+        unit="%",
+        description="近 60 个交易日最高价与最低价的区间宽度，相对区间最低价计算",
+    ),
+    MetricDefinition(
         "prev_5d_return_pct",
         "前5日累计涨幅",
         "额外",
@@ -88,6 +102,8 @@ METRIC_DEFINITIONS: List[MetricDefinition] = [
     MetricDefinition("price_range_90_width", "90%筹码价格区间宽度", "筹码峰-全部筹码", unit="元"),
     MetricDefinition("price_range_90_width_pct", "90%筹码价格区间宽度率", "筹码峰-全部筹码", unit="%"),
     MetricDefinition("chip_concentration_90", "90%筹码集中度", "筹码峰-全部筹码", unit="%"),
+    MetricDefinition("chip_concentration_90_avg_30d", "近30日平均90%筹码集中度", "筹码峰-全部筹码", unit="%"),
+    MetricDefinition("chip_concentration_90_avg_60d", "近60日平均90%筹码集中度", "筹码峰-全部筹码", unit="%"),
     MetricDefinition("cost_70_low", "70%筹码价格区间下限", "筹码峰-全部筹码", unit="元"),
     MetricDefinition("cost_70_high", "70%筹码价格区间上限", "筹码峰-全部筹码", unit="元"),
     MetricDefinition("price_range_70_mid", "70%筹码价格区间中枢", "筹码峰-全部筹码", unit="元"),
@@ -97,6 +113,11 @@ METRIC_DEFINITIONS: List[MetricDefinition] = [
     MetricDefinition("chip_peak_price", "筹码峰峰值价格", "筹码峰-全部筹码", unit="元"),
     MetricDefinition("chip_peak_percent", "筹码峰峰值占比", "筹码峰-全部筹码", unit="%"),
     MetricDefinition("chip_peak_distance_pct", "现价偏离筹码峰", "筹码峰-全部筹码", unit="%"),
+    MetricDefinition("chip_peak_count", "筹码峰数量", "筹码峰-全部筹码"),
+    MetricDefinition("chip_single_peak_signal", "单峰集中信号", "筹码峰-全部筹码", description="逐价位筹码分布仅存在一个主要峰时记为 1，否则记为 0"),
+    MetricDefinition("chip_peak_low_price", "筹码峰最低价", "筹码峰-全部筹码", unit="元", description="主要筹码峰价格带的最低价"),
+    MetricDefinition("chip_peak_high_price", "筹码峰最高价", "筹码峰-全部筹码", unit="元", description="主要筹码峰价格带的最高价"),
+    MetricDefinition("chip_peak_price_ratio", "筹码峰高低价比", "筹码峰-全部筹码", unit="倍", description="主要筹码峰最高价 / 最低价"),
     MetricDefinition("main_profit_ratio", "主力收盘获利", "筹码峰-主力筹码", unit="%"),
     MetricDefinition("main_trapped_ratio", "主力套牢盘", "筹码峰-主力筹码", unit="%"),
     MetricDefinition("main_profit_trapped_spread", "主力获利套牢差", "筹码峰-主力筹码", unit="百分点"),
@@ -124,6 +145,46 @@ METRIC_DEFINITIONS: List[MetricDefinition] = [
     MetricDefinition("net_large_order", "净大单", "实时监控", unit="元", description="基于主力净额拆分的估算值"),
     MetricDefinition("net_medium_order", "净中单", "实时监控", unit="元", description="基于主力净额拆分的估算值"),
     MetricDefinition("net_small_order", "净小单", "实时监控", unit="元", description="基于主力净额拆分的估算值"),
+    MetricDefinition(
+        "deducted_net_profit_yoy_pct",
+        "扣非净利同比",
+        "财务事件",
+        unit="%",
+        description="扣除非经常性损益后的净利润同比增速；用于财报/业绩公告事件映射",
+    ),
+    MetricDefinition(
+        "deducted_net_profit_qoq_pct",
+        "扣非净利环比",
+        "财务事件",
+        unit="%",
+        description="扣除非经常性损益后的单季净利润环比增速；优先使用数据源字段，缺失时由连续报告期扣非净利推导",
+    ),
+    MetricDefinition(
+        "announcement_next_day_gap_pct",
+        "公告次日跳空缺口",
+        "财务事件",
+        unit="%",
+        description="公告后第一个交易日开盘价相对上一交易日收盘价的跳空幅度",
+    ),
+    MetricDefinition(
+        "announcement_next_day_volume_ratio",
+        "公告次日量能/5日均量",
+        "财务事件",
+        unit="倍",
+        description="公告后第一个交易日成交量相对前 5 个交易日平均成交量的倍数",
+    ),
+    MetricDefinition(
+        "announcement_next_day_gap_unfilled",
+        "公告次日缺口未回补",
+        "财务事件",
+        description="公告后第一个交易日最低价高于上一交易日收盘价时记为 1，否则记为 0",
+    ),
+    MetricDefinition(
+        "net_profit_gap_signal",
+        "净利润断层信号",
+        "财务事件",
+        description="扣非净利同比 >=100%、环比 >=50%、公告次日跳空 >=3%、量能 >=1.5 倍且当日不回补缺口时记为 1",
+    ),
 ]
 
 METRIC_BY_KEY: Dict[str, MetricDefinition] = {item.key: item for item in METRIC_DEFINITIONS}
@@ -226,6 +287,86 @@ def _chip_peak_values(chip: Dict[str, Any], current_price: Optional[float]) -> D
     }
 
 
+def calculate_chip_shape_metrics(chip: Dict[str, Any]) -> Dict[str, Optional[float]]:
+    """Return simple shape metrics for a chip distribution."""
+    stored_peak_count = _to_float(chip.get("chip_peak_count", chip.get("peak_count")))
+    stored_single_peak = _to_float(chip.get("chip_single_peak_signal", chip.get("single_peak_signal")))
+    stored_peak_low = _to_float(chip.get("chip_peak_low_price", chip.get("peak_low_price")))
+    stored_peak_high = _to_float(chip.get("chip_peak_high_price", chip.get("peak_high_price")))
+    stored_peak_ratio = _to_float(chip.get("chip_peak_price_ratio", chip.get("peak_price_ratio")))
+
+    distribution = chip.get("distribution") if isinstance(chip.get("distribution"), list) else []
+    points: List[tuple[float, float]] = []
+    for point in distribution:
+        if not isinstance(point, dict):
+            continue
+        price = _to_float(point.get("price"))
+        percent = _normalize_ratio_percent(point.get("percent", point.get("ratio")))
+        if price is None or percent is None or percent <= 0:
+            continue
+        points.append((price, percent))
+
+    if not points:
+        return {
+            "chip_peak_count": stored_peak_count,
+            "chip_single_peak_signal": stored_single_peak,
+            "chip_peak_low_price": stored_peak_low,
+            "chip_peak_high_price": stored_peak_high,
+            "chip_peak_price_ratio": stored_peak_ratio,
+        }
+
+    points.sort(key=lambda item: item[0])
+    values = [percent for _price, percent in points]
+    max_percent = max(values)
+    if max_percent <= 0:
+        return {
+            "chip_peak_count": 0.0,
+            "chip_single_peak_signal": 0.0,
+            "chip_peak_low_price": stored_peak_low,
+            "chip_peak_high_price": stored_peak_high,
+            "chip_peak_price_ratio": stored_peak_ratio,
+        }
+
+    material_peak_floor = max(1.0, max_percent * 0.35)
+    peak_count = 0
+    peak_indices: List[int] = []
+    for index, value in enumerate(values):
+        previous_value = values[index - 1] if index > 0 else float("-inf")
+        next_value = values[index + 1] if index < len(values) - 1 else float("-inf")
+        is_local_peak = value >= previous_value and value >= next_value and (
+            value > previous_value or value > next_value
+        )
+        if is_local_peak and value >= material_peak_floor:
+            peak_count += 1
+            peak_indices.append(index)
+
+    if peak_count == 0 and max_percent >= material_peak_floor:
+        peak_count = 1
+        peak_indices = [values.index(max_percent)]
+
+    material_prices = [
+        price for price, percent in points
+        if percent >= material_peak_floor
+    ]
+    if not material_prices and peak_indices:
+        material_prices = [points[index][0] for index in peak_indices]
+    peak_low = min(material_prices) if material_prices else stored_peak_low
+    peak_high = max(material_prices) if material_prices else stored_peak_high
+    peak_ratio = (
+        peak_high / peak_low
+        if peak_low is not None and peak_high is not None and peak_low > 0 and peak_high > 0
+        else stored_peak_ratio
+    )
+
+    return {
+        "chip_peak_count": float(peak_count),
+        "chip_single_peak_signal": 1.0 if peak_count == 1 else 0.0,
+        "chip_peak_low_price": peak_low,
+        "chip_peak_high_price": peak_high,
+        "chip_peak_price_ratio": peak_ratio,
+    }
+
+
 def _chip_metric_values(chip: Dict[str, Any], current_price: Optional[float] = None, prefix: str = "") -> Dict[str, Optional[float]]:
     profit_ratio = _clip_percent(_normalize_ratio_percent(chip.get("profit_ratio")))
     trapped_ratio = 100 - profit_ratio if profit_ratio is not None else None
@@ -249,6 +390,7 @@ def _chip_metric_values(chip: Dict[str, Any], current_price: Optional[float] = N
         **_range_values(cost_70_low, cost_70_high, "price_range_70_"),
         "chip_concentration_70": _normalize_ratio_percent(chip.get("concentration_70")),
         **_chip_peak_values(chip, current_price),
+        **calculate_chip_shape_metrics(chip),
     }
     if not prefix:
         return values
@@ -327,6 +469,12 @@ def build_metric_frame(
         "limit_down_price",
         "price_speed",
         "entrust_ratio",
+        "deducted_net_profit_yoy_pct",
+        "deducted_net_profit_qoq_pct",
+        "announcement_next_day_gap_pct",
+        "announcement_next_day_volume_ratio",
+        "announcement_next_day_gap_unfilled",
+        "net_profit_gap_signal",
     )
     for col in numeric_columns:
         if col in df.columns:
@@ -377,6 +525,15 @@ def build_metric_frame(
     amplitude_base = df["prev_close"].fillna(df.get("open")).replace(0, pd.NA)
     computed_amplitude = ((df["high"] - df["low"]) / amplitude_base) * 100
     df["amplitude"] = pd.to_numeric(df["amplitude"], errors="coerce").fillna(computed_amplitude)
+
+    high = pd.to_numeric(df["high"], errors="coerce")
+    low = pd.to_numeric(df["low"], errors="coerce")
+    for window in (30, 60):
+        rolling_high = high.rolling(window=window, min_periods=window).max()
+        rolling_low = low.rolling(window=window, min_periods=window).min()
+        df[f"price_range_{window}d_pct"] = (
+            (rolling_high - rolling_low) / rolling_low.replace(0, pd.NA) * 100
+        )
 
     for window in (5, 10, 20, 30, 60):
         df[f"ma{window}"] = close.rolling(window=window, min_periods=window).mean()
@@ -468,5 +625,15 @@ def build_metric_frame(
             else {}
         )
         _apply_chip_distribution(df, main_chip, "main_")
+
+    if "chip_concentration_90" in df.columns:
+        chip_concentration = pd.to_numeric(df["chip_concentration_90"], errors="coerce")
+        for window in (30, 60):
+            df[f"chip_concentration_90_avg_{window}d"] = (
+                chip_concentration.rolling(window=window, min_periods=window).mean()
+            )
+    else:
+        df["chip_concentration_90_avg_30d"] = pd.NA
+        df["chip_concentration_90_avg_60d"] = pd.NA
 
     return df

@@ -24,6 +24,7 @@ from src.core import trading_calendar
 from src.config import get_config
 from src.repositories.stock_repo import StockRepository
 from src.services.daily_history_enrichment import enrich_daily_history_with_quote_fields
+from src.storage import DAILY_DERIVED_METRIC_COLUMNS
 
 logger = logging.getLogger(__name__)
 
@@ -623,10 +624,12 @@ class StockService:
 
             normalized_code = normalize_stock_code(stock_code)
             normalized_policy = str(data_policy or "default").strip().lower()
+            if normalized_policy == "db_only":
+                return None
             snapshot_payload = _get_snapshot_payload(normalized_code)
             if snapshot_payload is not None:
                 return snapshot_payload
-            if normalized_policy in {"snapshot_only", "db_only"}:
+            if normalized_policy == "snapshot_only":
                 return None
 
             cached_payload = _get_cached_quote_payload(normalized_code)
@@ -688,6 +691,13 @@ class StockService:
             normalized_to_original = {
                 normalize_stock_code(code): code for code in normalized_codes
             }
+            if normalized_policy == "db_only":
+                return {
+                    "items": [],
+                    "failed_codes": list(normalized_to_original.values()),
+                    "update_time": datetime.now().isoformat(),
+                    **_get_realtime_quote_snapshot_info(),
+                }
             missing_for_fetch: List[str] = []
             for normalized in normalized_to_original.keys():
                 snapshot_payload = None if force_refresh else _get_snapshot_payload(normalized)
@@ -1494,6 +1504,10 @@ class StockService:
                 "circ_mv": _to_optional_float(row.get("circ_mv")),
                 "total_shares": _to_optional_float(row.get("total_shares")),
                 "float_shares": _to_optional_float(row.get("float_shares")),
+                **{
+                    column: _to_optional_float(row.get(column))
+                    for column in DAILY_DERIVED_METRIC_COLUMNS
+                },
                 "data_source": _to_optional_string(row.get("data_source")),
                 "snapshot_id": _to_optional_string(row.get("snapshot_id")),
                 "snapshot_time": _to_optional_string(row.get("snapshot_time")),

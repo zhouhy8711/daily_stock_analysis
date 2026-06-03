@@ -120,6 +120,14 @@ class KLineData(BaseModel):
     circ_mv: Optional[float] = Field(None, description="流通市值（元）")
     total_shares: Optional[float] = Field(None, description="总股本（股）")
     float_shares: Optional[float] = Field(None, description="流通股本（股）")
+    price_range_30d_pct: Optional[float] = Field(None, description="近30日最高最低振幅 (%)")
+    price_range_60d_pct: Optional[float] = Field(None, description="近60日最高最低振幅 (%)")
+    deducted_net_profit_yoy_pct: Optional[float] = Field(None, description="扣非净利同比 (%)")
+    deducted_net_profit_qoq_pct: Optional[float] = Field(None, description="扣非净利环比 (%)")
+    announcement_next_day_gap_pct: Optional[float] = Field(None, description="公告次日跳空缺口 (%)")
+    announcement_next_day_volume_ratio: Optional[float] = Field(None, description="公告次日量能 / 5 日均量")
+    announcement_next_day_gap_unfilled: Optional[float] = Field(None, description="公告次日缺口未回补（1/0）")
+    net_profit_gap_signal: Optional[float] = Field(None, description="净利润断层信号（1/0）")
     data_source: Optional[str] = Field(None, description="K 线点位数据来源")
     snapshot_id: Optional[str] = Field(None, description="实时行情预热快照 ID")
     snapshot_time: Optional[str] = Field(None, description="实时行情预热快照时间")
@@ -151,6 +159,9 @@ class KLineData(BaseModel):
                 "amount": 18000000000,
                 "change_percent": 0.84,
                 "turnover_rate": 0.8,
+                "price_range_30d_pct": 24.5,
+                "deducted_net_profit_yoy_pct": 120.0,
+                "net_profit_gap_signal": 1.0,
                 "data_source": "intraday_hot_table"
             }
         }
@@ -216,6 +227,13 @@ class ChipDistributionSnapshot(BaseModel):
     cost_70_low: Optional[float] = Field(None, description="70% 筹码成本下限")
     cost_70_high: Optional[float] = Field(None, description="70% 筹码成本上限")
     concentration_70: Optional[float] = Field(None, description="70% 筹码集中度，0-1")
+    chip_peak_count: Optional[float] = Field(None, description="主要筹码峰数量")
+    chip_single_peak_signal: Optional[float] = Field(None, description="单峰集中信号（1/0）")
+    chip_peak_low_price: Optional[float] = Field(None, description="主要筹码峰价格带最低价")
+    chip_peak_high_price: Optional[float] = Field(None, description="主要筹码峰价格带最高价")
+    chip_peak_price_ratio: Optional[float] = Field(None, description="主要筹码峰最高价 / 最低价")
+    chip_concentration_90_avg_30d: Optional[float] = Field(None, description="近30日平均90%筹码集中度 (%)")
+    chip_concentration_90_avg_60d: Optional[float] = Field(None, description="近60日平均90%筹码集中度 (%)")
     distribution: List[ChipDistributionPoint] = Field(default_factory=list, description="逐价位筹码分布")
     chip_status: Optional[str] = Field(None, description="基于现价推导的筹码状态")
 
@@ -234,6 +252,13 @@ class ChipDistributionMetrics(BaseModel):
     cost_70_low: Optional[float] = Field(None, description="70% 筹码成本下限")
     cost_70_high: Optional[float] = Field(None, description="70% 筹码成本上限")
     concentration_70: Optional[float] = Field(None, description="70% 筹码集中度，0-1")
+    chip_peak_count: Optional[float] = Field(None, description="主要筹码峰数量")
+    chip_single_peak_signal: Optional[float] = Field(None, description="单峰集中信号（1/0）")
+    chip_peak_low_price: Optional[float] = Field(None, description="主要筹码峰价格带最低价")
+    chip_peak_high_price: Optional[float] = Field(None, description="主要筹码峰价格带最高价")
+    chip_peak_price_ratio: Optional[float] = Field(None, description="主要筹码峰最高价 / 最低价")
+    chip_concentration_90_avg_30d: Optional[float] = Field(None, description="近30日平均90%筹码集中度 (%)")
+    chip_concentration_90_avg_60d: Optional[float] = Field(None, description="近60日平均90%筹码集中度 (%)")
     distribution: List[ChipDistributionPoint] = Field(default_factory=list, description="逐价位筹码分布")
     snapshots: List[ChipDistributionSnapshot] = Field(default_factory=list, description="按交易日的筹码快照")
     chip_status: Optional[str] = Field(None, description="基于现价推导的筹码状态")

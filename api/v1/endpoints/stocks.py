@@ -39,6 +39,7 @@ from src.services.import_parser import (
     parse_import_from_text,
 )
 from src.services.stock_service import StockService
+from src.storage import DAILY_DERIVED_METRIC_COLUMNS
 
 logger = logging.getLogger(__name__)
 
@@ -577,6 +578,10 @@ def get_stock_history(
                 circ_mv=item.get("circ_mv"),
                 total_shares=item.get("total_shares"),
                 float_shares=item.get("float_shares"),
+                **{
+                    column: item.get(column)
+                    for column in DAILY_DERIVED_METRIC_COLUMNS
+                },
                 data_source=item.get("data_source"),
                 snapshot_id=item.get("snapshot_id"),
                 snapshot_time=item.get("snapshot_time"),

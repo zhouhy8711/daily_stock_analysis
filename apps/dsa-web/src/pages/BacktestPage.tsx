@@ -47,6 +47,7 @@ const UNCLASSIFIED_INDUSTRY = UNCLASSIFIED_INDUSTRY_LABEL;
 const DEFAULT_INDUSTRY = '半导体';
 
 export type BacktestPageMode = 'backtest' | 'live';
+type LiveTestCyclePhase = 'start' | 'poll' | 'matches';
 
 type StockListDisplayItem = {
   code: string;
@@ -79,6 +80,15 @@ type ResultValueColumn = {
   side: 'left' | 'right';
 };
 
+function isTransientLiveTestReadError(error: ParsedApiError): boolean {
+  return [
+    'request_timeout',
+    'upstream_timeout',
+    'upstream_network',
+    'local_connection_failed',
+  ].includes(error.category);
+}
+
 type RuleRunEventRow = {
   id: string;
   runId?: number;
@@ -97,6 +107,8 @@ type RuleResultGroup = {
   key: string;
   ruleId: number;
   ruleName: string;
+  conditionGroupId?: string | null;
+  conditionGroupLabel?: string | null;
   rows: RuleRunEventRow[];
   columns: ResultValueColumn[];
   tableMinWidth: number;
@@ -332,6 +344,14 @@ function getStockIndustryLabel(item: StockListDisplayItem): string {
   return item.industry?.trim() || UNCLASSIFIED_INDUSTRY;
 }
 
+function getResultRowIndustryLabel(
+  row: RuleRunEventRow,
+  lookup: Map<string, StockListDisplayItem>,
+): string {
+  const stockItem = getDisplayItemForCode(row.stockCode, lookup);
+  return getStockIndustryLabel(stockItem);
+}
+
 function formatStockListLine(item: StockListDisplayItem): string {
   const industry = getStockIndustryLabel(item);
   return item.name ? `${industry} ${item.code} ${item.name}` : `${industry} ${item.code}`;
@@ -394,10 +414,15 @@ function buildAllAshareIndustryOptions(stockIndex: StockIndexItem[]): StockListI
   );
 }
 
-function getAshareCodesByIndustry(stockIndex: StockIndexItem[], industry: string): string[] {
+function getAshareCodesByIndustries(stockIndex: StockIndexItem[], industries: string[]): string[] {
+  if (industries.length === 0) {
+    return [];
+  }
+
+  const selectedIndustrySet = new Set(industries);
   return Array.from(new Set(stockIndex
     .filter(isAllShareStock)
-    .filter((item) => getStockIndustryLabel(stockIndexToDisplayItem(item)) === industry)
+    .filter((item) => selectedIndustrySet.has(getStockIndustryLabel(stockIndexToDisplayItem(item))))
     .sort(compareStockIndexById)
     .map(getStockDisplayCode)));
 }
@@ -498,6 +523,14 @@ function isAshareLiveTestAllowed(value = new Date()): boolean {
   if (!Number.isFinite(hour) || !Number.isFinite(minute)) return false;
   const minuteOfDay = hour * 60 + minute;
   return minuteOfDay <= 15 * 60;
+}
+
+function isAshareLiveTestPreopen(value = new Date()): boolean {
+  const { weekday, hour, minute } = getShanghaiClockParts(value);
+  if (weekday === 'Sat' || weekday === 'Sun') return false;
+  if (!Number.isFinite(hour) || !Number.isFinite(minute)) return false;
+  const minuteOfDay = hour * 60 + minute;
+  return minuteOfDay < 9 * 60 + 30;
 }
 
 function formatLogTime(value: string): string {
@@ -639,6 +672,19 @@ function toDomId(value: string): string {
 function getMatchedGroups(event: Record<string, unknown>): Record<string, unknown>[] {
   const groups = event.matched_groups ?? event.matchedGroups;
   return Array.isArray(groups) ? groups.map(asRecord) : [];
+}
+
+function getPrimaryMatchedGroupId(row: RuleRunEventRow): string | null {
+  for (const group of getMatchedGroups(row.event)) {
+    if (group.matched === false) {
+      continue;
+    }
+    const groupId = String(group.id ?? '');
+    if (groupId) {
+      return groupId;
+    }
+  }
+  return null;
 }
 
 function getEventSnapshot(event: Record<string, unknown>): Record<string, unknown> {
@@ -809,6 +855,18 @@ function buildResultValueColumns(rules: RuleItem[], metrics: RuleMetricItem[]): 
   });
 }
 
+function buildResultValueColumnsForGroup(rule: RuleItem, groupId: string, metrics: RuleMetricItem[]): ResultValueColumn[] {
+  const group = rule.definition.groups.find((item) => item.id === groupId);
+  if (!group) return [];
+  return buildResultValueColumns([{
+    ...rule,
+    definition: {
+      ...rule.definition,
+      groups: [group],
+    },
+  }], metrics);
+}
+
 function buildFallbackResultValueColumns(rows: RuleRunEventRow[], metrics: RuleMetricItem[]): ResultValueColumn[] {
   const columns: ResultValueColumn[] = [];
   const seen = new Set<string>();
@@ -840,6 +898,17 @@ function buildFallbackResultValueColumns(rows: RuleRunEventRow[], metrics: RuleM
   return columns;
 }
 
+function getRuleConditionGroupLabel(rule: RuleItem | undefined, groupId: string | null, bucketCount: number): string | null {
+  if (!groupId || (rule ? rule.definition.groups.length <= 1 : bucketCount <= 1)) {
+    return null;
+  }
+  const windowMatch = groupId.match(/(?:^|[^0-9])([0-9]+)d(?:$|[^a-zA-Z0-9])/i);
+  if (windowMatch) {
+    return `近${windowMatch[1]}日条件组`;
+  }
+  return `条件组 ${groupId}`;
+}
+
 function buildRuleResultGroups(
   rows: RuleRunEventRow[],
   resultRules: RuleItem[],
@@ -855,21 +924,69 @@ function buildRuleResultGroups(
   const includedRuleIds = new Set<number>();
   const addGroup = (ruleId: number, rule?: RuleItem) => {
     if (includedRuleIds.has(ruleId)) return;
-    const groupRows = sortResultRows(rowsByRule.get(ruleId) ?? []);
+    const ruleRows = sortResultRows(rowsByRule.get(ruleId) ?? []);
     const resolvedRule = rule ?? allRules.find((item) => item.id === ruleId);
-    const columns = resolvedRule
-      ? buildResultValueColumns([resolvedRule], metrics)
-      : buildFallbackResultValueColumns(groupRows, metrics);
-    const effectiveColumns = columns.length > 0 ? columns : buildFallbackResultValueColumns(groupRows, metrics);
     includedRuleIds.add(ruleId);
-    groups.push({
-      key: `rule-${ruleId}`,
-      ruleId,
-      ruleName: resolvedRule?.name ?? groupRows[0]?.ruleName ?? `规则 ${ruleId}`,
-      rows: groupRows,
-      columns: effectiveColumns,
-      tableMinWidth: Math.max(520 + effectiveColumns.length * 140, 760),
-    });
+
+    if (ruleRows.length === 0) {
+      const columns = resolvedRule ? buildResultValueColumns([resolvedRule], metrics) : [];
+      const effectiveColumns = columns.length > 0 ? columns : buildFallbackResultValueColumns(ruleRows, metrics);
+      groups.push({
+        key: `rule-${ruleId}`,
+        ruleId,
+        ruleName: resolvedRule?.name ?? `规则 ${ruleId}`,
+        rows: ruleRows,
+        columns: effectiveColumns,
+        tableMinWidth: Math.max(520 + effectiveColumns.length * 140, 760),
+      });
+      return;
+    }
+
+    const buckets = new Map<string, { groupId: string | null; rows: RuleRunEventRow[] }>();
+    for (const row of ruleRows) {
+      const groupId = getPrimaryMatchedGroupId(row);
+      const bucketKey = groupId ?? '__ungrouped__';
+      const bucket = buckets.get(bucketKey);
+      if (bucket) {
+        bucket.rows.push(row);
+      } else {
+        buckets.set(bucketKey, { groupId, rows: [row] });
+      }
+    }
+
+    const orderedBucketKeys: string[] = [];
+    for (const conditionGroup of resolvedRule?.definition.groups ?? []) {
+      if (buckets.has(conditionGroup.id)) {
+        orderedBucketKeys.push(conditionGroup.id);
+      }
+    }
+    for (const bucketKey of buckets.keys()) {
+      if (!orderedBucketKeys.includes(bucketKey)) {
+        orderedBucketKeys.push(bucketKey);
+      }
+    }
+
+    const bucketCount = buckets.size;
+    for (const bucketKey of orderedBucketKeys) {
+      const bucket = buckets.get(bucketKey);
+      if (!bucket) continue;
+      const columns = resolvedRule && bucket.groupId
+        ? buildResultValueColumnsForGroup(resolvedRule, bucket.groupId, metrics)
+        : [];
+      const effectiveColumns = columns.length > 0 ? columns : buildFallbackResultValueColumns(bucket.rows, metrics);
+      const conditionGroupLabel = getRuleConditionGroupLabel(resolvedRule, bucket.groupId, bucketCount);
+      const baseRuleName = resolvedRule?.name ?? bucket.rows[0]?.ruleName ?? `规则 ${ruleId}`;
+      groups.push({
+        key: conditionGroupLabel ? `rule-${ruleId}-${bucketKey}` : `rule-${ruleId}`,
+        ruleId,
+        ruleName: conditionGroupLabel ? `${baseRuleName} · ${conditionGroupLabel}` : baseRuleName,
+        conditionGroupId: conditionGroupLabel ? bucket.groupId : null,
+        conditionGroupLabel,
+        rows: bucket.rows,
+        columns: effectiveColumns,
+        tableMinWidth: Math.max(520 + effectiveColumns.length * 140, 760),
+      });
+    }
   };
 
   resultRules.forEach((rule) => addGroup(rule.id, rule));
@@ -1171,7 +1288,9 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
   const [selectedRuleIds, setSelectedRuleIds] = useState<number[]>([]);
   const [targetScope, setTargetScope] = useState<BacktestTargetScope>('watchlist');
   const [targetCodes, setTargetCodes] = useState<string[]>([]);
-  const [selectedIndustry, setSelectedIndustry] = useState(DEFAULT_INDUSTRY);
+  const [selectedIndustries, setSelectedIndustries] = useState<string[]>([DEFAULT_INDUSTRY]);
+  const [industryPickerOpen, setIndustryPickerOpen] = useState(false);
+  const [industryPickerQuery, setIndustryPickerQuery] = useState('');
   const [startDate, setStartDate] = useState(() => getOneYearAgoInShanghai());
   const [endDate, setEndDate] = useState(() => getTodayInShanghai());
   const [watchlistItems, setWatchlistItems] = useState<StockListDisplayItem[]>([]);
@@ -1221,7 +1340,9 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
   const runHeartbeatRef = useRef<number | null>(null);
   const liveTestIntervalRef = useRef<number | null>(null);
   const liveTestSessionRef = useRef<number | null>(null);
+  const liveCacheKeyRef = useRef<string | null>(null);
   const liveTestCyclesInFlightRef = useRef(0);
+  const liveTransientReadErrorCountRef = useRef(0);
   const liveActiveRunRef = useRef<{
     runId: number;
     cycleIndex: number;
@@ -1229,6 +1350,7 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
     runStartedAt: string;
     runRuleNames: string[];
     lastCompletedCount: number;
+    prewarmOnly: boolean;
   } | null>(null);
   const liveLatestSnapshotIdRef = useRef<string | null>(null);
   const liveResultRowsRef = useRef<RuleRunEventRow[]>(displayRows);
@@ -1341,7 +1463,13 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
 
   useEffect(() => () => {
     clearLiveTestInterval();
+    const liveCacheKey = liveCacheKeyRef.current;
+    liveCacheKeyRef.current = null;
+    if (liveCacheKey) {
+      void rulesApi.clearLiveCache(liveCacheKey);
+    }
     liveTestSessionRef.current = null;
+    liveTransientReadErrorCountRef.current = 0;
     if (isLiveMode) {
       setIsRunning(false);
       setRunProgressById({});
@@ -1376,9 +1504,14 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
     () => buildAllAshareIndustryOptions(stockIndex),
     [stockIndex],
   );
+  const normalizedIndustryPickerQuery = normalizeIndustryQuery(industryPickerQuery);
+  const visibleAshareIndustryOptions = useMemo(
+    () => allAshareIndustryOptions.filter((option) => matchesIndustryQuery(option, normalizedIndustryPickerQuery)),
+    [allAshareIndustryOptions, normalizedIndustryPickerQuery],
+  );
   const industryTargetCodes = useMemo(
-    () => getAshareCodesByIndustry(stockIndex, selectedIndustry),
-    [selectedIndustry, stockIndex],
+    () => getAshareCodesByIndustries(stockIndex, selectedIndustries),
+    [selectedIndustries, stockIndex],
   );
   const stockLookup = useMemo(() => buildStockLookup(stockIndex, watchlistItems), [stockIndex, watchlistItems]);
   const stockListItems = useMemo(
@@ -1388,6 +1521,14 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
   const targetCodesText = useMemo(
     () => formatStockListText(targetCodes, stockLookup),
     [stockLookup, targetCodes],
+  );
+  const selectableRules = useMemo(
+    () => rules.filter((rule) => rule.isActive),
+    [rules],
+  );
+  const selectableRuleIds = useMemo(
+    () => new Set(selectableRules.map((rule) => rule.id)),
+    [selectableRules],
   );
   const selectedRule = useMemo(
     () => rules.find((rule) => rule.id === selectedRuleIds[0]),
@@ -1471,9 +1612,21 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
     : selectedStockListIndustries.length === 1
       ? selectedStockListIndustries[0]
       : `行业 ${selectedStockListIndustries.length}`;
+  const industryPickerLabel = selectedIndustries.length === 0
+    ? '请选择行业'
+    : selectedIndustries.length === 1
+      ? selectedIndustries[0]
+      : `${selectedIndustries.length} 个行业`;
   const isDateRangeInvalid = !isLiveMode && Boolean(startDate && endDate && startDate > endDate);
   const runDisabled = selectedRuleIds.length === 0 || targetCodes.length === 0 || isDateRangeInvalid || (!isLiveMode && isRunning);
   const hasActiveRun = Object.values(runProgressById).some((item) => item.progress < 100);
+
+  useEffect(() => {
+    setSelectedRuleIds((current) => {
+      const next = current.filter((ruleId) => selectableRuleIds.has(ruleId));
+      return next.length === current.length ? current : next;
+    });
+  }, [selectableRuleIds]);
 
   useEffect(() => {
     const availableIndustries = new Set(stockListIndustryOptions.map((option) => option.name));
@@ -1484,13 +1637,20 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
   }, [stockListIndustryOptions]);
 
   useEffect(() => {
-    if (allAshareIndustryOptions.length === 0) return;
-    setSelectedIndustry((current) => {
-      if (allAshareIndustryOptions.some((option) => option.name === current)) {
-        return current;
+    if (allAshareIndustryOptions.length === 0) {
+      setSelectedIndustries([]);
+      return;
+    }
+
+    const availableIndustries = new Set(allAshareIndustryOptions.map((option) => option.name));
+    setSelectedIndustries((current) => {
+      const next = current.filter((industry) => availableIndustries.has(industry));
+      if (next.length > 0) {
+        return next;
       }
-      return allAshareIndustryOptions.find((option) => option.name === DEFAULT_INDUSTRY)?.name
-        ?? allAshareIndustryOptions[0].name;
+      const fallbackIndustry = allAshareIndustryOptions.find((option) => option.name === DEFAULT_INDUSTRY)?.name
+        ?? allAshareIndustryOptions[0]?.name;
+      return fallbackIndustry ? [fallbackIndustry] : [];
     });
   }, [allAshareIndustryOptions]);
 
@@ -1640,7 +1800,7 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
         .sort(compareStockIndexById)
         .map(getStockDisplayCode)));
       const groupedPersistedRuns = groupLegacyRunHistory(persistedRuns);
-      const firstRule = ruleItems[0];
+      const firstRule = ruleItems.find((item) => item.isActive);
       const shouldHydratePersistedRuns = !isLiveMode && !hasBacktestRuntimeSession(mode);
       let persistedSelectedRun = shouldHydratePersistedRuns
         ? groupedPersistedRuns.find((run) => run.status !== 'running') ?? groupedPersistedRuns[0] ?? null
@@ -1729,20 +1889,22 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
   }, [loadData]);
 
   const toggleRule = (ruleId: number) => {
+    const rule = selectableRules.find((item) => item.id === ruleId);
+    if (!rule) return;
     const isSelected = selectedRuleIds.includes(ruleId);
     const next = isSelected
       ? selectedRuleIds.filter((item) => item !== ruleId)
       : [...selectedRuleIds, ruleId];
     setSelectedRuleIds(next);
     if (!isSelected && selectedRuleIds.length === 0) {
-      applyTargetFromRule(rules.find((rule) => rule.id === ruleId), watchlistCodes, allAshareCodes);
+      applyTargetFromRule(rule, watchlistCodes, allAshareCodes);
     }
   };
 
   const selectAllRules = () => {
-    setSelectedRuleIds(rules.map((rule) => rule.id));
+    setSelectedRuleIds(selectableRules.map((rule) => rule.id));
     if (selectedRuleIds.length === 0) {
-      applyTargetFromRule(rules[0], watchlistCodes, allAshareCodes);
+      applyTargetFromRule(selectableRules[0], watchlistCodes, allAshareCodes);
     }
   };
 
@@ -1752,6 +1914,8 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
 
   const handleScopeChange = (scope: BacktestTargetScope) => {
     setTargetScope(scope);
+    setIndustryPickerOpen(false);
+    setIndustryPickerQuery('');
     setStockListFilter('');
     setStockListIndustryFilterOpen(false);
     setStockListIndustryQuery('');
@@ -1769,6 +1933,19 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
       return;
     }
     setTargetCodes((current) => current);
+  };
+
+  const toggleTargetIndustry = (industry: string) => {
+    setSelectedIndustries((current) => (
+      current.includes(industry)
+        ? current.filter((item) => item !== industry)
+        : [...current, industry]
+    ));
+  };
+
+  const clearTargetIndustries = () => {
+    setSelectedIndustries([]);
+    setIndustryPickerQuery('');
   };
 
   const handleLiveCompactModeChange = (checked: boolean) => {
@@ -1816,10 +1993,13 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
 
   const stopLiveTest = useCallback((message = '实测已停止', level: LogLevel = 'info') => {
     const sessionId = liveTestSessionRef.current;
+    const liveCacheKey = liveCacheKeyRef.current;
     const finishedAt = new Date().toISOString();
     clearLiveTestInterval();
     liveTestSessionRef.current = null;
+    liveCacheKeyRef.current = null;
     liveTestCyclesInFlightRef.current = 0;
+    liveTransientReadErrorCountRef.current = 0;
     liveActiveRunRef.current = null;
     liveLatestSnapshotIdRef.current = null;
     setIsRunning(false);
@@ -1828,6 +2008,14 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
       ? { ...current, status: 'completed', finishedAt }
       : current));
     appendExecutionLog(message, level);
+    if (liveCacheKey) {
+      void rulesApi.clearLiveCache(liveCacheKey).then(() => {
+        appendExecutionLog('本次实测数据缓存已清理');
+      }).catch((error) => {
+        const parsedError = getParsedApiError(error);
+        appendExecutionLog(`本次实测数据缓存清理失败：${parsedError.message}`, 'warning');
+      });
+    }
   }, [appendExecutionLog, clearLiveTestInterval, setIsRunning, setRunProgressById, setSelectedRun]);
 
   const runLiveTestCycle = useCallback(async (
@@ -1847,25 +2035,49 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
     if (liveTestCyclesInFlightRef.current > 0) return;
 
     liveTestCyclesInFlightRef.current += 1;
+    let cyclePhase: LiveTestCyclePhase = liveActiveRunRef.current == null ? 'start' : 'poll';
+    let cycleRunId = liveActiveRunRef.current?.runId ?? null;
 
     try {
       if (liveTestSessionRef.current !== sessionId) return;
 
       let activeRun = liveActiveRunRef.current;
       if (activeRun == null) {
+        cyclePhase = 'start';
         const cycleExecutionTime = formatDateTimeToSecond(new Date().toISOString());
         updateRunProgress(sessionId, 12, `第 ${cycleIndex} 次触发：请求后台实测任务`);
         appendExecutionLog(`第 ${cycleIndex} 次触发：启动后台实测，扫描 ${targetCodes.length} 只股票，执行 ${selectedRuleIds.length} 条规则`);
         const startedRun = await rulesApi.runBatchAsync({
           ruleIds: selectedRuleIds,
           mode: 'latest',
-          dataPolicy: 'snapshot_only',
+          dataPolicy: 'db_only',
+          liveCacheKey: liveCacheKeyRef.current ?? undefined,
           target: {
             scope: targetScope === 'industry' ? 'custom' : targetScope,
             stockCodes: targetCodes,
           },
         });
         if (liveTestSessionRef.current !== sessionId) return;
+        const totalCount = Math.max(0, startedRun.targetCount || targetCodes.length);
+        if (startedRun.prewarmOnly && startedRun.status !== 'running') {
+          const hitCount = startedRun.prewarmHitCount ?? startedRun.completedCount ?? 0;
+          const missCount = startedRun.prewarmMissCount ?? Math.max(0, totalCount - hitCount);
+          liveActiveRunRef.current = null;
+          updateRunProgress(
+            sessionId,
+            100,
+            `第 ${cycleIndex} 次触发：开盘前历史数据预热完成 ${hitCount}/${totalCount}`,
+          );
+          appendExecutionLog(
+            `第 ${cycleIndex} 次触发：09:30 前仅预热历史数据，不执行实测命中汇总；历史缓存命中 ${hitCount}/${totalCount}，缺失 ${missCount} 只`,
+            missCount > 0 ? 'warning' : 'info',
+          );
+          setRunWarning(missCount > 0 ? `开盘前预热缺失 ${missCount} 只股票的历史数据，请通过离线任务或补数据补齐` : null);
+          setRunError(null);
+          setPageError(null);
+          setActiveResultTab('logs');
+          return;
+        }
         activeRun = {
           runId: startedRun.runId,
           cycleIndex,
@@ -1873,28 +2085,41 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
           runStartedAt,
           runRuleNames,
           lastCompletedCount: startedRun.completedCount ?? 0,
+          prewarmOnly: Boolean(startedRun.prewarmOnly),
         };
         liveActiveRunRef.current = activeRun;
-        const totalCount = Math.max(0, startedRun.targetCount || targetCodes.length);
-        updateRunProgress(sessionId, startedRun.status === 'running' ? 1 : 100, `#${startedRun.runId} 执行完成 ${startedRun.completedCount ?? 0}/${totalCount}`);
+        cycleRunId = activeRun.runId;
+        liveTransientReadErrorCountRef.current = 0;
+        const startCompleted = startedRun.completedCount ?? 0;
+        const startStage = activeRun.prewarmOnly
+          ? `#${startedRun.runId} 历史缓存预热 ${startCompleted}/${totalCount}`
+          : `#${startedRun.runId} 执行完成 ${startCompleted}/${totalCount}`;
+        updateRunProgress(sessionId, startedRun.status === 'running' ? 1 : 100, startStage);
         appendExecutionLog(
           startedRun.reusedRun
             ? `#${startedRun.runId} 已有同快照实测任务，复用当前结果`
-            : `#${startedRun.runId} 后台实测已启动：执行完成 ${startedRun.completedCount ?? 0}/${totalCount}`,
+            : activeRun.prewarmOnly
+              ? `#${startedRun.runId} 开盘前历史缓存预热已启动：${startCompleted}/${totalCount}`
+              : `#${startedRun.runId} 后台实测已启动：执行完成 ${startCompleted}/${totalCount}`,
           startedRun.reusedRun ? 'info' : 'info',
         );
         setPageError(null);
       }
 
+      cyclePhase = 'poll';
+      cycleRunId = activeRun.runId;
       const run = await rulesApi.getRun(activeRun.runId);
       if (liveTestSessionRef.current !== sessionId) return;
+      liveTransientReadErrorCountRef.current = 0;
       const nextTotal = Math.max(0, run.targetCount || targetCodes.length);
       const completed = Math.min(nextTotal, Math.max(0, run.completedCount || 0));
       const isStillRunning = run.status === 'running';
+      const isPrewarmRun = activeRun.prewarmOnly || Boolean(run.prewarmOnly);
       const progress = nextTotal > 0
         ? Math.min(isStillRunning ? 99 : 100, Math.round((completed / nextTotal) * 100))
         : isStillRunning ? 50 : 100;
-      const stage = isStillRunning ? `#${activeRun.runId} 执行完成 ${completed}/${nextTotal}` : `#${activeRun.runId} 执行完成 ${nextTotal}/${nextTotal}`;
+      const progressLabel = isPrewarmRun ? '历史缓存预热' : '执行完成';
+      const stage = isStillRunning ? `#${activeRun.runId} ${progressLabel} ${completed}/${nextTotal}` : `#${activeRun.runId} ${progressLabel} ${nextTotal}/${nextTotal}`;
       updateRunProgress(sessionId, progress, stage);
       if (completed !== activeRun.lastCompletedCount) {
         activeRun.lastCompletedCount = completed;
@@ -1902,8 +2127,8 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
       }
       if (isStillRunning) return;
 
-      liveActiveRunRef.current = null;
       if (run.status === 'failed') {
+        liveActiveRunRef.current = null;
         const failureMessage = run.error || '实测执行失败';
         setRunError(getParsedApiError(new Error(failureMessage)));
         setRunWarning(null);
@@ -1912,24 +2137,47 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
         return;
       }
 
+      if (isPrewarmRun) {
+        const hitCount = run.prewarmHitCount ?? run.completedCount ?? 0;
+        const missCount = run.prewarmMissCount ?? Math.max(0, nextTotal - hitCount);
+        liveActiveRunRef.current = null;
+        updateRunProgress(
+          sessionId,
+          100,
+          `第 ${activeRun.cycleIndex} 次触发：开盘前历史数据预热完成 ${hitCount}/${nextTotal}`,
+        );
+        appendExecutionLog(
+          `第 ${activeRun.cycleIndex} 次触发：09:30 前仅预热历史数据，不执行实测命中汇总；历史缓存命中 ${hitCount}/${nextTotal}，缺失 ${missCount} 只`,
+          missCount > 0 ? 'warning' : 'info',
+        );
+        setRunWarning(missCount > 0 ? `开盘前预热缺失 ${missCount} 只股票的历史数据，请通过离线任务或补数据补齐` : null);
+        setRunError(null);
+        setPageError(null);
+        setActiveResultTab('logs');
+        return;
+      }
+
       if (run.snapshotId && liveLatestSnapshotIdRef.current) {
         if (run.snapshotId === liveLatestSnapshotIdRef.current) {
+          liveActiveRunRef.current = null;
           updateRunProgress(sessionId, 100, `第 ${activeRun.cycleIndex} 次完成：快照未变化，等待下次刷新`);
           appendExecutionLog(`第 ${activeRun.cycleIndex} 次实测跳过汇总：快照 ${run.snapshotId} 已处理`, 'info');
           setRunError(null);
           return;
         }
         if (run.snapshotId < liveLatestSnapshotIdRef.current) {
+          liveActiveRunRef.current = null;
           appendExecutionLog(`第 ${activeRun.cycleIndex} 次实测结果已过期：快照 ${run.snapshotId} 早于 ${liveLatestSnapshotIdRef.current}`, 'warning');
           return;
         }
       }
+      cyclePhase = 'matches';
+      const matches = await rulesApi.getRunMatches(activeRun.runId);
+      if (liveTestSessionRef.current !== sessionId) return;
+      liveTransientReadErrorCountRef.current = 0;
       if (run.snapshotId) {
         liveLatestSnapshotIdRef.current = run.snapshotId;
       }
-
-      const matches = await rulesApi.getRunMatches(activeRun.runId);
-      if (liveTestSessionRef.current !== sessionId) return;
       const now = new Date().toISOString();
       const resultRuleIds = run.ruleIds && run.ruleIds.length > 0 ? run.ruleIds : selectedRuleIds;
       const resultRuleNames = run.ruleNames && run.ruleNames.length > 0 ? run.ruleNames : activeRun.runRuleNames;
@@ -1966,6 +2214,7 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
       setSelectedRun(runMeta);
       setDisplayRows(cumulativeRows);
       setRunWarning(run.error || null);
+      liveActiveRunRef.current = null;
       updateRunProgress(
         sessionId,
         100,
@@ -2001,6 +2250,20 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
     } catch (err) {
       if (liveTestSessionRef.current !== sessionId) return;
       const parsedError = getParsedApiError(err);
+      if (cyclePhase !== 'start' && cycleRunId != null && isTransientLiveTestReadError(parsedError)) {
+        liveTransientReadErrorCountRef.current += 1;
+        const retryCount = liveTransientReadErrorCountRef.current;
+        const actionText = cyclePhase === 'matches' ? '命中明细读取' : '进度轮询';
+        const retryText = retryCount > 1 ? `（连续 ${retryCount} 次）` : '';
+        appendExecutionLog(
+          `第 ${cycleIndex} 次${actionText}暂时超时${retryText}：后台实测 #${cycleRunId} 未判定失败，将继续重试。${parsedError.message}`,
+          'warning',
+        );
+        setRunWarning(`后台实测 #${cycleRunId} 仍会继续重试读取结果；最近一次${actionText}超时。`);
+        setRunError(null);
+        setActiveResultTab('logs');
+        return;
+      }
       if (parsedError.message.includes('实时交易时段') || parsedError.message.includes('实测已暂停')) {
         updateRunProgress(sessionId, 100, '休市暂停');
         setRunError(null);
@@ -2009,7 +2272,11 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
         stopLiveTest(parsedError.message, 'warning');
         return;
       }
-      if (parsedError.message.includes('快照预热') || parsedError.message.includes('快照尚未准备')) {
+      if (
+        parsedError.message.includes('快照预热')
+        || parsedError.message.includes('快照尚未准备')
+        || parsedError.message.includes('预热入库')
+      ) {
         liveActiveRunRef.current = null;
         updateRunProgress(sessionId, 100, '等待实时行情快照预热');
         appendExecutionLog(`第 ${cycleIndex} 次实测未启动：${parsedError.message}`, 'warning');
@@ -2051,6 +2318,7 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
       return;
     }
     const sessionId = -Date.now();
+    const liveCacheKey = `live-${Math.abs(sessionId)}`;
     const runStartedAt = new Date().toISOString();
     const runRuleNames = selectedRuleIds
       .map((ruleId) => rules.find((item) => item.id === ruleId)?.name ?? `规则 ${ruleId}`);
@@ -2071,7 +2339,9 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
 
     clearLiveTestInterval();
     liveTestSessionRef.current = sessionId;
+    liveCacheKeyRef.current = liveCacheKey;
     liveTestCyclesInFlightRef.current = 0;
+    liveTransientReadErrorCountRef.current = 0;
     liveActiveRunRef.current = null;
     liveLatestSnapshotIdRef.current = null;
     liveResultRowsRef.current = [];
@@ -2088,20 +2358,24 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
 
     const shouldReportSnapshotStats = targetScope === 'all_a_shares' || targetCodes.length >= 1000;
     if (shouldReportSnapshotStats) {
-      const snapshotStats = await refreshLiveSnapshotStats();
-      if (liveTestSessionRef.current !== sessionId) return;
-      if (snapshotStats) {
-        const hitCount = snapshotStats.quoteSnapshotItems ?? snapshotStats.snapshotHitCount ?? 0;
-        const ready = Boolean(snapshotStats.snapshotId) && hitCount >= targetCodes.length;
-        appendExecutionLog(
-          `实时行情快照覆盖：${hitCount}/${targetCodes.length}，快照 ${snapshotStats.snapshotId ?? '未就绪'}`,
-          ready ? 'info' : 'warning',
-        );
-        if (!ready) {
-          setRunWarning(`实时行情快照覆盖 ${hitCount}/${targetCodes.length}，等待后端快照预热校验`);
-        }
+      if (isAshareLiveTestPreopen()) {
+        appendExecutionLog('开盘前实时行情快照尚未生成，将只预热历史缓存；09:30 后再校验实时快照');
       } else {
-        appendExecutionLog('实时行情快照状态读取失败，将交给后端校验', 'warning');
+        const snapshotStats = await refreshLiveSnapshotStats();
+        if (liveTestSessionRef.current !== sessionId) return;
+        if (snapshotStats) {
+          const hitCount = snapshotStats.quoteSnapshotItems ?? snapshotStats.snapshotHitCount ?? 0;
+          const ready = Boolean(snapshotStats.snapshotId) && hitCount >= targetCodes.length;
+          appendExecutionLog(
+            `实时行情快照覆盖：${hitCount}/${targetCodes.length}，快照 ${snapshotStats.snapshotId ?? '未就绪'}`,
+            ready ? 'info' : 'warning',
+          );
+          if (!ready) {
+            setRunWarning(`实时行情快照覆盖 ${hitCount}/${targetCodes.length}，等待后端快照预热校验`);
+          }
+        } else {
+          appendExecutionLog('实时行情快照状态读取失败，将交给后端校验', 'warning');
+        }
       }
     }
 
@@ -2177,6 +2451,7 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
       const startedRun = await rulesApi.runBatchAsync({
         ruleIds: selectedRuleIds,
         mode: 'history',
+        dataPolicy: 'db_only',
         target: {
           scope: targetScope === 'industry' ? 'custom' : targetScope,
           stockCodes: targetCodes,
@@ -2435,15 +2710,18 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
     const groupKey = options.groupKey ?? group.key;
     const expanded = expandedResultGroups[groupKey] ?? true;
     const panelId = `${options.panelIdPrefix ?? 'backtest-rule-group-panel'}-${toDomId(groupKey)}`;
+    const testId = group.conditionGroupId
+      ? `${options.testIdPrefix ?? 'backtest-rule-group'}-${group.ruleId}-${toDomId(group.conditionGroupId)}`
+      : `${options.testIdPrefix ?? 'backtest-rule-group'}-${group.ruleId}`;
     const tableMinWidth = Math.max(
-      (isLiveMode ? 400 : 520) + group.columns.length * 140,
-      isLiveMode ? 680 : 760,
+      (isLiveMode ? 520 : 640) + group.columns.length * 140,
+      isLiveMode ? 760 : 840,
     );
 
     return (
       <section
         key={groupKey}
-        data-testid={`${options.testIdPrefix ?? 'backtest-rule-group'}-${group.ruleId}`}
+        data-testid={testId}
         className="overflow-hidden rounded-xl border border-border/60 bg-elevated/25"
       >
         <button
@@ -2472,6 +2750,7 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
                   <thead className="backtest-table-head">
                     <tr className="text-left">
                       <th className="backtest-table-head-cell">股票</th>
+                      <th className="backtest-table-head-cell">行业</th>
                       {!isLiveMode ? <th className="backtest-table-head-cell">日期</th> : null}
                       {group.columns.map((column) => (
                         <th key={column.key} className="backtest-table-head-cell">
@@ -2485,6 +2764,7 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
                   <tbody>
                     {group.rows.map((row) => {
                       const rowExecutionTime = formatDateTimeToSecond(row.executionTime);
+                      const rowIndustryLabel = getResultRowIndustryLabel(row, stockLookup);
                       const rowAnalysisLabel = isLiveMode
                         ? `查看 ${row.stockName || row.stockCode} ${rowExecutionTime} 指标分析`
                         : `查看 ${row.stockName || row.stockCode} ${row.eventDate} 指标分析`;
@@ -2510,6 +2790,19 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
                                 <span className="mt-0.5 text-[11px] font-mono text-muted-text">执行 {rowExecutionTime}</span>
                               ) : null}
                             </button>
+                          </td>
+                          <td className="backtest-table-cell text-secondary-text">
+                            <span
+                              className={[
+                                'inline-flex max-w-[9rem] items-center rounded-lg border px-2 py-1 text-xs font-medium',
+                                rowIndustryLabel === UNCLASSIFIED_INDUSTRY
+                                  ? 'border-border/60 bg-muted/20 text-muted-text'
+                                  : 'border-primary/25 bg-primary/10 text-primary',
+                              ].join(' ')}
+                              title={rowIndustryLabel}
+                            >
+                              <span className="truncate">{rowIndustryLabel}</span>
+                            </span>
                           </td>
                           {!isLiveMode ? (
                             <td className="backtest-table-cell font-mono text-secondary-text">{row.eventDate}</td>
@@ -2539,7 +2832,7 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
           <div className="flex min-w-0 flex-col gap-1 text-xs text-muted-text">
             <div className="flex items-center justify-between gap-2">
               <span>规则</span>
-              <span>{selectedRuleIds.length} / {rules.length}</span>
+              <span>{selectedRuleIds.length} / {selectableRules.length}</span>
             </div>
             <details className="relative">
               <summary
@@ -2554,7 +2847,7 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
                   <button
                     type="button"
                     onClick={selectAllRules}
-                    disabled={isLoading || isRunning || rules.length === 0}
+                    disabled={isLoading || isRunning || selectableRules.length === 0}
                     className="rounded-lg border border-border/60 px-2 py-1 text-xs text-secondary-text transition-all hover:border-primary/45 hover:text-primary disabled:opacity-50"
                   >
                     全选
@@ -2569,12 +2862,12 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
                   </button>
                 </div>
                 <div className="max-h-56 space-y-1 overflow-y-auto pr-1">
-                  {rules.length === 0 ? (
+                  {selectableRules.length === 0 ? (
                     <div className="rounded-xl border border-dashed border-border/60 px-3 py-4 text-center text-xs text-muted-text">
-                      暂无规则
+                      暂无启用规则
                     </div>
                   ) : (
-                    rules.map((rule) => (
+                    selectableRules.map((rule) => (
                       <label
                         key={rule.id}
                         className="flex cursor-pointer items-center gap-2 rounded-xl px-2 py-2 text-xs text-secondary-text transition-all hover:bg-hover hover:text-foreground"
@@ -2613,21 +2906,81 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
                 </select>
               </label>
               {targetScope === 'industry' ? (
-                <label className="flex min-w-0 flex-col gap-1 text-xs text-muted-text">
+                <div className="flex min-w-0 flex-col gap-1 text-xs text-muted-text">
                   <span>行业</span>
-                  <select
-                    value={selectedIndustry}
-                    onChange={(event) => setSelectedIndustry(event.target.value)}
-                    disabled={isRunning || allAshareIndustryOptions.length === 0}
-                    className={INPUT_CLASS}
-                  >
-                    {allAshareIndustryOptions.map((option) => (
-                      <option key={option.name} value={option.name} className="bg-elevated text-foreground">
-                        {option.name}（{option.count}）
-                      </option>
-                    ))}
-                  </select>
-                </label>
+                  <div className="relative">
+                    <button
+                      type="button"
+                      aria-label="行业"
+                      aria-haspopup="menu"
+                      aria-expanded={industryPickerOpen}
+                      disabled={isRunning || allAshareIndustryOptions.length === 0}
+                      onClick={() => setIndustryPickerOpen((current) => !current)}
+                      className={`${INPUT_CLASS} flex items-center justify-between gap-2 text-left`}
+                    >
+                      <span className="min-w-0 truncate">{industryPickerLabel}</span>
+                      <ChevronDown className="h-4 w-4 shrink-0 text-muted-text" />
+                    </button>
+                    {industryPickerOpen ? (
+                      <div
+                        role="menu"
+                        className="absolute left-0 z-50 mt-2 w-72 max-w-[calc(100vw-2rem)] overflow-hidden rounded-xl border border-subtle bg-elevated/95 shadow-2xl backdrop-blur"
+                      >
+                        <div className="flex items-center justify-between gap-2 border-b border-subtle px-3 py-2">
+                          <span className="text-xs font-semibold text-foreground">行业多选</span>
+                          <button
+                            type="button"
+                            aria-label="清空行业选择"
+                            disabled={selectedIndustries.length === 0}
+                            onClick={clearTargetIndustries}
+                            className="inline-flex h-7 items-center gap-1 rounded-md px-2 text-xs text-secondary-text transition-colors hover:bg-hover hover:text-foreground disabled:pointer-events-none disabled:opacity-40"
+                          >
+                            <X className="h-3.5 w-3.5" />
+                            清空
+                          </button>
+                        </div>
+                        <div className="border-b border-subtle px-3 py-2">
+                          <div className="flex h-9 items-center gap-2 rounded-lg border border-subtle bg-surface/80 px-2">
+                            <Search className="h-4 w-4 shrink-0 text-muted-text" />
+                            <input
+                              type="search"
+                              value={industryPickerQuery}
+                              onChange={(event) => setIndustryPickerQuery(event.target.value)}
+                              placeholder="中文 / 拼音首字母"
+                              aria-label="搜索行业"
+                              className="min-w-0 flex-1 bg-transparent text-sm text-foreground outline-none placeholder:text-muted-text"
+                            />
+                          </div>
+                        </div>
+                        <div className="max-h-72 overflow-y-auto p-2">
+                          {visibleAshareIndustryOptions.length === 0 ? (
+                            <div className="px-3 py-6 text-center text-sm text-muted-text">
+                              没有匹配的行业
+                            </div>
+                          ) : visibleAshareIndustryOptions.map((option) => {
+                            const checked = selectedIndustries.includes(option.name);
+                            return (
+                              <label
+                                key={option.name}
+                                className="flex cursor-pointer items-center gap-2 rounded-lg px-2 py-1.5 text-sm text-secondary-text transition-colors hover:bg-hover hover:text-foreground"
+                              >
+                                <input
+                                  type="checkbox"
+                                  checked={checked}
+                                  onChange={() => toggleTargetIndustry(option.name)}
+                                  aria-label={`选择行业 ${option.name}`}
+                                  className="h-3.5 w-3.5 rounded border-subtle-hover bg-transparent accent-primary focus:ring-primary/30"
+                                />
+                                <span className="min-w-0 flex-1 truncate">{option.name}</span>
+                                <span className="shrink-0 text-xs text-muted-text">{option.count}</span>
+                              </label>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    ) : null}
+                  </div>
+                </div>
               ) : null}
               {!isLiveMode ? (
                 <>

@@ -32,7 +32,7 @@ quote 查询顺序：
 2. 当前进程内短缓存。
 3. 默认策略下远程实时行情源。
 
-`snapshot_only` 只读快照和本地历史，不触发实时行情远程请求；实测页使用该策略。`cache_only` 可读快照、短缓存和本地历史/热表，也不触发远程实时行情请求。
+`snapshot_only` 只读快照和本地历史，不触发实时行情远程请求。规则实测/回测使用 `db_only`，只读 `stock_daily`、`stock_intraday_minute` 和 `stock_chip_daily` 等本地库数据。`cache_only` 可读快照、短缓存和本地历史/热表，也不触发远程实时行情请求。
 
 ## 分钟热表
 
@@ -66,10 +66,11 @@ FastAPI/Web 服务启动和 `python main.py --schedule` 定时模式都会注册
 
 实测页：
 
-- 每轮请求携带 `dataPolicy: snapshot_only`。
-- 只在 A 股交易日 15:00 及以前触发；9:30 前和午休允许扫描，15:00 后、周末或节假日不再按旧快照重复扫描。
+- 每轮请求携带 `dataPolicy: db_only`。
+- 只在 A 股交易日 15:00 及以前触发；每次实测使用独立的 live 数据缓存；9:30 前只预热规则所需的当天前历史日线缓存，不读取分钟热表、不评估命中、不通知；9:30 后和午休复用同一份 live 缓存中的历史、指标和财务事件派生数据，并基于已入库分钟热表扫描；15:00 后、周末或节假日不再按旧快照重复扫描。
 - 最多允许 2 个实测 cycle 并发。
-- 结果按 `snapshot_id` 去重；旧快照结果不会覆盖更新快照的摘要。
+- `prewarm_only=true` 的结果只写日志，不进入命中汇总；真扫描结果按 `snapshot_id` 去重，旧快照结果不会覆盖更新快照的摘要。
+- 停止实测时调用 `DELETE /api/v1/rules/live-cache/{live_cache_key}` 清理本次 live 缓存。
 
 指标分析页：
 
@@ -83,6 +84,7 @@ FastAPI/Web 服务启动和 `python main.py --schedule` 定时模式都会注册
 
 - `REALTIME_QUOTE_CACHE_SECONDS` 与旧名兼容解析，新名优先。
 - `snapshot_only` 不调用远程 quote。
+- 规则实测/回测不调用远程 quote、日线或财务数据源；缺失数据由离线预热、归档或补数据任务提前入库；9:30 前实测按钮只负责把本地历史日线读入本次实测专用缓存。
 - 后台预热使用全量活跃 A 股代码并刷新快照。
 - 分钟热表同一分钟 upsert 聚合正确。
 - 指标分析 history 接口优先返回分钟热表。

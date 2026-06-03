@@ -55,6 +55,7 @@ class RuleCreateRequest(BaseModel):
     name: str = Field(..., min_length=1, max_length=100)
     description: Optional[str] = Field(None, max_length=1000)
     is_active: bool = True
+    is_disable: bool = Field(False, description="Whether to hide this rule from rule lists")
     definition: RuleDefinition
 
 
@@ -62,6 +63,7 @@ class RuleUpdateRequest(BaseModel):
     name: Optional[str] = Field(None, min_length=1, max_length=100)
     description: Optional[str] = Field(None, max_length=1000)
     is_active: Optional[bool] = None
+    is_disable: Optional[bool] = Field(None, description="Whether to hide this rule from rule lists")
     definition: Optional[RuleDefinition] = None
 
 
@@ -70,7 +72,8 @@ class RuleRunRequest(BaseModel):
     target: Optional[RuleTarget] = Field(None, description="Optional runtime target override")
     start_date: Optional[date] = Field(None, description="Optional backtest start date")
     end_date: Optional[date] = Field(None, description="Optional backtest end date")
-    data_policy: str = Field("default", description="default/snapshot_only/cache_only/db_only")
+    data_policy: str = Field("db_only", description="规则实测/回测强制只读本地数据库数据")
+    live_cache_key: Optional[str] = Field(None, description="Live-test only data cache key")
 
 
 class RuleBatchRunRequest(RuleRunRequest):
@@ -115,6 +118,9 @@ class RuleRunHistoryItem(BaseModel):
     quote_hit_count: int = 0
     quote_miss_count: int = 0
     reused_run: bool = False
+    prewarm_only: bool = False
+    prewarm_hit_count: int = 0
+    prewarm_miss_count: int = 0
 
 
 class RuleRunHistoryResponse(BaseModel):
@@ -126,6 +132,7 @@ class RuleItem(BaseModel):
     name: str
     description: Optional[str] = None
     is_active: bool
+    is_disable: bool = False
     period: str
     lookback_days: int
     target_scope: str
@@ -187,6 +194,9 @@ class RuleRunResponse(BaseModel):
     quote_hit_count: int = 0
     quote_miss_count: int = 0
     reused_run: bool = False
+    prewarm_only: bool = False
+    prewarm_hit_count: int = 0
+    prewarm_miss_count: int = 0
 
 
 class RuleRunMatchListResponse(BaseModel):
