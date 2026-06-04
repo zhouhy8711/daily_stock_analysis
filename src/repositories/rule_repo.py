@@ -167,6 +167,13 @@ class RuleRepository:
             "prewarm_only": bool(batch_metadata.get("prewarm_only") or False),
             "prewarm_hit_count": int(batch_metadata.get("prewarm_hit_count") or 0),
             "prewarm_miss_count": int(batch_metadata.get("prewarm_miss_count") or 0),
+            "fast_latest_scan": bool(batch_metadata.get("fast_latest_scan") or False),
+            "skipped_count": int(batch_metadata.get("skipped_count") or 0),
+            "skip_counts": (
+                batch_metadata.get("skip_counts")
+                if isinstance(batch_metadata.get("skip_counts"), dict)
+                else {}
+            ),
         }
 
     def find_reusable_run_by_key(self, run_key: str) -> Optional[Dict[str, Any]]:

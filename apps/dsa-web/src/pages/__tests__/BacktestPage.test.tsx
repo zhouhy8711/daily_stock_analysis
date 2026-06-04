@@ -1,6 +1,6 @@
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { AxiosError } from 'axios';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { createApiError, createParsedApiError } from '../../api/error';
 import { historyApi } from '../../api/history';
 import { rulesApi } from '../../api/rules';
 import { stocksApi, type KLineData, type KLinePeriod } from '../../api/stocks';
@@ -304,11 +304,7 @@ function createDeferred<T>() {
 }
 
 function createRequestTimeoutError() {
-  return createApiError(createParsedApiError({
-    title: '请求本地服务超时',
-    message: '本地服务响应超时，后台任务可能仍在执行，请稍后刷新或检查服务负载。',
-    category: 'request_timeout',
-  }), { code: 'ECONNABORTED' });
+  return new AxiosError('timeout of 30000ms exceeded', 'ECONNABORTED');
 }
 
 function makeIndicatorHistory(period: KLinePeriod): KLineData[] {

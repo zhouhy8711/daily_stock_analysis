@@ -46,6 +46,19 @@ function toNumberArray(value: unknown): number[] | undefined {
   return Array.isArray(value) ? value.map((item) => toNumber(item)) : undefined;
 }
 
+function toNumberRecord(value: unknown): Record<string, number> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return {};
+  }
+  return Object.entries(value as Record<string, unknown>).reduce<Record<string, number>>((acc, [key, item]) => {
+    const count = toNumber(item);
+    if (key && count > 0) {
+      acc[key] = count;
+    }
+    return acc;
+  }, {});
+}
+
 function normalizeValueExpression(raw: unknown): RuleValueExpression {
   const item = raw && typeof raw === 'object' ? raw as Record<string, unknown> : {};
   const type = toString(item.type || 'literal');
@@ -245,6 +258,9 @@ function normalizeRunHistory(raw: Record<string, unknown>): RuleRunHistoryItem {
     prewarmOnly: toBoolean(raw.prewarm_only ?? raw.prewarmOnly),
     prewarmHitCount: toNumber(raw.prewarm_hit_count ?? raw.prewarmHitCount),
     prewarmMissCount: toNumber(raw.prewarm_miss_count ?? raw.prewarmMissCount),
+    fastLatestScan: toBoolean(raw.fast_latest_scan ?? raw.fastLatestScan),
+    skippedCount: toNumber(raw.skipped_count ?? raw.skippedCount),
+    skipCounts: toNumberRecord(raw.skip_counts ?? raw.skipCounts),
   };
 }
 
@@ -372,6 +388,9 @@ export const rulesApi = {
       prewarmOnly: toBoolean(response.data.prewarm_only ?? response.data.prewarmOnly),
       prewarmHitCount: toNumber(response.data.prewarm_hit_count ?? response.data.prewarmHitCount),
       prewarmMissCount: toNumber(response.data.prewarm_miss_count ?? response.data.prewarmMissCount),
+      fastLatestScan: toBoolean(response.data.fast_latest_scan ?? response.data.fastLatestScan),
+      skippedCount: toNumber(response.data.skipped_count ?? response.data.skippedCount),
+      skipCounts: toNumberRecord(response.data.skip_counts ?? response.data.skipCounts),
     };
   },
 
@@ -416,6 +435,9 @@ export const rulesApi = {
       prewarmOnly: toBoolean(response.data.prewarm_only ?? response.data.prewarmOnly),
       prewarmHitCount: toNumber(response.data.prewarm_hit_count ?? response.data.prewarmHitCount),
       prewarmMissCount: toNumber(response.data.prewarm_miss_count ?? response.data.prewarmMissCount),
+      fastLatestScan: toBoolean(response.data.fast_latest_scan ?? response.data.fastLatestScan),
+      skippedCount: toNumber(response.data.skipped_count ?? response.data.skippedCount),
+      skipCounts: toNumberRecord(response.data.skip_counts ?? response.data.skipCounts),
     };
   },
 
@@ -460,6 +482,9 @@ export const rulesApi = {
       prewarmOnly: toBoolean(response.data.prewarm_only ?? response.data.prewarmOnly),
       prewarmHitCount: toNumber(response.data.prewarm_hit_count ?? response.data.prewarmHitCount),
       prewarmMissCount: toNumber(response.data.prewarm_miss_count ?? response.data.prewarmMissCount),
+      fastLatestScan: toBoolean(response.data.fast_latest_scan ?? response.data.fastLatestScan),
+      skippedCount: toNumber(response.data.skipped_count ?? response.data.skippedCount),
+      skipCounts: toNumberRecord(response.data.skip_counts ?? response.data.skipCounts),
     };
   },
 

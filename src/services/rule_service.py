@@ -72,6 +72,7 @@ _RULE_RUN_HISTORY_CACHE: Dict[str, Dict[str, Any]] = {}
 _LIVE_RULE_RUN_HISTORY_CACHE_LOCK = threading.RLock()
 _LIVE_RULE_RUN_HISTORY_CACHE: Dict[str, Dict[str, Dict[str, Any]]] = {}
 _LIVE_RULE_RUN_SCAN_CACHE: Dict[str, Dict[str, Dict[str, Any]]] = {}
+FAST_LATEST_CHIP_MAX_STALE_DAYS = 7
 EARNINGS_GAP_METRIC_KEYS = set(EARNINGS_GAP_DAILY_METRIC_COLUMNS)
 LIVE_REPRICED_CHIP_KEYS = ("chip_distribution", "main_chip_distribution")
 FAST_LATEST_SIMPLE_OPERATORS = {
@@ -119,6 +120,11 @@ FAST_LATEST_CHIP_METRIC_KEYS = {
     "chip_peak_low_price",
     "chip_peak_high_price",
     "chip_peak_price_ratio",
+}
+FAST_LATEST_REPRICED_CHIP_METRIC_KEYS = {
+    "profit_ratio",
+    "trapped_ratio",
+    "profit_trapped_spread",
 }
 FAST_LATEST_METRIC_KEYS = FAST_LATEST_QUOTE_METRIC_KEYS | FAST_LATEST_CHIP_METRIC_KEYS
 
@@ -903,6 +909,8 @@ class RuleService:
         left_metric = str(left.get("metric") or "")
         if left_metric not in FAST_LATEST_METRIC_KEYS or not cls._expression_has_zero_offset(left):
             return False
+        if operator == "not_exists" and left_metric in FAST_LATEST_CHIP_METRIC_KEYS:
+            return False
 
         if operator in {"exists", "not_exists", SANDWICH_NUMBER_OPERATOR, PAIR_NUMBER_OPERATOR}:
             return True
@@ -941,6 +949,9 @@ class RuleService:
         if run_mode != "latest" or data_policy not in {"snapshot_only", "cache_only", "db_only"}:
             return False
         if not prepared:
+            return False
+        stock_codes = cls._resolve_batch_stock_codes(prepared)
+        if not stock_codes or not all(cls._is_cn_a_share_code(code) for code in stock_codes):
             return False
         return all(
             cls._definition_fast_latest_compatible(definition)
@@ -990,6 +1001,7 @@ class RuleService:
             )
         ordered_matches: List[List[Dict[str, Any]]] = [[] for _ in stock_codes]
         ordered_errors: List[List[str]] = [[] for _ in stock_codes]
+        ordered_skips: List[List[str]] = [[] for _ in stock_codes]
         completed_count = 0
         target_count = len(stock_codes)
         progress_batch_size = self._resolve_progress_batch_size(target_count)
@@ -1045,7 +1057,11 @@ class RuleService:
                 completed_count=count,
                 target_count=target_count,
                 errors=current_errors,
-                metadata=batch_metadata,
+                metadata=self._build_runtime_scan_metadata(
+                    batch_metadata,
+                    fast_latest_scan=fast_latest_scan,
+                    ordered_skips=ordered_skips,
+                ),
             )
             last_progress_count = count
             last_progress_update_at = time.monotonic()
@@ -1079,6 +1095,8 @@ class RuleService:
                         scan_cache=scan_cache,
                     )
             except RuleDataUnavailable as exc:
+                reason = str(exc) or type(exc).__name__
+                ordered_skips[index] = [reason]
                 logger.info(
                     "异步批量规则回测跳过无缓存股票: run_id=%s, stock=%s, reason=%s",
                     run_id,
@@ -1152,10 +1170,36 @@ class RuleService:
                 if should_update_progress(completed_count):
                     update_progress(completed_count)
 
+        if batch_metadata is not None:
+            batch_metadata.update(
+                self._build_runtime_scan_metadata(
+                    {},
+                    fast_latest_scan=fast_latest_scan,
+                    ordered_skips=ordered_skips,
+                )
+            )
         return (
             [match for stock_matches in ordered_matches for match in stock_matches],
             [error for stock_errors in ordered_errors for error in stock_errors],
         )
+
+    @staticmethod
+    def _build_runtime_scan_metadata(
+        metadata: Optional[Dict[str, Any]],
+        *,
+        fast_latest_scan: bool,
+        ordered_skips: List[List[str]],
+    ) -> Dict[str, Any]:
+        next_metadata = dict(metadata or {})
+        next_metadata["fast_latest_scan"] = bool(fast_latest_scan)
+        skip_counts: Dict[str, int] = {}
+        for stock_skips in ordered_skips:
+            for reason in stock_skips:
+                reason_key = str(reason or "unknown")
+                skip_counts[reason_key] = skip_counts.get(reason_key, 0) + 1
+        next_metadata["skip_counts"] = skip_counts
+        next_metadata["skipped_count"] = sum(skip_counts.values())
+        return next_metadata
 
     def _maybe_pause_realtime_quote_archive(
         self,
@@ -1314,8 +1358,21 @@ class RuleService:
         scan_extras: Dict[str, Dict[str, Any]],
     ) -> Dict[str, Dict[str, Any]]:
         chip_cache = scan_extras.setdefault("chip_metrics_by_code", {})
+        chip_meta_cache = scan_extras.setdefault("chip_metrics_meta_by_code", {})
         normalized_codes = [self._normalize_scan_stock_code(code) for code in stock_codes]
-        missing_codes = [code for code in normalized_codes if code and code not in chip_cache]
+        as_of_text = as_of.isoformat()
+        missing_codes = [
+            code
+            for code in normalized_codes
+            if code and (
+                code not in chip_cache
+                or not isinstance(chip_meta_cache.get(code), dict)
+                or chip_meta_cache.get(code, {}).get("as_of") != as_of_text
+            )
+        ]
+        for code in missing_codes:
+            chip_cache.pop(code, None)
+            chip_meta_cache.pop(code, None)
         if missing_codes:
             loaded_chips: Dict[str, Dict[str, Any]] = {}
             db = getattr(getattr(self.stock_service, "repo", None), "db", None)
@@ -1342,14 +1399,28 @@ class RuleService:
                 if not isinstance(payload, dict):
                     continue
                 cache_key = self._normalize_scan_stock_code(payload.get("code") or code)
-                if cache_key:
+                chip_date = self._coerce_history_row_date(payload.get("date"))
+                if cache_key and chip_date and self._is_fast_latest_chip_fresh(chip_date, as_of):
                     chip_cache[cache_key] = dict(payload)
+                    chip_meta_cache[cache_key] = {
+                        "as_of": as_of_text,
+                        "chip_date": chip_date.isoformat(),
+                    }
 
         return {
             code: copy.deepcopy(chip_cache[code])
             for code in normalized_codes
-            if code in chip_cache and isinstance(chip_cache.get(code), dict)
+            if (
+                code in chip_cache
+                and isinstance(chip_cache.get(code), dict)
+                and isinstance(chip_meta_cache.get(code), dict)
+                and chip_meta_cache.get(code, {}).get("as_of") == as_of_text
+            )
         }
+
+    @staticmethod
+    def _is_fast_latest_chip_fresh(chip_date: date, as_of: date) -> bool:
+        return timedelta(days=0) <= (as_of - chip_date) <= timedelta(days=FAST_LATEST_CHIP_MAX_STALE_DAYS)
 
     def _prewarm_rule_scan_cache(
         self,
@@ -1434,6 +1505,7 @@ class RuleService:
         return {
             "indicator_metrics_by_code": {},
             "chip_metrics_by_code": {},
+            "chip_metrics_meta_by_code": {},
             "earnings_events_by_code": {},
             "earnings_gap_metrics_by_code": {},
         }
@@ -2153,6 +2225,11 @@ class RuleService:
             return value
 
     @staticmethod
+    def _is_cn_a_share_code(stock_code: Any) -> bool:
+        normalized = RuleService._normalize_scan_stock_code(stock_code)
+        return normalized.isdigit() and len(normalized) == 6
+
+    @staticmethod
     def _calculate_snapshot_age_seconds(snapshot_time: Any) -> Optional[int]:
         if not snapshot_time:
             return None
@@ -2830,6 +2907,7 @@ class RuleService:
             "latest",
             data_policy,
             scan_cache=scan_cache,
+            allow_intraday_fallback=False,
         )
         if quote is None:
             raise RuleDataUnavailable("quote_snapshot_miss")
@@ -2869,18 +2947,27 @@ class RuleService:
             self._definition_uses_chip_metrics(definition)
             for _rule_id, _rule, definition in rules
         )
+        required_chip_metrics = {
+            metric_key
+            for _rule_id, _rule, definition in rules
+            for metric_key in self._definition_metric_keys(definition)
+            if metric_key in FAST_LATEST_CHIP_METRIC_KEYS
+        }
         indicator_metrics = (
             self._build_fast_latest_chip_indicator_metrics(
                 stock_code,
                 latest_row,
+                required_chip_metrics=required_chip_metrics,
                 scan_cache=scan_cache,
             )
             if require_chip_metrics
             else {}
         )
+        if require_chip_metrics and not isinstance(indicator_metrics.get("chip_distribution"), dict):
+            raise RuleDataUnavailable("chip_incremental_miss")
         history = {
             "stock_code": stock_code,
-            "stock_name": quote.get("stock_name"),
+            "stock_name": quote.get("stock_name") or StockService._get_local_stock_name(stock_code),
             "period": "daily",
             "data_source": "fast_latest_scan",
             "data": [latest_row],
@@ -2901,27 +2988,51 @@ class RuleService:
         stock_code: str,
         latest_row: Dict[str, Any],
         *,
+        required_chip_metrics: Optional[Set[str]] = None,
         scan_cache: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         chip_by_code = (scan_cache or {}).get("chip_metrics_by_code") or {}
         cache_key = self._normalize_scan_stock_code(stock_code)
         chip = chip_by_code.get(cache_key) or chip_by_code.get(str(stock_code or "").strip().upper())
         if not isinstance(chip, dict):
-            return {}
+            raise RuleDataUnavailable("chip_daily_miss")
 
         latest_date = self._coerce_history_row_date(latest_row.get("date"))
         latest_close = self._to_optional_float(latest_row.get("close"))
         if latest_date is None or latest_close is None or latest_close <= 0:
-            return {"chip_distribution": copy.deepcopy(chip)}
+            raise RuleDataUnavailable("latest_chip_price_miss")
 
-        return {
-            "chip_distribution": self._reprice_chip_distribution_for_live_row(
-                chip,
-                latest_date,
-                latest_close,
-                force=True,
-            )
-        }
+        required_metrics = set(required_chip_metrics or set())
+        requires_incremental_shape = bool(required_metrics - FAST_LATEST_REPRICED_CHIP_METRIC_KEYS)
+        if requires_incremental_shape:
+            turnover_rate = self._to_optional_float(latest_row.get("turnover_rate"))
+            if turnover_rate is None or turnover_rate <= 0:
+                raise RuleDataUnavailable("chip_turnover_miss")
+            try:
+                from data_provider.local_chip_model_fetcher import update_chip_distribution_from_previous
+
+                incremented = update_chip_distribution_from_previous(
+                    cache_key or stock_code,
+                    chip,
+                    latest_row,
+                    history_source=str(chip.get("source") or "stock_chip_daily"),
+                )
+            except Exception as exc:
+                logger.debug("实测快路径增量筹码重算失败: stock=%s error=%s", stock_code, exc)
+                incremented = None
+            if incremented is None:
+                raise RuleDataUnavailable("chip_incremental_miss")
+            return {"chip_distribution": incremented.to_dict()}
+
+        repriced = self._reprice_chip_distribution_for_live_row(
+            chip,
+            latest_date,
+            latest_close,
+            force=True,
+        )
+        if "profit_ratio" not in repriced:
+            raise RuleDataUnavailable("chip_distribution_miss")
+        return {"chip_distribution": repriced}
 
     def _get_stock_quote_for_rule_run(
         self,
@@ -2930,13 +3041,14 @@ class RuleService:
         data_policy: str,
         *,
         scan_cache: Optional[Dict[str, Any]] = None,
+        allow_intraday_fallback: bool = True,
     ) -> Optional[Dict[str, Any]]:
         if mode != "latest":
             return None
 
         quote = self._get_preloaded_quote(scan_cache, stock_code)
         if data_policy == "db_only":
-            if quote is None:
+            if quote is None and allow_intraday_fallback:
                 quote = self._build_intraday_hot_table_quote(stock_code)
             if quote is None:
                 raise RuleDataUnavailable("intraday_hot_table_miss")
@@ -2947,10 +3059,12 @@ class RuleService:
                 if data_policy == "snapshot_only"
                 else self._get_stock_realtime_quote(stock_code)
             )
-        if data_policy == "snapshot_only" and quote is None:
+        if data_policy == "snapshot_only" and quote is None and allow_intraday_fallback:
             quote = self._build_intraday_hot_table_quote(stock_code)
             if quote is None:
                 raise RuleDataUnavailable("quote_snapshot_miss")
+        elif data_policy == "snapshot_only" and quote is None:
+            raise RuleDataUnavailable("quote_snapshot_miss")
         return quote
 
     @staticmethod
@@ -3553,6 +3667,8 @@ class RuleService:
         repriced["date"] = latest_date.isoformat()
         if profit_ratio is not None:
             repriced["profit_ratio"] = profit_ratio
+        elif force:
+            repriced.pop("profit_ratio", None)
 
         source = str(repriced.get("source") or "").strip()
         if source and "live_repriced" not in source:

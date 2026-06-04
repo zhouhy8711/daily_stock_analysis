@@ -289,6 +289,102 @@ def compute_chip_distribution_from_history(
     return chip
 
 
+def update_chip_distribution_from_previous(
+    stock_code: str,
+    previous_chip: dict[str, Any],
+    latest_row: dict[str, Any],
+    *,
+    history_source: str = "stock_chip_daily",
+    max_price_points: int = 180,
+) -> Optional[ChipDistribution]:
+    """Apply one live daily row to a persisted chip distribution.
+
+    This keeps the same turnover-decay model used by
+    ``compute_chip_distribution_from_history`` while avoiding a full historical
+    rebuild for live scans.
+    """
+    distribution = previous_chip.get("distribution") if isinstance(previous_chip, dict) else None
+    previous_prices, previous_chips = _distribution_to_arrays(distribution)
+    if previous_prices.size == 0 or previous_chips.size == 0:
+        return None
+
+    latest = _prepare_history(pd.DataFrame([latest_row]), window_days=1)
+    if latest.empty:
+        return None
+    latest_series = latest.iloc[-1]
+
+    low = min(float(previous_prices.min()), float(latest_series["low"]))
+    high = max(float(previous_prices.max()), float(latest_series["high"]))
+    prices = _build_price_axis(
+        pd.DataFrame([{"low": low, "high": high}]),
+        max_price_points=max_price_points,
+    )
+    if prices.size == 0:
+        return None
+
+    chips = np.zeros(prices.size, dtype=float)
+    for price, percent in zip(previous_prices, previous_chips):
+        index = int(np.argmin(np.abs(prices - price)))
+        chips[index] += percent
+    total = float(chips.sum())
+    if total <= 0:
+        return None
+    chips = chips / total
+
+    turnover = _normalize_turnover(float(latest_series["turnover_rate"]))
+    if turnover <= 0:
+        return None
+
+    weights = _daily_price_weights(
+        prices,
+        low=float(latest_series["low"]),
+        high=float(latest_series["high"]),
+        peak=_daily_average_price(latest_series),
+    )
+    if weights.sum() <= 0:
+        return None
+
+    chips = chips * (1 - turnover) + weights * turnover
+    total = float(chips.sum())
+    if total <= 0:
+        return None
+
+    return _build_chip_distribution(
+        stock_code=stock_code,
+        source=f"local_chip_model_incremental:{history_source}",
+        prices=prices,
+        chips=chips / total,
+        latest=latest_series,
+    )
+
+
+def _distribution_to_arrays(distribution: Any) -> Tuple[np.ndarray, np.ndarray]:
+    if not isinstance(distribution, list):
+        return np.array([]), np.array([])
+
+    prices = []
+    chips = []
+    for point in distribution:
+        if not isinstance(point, dict):
+            continue
+        price = _safe_positive_float(point.get("price"))
+        percent = _safe_positive_float(point.get("percent", point.get("ratio")))
+        if price is None or percent is None:
+            continue
+        prices.append(price)
+        chips.append(percent)
+
+    if not prices or not chips:
+        return np.array([]), np.array([])
+
+    price_array = np.array(prices, dtype=float)
+    chip_array = np.array(chips, dtype=float)
+    total = float(chip_array.sum())
+    if total <= 0:
+        return np.array([]), np.array([])
+    return price_array, chip_array / total
+
+
 def _build_chip_distribution(
     stock_code: str,
     source: str,

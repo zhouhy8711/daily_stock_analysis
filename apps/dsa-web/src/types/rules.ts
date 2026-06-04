@@ -142,6 +142,9 @@ export type RuleRunResponse = {
   prewarmOnly?: boolean;
   prewarmHitCount?: number;
   prewarmMissCount?: number;
+  fastLatestScan?: boolean;
+  skippedCount?: number;
+  skipCounts?: Record<string, number>;
 };
 
 export type RuleRunNotifyPayload = {
@@ -202,6 +205,9 @@ export type RuleRunHistoryItem = {
   prewarmOnly?: boolean;
   prewarmHitCount?: number;
   prewarmMissCount?: number;
+  fastLatestScan?: boolean;
+  skippedCount?: number;
+  skipCounts?: Record<string, number>;
 };
 
 export type RuleCreatePayload = {

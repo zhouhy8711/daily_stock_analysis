@@ -2542,19 +2542,27 @@ class DatabaseManager:
 
         result: Dict[str, Dict[str, Any]] = {}
         chunk_size = 800
-        only_cn_equities = all(code.isdigit() and len(code) == 6 for code in normalized_codes)
 
         def _conditions_for(code_chunk: List[str]) -> List[Any]:
+            cn_codes = [code for code in code_chunk if code.isdigit() and len(code) == 6]
+            other_codes = [code for code in code_chunk if code not in cn_codes]
+            minute_text = func.strftime("%H:%M", StockIntradayMinute.minute_ts)
+            regular_session = or_(
+                and_(minute_text >= "09:30", minute_text <= "11:30"),
+                and_(minute_text >= "13:00", minute_text <= "15:00"),
+            )
+            code_conditions = []
+            if cn_codes:
+                code_conditions.append(and_(
+                    StockIntradayMinute.code.in_(cn_codes),
+                    regular_session,
+                ))
+            if other_codes:
+                code_conditions.append(StockIntradayMinute.code.in_(other_codes))
             conditions = [
                 StockIntradayMinute.trade_date == target_date,
-                StockIntradayMinute.code.in_(code_chunk),
+                or_(*code_conditions),
             ]
-            if only_cn_equities:
-                minute_text = func.strftime("%H:%M", StockIntradayMinute.minute_ts)
-                conditions.append(or_(
-                    and_(minute_text >= "09:30", minute_text <= "11:30"),
-                    and_(minute_text >= "13:00", minute_text <= "15:00"),
-                ))
             return conditions
 
         with self.get_session() as session:
@@ -2748,10 +2756,21 @@ class DatabaseManager:
     def get_intraday_minute_snapshot_summary(self, *, trade_date: Optional[date] = None) -> Dict[str, Any]:
         """Return hot-table coverage and latest snapshot metadata for a trade date."""
         target_date = trade_date or date.today()
+        minute_text = func.strftime("%H:%M", StockIntradayMinute.minute_ts)
+        regular_session = or_(
+            and_(minute_text >= "09:30", minute_text <= "11:30"),
+            and_(minute_text >= "13:00", minute_text <= "15:00"),
+        )
+        cn_a_share_code = and_(
+            func.length(StockIntradayMinute.code) == 6,
+            StockIntradayMinute.code >= "000000",
+            StockIntradayMinute.code <= "999999",
+        )
+        conditions = and_(StockIntradayMinute.trade_date == target_date, regular_session, cn_a_share_code)
         with self.get_session() as session:
             codes = session.execute(
                 select(StockIntradayMinute.code)
-                .where(StockIntradayMinute.trade_date == target_date)
+                .where(conditions)
                 .distinct()
                 .order_by(StockIntradayMinute.code)
             ).scalars().all()
@@ -2761,7 +2780,7 @@ class DatabaseManager:
                     StockIntradayMinute.snapshot_time,
                     StockIntradayMinute.minute_ts,
                 )
-                .where(StockIntradayMinute.trade_date == target_date)
+                .where(conditions)
                 .order_by(
                     desc(StockIntradayMinute.snapshot_time),
                     desc(StockIntradayMinute.minute_ts),

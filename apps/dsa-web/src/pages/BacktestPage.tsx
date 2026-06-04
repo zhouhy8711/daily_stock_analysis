@@ -89,6 +89,27 @@ function isTransientLiveTestReadError(error: ParsedApiError): boolean {
   ].includes(error.category);
 }
 
+const LIVE_SKIP_REASON_LABELS: Record<string, string> = {
+  intraday_hot_table_miss: '分钟热表行情缺失',
+  quote_snapshot_miss: '实时行情缺失',
+  latest_date_miss: '判断日缺失',
+  latest_chip_price_miss: '筹码重算价格缺失',
+  chip_daily_miss: '筹码日缓存缺失',
+  chip_distribution_miss: '筹码分布缺失',
+  chip_turnover_miss: '实时换手率缺失',
+  chip_incremental_miss: '筹码增量重算失败',
+};
+
+function formatLiveSkipSummary(skipCounts?: Record<string, number>): string | null {
+  const entries = Object.entries(skipCounts || {})
+    .filter(([, count]) => Number.isFinite(count) && count > 0)
+    .sort((a, b) => b[1] - a[1]);
+  if (entries.length === 0) return null;
+  return entries
+    .map(([reason, count]) => `${LIVE_SKIP_REASON_LABELS[reason] ?? reason} ${count} 只`)
+    .join('，');
+}
+
 type RuleRunEventRow = {
   id: string;
   runId?: number;
@@ -1464,10 +1485,12 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
   useEffect(() => () => {
     clearLiveTestInterval();
     const liveCacheKey = liveCacheKeyRef.current;
+    const activeRun = liveActiveRunRef.current;
     liveCacheKeyRef.current = null;
-    if (liveCacheKey) {
+    if (liveCacheKey && !activeRun) {
       void rulesApi.clearLiveCache(liveCacheKey);
     }
+    liveActiveRunRef.current = null;
     liveTestSessionRef.current = null;
     liveTransientReadErrorCountRef.current = 0;
     if (isLiveMode) {
@@ -1994,6 +2017,7 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
   const stopLiveTest = useCallback((message = '实测已停止', level: LogLevel = 'info') => {
     const sessionId = liveTestSessionRef.current;
     const liveCacheKey = liveCacheKeyRef.current;
+    const activeRun = liveActiveRunRef.current;
     const finishedAt = new Date().toISOString();
     clearLiveTestInterval();
     liveTestSessionRef.current = null;
@@ -2008,13 +2032,15 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
       ? { ...current, status: 'completed', finishedAt }
       : current));
     appendExecutionLog(message, level);
-    if (liveCacheKey) {
+    if (liveCacheKey && !activeRun) {
       void rulesApi.clearLiveCache(liveCacheKey).then(() => {
         appendExecutionLog('本次实测数据缓存已清理');
       }).catch((error) => {
         const parsedError = getParsedApiError(error);
         appendExecutionLog(`本次实测数据缓存清理失败：${parsedError.message}`, 'warning');
       });
+    } else if (liveCacheKey && activeRun) {
+      appendExecutionLog(`后台实测 #${activeRun.runId} 仍在执行，已暂缓清理本次实测数据缓存`, 'warning');
     }
   }, [appendExecutionLog, clearLiveTestInterval, setIsRunning, setRunProgressById, setSelectedRun]);
 
@@ -2209,6 +2235,9 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
         startedAt: runStartedAt,
         finishedAt: now,
         durationMs: run.durationMs,
+        fastLatestScan: run.fastLatestScan,
+        skippedCount: run.skippedCount,
+        skipCounts: run.skipCounts,
       };
 
       setSelectedRun(runMeta);
@@ -2224,6 +2253,10 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
         `第 ${activeRun.cycleIndex} 次实测完成：快照 ${run.snapshotId ?? 'unknown'}，命中股票 ${run.matchCount} 只，命中记录 ${nextRows.length} 条`,
         run.status === 'partial' || run.error ? 'warning' : 'success',
       );
+      const skipSummary = formatLiveSkipSummary(run.skipCounts);
+      if (run.fastLatestScan && skipSummary) {
+        appendExecutionLog(`第 ${activeRun.cycleIndex} 次快路径跳过 ${run.skippedCount ?? 0} 只：${skipSummary}`, 'warning');
+      }
       if (nextRows.length > 0) {
         void rulesApi.notifyRunMatches(activeRun.runId, {
           executionTime: activeRun.executionTime,
@@ -2250,6 +2283,20 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
     } catch (err) {
       if (liveTestSessionRef.current !== sessionId) return;
       const parsedError = getParsedApiError(err);
+      if (cyclePhase === 'start' && isTransientLiveTestReadError(parsedError)) {
+        liveTransientReadErrorCountRef.current += 1;
+        const retryCount = liveTransientReadErrorCountRef.current;
+        const retryText = retryCount > 1 ? `（连续 ${retryCount} 次）` : '';
+        updateRunProgress(sessionId, 12, `第 ${cycleIndex} 次启动请求暂时超时，等待下次重试`);
+        appendExecutionLog(
+          `第 ${cycleIndex} 次后台任务启动请求暂时超时${retryText}：后台任务可能仍在创建，将使用同一缓存会话继续重试。${parsedError.message}`,
+          'warning',
+        );
+        setRunWarning('后台任务启动请求超时，可能仍在创建任务；将使用同一缓存会话继续重试。');
+        setRunError(null);
+        setActiveResultTab('logs');
+        return;
+      }
       if (cyclePhase !== 'start' && cycleRunId != null && isTransientLiveTestReadError(parsedError)) {
         liveTransientReadErrorCountRef.current += 1;
         const retryCount = liveTransientReadErrorCountRef.current;
@@ -2799,7 +2846,7 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
                                   ? 'border-border/60 bg-muted/20 text-muted-text'
                                   : 'border-primary/25 bg-primary/10 text-primary',
                               ].join(' ')}
-                              title={rowIndustryLabel}
+                              aria-label={rowIndustryLabel}
                             >
                               <span className="truncate">{rowIndustryLabel}</span>
                             </span>

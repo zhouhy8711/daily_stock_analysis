@@ -442,6 +442,147 @@ class TestStorage(unittest.TestCase):
 
         DatabaseManager.reset_instance()
 
+    def test_intraday_minute_latest_quotes_batch_filters_regular_session_and_refreshes(self):
+        DatabaseManager.reset_instance()
+        db = DatabaseManager(db_url="sqlite:///:memory:")
+        trade_date = date(2026, 5, 7)
+
+        db.save_intraday_minute_dataframe(
+            pd.DataFrame([
+                {
+                    "date": datetime(2026, 5, 7, 9, 25),
+                    "open": 99.0,
+                    "high": 99.0,
+                    "low": 99.0,
+                    "close": 99.0,
+                    "volume": 100,
+                    "amount": 9900,
+                    "change_percent": 900.0,
+                },
+                {
+                    "date": datetime(2026, 5, 7, 9, 30),
+                    "open": 10.0,
+                    "high": 11.0,
+                    "low": 9.0,
+                    "close": 10.0,
+                    "volume": 100,
+                    "amount": 1000,
+                    "change_percent": 1.0,
+                },
+                {
+                    "date": datetime(2026, 5, 7, 9, 31),
+                    "open": 10.0,
+                    "high": 12.0,
+                    "low": 9.5,
+                    "close": 11.0,
+                    "volume": 200,
+                    "amount": 2200,
+                    "change_percent": 2.0,
+                },
+                {
+                    "date": datetime(2026, 5, 7, 11, 31),
+                    "open": 50.0,
+                    "high": 50.0,
+                    "low": 50.0,
+                    "close": 50.0,
+                    "volume": 100,
+                    "amount": 5000,
+                    "change_percent": 400.0,
+                },
+            ]),
+            "600519",
+            data_source="unit",
+            snapshot_id="batch-1",
+            snapshot_time=datetime(2026, 5, 7, 9, 31),
+        )
+        db.save_intraday_minute_dataframe(
+            pd.DataFrame([
+                {
+                    "date": datetime(2026, 5, 7, 10, 31),
+                    "open": 100.0,
+                    "high": 102.0,
+                    "low": 99.0,
+                    "close": 101.0,
+                    "volume": 100,
+                    "amount": 10100,
+                    "change_percent": 1.0,
+                },
+            ]),
+            "AAPL",
+            data_source="unit",
+            snapshot_id="us-batch-1",
+            snapshot_time=datetime(2026, 5, 7, 10, 31),
+        )
+
+        first_quotes = db.get_intraday_minute_latest_quotes_batch(["SH600519"], trade_date=trade_date)
+
+        self.assertEqual(first_quotes["600519"]["current_price"], 11.0)
+        self.assertEqual(first_quotes["600519"]["open"], 10.0)
+        self.assertEqual(first_quotes["600519"]["high"], 12.0)
+        self.assertEqual(first_quotes["600519"]["low"], 9.0)
+        self.assertEqual(first_quotes["600519"]["volume"], 3)
+        self.assertEqual(first_quotes["600519"]["amount"], 3200)
+        self.assertEqual(first_quotes["600519"]["change_percent"], 2.0)
+        self.assertEqual(first_quotes["600519"]["snapshot_id"], "batch-1")
+
+        mixed_quotes = db.get_intraday_minute_latest_quotes_batch(["600519", "AAPL"], trade_date=trade_date)
+        self.assertEqual(mixed_quotes["600519"]["current_price"], 11.0)
+        self.assertEqual(mixed_quotes["AAPL"]["current_price"], 101.0)
+
+        summary = db.get_intraday_minute_snapshot_summary(trade_date=trade_date)
+        self.assertEqual(summary["codes"], ["600519"])
+        self.assertEqual(summary["snapshot_id"], "batch-1")
+
+        db.save_intraday_minute_dataframe(
+            pd.DataFrame([
+                {
+                    "date": datetime(2026, 5, 7, 9, 32),
+                    "open": 11.0,
+                    "high": 13.0,
+                    "low": 10.8,
+                    "close": 13.0,
+                    "volume": 300,
+                    "amount": 3900,
+                    "change_percent": 3.0,
+                },
+            ]),
+            "600519",
+            data_source="unit",
+            snapshot_id="batch-2",
+            snapshot_time=datetime(2026, 5, 7, 9, 32),
+        )
+
+        refreshed_quotes = db.get_intraday_minute_latest_quotes_batch(["600519"], trade_date=trade_date)
+
+        self.assertEqual(refreshed_quotes["600519"]["current_price"], 13.0)
+        self.assertEqual(refreshed_quotes["600519"]["high"], 13.0)
+        self.assertEqual(refreshed_quotes["600519"]["volume"], 6)
+        self.assertEqual(refreshed_quotes["600519"]["amount"], 7100)
+        self.assertEqual(refreshed_quotes["600519"]["snapshot_id"], "batch-2")
+
+        large_codes = [f"{600000 + index:06d}" for index in range(805)]
+        saved_large = db.save_intraday_quote_samples(
+            [
+                {
+                    "stock_code": code,
+                    "current_price": 10 + index,
+                    "volume": 100,
+                    "amount": (10 + index) * 100,
+                    "change_percent": 0.5,
+                }
+                for index, code in enumerate(large_codes)
+            ],
+            snapshot_id="large-batch",
+            snapshot_time=datetime(2026, 5, 7, 10, 0),
+        )
+        large_quotes = db.get_intraday_minute_latest_quotes_batch(large_codes, trade_date=trade_date)
+
+        self.assertEqual(saved_large["saved_count"], len(large_codes))
+        self.assertEqual(len(large_quotes), len(large_codes))
+        self.assertEqual(large_quotes[large_codes[-1]]["current_price"], 10 + len(large_codes) - 1)
+
+        DatabaseManager.reset_instance()
+
     def test_intraday_quote_samples_normalize_raw_share_volume_before_archive(self):
         DatabaseManager.reset_instance()
         db = DatabaseManager(db_url="sqlite:///:memory:")
@@ -644,6 +785,19 @@ class TestStorage(unittest.TestCase):
         rolling_latest = db.get_latest_chip_daily("000001", as_of=start + timedelta(days=59))
         self.assertEqual(rolling_latest["chip_concentration_90_avg_30d"], 10)
         self.assertEqual(rolling_latest["chip_concentration_90_avg_60d"], 10)
+
+        batch_latest = db.get_latest_chip_daily_batch(
+            ["SH600519", "000001", "missing"],
+            as_of=date(2026, 5, 8),
+        )
+        self.assertEqual(set(batch_latest.keys()), {"600519", "000001"})
+        self.assertEqual(batch_latest["600519"]["date"], "2026-05-07")
+        self.assertEqual(batch_latest["600519"]["profit_ratio"], 0.9)
+        self.assertEqual(batch_latest["000001"]["date"], (start + timedelta(days=59)).isoformat())
+        self.assertEqual(batch_latest["000001"]["chip_concentration_90_avg_60d"], 10)
+
+        early_batch_latest = db.get_latest_chip_daily_batch(["600519"], as_of=date(2026, 5, 6))
+        self.assertEqual(early_batch_latest, {})
 
         DatabaseManager.reset_instance()
 
