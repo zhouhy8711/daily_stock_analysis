@@ -44,6 +44,9 @@ _REALTIME_QUOTE_SNAPSHOT: Dict[str, Any] = {
 _REALTIME_QUOTE_INTRADAY_ARCHIVE_LOCK = RLock()
 _REALTIME_QUOTE_INTRADAY_ARCHIVE_PAUSE_DEPTH = 0
 _REALTIME_QUOTE_INTRADAY_ARCHIVE_PAUSE_REASON: Optional[str] = None
+_REALTIME_QUOTE_PREFETCH_PAUSE_LOCK = RLock()
+_REALTIME_QUOTE_PREFETCH_PAUSE_DEPTH = 0
+_REALTIME_QUOTE_PREFETCH_PAUSE_REASON: Optional[str] = None
 
 
 def _get_realtime_cache_ttl() -> int:
@@ -115,6 +118,33 @@ def _realtime_quote_intraday_archive_pause_reason() -> Optional[str]:
         if _REALTIME_QUOTE_INTRADAY_ARCHIVE_PAUSE_DEPTH <= 0:
             return None
         return _REALTIME_QUOTE_INTRADAY_ARCHIVE_PAUSE_REASON or "paused"
+
+
+@contextmanager
+def pause_realtime_quote_prefetch(reason: str = "rule_run"):
+    """Temporarily skip low-priority background realtime quote prefetch."""
+    global _REALTIME_QUOTE_PREFETCH_PAUSE_DEPTH
+    global _REALTIME_QUOTE_PREFETCH_PAUSE_REASON
+    with _REALTIME_QUOTE_PREFETCH_PAUSE_LOCK:
+        _REALTIME_QUOTE_PREFETCH_PAUSE_DEPTH += 1
+        _REALTIME_QUOTE_PREFETCH_PAUSE_REASON = reason
+    try:
+        yield
+    finally:
+        with _REALTIME_QUOTE_PREFETCH_PAUSE_LOCK:
+            _REALTIME_QUOTE_PREFETCH_PAUSE_DEPTH = max(
+                0,
+                _REALTIME_QUOTE_PREFETCH_PAUSE_DEPTH - 1,
+            )
+            if _REALTIME_QUOTE_PREFETCH_PAUSE_DEPTH == 0:
+                _REALTIME_QUOTE_PREFETCH_PAUSE_REASON = None
+
+
+def realtime_quote_prefetch_pause_reason() -> Optional[str]:
+    with _REALTIME_QUOTE_PREFETCH_PAUSE_LOCK:
+        if _REALTIME_QUOTE_PREFETCH_PAUSE_DEPTH <= 0:
+            return None
+        return _REALTIME_QUOTE_PREFETCH_PAUSE_REASON or "paused"
 
 
 def _realtime_quote_cache_size() -> int:
@@ -483,11 +513,14 @@ def _normalize_cn_volume_to_lots(
     if inferred_shares <= 0 or inferred_lots <= 0:
         return volume_value
 
-    if (
-        _relative_gap(volume_value, inferred_shares) <= 0.2
-        and _relative_gap(volume_value, inferred_lots) > 0.2
-    ):
-        return volume_value / 100
+    candidates = (
+        volume_value,
+        volume_value * 100,
+        volume_value / 100,
+    )
+    best = min(candidates, key=lambda candidate: _relative_gap(candidate, inferred_lots))
+    if _relative_gap(best, inferred_lots) <= 0.2:
+        return round(best, 2)
     return volume_value
 
 
@@ -602,6 +635,10 @@ class StockService:
     @staticmethod
     def pause_realtime_quote_intraday_archive(reason: str = "rule_run"):
         return pause_realtime_quote_intraday_archive(reason)
+
+    @staticmethod
+    def pause_realtime_quote_prefetch(reason: str = "rule_run"):
+        return pause_realtime_quote_prefetch(reason)
     
     def get_realtime_quote(
         self,
@@ -1011,10 +1048,28 @@ class StockService:
         if not all_candidates:
             return {}
 
+        limit_by_candidate: Dict[str, int] = {}
+        normalizer = getattr(self.repo.db, "_normalize_stock_code", None)
+        for stock_code, candidates in candidate_by_code.items():
+            requested_days = requested_days_by_code.get(stock_code, 1)
+            for candidate in candidates:
+                normalized_candidate = (
+                    normalizer(candidate)
+                    if callable(normalizer)
+                    else str(candidate or "").strip().upper()
+                )
+                if not normalized_candidate:
+                    continue
+                limit_by_candidate[normalized_candidate] = max(
+                    limit_by_candidate.get(normalized_candidate, 0),
+                    requested_days,
+                )
+
         rows_by_candidate = self.repo.db.get_daily_data_range_by_codes(
             all_candidates,
             min(start_date_by_code.values()),
             max(target_date_by_code.values()),
+            limit_by_code=limit_by_candidate,
         )
         histories: Dict[str, Dict[str, Any]] = {}
         for stock_code in unique_codes:

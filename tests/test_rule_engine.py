@@ -1,4 +1,5 @@
 import json
+import math
 import sqlite3
 import threading
 import time
@@ -8,11 +9,12 @@ from unittest import mock
 from sqlalchemy.exc import OperationalError
 
 import src.services.rule_service as rule_service_module
+import src.rules.engine as rule_engine_module
 from src.rules.engine import evaluate_rule, evaluate_rule_history
 from src.rules.metrics import build_metric_frame, get_metric_registry
 from src.repositories.rule_repo import RuleRepository, _decode_rule_batch_metadata, encode_rule_batch_metadata
 from src.services.rule_service import RuleService, RuleValidationError
-from src.storage import DatabaseManager, StockRule, StockRuleMatch, StockRuleRun
+from src.storage import DatabaseManager, StockDaily, StockRule, StockRuleMatch, StockRuleRun
 
 
 def _history():
@@ -56,6 +58,67 @@ def test_rule_engine_matches_aggregate_condition():
 
     assert result["matched"] is True
     assert result["matched_groups"][0]["id"] == "g1"
+
+
+def test_rule_engine_history_scan_accepts_index_subset():
+    frame = build_metric_frame(_history())
+    definition = {
+        "period": "daily",
+        "groups": [
+            {
+                "id": "g1",
+                "conditions": [
+                    {
+                        "id": "c1",
+                        "left": {"metric": "close"},
+                        "operator": ">",
+                        "right": {"type": "literal", "value": 0},
+                    }
+                ],
+            }
+        ],
+    }
+
+    events = evaluate_rule_history(definition, frame, indices=[1, 3])
+
+    assert [event["date"] for event in events] == ["2026-04-02", "2026-04-04"]
+
+
+def test_rule_engine_history_scan_short_circuits_failed_group(monkeypatch):
+    frame = build_metric_frame(_history())
+    definition = {
+        "period": "daily",
+        "groups": [
+            {
+                "id": "g1",
+                "conditions": [
+                    {
+                        "id": "fail-first",
+                        "left": {"metric": "close"},
+                        "operator": ">",
+                        "right": {"type": "literal", "value": 999},
+                    },
+                    {
+                        "id": "should-not-run",
+                        "left": {"metric": "volume"},
+                        "operator": ">",
+                        "right": {"type": "literal", "value": 0},
+                    },
+                ],
+            }
+        ],
+    }
+    calls = []
+    original = rule_engine_module.evaluate_condition
+
+    def spy_evaluate_condition(df, condition, index):
+        calls.append(condition["id"])
+        return original(df, condition, index)
+
+    monkeypatch.setattr(rule_engine_module, "evaluate_condition", spy_evaluate_condition)
+
+    assert evaluate_rule_history(definition, frame, indices=[0]) == []
+    assert calls == ["fail-first"]
 
 
 def test_rule_engine_does_not_match_missing_metric_value():
@@ -551,6 +614,187 @@ def test_rule_repository_fail_stale_running_runs_marks_only_old_running_runs():
         DatabaseManager.reset_instance()
 
 
+def test_rule_repository_fail_running_runs_started_before_marks_orphaned_runs():
+    DatabaseManager.reset_instance()
+    db = DatabaseManager(db_url="sqlite:///:memory:")
+    process_started_at = datetime(2026, 5, 8, 15, 0, 0)
+    now = process_started_at + timedelta(minutes=5)
+    try:
+        repo = RuleRepository(db)
+        with db.get_session() as session:
+            rule = StockRule(
+                name="放量观察",
+                period="daily",
+                lookback_days=120,
+                target_scope="custom",
+                target_codes_json="[]",
+                definition_json="{}",
+            )
+            session.add(rule)
+            session.commit()
+            session.refresh(rule)
+
+            orphaned_run = StockRuleRun(
+                rule_id=rule.id,
+                status="running",
+                target_count=120,
+                match_count=0,
+                started_at=process_started_at - timedelta(seconds=1),
+                error=encode_rule_batch_metadata(
+                    [rule.id],
+                    ["放量观察"],
+                    [],
+                    completed_count=60,
+                    run_key="same-snapshot",
+                ),
+            )
+            active_run = StockRuleRun(
+                rule_id=rule.id,
+                status="running",
+                target_count=120,
+                match_count=0,
+                started_at=process_started_at + timedelta(seconds=1),
+            )
+            session.add_all([orphaned_run, active_run])
+            session.commit()
+            session.refresh(orphaned_run)
+            session.refresh(active_run)
+            orphaned_run_id = orphaned_run.id
+            active_run_id = active_run.id
+
+        cleaned = repo.fail_running_runs_started_before(process_started_at, now=now)
+
+        assert cleaned == 1
+        orphaned_item = repo.get_run(orphaned_run_id)
+        active_item = repo.get_run(active_run_id)
+        assert orphaned_item["status"] == "failed"
+        assert orphaned_item["completed_count"] == 60
+        assert "服务已重启" in orphaned_item["error"]
+        assert active_item["status"] == "running"
+    finally:
+        DatabaseManager.reset_instance()
+
+
+def test_rule_repository_reusable_run_reports_event_count_from_snapshots():
+    DatabaseManager.reset_instance()
+    db = DatabaseManager(db_url="sqlite:///:memory:")
+    try:
+        repo = RuleRepository(db)
+        with db.get_session() as session:
+            rule = StockRule(
+                name="放量观察",
+                period="daily",
+                lookback_days=120,
+                target_scope="custom",
+                target_codes_json="[]",
+                definition_json="{}",
+            )
+            session.add(rule)
+            session.commit()
+            session.refresh(rule)
+            run = StockRuleRun(
+                rule_id=rule.id,
+                status="completed",
+                target_count=1,
+                match_count=1,
+                error=encode_rule_batch_metadata(
+                    [rule.id],
+                    ["放量观察"],
+                    [],
+                    completed_count=1,
+                    run_key="same-snapshot",
+                ),
+            )
+            session.add(run)
+            session.commit()
+            session.refresh(run)
+            session.add(StockRuleMatch(
+                run_id=run.id,
+                rule_id=rule.id,
+                stock_code="600519",
+                stock_name="贵州茅台",
+                matched_groups_json="[]",
+                snapshot_json=json.dumps({
+                    "_matched_events": [
+                        {"date": "2026-05-07"},
+                        {"date": "2026-05-08"},
+                    ],
+                }),
+            ))
+            session.commit()
+
+        item = repo.find_reusable_run_by_key("same-snapshot")
+
+        assert item["match_count"] == 1
+        assert item["event_count"] == 2
+        assert item["reused_run"] is True
+    finally:
+        DatabaseManager.reset_instance()
+
+
+def test_rule_repository_list_runs_skips_large_snapshot_event_recount():
+    DatabaseManager.reset_instance()
+    db = DatabaseManager(db_url="sqlite:///:memory:")
+    try:
+        repo = RuleRepository(db)
+        with db.get_session() as session:
+            rule = StockRule(
+                name="放量观察",
+                period="daily",
+                lookback_days=120,
+                target_scope="custom",
+                target_codes_json="[]",
+                definition_json="{}",
+            )
+            session.add(rule)
+            session.commit()
+            session.refresh(rule)
+            small_run = StockRuleRun(
+                rule_id=rule.id,
+                status="completed",
+                target_count=1,
+                match_count=1,
+                started_at=datetime(2026, 5, 7, 9, 30),
+            )
+            large_run = StockRuleRun(
+                rule_id=rule.id,
+                status="completed",
+                target_count=1001,
+                match_count=1001,
+                started_at=datetime(2026, 5, 7, 10, 30),
+            )
+            session.add_all([small_run, large_run])
+            session.commit()
+            session.refresh(small_run)
+            session.refresh(large_run)
+            small_run_id = small_run.id
+            large_run_id = large_run.id
+            for run in (small_run, large_run):
+                session.add(StockRuleMatch(
+                    run_id=run.id,
+                    rule_id=rule.id,
+                    stock_code="600519",
+                    stock_name="贵州茅台",
+                    matched_groups_json="[]",
+                    snapshot_json=json.dumps({
+                        "_matched_events": [
+                            {"date": "2026-05-07"},
+                            {"date": "2026-05-08"},
+                        ],
+                    }),
+                ))
+            session.commit()
+
+        items = repo.list_runs(limit=2)
+        by_id = {item["id"]: item for item in items}
+
+        assert by_id[small_run_id]["event_count"] == 2
+        assert by_id[large_run_id]["event_count"] == 1001
+        assert repo.get_run(large_run_id)["event_count"] == 2
+    finally:
+        DatabaseManager.reset_instance()
+
+
 def test_metric_frame_maps_chip_ratios_to_percent_values():
     frame = build_metric_frame(
         _history(),
@@ -645,10 +889,20 @@ def test_metric_registry_groups_indicator_page_metrics_by_chart_area():
 
     assert registry["current_price"]["category"] == "核心行情"
     assert registry["total_mv"]["category"] == "核心行情"
+    assert registry["pe_ratio_percentile_250d"]["category"] == "核心行情"
+    assert registry["pe_ratio_percentile_250d"]["unit"] == "%"
     assert registry["close"]["category"] == "K线图"
     assert registry["price_range_30d_pct"]["category"] == "K线图"
     assert registry["prev_5d_return_pct"]["category"] == "额外"
     assert registry["prev_20d_return_pct"]["category"] == "额外"
+    assert registry["trend_start_signal"]["category"] == "趋势起涨"
+    assert registry["trend_live_setup_score"]["category"] == "趋势起涨"
+    assert registry["trend_live_confirm_signal"]["category"] == "趋势起涨"
+    assert registry["trend_overheat_risk_signal"]["category"] == "趋势起涨"
+    assert registry["trend_failure_signal"]["category"] == "趋势起涨"
+    assert registry["history_trading_days_count"]["category"] == "趋势起涨"
+    assert registry["prior_10d_breakout_20d_count"]["category"] == "趋势起涨"
+    assert registry["volume_expansion_20d_ratio"]["unit"] == "倍"
     assert registry["limit_up_price"]["category"] == "K线图"
     assert registry["volume_ma5"]["category"] == "成交量图"
     assert registry["volume"]["unit"] == "手"
@@ -701,6 +955,291 @@ def test_metric_frame_calculates_indicator_page_metrics_for_rules():
     assert latest["amount_ma5"] == 19920
     assert latest["main_force_net"] > 0
     assert round(latest["net_super_large_order"], 6) == round(latest["main_force_net"] * 0.44, 6)
+
+
+def test_metric_frame_calculates_pe_ratio_percentile_250d():
+    history = []
+    base = date(2025, 1, 1)
+    for index in range(85):
+        close = 10 + index * 0.1
+        history.append({
+            "date": (base + timedelta(days=index)).isoformat(),
+            "open": close - 0.1,
+            "high": close + 0.2,
+            "low": close - 0.2,
+            "close": close,
+            "volume": 1000 + index,
+            "amount": close * (1000 + index),
+            "pct_chg": 1,
+            "pe_ratio": 20 + index,
+        })
+
+    frame = build_metric_frame(history)
+
+    assert math.isnan(frame.iloc[78]["pe_ratio_percentile_250d"])
+    assert frame.iloc[79]["pe_ratio_percentile_250d"] == 100
+    assert frame.iloc[-1]["pe_ratio_percentile_250d"] == 100
+
+
+def test_live_history_sync_carries_forward_valuation_fields_for_latest_metrics():
+    history = []
+    base = date(2025, 1, 1)
+    for index in range(85):
+        close = 10 + index * 0.1
+        history.append({
+            "date": (base + timedelta(days=index)).isoformat(),
+            "open": close - 0.1,
+            "high": close + 0.2,
+            "low": close - 0.2,
+            "close": close,
+            "volume": 1000 + index,
+            "amount": close * (1000 + index),
+            "pct_chg": 1,
+            "pe_ratio": 20 + index,
+            "total_mv": 1_000_000 + index * 10_000,
+            "circ_mv": 800_000 + index * 8_000,
+            "total_shares": 100_000,
+            "float_shares": 80_000,
+        })
+
+    previous_close = history[-1]["close"]
+    previous_pe = history[-1]["pe_ratio"]
+    quote = {
+        "stock_code": "600519",
+        "current_price": previous_close * 1.1,
+        "open": previous_close,
+        "high": previous_close * 1.12,
+        "low": previous_close * 0.99,
+        "volume": 2000,
+        "amount": previous_close * 1.1 * 2000,
+        "change_percent": 10,
+        "snapshot_time": "2025-04-01T10:00:00",
+        "quote_time": "2025-04-01T10:00:00",
+        "source": "intraday_hot_table",
+    }
+
+    rows = RuleService._sync_latest_history_rows_with_quote("600519", history, quote)
+    frame = build_metric_frame(rows, quote)
+    latest = frame.iloc[-1]
+
+    assert latest["date"] == "2025-04-01"
+    assert round(latest["pe_ratio"], 6) == round(previous_pe * 1.1, 6)
+    assert latest["pe_ratio_percentile_250d"] == 100
+    assert latest["total_shares"] == 100_000
+    assert latest["float_shares"] == 80_000
+
+
+def test_metric_frame_tracks_history_days_and_prior_breakout_count():
+    base = date(2026, 1, 1)
+    history = []
+    for index in range(25):
+        close = 10 + index * 0.1
+        history.append({
+            "date": (base + timedelta(days=index)).isoformat(),
+            "open": close - 0.05,
+            "high": close + 0.1,
+            "low": close - 0.1,
+            "close": close,
+            "volume": 1000 + index * 10,
+            "amount": close * (1000 + index * 10),
+        })
+
+    frame = build_metric_frame(history)
+
+    assert frame.iloc[0]["history_trading_days_count"] == 1
+    assert frame.iloc[-1]["history_trading_days_count"] == 25
+    first_breakout_index = frame.index[frame["price_breakout_20d_signal"] == 1][0]
+    assert frame.iloc[first_breakout_index]["prior_10d_breakout_20d_count"] == 0
+    assert frame.iloc[first_breakout_index + 1]["prior_10d_breakout_20d_count"] == 1
+
+
+def _trend_start_history(latest_volume=3000):
+    base = date(2026, 1, 1)
+    history = []
+    for index in range(60):
+        close = 10 + (index % 3) * 0.02
+        history.append({
+            "date": (base + timedelta(days=index)).isoformat(),
+            "open": close,
+            "high": close + 0.1,
+            "low": close - 0.1,
+            "close": close,
+            "volume": 1000,
+            "amount": close * 1000,
+        })
+
+    for offset, close in enumerate([11, 12, 13, 14], start=60):
+        history.append({
+            "date": (base + timedelta(days=offset)).isoformat(),
+            "open": close - 0.2,
+            "high": close + 0.2,
+            "low": close - 0.5,
+            "close": close,
+            "volume": 1200,
+            "amount": close * 1200,
+        })
+
+    history.append({
+        "date": (base + timedelta(days=64)).isoformat(),
+        "open": 14.2,
+        "high": 15.0,
+        "low": 14.1,
+        "close": 14.8,
+        "volume": latest_volume,
+        "amount": 14.8 * latest_volume,
+    })
+    return history
+
+
+def _live_trend_setup_history(latest_close=11.0, latest_volume=1800):
+    base = date(2026, 1, 1)
+    history = []
+    for index in range(60):
+        close = 10 + (index % 5) * 0.03 - (0.02 if index % 2 else 0)
+        history.append({
+            "date": (base + timedelta(days=index)).isoformat(),
+            "open": close - 0.02,
+            "high": close + 0.08,
+            "low": close - 0.08,
+            "close": close,
+            "volume": 1000,
+            "amount": close * 1000,
+        })
+
+    for offset, close in enumerate([10.15, 10.05, 10.25, 10.20, 10.42], start=60):
+        history.append({
+            "date": (base + timedelta(days=offset)).isoformat(),
+            "open": close - 0.05,
+            "high": close + 0.08,
+            "low": close - 0.1,
+            "close": close,
+            "volume": 1100,
+            "amount": close * 1100,
+        })
+
+    history.append({
+        "date": (base + timedelta(days=65)).isoformat(),
+        "open": 10.48 if latest_close >= 10 else 10.2,
+        "high": max(10.25, latest_close + 0.05),
+        "low": min(10.45, latest_close - 0.05),
+        "close": latest_close,
+        "volume": latest_volume,
+        "amount": latest_close * latest_volume,
+    })
+    return history
+
+
+def test_metric_frame_calculates_trend_start_signal():
+    frame = build_metric_frame(_trend_start_history())
+    latest = frame.iloc[-1]
+
+    assert latest["ma_bullish_alignment_signal"] == 1
+    assert latest["ma_uptrend_signal"] == 1
+    assert latest["price_breakout_20d_signal"] == 1
+    assert latest["price_breakout_60d_signal"] == 1
+    assert latest["volume_expansion_signal"] == 1
+    assert latest["macd_dif"] > latest["macd_dea"] > 0
+    assert 0 < latest["bias_ma5_pct"] <= 15
+    assert latest["trend_start_signal"] == 1
+
+
+def test_metric_frame_calculates_live_trend_confirm_signal_without_future_returns():
+    frame = build_metric_frame(_live_trend_setup_history())
+    latest = frame.iloc[-1]
+
+    assert latest["price_breakout_20d_signal"] == 1
+    assert latest["volume_expansion_20d_ratio"] >= 1.2
+    assert latest["macd_dif"] > latest["macd_dea"] > 0
+    assert latest["trend_live_setup_score"] >= 9
+    assert latest["trend_live_watch_signal"] == 1
+    assert latest["trend_live_confirm_signal"] == 1
+    assert latest["trend_overheat_risk_signal"] == 0
+    assert latest["trend_failure_signal"] == 0
+
+
+def test_metric_frame_blocks_live_trend_confirm_when_overheated():
+    frame = build_metric_frame(_trend_start_history())
+    latest = frame.iloc[-1]
+
+    assert latest["trend_live_setup_score"] >= 7
+    assert latest["trend_overheat_risk_score"] >= 3
+    assert latest["trend_overheat_risk_signal"] == 1
+    assert latest["trend_live_watch_signal"] == 0
+    assert latest["trend_live_confirm_signal"] == 0
+
+
+def test_metric_frame_flags_live_trend_failure_after_losing_ma20():
+    frame = build_metric_frame(_live_trend_setup_history(latest_close=9.7, latest_volume=1200))
+    latest = frame.iloc[-1]
+
+    assert latest["close"] < latest["ma20"]
+    assert latest["trend_failure_signal"] == 1
+    assert latest["trend_live_watch_signal"] == 0
+    assert latest["trend_live_confirm_signal"] == 0
+
+
+def test_rule_engine_matches_trend_start_signal_metric():
+    frame = build_metric_frame(_trend_start_history())
+    definition = {
+        "period": "daily",
+        "lookback_days": 120,
+        "target": {"scope": "custom", "stock_codes": ["600519"]},
+        "groups": [
+            {
+                "id": "g1",
+                "conditions": [
+                    {
+                        "id": "c1",
+                        "left": {"metric": "trend_start_signal"},
+                        "operator": "=",
+                        "right": {"type": "literal", "value": 1},
+                    }
+                ],
+            }
+        ],
+    }
+
+    result = evaluate_rule(definition, frame)
+
+    assert result["matched"] is True
+    assert result["matched_groups"][0]["conditions"][0]["values"]["left"] == 1
+
+
+def test_rule_engine_matches_live_trend_confirm_signal_metric():
+    frame = build_metric_frame(_live_trend_setup_history())
+    definition = {
+        "period": "daily",
+        "lookback_days": 120,
+        "target": {"scope": "custom", "stock_codes": ["600519"]},
+        "groups": [
+            {
+                "id": "g1",
+                "conditions": [
+                    {
+                        "id": "c1",
+                        "left": {"metric": "trend_live_confirm_signal"},
+                        "operator": "=",
+                        "right": {"type": "literal", "value": 1},
+                    }
+                ],
+            }
+        ],
+    }
+
+    result = evaluate_rule(definition, frame)
+
+    assert result["matched"] is True
+    assert result["matched_groups"][0]["conditions"][0]["values"]["left"] == 1
+
+
+def test_metric_frame_rejects_trend_start_without_volume_expansion():
+    frame = build_metric_frame(_trend_start_history(latest_volume=900))
+    latest = frame.iloc[-1]
+
+    assert latest["ma_bullish_alignment_signal"] == 1
+    assert latest["price_breakout_60d_signal"] == 1
+    assert latest["volume_expansion_signal"] == 0
+    assert latest["trend_start_signal"] == 0
 
 
 def test_metric_frame_calculates_previous_window_cumulative_return_metrics():
@@ -1251,6 +1790,90 @@ def _service_rule_for_codes(codes):
     return rule
 
 
+def test_rule_service_batch_run_key_changes_when_rule_definition_changes():
+    first_rule = _service_rule_for_codes(["600519"])
+    second_rule = _service_rule_for_codes(["600519"])
+    second_rule["definition"]["groups"][0]["conditions"][0]["right"]["value"] = 13
+
+    first_fingerprint = RuleService._build_rule_definition_fingerprints([
+        (1, first_rule, first_rule["definition"], ["600519"]),
+    ])
+    second_fingerprint = RuleService._build_rule_definition_fingerprints([
+        (1, second_rule, second_rule["definition"], ["600519"]),
+    ])
+    first_key = RuleService._build_batch_run_key(
+        [1],
+        first_fingerprint,
+        "history",
+        "db_only",
+        date(2026, 1, 1),
+        date(2026, 6, 7),
+        ["600519"],
+        None,
+    )
+    second_key = RuleService._build_batch_run_key(
+        [1],
+        second_fingerprint,
+        "history",
+        "db_only",
+        date(2026, 1, 1),
+        date(2026, 6, 7),
+        ["600519"],
+        None,
+    )
+
+    assert first_fingerprint != second_fingerprint
+    assert first_key != second_key
+
+
+def test_rule_service_history_events_passes_only_requested_date_indices(monkeypatch):
+    frame = build_metric_frame(_history())
+    definition = {
+        "period": "daily",
+        "groups": [
+            {
+                "id": "g1",
+                "conditions": [
+                    {
+                        "id": "c1",
+                        "left": {"metric": "close"},
+                        "operator": ">",
+                        "right": {"type": "literal", "value": 0},
+                    }
+                ],
+            }
+        ],
+    }
+    captured = {}
+
+    def fake_evaluate_rule_history(_definition, metric_frame, indices=None):
+        captured["indices"] = list(indices or [])
+        return [
+            {
+                "date": str(metric_frame.iloc[index].get("date")),
+                "index": index,
+                "matched_groups": [{"id": "g1", "matched": True, "conditions": []}],
+                "condition_results": [],
+                "snapshot": {},
+            }
+            for index in captured["indices"]
+        ]
+
+    monkeypatch.setattr(rule_service_module, "evaluate_rule_history", fake_evaluate_rule_history)
+    service = RuleService.__new__(RuleService)
+
+    events = service._evaluate_history_events(
+        definition,
+        frame,
+        lookback_days=120,
+        start_date=date(2026, 4, 3),
+        end_date=date(2026, 4, 4),
+    )
+
+    assert captured["indices"] == [2, 3]
+    assert [event["date"] for event in events] == ["2026-04-03", "2026-04-04"]
+
+
 class _PartiallyFailingStockService(_FakeStockService):
     def get_history_data(self, stock_code, period="daily", days=30):
         if stock_code == "000001":
@@ -1452,6 +2075,39 @@ class _PreopenBatchHistoryStockService(_BatchHistoryOnlyStockService):
                 "data_source": "intraday_hot_table",
             }
         return super().get_history_data(stock_code, period=period, days=days, data_policy=data_policy)
+
+
+class _BatchHistoryWithIntradayQuoteDb:
+    def __init__(self):
+        self.quote_batch_calls = []
+
+    def get_intraday_minute_latest_quotes_batch(self, codes, *, trade_date=None):
+        self.quote_batch_calls.append((list(codes), trade_date))
+        return {
+            code: {
+                "stock_code": code,
+                "stock_name": "测试股票",
+                "current_price": 16,
+                "open": 15,
+                "high": 17,
+                "low": 14,
+                "volume": 3000,
+                "amount": 48000,
+                "change_percent": 6.67,
+                "quote_time": "2026-05-08T10:00:00",
+                "snapshot_id": "slow-path-batch-snapshot",
+                "snapshot_time": "2026-05-08T10:00:00",
+                "source": "intraday_hot_table",
+            }
+            for code in codes
+        }
+
+
+class _BatchHistoryWithIntradayQuoteStockService(_BatchHistoryOnlyStockService):
+    def __init__(self):
+        super().__init__()
+        self.db = _BatchHistoryWithIntradayQuoteDb()
+        self.repo = mock.Mock(db=self.db)
 
 
 class _FastLatestRuleDb:
@@ -2285,6 +2941,9 @@ def test_rule_service_async_batch_updates_completed_stock_progress():
     assert [item["completed_count"] for item in repo.progress_updates] == [1, 2]
     assert repo.finished_status == "completed"
     assert len(repo.finished_matches) == 4
+    finished_metadata, _ = _decode_rule_batch_metadata(repo.finished_error)
+    assert finished_metadata.get("run_key")
+    assert "rule_fingerprints" not in finished_metadata
 
 
 def test_rule_service_async_batch_skips_locked_progress_and_finishes_run():
@@ -2326,6 +2985,11 @@ def test_rule_service_async_batch_cleans_stale_runs_before_starting_new_run():
         def __init__(self, rules):
             super().__init__(rules)
             self.cleaned_stale_runs = False
+            self.orphaned_cutoff = None
+
+        def fail_running_runs_started_before(self, cutoff):
+            self.orphaned_cutoff = cutoff
+            return 1
 
         def fail_stale_running_runs(self):
             self.cleaned_stale_runs = True
@@ -2343,6 +3007,7 @@ def test_rule_service_async_batch_cleans_stale_runs_before_starting_new_run():
 
     assert response["status"] == "running"
     assert context is not None
+    assert repo.orphaned_cutoff == rule_service_module.RULE_SERVICE_PROCESS_STARTED_AT
     assert repo.cleaned_stale_runs is True
 
 
@@ -2411,6 +3076,26 @@ def test_rule_service_async_batch_reuses_preloaded_history_cache():
         assert stock_service.per_stock_history_calls == []
         assert repo.finished_status == "completed"
         assert len(repo.finished_matches) == 2
+    finally:
+        rule_service_module._RULE_RUN_HISTORY_CACHE.clear()
+
+
+def test_rule_service_large_history_batch_skips_shared_history_cache():
+    rule_service_module._RULE_RUN_HISTORY_CACHE.clear()
+    try:
+        codes = [f"6{index:05d}" for index in range(rule_service_module.RULE_RUN_HISTORY_CACHE_MAX_STOCKS + 1)]
+        stock_service = _BatchHistoryOnlyStockService()
+        service = RuleService(repo=mock.Mock(), stock_service=stock_service)
+
+        history = service._get_or_load_rule_history_cache(
+            codes,
+            {code: 120 for code in codes},
+            "db_only",
+        )
+
+        assert len(stock_service.batch_history_calls) == 1
+        assert len(history) == len(codes)
+        assert rule_service_module._RULE_RUN_HISTORY_CACHE == {}
     finally:
         rule_service_module._RULE_RUN_HISTORY_CACHE.clear()
 
@@ -2557,6 +3242,51 @@ def test_rule_service_preopen_prewarm_metadata_persists_in_repository():
         rule_service_module._RULE_RUN_HISTORY_CACHE.clear()
         rule_service_module._LIVE_RULE_RUN_HISTORY_CACHE.clear()
         rule_service_module._LIVE_RULE_RUN_SCAN_CACHE.clear()
+
+
+def test_rule_service_slow_latest_batch_preloads_intraday_hot_table_quotes():
+    rule = _service_rule_for_codes(["600519", "000001"])
+    rule["definition"]["groups"][0]["conditions"] = [
+        {
+            "id": "cond-trend-start",
+            "left": {"metric": "trend_start_signal", "offset": 0},
+            "operator": "=",
+            "right": {"type": "literal", "value": 1},
+        }
+    ]
+    repo = _ProgressRuleRepo([rule])
+    stock_service = _BatchHistoryWithIntradayQuoteStockService()
+    service = RuleService(repo=repo, stock_service=stock_service)
+    service._resolve_run_workers = lambda target_count: 1
+    service._build_intraday_hot_table_quote = mock.Mock(
+        side_effect=AssertionError("slow latest batch should use preloaded quote cache")
+    )
+
+    with mock.patch(
+        "src.services.rule_service.RuleService._is_cn_live_test_allowed",
+        return_value=True,
+    ), mock.patch(
+        "src.services.rule_service.trading_calendar.get_market_now",
+        return_value=datetime(2026, 5, 8, 10, 0),
+    ), mock.patch(
+        "src.services.rule_service.trading_calendar.is_market_open",
+        return_value=True,
+    ):
+        response, context = service.start_run_rules(
+            [1],
+            mode="latest",
+            target_override={"scope": "custom", "stock_codes": ["600519", "000001"]},
+            data_policy="default",
+        )
+        service.complete_started_run_rules(**context)
+
+    assert response["status"] == "running"
+    assert stock_service.db.quote_batch_calls == [
+        (["600519", "000001"], date(2026, 5, 8)),
+    ]
+    assert stock_service.per_stock_history_calls == []
+    service._build_intraday_hot_table_quote.assert_not_called()
+    assert repo.finished_status == "completed"
 
 
 def test_rule_service_async_batch_reuses_history_and_skips_chip_for_light_rules():
@@ -2963,6 +3693,35 @@ def test_rule_service_resolves_all_a_shares_scope_from_stock_index():
         codes = service._resolve_target_codes({"scope": "all_a_shares", "stock_codes": []})
 
     assert codes == ["000001", "600519"]
+
+
+def test_rule_service_all_a_shares_merges_local_daily_codes_missing_from_index():
+    DatabaseManager.reset_instance()
+    db = DatabaseManager(db_url="sqlite:///:memory:")
+    try:
+        with db.get_session() as session:
+            session.add_all([
+                StockDaily(code="688813", date=date(2026, 4, 30), close=186.8),
+                StockDaily(code="920125", date=date(2026, 5, 27), close=189.83),
+                StockDaily(code="00700", date=date(2026, 5, 27), close=500),
+            ])
+            session.commit()
+
+        service = RuleService.__new__(RuleService)
+        service.stock_service = mock.Mock(repo=mock.Mock(db=db))
+
+        with mock.patch(
+            "src.data.stock_index_loader.get_all_a_share_stock_codes",
+            return_value=["600519"],
+        ):
+            codes = service._resolve_target_codes({"scope": "all_a_shares", "stock_codes": []})
+
+        assert codes[:1] == ["600519"]
+        assert "688813" in codes
+        assert "920125" in codes
+        assert "00700" not in codes
+    finally:
+        DatabaseManager.reset_instance()
 
 
 def test_rule_service_rejects_empty_all_a_shares_stock_index():

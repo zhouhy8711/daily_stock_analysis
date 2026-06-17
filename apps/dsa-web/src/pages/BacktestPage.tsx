@@ -1,10 +1,15 @@
 import type React from 'react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
+  ArrowDown,
+  ArrowUp,
+  ArrowUpDown,
   CalendarDays,
   ChevronDown,
+  ChevronLeft,
   ChevronRight,
   ClipboardList,
+  Download,
   Filter,
   ListFilter,
   Maximize2,
@@ -41,6 +46,7 @@ const TEXTAREA_CLASS =
 const WATCHLIST_HISTORY_LIMIT = 20;
 const LIVE_TEST_POLL_INTERVAL_MS = 30_000;
 const LIVE_COMPACT_MODE_STORAGE_KEY = 'dsa.liveTest.compactMode.v1';
+const RESULT_TABLE_PAGE_SIZE = 250;
 const ASHARE_LIVE_TEST_WINDOW_TEXT = 'A股实测仅在交易日 15:00 及以前运行';
 const ASHARE_LIVE_TEST_CLOSED_MESSAGE = `${ASHARE_LIVE_TEST_WINDOW_TEXT}；当前已超过实测时间，未触发实时扫描`;
 const UNCLASSIFIED_INDUSTRY = UNCLASSIFIED_INDUSTRY_LABEL;
@@ -79,6 +85,13 @@ type ResultValueColumn = {
   header: string;
   side: 'left' | 'right';
 };
+type ResultSortField = 'stock' | 'industry' | 'date';
+type ResultSortDirection = 'asc' | 'desc';
+type ResultSortCriterion = {
+  field: ResultSortField;
+  direction: ResultSortDirection;
+};
+type ResultSortState = ResultSortCriterion[];
 
 function isTransientLiveTestReadError(error: ParsedApiError): boolean {
   return [
@@ -159,6 +172,7 @@ type IndicatorAnalysisSelection = {
   stockCode: string;
   stockName: string;
   eventDate: string;
+  historicalCutoffDate?: string | null;
 };
 
 type BacktestRuntimeState = {
@@ -617,6 +631,9 @@ function getStockIdSortKey(stockCode: string): string {
 }
 
 function compareResultRows(left: RuleRunEventRow, right: RuleRunEventRow): number {
+  const stockIdCompare = getStockIdSortKey(left.stockCode).localeCompare(getStockIdSortKey(right.stockCode));
+  if (stockIdCompare !== 0) return stockIdCompare;
+
   const leftDate = getResultRowDateSortValue(left);
   const rightDate = getResultRowDateSortValue(right);
   if (leftDate != null && rightDate != null && leftDate !== rightDate) {
@@ -626,9 +643,6 @@ function compareResultRows(left: RuleRunEventRow, right: RuleRunEventRow): numbe
   const dateTextCompare = right.eventDate.localeCompare(left.eventDate);
   if (dateTextCompare !== 0) return dateTextCompare;
 
-  const stockIdCompare = getStockIdSortKey(left.stockCode).localeCompare(getStockIdSortKey(right.stockCode));
-  if (stockIdCompare !== 0) return stockIdCompare;
-
   const stockCodeCompare = left.stockCode.localeCompare(right.stockCode);
   if (stockCodeCompare !== 0) return stockCodeCompare;
 
@@ -637,6 +651,319 @@ function compareResultRows(left: RuleRunEventRow, right: RuleRunEventRow): numbe
 
 function sortResultRows(rows: RuleRunEventRow[]): RuleRunEventRow[] {
   return [...rows].sort(compareResultRows);
+}
+
+function compareOptionalText(left: string | null | undefined, right: string | null | undefined): number {
+  const leftText = left?.trim();
+  const rightText = right?.trim();
+  if (!leftText && !rightText) return 0;
+  if (!leftText) return 1;
+  if (!rightText) return -1;
+  return leftText.localeCompare(rightText);
+}
+
+function compareResultRowsByField(
+  left: RuleRunEventRow,
+  right: RuleRunEventRow,
+  field: ResultSortField,
+  stockLookup: Map<string, StockListDisplayItem>,
+): number {
+  if (field === 'stock') {
+    const stockIdCompare = compareOptionalText(getStockIdSortKey(left.stockCode), getStockIdSortKey(right.stockCode));
+    if (stockIdCompare !== 0) return stockIdCompare;
+    return compareOptionalText(left.stockCode, right.stockCode);
+  }
+
+  if (field === 'industry') {
+    return compareOptionalText(
+      getResultRowIndustryLabel(left, stockLookup),
+      getResultRowIndustryLabel(right, stockLookup),
+    );
+  }
+
+  const leftDate = getResultRowDateSortValue(left);
+  const rightDate = getResultRowDateSortValue(right);
+  if (leftDate != null && rightDate != null && leftDate !== rightDate) {
+    return leftDate - rightDate;
+  }
+  return compareOptionalText(left.eventDate, right.eventDate);
+}
+
+function compareResultRowsBySort(
+  left: RuleRunEventRow,
+  right: RuleRunEventRow,
+  sortState: ResultSortState,
+  stockLookup: Map<string, StockListDisplayItem>,
+): number {
+  for (const criterion of sortState) {
+    const result = compareResultRowsByField(left, right, criterion.field, stockLookup);
+    if (result !== 0) {
+      return criterion.direction === 'asc' ? result : -result;
+    }
+  }
+  return compareResultRows(left, right);
+}
+
+function sortResultRowsForDisplay(
+  rows: RuleRunEventRow[],
+  sortState: ResultSortState,
+  stockLookup: Map<string, StockListDisplayItem>,
+): RuleRunEventRow[] {
+  if (sortState.length === 0) {
+    return rows;
+  }
+  return [...rows].sort((left, right) => compareResultRowsBySort(left, right, sortState, stockLookup));
+}
+
+function escapeSpreadsheetXml(value: string): string {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;');
+}
+
+function sanitizeDownloadName(value: string): string {
+  return value
+    .trim()
+    .replace(/[\\/:*?"<>|]+/g, '_')
+    .replace(/\s+/g, '_')
+    .slice(0, 60) || 'rule';
+}
+
+function buildXlsxCell(column: string, rowIndex: number, value: string): string {
+  return `<c r="${column}${rowIndex}" t="inlineStr"><is><t>${escapeSpreadsheetXml(value)}</t></is></c>`;
+}
+
+function buildBacktestResultWorksheetXml(
+  rows: RuleRunEventRow[],
+  stockLookup: Map<string, StockListDisplayItem>,
+): string {
+  const header = ['股票', '行业', '日期'];
+  const tableRows = [
+    header,
+    ...rows.map((row) => [
+      row.stockName ? `${row.stockCode} ${row.stockName}` : row.stockCode,
+      getResultRowIndustryLabel(row, stockLookup),
+      row.eventDate,
+    ]),
+  ];
+  const sheetRows = tableRows
+    .map((row, rowIndex) => {
+      const excelRowIndex = rowIndex + 1;
+      const cells = row
+        .map((cellValue, columnIndex) => buildXlsxCell(['A', 'B', 'C'][columnIndex], excelRowIndex, cellValue))
+        .join('');
+      return `<row r="${excelRowIndex}">${cells}</row>`;
+    })
+    .join('');
+  const lastRow = Math.max(tableRows.length, 1);
+
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <dimension ref="A1:C${lastRow}"/>
+  <cols>
+    <col min="1" max="1" width="24" customWidth="1"/>
+    <col min="2" max="2" width="18" customWidth="1"/>
+    <col min="3" max="3" width="14" customWidth="1"/>
+  </cols>
+  <sheetData>${sheetRows}</sheetData>
+</worksheet>`;
+}
+
+const XLSX_MIME_TYPE = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+const ZIP_DOS_TIME = 0;
+const ZIP_DOS_DATE = ((2026 - 1980) << 9) | (1 << 5) | 1;
+
+function buildCrc32Table(): number[] {
+  const table: number[] = [];
+  for (let index = 0; index < 256; index += 1) {
+    let value = index;
+    for (let bit = 0; bit < 8; bit += 1) {
+      value = value & 1 ? 0xedb88320 ^ (value >>> 1) : value >>> 1;
+    }
+    table[index] = value >>> 0;
+  }
+  return table;
+}
+
+const CRC32_TABLE = buildCrc32Table();
+
+function calculateCrc32(data: Uint8Array): number {
+  let crc = 0xffffffff;
+  for (const byte of data) {
+    crc = CRC32_TABLE[(crc ^ byte) & 0xff] ^ (crc >>> 8);
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+function writeUint16Le(buffer: Uint8Array, offset: number, value: number): number {
+  buffer[offset] = value & 0xff;
+  buffer[offset + 1] = (value >>> 8) & 0xff;
+  return offset + 2;
+}
+
+function writeUint32Le(buffer: Uint8Array, offset: number, value: number): number {
+  buffer[offset] = value & 0xff;
+  buffer[offset + 1] = (value >>> 8) & 0xff;
+  buffer[offset + 2] = (value >>> 16) & 0xff;
+  buffer[offset + 3] = (value >>> 24) & 0xff;
+  return offset + 4;
+}
+
+type XlsxZipFile = {
+  path: string;
+  content: string;
+};
+
+function buildStoredZip(files: XlsxZipFile[]): Uint8Array {
+  const encoder = new TextEncoder();
+  const entries = files.map((file) => {
+    const nameBytes = encoder.encode(file.path);
+    const data = encoder.encode(file.content);
+    return {
+      nameBytes,
+      data,
+      crc32: calculateCrc32(data),
+      localHeaderOffset: 0,
+    };
+  });
+  const localSize = entries.reduce((sum, entry) => sum + 30 + entry.nameBytes.length + entry.data.length, 0);
+  const centralDirectorySize = entries.reduce((sum, entry) => sum + 46 + entry.nameBytes.length, 0);
+  const archive = new Uint8Array(localSize + centralDirectorySize + 22);
+  let offset = 0;
+
+  for (const entry of entries) {
+    entry.localHeaderOffset = offset;
+    offset = writeUint32Le(archive, offset, 0x04034b50);
+    offset = writeUint16Le(archive, offset, 20);
+    offset = writeUint16Le(archive, offset, 0x0800);
+    offset = writeUint16Le(archive, offset, 0);
+    offset = writeUint16Le(archive, offset, ZIP_DOS_TIME);
+    offset = writeUint16Le(archive, offset, ZIP_DOS_DATE);
+    offset = writeUint32Le(archive, offset, entry.crc32);
+    offset = writeUint32Le(archive, offset, entry.data.length);
+    offset = writeUint32Le(archive, offset, entry.data.length);
+    offset = writeUint16Le(archive, offset, entry.nameBytes.length);
+    offset = writeUint16Le(archive, offset, 0);
+    archive.set(entry.nameBytes, offset);
+    offset += entry.nameBytes.length;
+    archive.set(entry.data, offset);
+    offset += entry.data.length;
+  }
+
+  const centralDirectoryOffset = offset;
+  for (const entry of entries) {
+    offset = writeUint32Le(archive, offset, 0x02014b50);
+    offset = writeUint16Le(archive, offset, 20);
+    offset = writeUint16Le(archive, offset, 20);
+    offset = writeUint16Le(archive, offset, 0x0800);
+    offset = writeUint16Le(archive, offset, 0);
+    offset = writeUint16Le(archive, offset, ZIP_DOS_TIME);
+    offset = writeUint16Le(archive, offset, ZIP_DOS_DATE);
+    offset = writeUint32Le(archive, offset, entry.crc32);
+    offset = writeUint32Le(archive, offset, entry.data.length);
+    offset = writeUint32Le(archive, offset, entry.data.length);
+    offset = writeUint16Le(archive, offset, entry.nameBytes.length);
+    offset = writeUint16Le(archive, offset, 0);
+    offset = writeUint16Le(archive, offset, 0);
+    offset = writeUint16Le(archive, offset, 0);
+    offset = writeUint16Le(archive, offset, 0);
+    offset = writeUint32Le(archive, offset, 0);
+    offset = writeUint32Le(archive, offset, entry.localHeaderOffset);
+    archive.set(entry.nameBytes, offset);
+    offset += entry.nameBytes.length;
+  }
+
+  offset = writeUint32Le(archive, offset, 0x06054b50);
+  offset = writeUint16Le(archive, offset, 0);
+  offset = writeUint16Le(archive, offset, 0);
+  offset = writeUint16Le(archive, offset, entries.length);
+  offset = writeUint16Le(archive, offset, entries.length);
+  offset = writeUint32Le(archive, offset, centralDirectorySize);
+  offset = writeUint32Le(archive, offset, centralDirectoryOffset);
+  writeUint16Le(archive, offset, 0);
+
+  return archive;
+}
+
+function buildBacktestResultXlsxBlob(
+  rows: RuleRunEventRow[],
+  stockLookup: Map<string, StockListDisplayItem>,
+): Blob {
+  const worksheetXml = buildBacktestResultWorksheetXml(rows, stockLookup);
+  const archive = buildStoredZip([
+    {
+      path: '[Content_Types].xml',
+      content: `<?xml version="1.0" encoding="UTF-8"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
+  <Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
+</Types>`,
+    },
+    {
+      path: '_rels/.rels',
+      content: `<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
+</Relationships>`,
+    },
+    {
+      path: 'xl/workbook.xml',
+      content: `<?xml version="1.0" encoding="UTF-8"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+  xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <sheets>
+    <sheet name="命中结果" sheetId="1" r:id="rId1"/>
+  </sheets>
+</workbook>`,
+    },
+    {
+      path: 'xl/_rels/workbook.xml.rels',
+      content: `<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
+</Relationships>`,
+    },
+    {
+      path: 'xl/worksheets/sheet1.xml',
+      content: worksheetXml,
+    },
+  ]);
+  const archiveBuffer = new ArrayBuffer(archive.byteLength);
+  new Uint8Array(archiveBuffer).set(archive);
+
+  return new Blob([archiveBuffer], { type: XLSX_MIME_TYPE });
+}
+
+function downloadBacktestResultExcel(
+  rows: RuleRunEventRow[],
+  group: RuleResultGroup,
+  stockLookup: Map<string, StockListDisplayItem>,
+  runId?: number,
+): void {
+  if (
+    typeof document === 'undefined'
+    || typeof URL === 'undefined'
+    || typeof URL.createObjectURL !== 'function'
+    || rows.length === 0
+  ) {
+    return;
+  }
+
+  const blob = buildBacktestResultXlsxBlob(rows, stockLookup);
+  const objectUrl = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  const runPart = runId ? `run-${runId}` : 'current';
+  link.href = objectUrl;
+  link.download = `回测命中_${runPart}_规则${group.ruleId}_${sanitizeDownloadName(group.ruleName)}.xlsx`;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  window.setTimeout(() => URL.revokeObjectURL(objectUrl), 0);
 }
 
 function readLiveCompactModePreference(): boolean {
@@ -938,7 +1265,12 @@ function buildRuleResultGroups(
 ): RuleResultGroup[] {
   const rowsByRule = new Map<number, RuleRunEventRow[]>();
   for (const row of rows) {
-    rowsByRule.set(row.ruleId, [...(rowsByRule.get(row.ruleId) ?? []), row]);
+    const ruleRows = rowsByRule.get(row.ruleId);
+    if (ruleRows) {
+      ruleRows.push(row);
+    } else {
+      rowsByRule.set(row.ruleId, [row]);
+    }
   }
 
   const groups: RuleResultGroup[] = [];
@@ -1024,7 +1356,12 @@ function buildLiveExecutionGroups(
   const rowsByExecutionTime = new Map<string, RuleRunEventRow[]>();
   for (const row of rows) {
     const executionTime = getRowExecutionTime(row);
-    rowsByExecutionTime.set(executionTime, [...(rowsByExecutionTime.get(executionTime) ?? []), row]);
+    const executionRows = rowsByExecutionTime.get(executionTime);
+    if (executionRows) {
+      executionRows.push(row);
+    } else {
+      rowsByExecutionTime.set(executionTime, [row]);
+    }
   }
 
   return Array.from(rowsByExecutionTime.entries())
@@ -1324,6 +1661,8 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
   const [displayRows, setDisplayRowsState] = useState<RuleRunEventRow[]>(
     () => cloneBacktestRuntimeState(mode).displayRows,
   );
+  const [resultSort, setResultSort] = useState<ResultSortState>([]);
+  const [resultPageByGroupKey, setResultPageByGroupKey] = useState<Record<string, number>>({});
   const [activeResultTab, setActiveResultTabState] = useState<ResultTab>(
     () => cloneBacktestRuntimeState(mode).activeResultTab,
   );
@@ -1364,6 +1703,7 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
   const liveCacheKeyRef = useRef<string | null>(null);
   const liveTestCyclesInFlightRef = useRef(0);
   const liveTransientReadErrorCountRef = useRef(0);
+  const livePreopenPrewarmCompletedRef = useRef(false);
   const liveActiveRunRef = useRef<{
     runId: number;
     cycleIndex: number;
@@ -1376,6 +1716,8 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
   const liveLatestSnapshotIdRef = useRef<string | null>(null);
   const liveResultRowsRef = useRef<RuleRunEventRow[]>(displayRows);
   const liveRunIdsRef = useRef<number[]>(selectedRun ? getRunIds(selectedRun) : []);
+  const selectedRunRef = useRef<RuleRunHistoryItem | null>(selectedRun);
+  const displayRowsRef = useRef<RuleRunEventRow[]>(displayRows);
   const logScrollerRef = useRef<HTMLDivElement | null>(null);
 
   const setRunHistory = useCallback((action: React.SetStateAction<RuleRunHistoryItem[]>) => {
@@ -1504,6 +1846,11 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
     liveResultRowsRef.current = displayRows;
     liveRunIdsRef.current = selectedRun ? getRunIds(selectedRun) : [];
   }, [displayRows, isLiveMode, selectedRun]);
+
+  useEffect(() => {
+    selectedRunRef.current = selectedRun;
+    displayRowsRef.current = displayRows;
+  }, [displayRows, selectedRun]);
 
   useEffect(() => {
     if (activeResultTab !== 'logs') return;
@@ -1645,6 +1992,26 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
   const hasActiveRun = Object.values(runProgressById).some((item) => item.progress < 100);
 
   useEffect(() => {
+    if (!pageError || !isTransientLiveTestReadError(pageError)) return;
+    if (activeResultTab !== 'results' || runRows.length === 0 || selectedRun?.status === 'running') return;
+
+    const runId = selectedRun?.id;
+    setPageError(null);
+    setRunWarning((current) => current ?? (
+      runId != null
+        ? `结果读取接口暂时超时，已保留当前 #${runId} 的已加载结果；稍后刷新会自动补读。`
+        : '结果读取接口暂时超时，已保留当前已加载结果；稍后刷新会自动补读。'
+    ));
+  }, [
+    activeResultTab,
+    pageError,
+    runRows.length,
+    selectedRun?.id,
+    selectedRun?.status,
+    setRunWarning,
+  ]);
+
+  useEffect(() => {
     setSelectedRuleIds((current) => {
       const next = current.filter((ruleId) => selectableRuleIds.has(ruleId));
       return next.length === current.length ? current : next;
@@ -1730,7 +2097,18 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
       setRunHistory((current) => current.map((item) => (item.id === run.id ? nextRun : item)));
       setPageError(null);
     } catch (err) {
-      setPageError(getParsedApiError(err));
+      const parsedError = getParsedApiError(err);
+      const currentSelectedRun = selectedRunRef.current;
+      const currentRows = displayRowsRef.current;
+      const runIds = new Set(getRunIds(run));
+      const hasReusableRowsForRun = currentSelectedRun?.id === run.id
+        && currentRows.some((row) => row.runId == null || runIds.has(row.runId));
+      if (hasReusableRowsForRun && isTransientLiveTestReadError(parsedError)) {
+        setPageError(null);
+        setRunWarning(`命中明细读取暂时超时，已保留当前 #${run.id} 的已加载结果；稍后可再次点击该运行记录刷新。`);
+      } else {
+        setPageError(parsedError);
+      }
     } finally {
       setIsLoadingMatches(false);
     }
@@ -1854,7 +2232,19 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
             });
             persistedSelectedRun = { ...persistedSelectedRun, eventCount: persistedRows.length };
           } catch (err) {
-            setPageError(getParsedApiError(err));
+            const parsedError = getParsedApiError(err);
+            const currentRun = selectedRunRef.current;
+            const currentRows = displayRowsRef.current;
+            if (
+              currentRun?.id === persistedSelectedRun.id
+              && currentRows.length > 0
+              && isTransientLiveTestReadError(parsedError)
+            ) {
+              setPageError(null);
+              setRunWarning(`命中明细读取暂时超时，已保留当前 #${persistedSelectedRun.id} 的已加载结果；稍后刷新会自动补读。`);
+            } else {
+              setPageError(parsedError);
+            }
           }
         }
       }
@@ -2024,6 +2414,7 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
     liveCacheKeyRef.current = null;
     liveTestCyclesInFlightRef.current = 0;
     liveTransientReadErrorCountRef.current = 0;
+    livePreopenPrewarmCompletedRef.current = false;
     liveActiveRunRef.current = null;
     liveLatestSnapshotIdRef.current = null;
     setIsRunning(false);
@@ -2059,6 +2450,14 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
       return;
     }
     if (liveTestCyclesInFlightRef.current > 0) return;
+    if (
+      livePreopenPrewarmCompletedRef.current
+      && liveActiveRunRef.current == null
+      && isAshareLiveTestPreopen()
+    ) {
+      updateRunProgress(sessionId, 100, '开盘前历史数据预热完成，等待 09:30 后实测');
+      return;
+    }
 
     liveTestCyclesInFlightRef.current += 1;
     let cyclePhase: LiveTestCyclePhase = liveActiveRunRef.current == null ? 'start' : 'poll';
@@ -2089,13 +2488,14 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
           const hitCount = startedRun.prewarmHitCount ?? startedRun.completedCount ?? 0;
           const missCount = startedRun.prewarmMissCount ?? Math.max(0, totalCount - hitCount);
           liveActiveRunRef.current = null;
+          livePreopenPrewarmCompletedRef.current = true;
           updateRunProgress(
             sessionId,
             100,
-            `第 ${cycleIndex} 次触发：开盘前历史数据预热完成 ${hitCount}/${totalCount}`,
+            `第 ${cycleIndex} 次触发：开盘前历史数据预热完成 ${hitCount}/${totalCount}，等待 09:30 后实测`,
           );
           appendExecutionLog(
-            `第 ${cycleIndex} 次触发：09:30 前仅预热历史数据，不执行实测命中汇总；历史缓存命中 ${hitCount}/${totalCount}，缺失 ${missCount} 只`,
+            `第 ${cycleIndex} 次触发：09:30 前仅预热历史数据，不执行实测命中汇总；历史缓存命中 ${hitCount}/${totalCount}，缺失 ${missCount} 只；将保持实测开启，09:30 后自动开始实时扫描`,
             missCount > 0 ? 'warning' : 'info',
           );
           setRunWarning(missCount > 0 ? `开盘前预热缺失 ${missCount} 只股票的历史数据，请通过离线任务或补数据补齐` : null);
@@ -2167,13 +2567,14 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
         const hitCount = run.prewarmHitCount ?? run.completedCount ?? 0;
         const missCount = run.prewarmMissCount ?? Math.max(0, nextTotal - hitCount);
         liveActiveRunRef.current = null;
+        livePreopenPrewarmCompletedRef.current = true;
         updateRunProgress(
           sessionId,
           100,
-          `第 ${activeRun.cycleIndex} 次触发：开盘前历史数据预热完成 ${hitCount}/${nextTotal}`,
+          `第 ${activeRun.cycleIndex} 次触发：开盘前历史数据预热完成 ${hitCount}/${nextTotal}，等待 09:30 后实测`,
         );
         appendExecutionLog(
-          `第 ${activeRun.cycleIndex} 次触发：09:30 前仅预热历史数据，不执行实测命中汇总；历史缓存命中 ${hitCount}/${nextTotal}，缺失 ${missCount} 只`,
+          `第 ${activeRun.cycleIndex} 次触发：09:30 前仅预热历史数据，不执行实测命中汇总；历史缓存命中 ${hitCount}/${nextTotal}，缺失 ${missCount} 只；将保持实测开启，09:30 后自动开始实时扫描`,
           missCount > 0 ? 'warning' : 'info',
         );
         setRunWarning(missCount > 0 ? `开盘前预热缺失 ${missCount} 只股票的历史数据，请通过离线任务或补数据补齐` : null);
@@ -2389,6 +2790,7 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
     liveCacheKeyRef.current = liveCacheKey;
     liveTestCyclesInFlightRef.current = 0;
     liveTransientReadErrorCountRef.current = 0;
+    livePreopenPrewarmCompletedRef.current = false;
     liveActiveRunRef.current = null;
     liveLatestSnapshotIdRef.current = null;
     liveResultRowsRef.current = [];
@@ -2707,13 +3109,69 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
     }));
   }, []);
 
+  const setResultGroupPage = useCallback((groupKey: string, page: number, totalPages: number) => {
+    const nextPage = Math.min(Math.max(page, 1), Math.max(totalPages, 1));
+    setResultPageByGroupKey((current) => (
+      current[groupKey] === nextPage ? current : { ...current, [groupKey]: nextPage }
+    ));
+  }, []);
+
   const openIndicatorAnalysis = useCallback((row: RuleRunEventRow) => {
     setIndicatorSelection({
       stockCode: row.stockCode,
       stockName: row.stockName || row.stockCode,
       eventDate: row.eventDate,
+      historicalCutoffDate: null,
     });
   }, []);
+
+  const toggleResultSort = useCallback((field: ResultSortField) => {
+    setResultPageByGroupKey({});
+    setResultSort((current) => {
+      const existingIndex = current.findIndex((criterion) => criterion.field === field);
+      if (existingIndex === -1) {
+        return [...current, { field, direction: 'asc' }];
+      }
+      return current.map((criterion, index) => (
+        index === existingIndex
+          ? { ...criterion, direction: criterion.direction === 'asc' ? 'desc' : 'asc' }
+          : criterion
+      ));
+    });
+  }, []);
+
+  const renderSortableResultHeader = (field: ResultSortField, label: string) => {
+    const sortIndex = resultSort.findIndex((criterion) => criterion.field === field);
+    const active = sortIndex !== -1;
+    const direction = active ? resultSort[sortIndex].direction : undefined;
+    const Icon = direction === 'asc'
+      ? ArrowUp
+      : direction === 'desc'
+        ? ArrowDown
+        : ArrowUpDown;
+
+    return (
+      <th
+        className="backtest-table-head-cell"
+        aria-sort={active ? (direction === 'asc' ? 'ascending' : 'descending') : 'none'}
+      >
+        <button
+          type="button"
+          onClick={() => toggleResultSort(field)}
+          aria-pressed={active}
+          title={`${label}排序`}
+          className={[
+            'inline-flex min-w-0 items-center gap-1 rounded-md px-1 py-0.5 text-left transition-colors',
+            'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/45',
+            active ? 'text-primary' : 'text-secondary-text hover:text-foreground',
+          ].join(' ')}
+        >
+          <span>{label}</span>
+          <Icon className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+        </button>
+      </th>
+    );
+  };
 
   const selectedRowSnapshot = selectedRow ? getEventSnapshot(selectedRow.event) : {};
   const selectedRowSnapshotEntries = Object.entries(selectedRowSnapshot)
@@ -2764,6 +3222,13 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
       (isLiveMode ? 520 : 640) + group.columns.length * 140,
       isLiveMode ? 760 : 840,
     );
+    const sortedRows = sortResultRowsForDisplay(group.rows, resultSort, stockLookup);
+    const totalPages = Math.max(1, Math.ceil(sortedRows.length / RESULT_TABLE_PAGE_SIZE));
+    const currentPage = Math.min(resultPageByGroupKey[groupKey] ?? 1, totalPages);
+    const pageStartIndex = (currentPage - 1) * RESULT_TABLE_PAGE_SIZE;
+    const visibleRows = sortedRows.slice(pageStartIndex, pageStartIndex + RESULT_TABLE_PAGE_SIZE);
+    const pageEndIndex = Math.min(pageStartIndex + visibleRows.length, sortedRows.length);
+    const isPaginated = sortedRows.length > RESULT_TABLE_PAGE_SIZE;
 
     return (
       <section
@@ -2771,22 +3236,39 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
         data-testid={testId}
         className="overflow-hidden rounded-xl border border-border/60 bg-elevated/25"
       >
-        <button
-          type="button"
-          aria-expanded={expanded}
-          aria-controls={panelId}
-          aria-label={`${expanded ? '收起' : '展开'}规则 #${group.ruleId} ${group.ruleName}`}
-          onClick={() => toggleResultGroup(groupKey, true)}
-          className="flex w-full items-center gap-3 border-b border-border/45 px-3 py-3 text-left transition-all hover:bg-hover/60"
-        >
-          <span className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-lg border border-primary/35 bg-primary/10 text-primary">
-            {expanded ? <ChevronDown className="h-4 w-4" /> : <ChevronRight className="h-4 w-4" />}
-          </span>
-          <span className="min-w-0 flex-1">
-            <span className="block truncate text-sm font-semibold text-foreground">#{group.ruleId} {group.ruleName}</span>
-            <span className="mt-0.5 block text-xs text-secondary-text">命中 {group.rows.length} 条</span>
-          </span>
-        </button>
+        <div className="flex items-center gap-2 border-b border-border/45 px-3 py-3 transition-all hover:bg-hover/60">
+          <button
+            type="button"
+            aria-expanded={expanded}
+            aria-controls={panelId}
+            aria-label={`${expanded ? '收起' : '展开'}规则 #${group.ruleId} ${group.ruleName}`}
+            onClick={() => toggleResultGroup(groupKey, true)}
+            className="flex min-w-0 flex-1 items-center gap-3 rounded-lg text-left focus-visible:outline-none focus-visible:ring-4 focus-visible:ring-cyan/20"
+          >
+            <span className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-lg border border-primary/35 bg-primary/10 text-primary">
+              {expanded ? <ChevronDown className="h-4 w-4" /> : <ChevronRight className="h-4 w-4" />}
+            </span>
+            <span className="min-w-0 flex-1">
+              <span className="block truncate text-sm font-semibold text-foreground">#{group.ruleId} {group.ruleName}</span>
+              <span className="mt-0.5 block text-xs text-secondary-text">命中 {group.rows.length} 条</span>
+            </span>
+          </button>
+          {!isLiveMode ? (
+            <button
+              type="button"
+              aria-label={`下载规则 #${group.ruleId} ${group.ruleName} 命中数据`}
+              title="下载命中数据"
+              disabled={sortedRows.length === 0}
+              onClick={(event) => {
+                event.stopPropagation();
+                downloadBacktestResultExcel(sortedRows, group, stockLookup, selectedRun?.id);
+              }}
+              className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-border/60 bg-elevated text-primary transition-all hover:border-primary/45 hover:bg-primary/10 disabled:cursor-not-allowed disabled:opacity-45"
+            >
+              <Download className="h-4 w-4" aria-hidden="true" />
+            </button>
+          ) : null}
+        </div>
         {expanded ? (
           <div id={panelId}>
             {group.rows.length === 0 ? (
@@ -2796,9 +3278,9 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
                 <table className="backtest-table w-full text-sm" style={{ minWidth: `${tableMinWidth}px` }}>
                   <thead className="backtest-table-head">
                     <tr className="text-left">
-                      <th className="backtest-table-head-cell">股票</th>
-                      <th className="backtest-table-head-cell">行业</th>
-                      {!isLiveMode ? <th className="backtest-table-head-cell">日期</th> : null}
+                      {renderSortableResultHeader('stock', '股票')}
+                      {renderSortableResultHeader('industry', '行业')}
+                      {!isLiveMode ? renderSortableResultHeader('date', '日期') : null}
                       {group.columns.map((column) => (
                         <th key={column.key} className="backtest-table-head-cell">
                           <span className={column.side === 'left' ? 'text-danger' : undefined}>
@@ -2809,7 +3291,7 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
                     </tr>
                   </thead>
                   <tbody>
-                    {group.rows.map((row) => {
+                    {visibleRows.map((row) => {
                       const rowExecutionTime = formatDateTimeToSecond(row.executionTime);
                       const rowIndustryLabel = getResultRowIndustryLabel(row, stockLookup);
                       const rowAnalysisLabel = isLiveMode
@@ -2864,6 +3346,38 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
                     })}
                   </tbody>
                 </table>
+                {isPaginated ? (
+                  <div className="flex items-center justify-between gap-3 border-t border-border/45 px-3 py-2 text-xs text-secondary-text">
+                    <span>
+                      显示 {pageStartIndex + 1}-{pageEndIndex} / {sortedRows.length}
+                    </span>
+                    <div className="flex items-center gap-2">
+                      <button
+                        type="button"
+                        aria-label="上一页"
+                        title="上一页"
+                        disabled={currentPage === 1}
+                        onClick={() => setResultGroupPage(groupKey, currentPage - 1, totalPages)}
+                        className="inline-flex h-8 w-8 items-center justify-center rounded-lg border border-border/60 bg-elevated text-secondary-text transition-all hover:bg-hover hover:text-foreground disabled:cursor-not-allowed disabled:opacity-45"
+                      >
+                        <ChevronLeft className="h-4 w-4" aria-hidden="true" />
+                      </button>
+                      <span className="min-w-[5.5rem] text-center font-mono">
+                        {currentPage} / {totalPages}
+                      </span>
+                      <button
+                        type="button"
+                        aria-label="下一页"
+                        title="下一页"
+                        disabled={currentPage === totalPages}
+                        onClick={() => setResultGroupPage(groupKey, currentPage + 1, totalPages)}
+                        className="inline-flex h-8 w-8 items-center justify-center rounded-lg border border-border/60 bg-elevated text-secondary-text transition-all hover:bg-hover hover:text-foreground disabled:cursor-not-allowed disabled:opacity-45"
+                      >
+                        <ChevronRight className="h-4 w-4" aria-hidden="true" />
+                      </button>
+                    </div>
+                  </div>
+                ) : null}
               </div>
             )}
           </div>
@@ -3601,6 +4115,7 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
           stockName={indicatorSelection.stockName}
           initialDate={indicatorSelection.eventDate}
           initialHistoryDays={getIndicatorHistoryDays(indicatorSelection.eventDate)}
+          historicalCutoffDate={indicatorSelection.historicalCutoffDate}
           dataMode="historical"
           onClose={() => setIndicatorSelection(null)}
         />

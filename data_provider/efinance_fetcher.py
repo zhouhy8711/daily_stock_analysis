@@ -69,7 +69,7 @@ from .base import (
 from .realtime_types import (
     UnifiedRealtimeQuote, RealtimeSource,
     get_realtime_circuit_breaker,
-    safe_float, safe_int  # 使用统一的类型转换函数
+    safe_float  # 使用统一的类型转换函数
 )
 
 
@@ -211,6 +211,38 @@ def _is_us_code(stock_code: str) -> bool:
     """
     code = stock_code.strip().upper()
     return bool(re.match(r'^[A-Z]{1,5}(\.[A-Z])?$', code))
+
+
+def _relative_gap(value: float, target: float) -> float:
+    if target <= 0:
+        return float("inf")
+    return abs(value - target) / target
+
+
+def _normalize_realtime_volume_to_lots(volume: Any, amount: Any, price: Any) -> Optional[float]:
+    """Normalize efinance realtime volume to A-share lots (手)."""
+    volume_value = safe_float(volume)
+    if volume_value is None:
+        return None
+
+    amount_value = safe_float(amount)
+    price_value = safe_float(price)
+    if amount_value is None or price_value is None or price_value <= 0:
+        return volume_value
+
+    inferred_lots = amount_value / price_value / 100
+    if inferred_lots <= 0:
+        return volume_value
+
+    candidates = (
+        volume_value,
+        volume_value * 100,
+        volume_value / 100,
+    )
+    best = min(candidates, key=lambda candidate: _relative_gap(candidate, inferred_lots))
+    if _relative_gap(best, inferred_lots) <= 0.2:
+        return round(best, 2)
+    return volume_value
 
 
 def _ef_call_with_timeout(func, *args, timeout=None, **kwargs):
@@ -801,15 +833,17 @@ class EfinanceFetcher(BaseFetcher):
             circ_mv_col = '流通市值' if '流通市值' in df.columns else 'circ_mv'
             speed_col = '涨速' if '涨速' in df.columns else 'price_speed'
             
+            price = safe_float(row.get(price_col))
+            amount = safe_float(row.get(amt_col))
             quote = UnifiedRealtimeQuote(
                 code=stock_code,
                 name=str(row.get(name_col, '')),
                 source=RealtimeSource.EFINANCE,
-                price=safe_float(row.get(price_col)),
+                price=price,
                 change_pct=safe_float(row.get(pct_col)),
                 change_amount=safe_float(row.get(chg_col)),
-                volume=safe_int(row.get(vol_col)),
-                amount=safe_float(row.get(amt_col)),
+                volume=_normalize_realtime_volume_to_lots(row.get(vol_col), amount, price),
+                amount=amount,
                 turnover_rate=safe_float(row.get(turn_col)),
                 amplitude=safe_float(row.get(amp_col)),
                 high=safe_float(row.get(high_col)),
@@ -910,15 +944,17 @@ class EfinanceFetcher(BaseFetcher):
                 code = str(row.get('_normalized_code') or row.get(code_col) or '').zfill(6)
                 if not code:
                     continue
+                price = safe_float(row.get(price_col))
+                amount = safe_float(row.get(amt_col))
                 quotes[code] = UnifiedRealtimeQuote(
                     code=code,
                     name=str(row.get(name_col, '')),
                     source=RealtimeSource.EFINANCE,
-                    price=safe_float(row.get(price_col)),
+                    price=price,
                     change_pct=safe_float(row.get(pct_col)),
                     change_amount=safe_float(row.get(chg_col)),
-                    volume=safe_int(row.get(vol_col)),
-                    amount=safe_float(row.get(amt_col)),
+                    volume=_normalize_realtime_volume_to_lots(row.get(vol_col), amount, price),
+                    amount=amount,
                     turnover_rate=safe_float(row.get(turn_col)),
                     amplitude=safe_float(row.get(amp_col)),
                     high=safe_float(row.get(high_col)),
@@ -1009,15 +1045,17 @@ class EfinanceFetcher(BaseFetcher):
             low_col = '最低' if '最低' in df.columns else 'low'
             open_col = '开盘' if '开盘' in df.columns else 'open'
 
+            price = safe_float(row.get(price_col))
+            amount = safe_float(row.get(amt_col))
             quote = UnifiedRealtimeQuote(
                 code=target_code,
                 name=str(row.get(name_col, '')),
                 source=RealtimeSource.EFINANCE,
-                price=safe_float(row.get(price_col)),
+                price=price,
                 change_pct=safe_float(row.get(pct_col)),
                 change_amount=safe_float(row.get(chg_col)),
-                volume=safe_int(row.get(vol_col)),
-                amount=safe_float(row.get(amt_col)),
+                volume=_normalize_realtime_volume_to_lots(row.get(vol_col), amount, price),
+                amount=amount,
                 turnover_rate=safe_float(row.get(turn_col)),
                 amplitude=safe_float(row.get(amp_col)),
                 high=safe_float(row.get(high_col)),

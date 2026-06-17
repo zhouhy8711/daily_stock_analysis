@@ -32,6 +32,7 @@ from api.middlewares.auth import add_auth_middleware
 from api.middlewares.error_handler import add_error_handlers
 from api.v1.schemas.common import HealthResponse
 from src.services.intraday_daily_archive_service import get_intraday_daily_archive_worker
+from src.services.qfq_corporate_action_refresh_service import get_qfq_corporate_action_refresh_worker
 from src.services.realtime_quote_cache_warmer import get_realtime_quote_cache_warmer
 from src.services.system_config_service import SystemConfigService
 
@@ -44,9 +45,14 @@ async def app_lifespan(app: FastAPI):
     app.state.realtime_quote_cache_warmer.start()
     app.state.intraday_daily_archive_worker = get_intraday_daily_archive_worker()
     app.state.intraday_daily_archive_worker.start()
+    app.state.qfq_corporate_action_refresh_worker = get_qfq_corporate_action_refresh_worker()
+    app.state.qfq_corporate_action_refresh_worker.start()
     try:
         yield
     finally:
+        if hasattr(app.state, "qfq_corporate_action_refresh_worker"):
+            app.state.qfq_corporate_action_refresh_worker.stop()
+            delattr(app.state, "qfq_corporate_action_refresh_worker")
         if hasattr(app.state, "intraday_daily_archive_worker"):
             app.state.intraday_daily_archive_worker.stop()
             delattr(app.state, "intraday_daily_archive_worker")

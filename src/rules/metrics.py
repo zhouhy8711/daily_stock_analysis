@@ -6,6 +6,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from typing import Any, Dict, Iterable, List, Optional
 
+import numpy as np
 import pandas as pd
 
 
@@ -27,6 +28,13 @@ METRIC_DEFINITIONS: List[MetricDefinition] = [
     MetricDefinition("total_mv", "总市值", "核心行情", unit="元"),
     MetricDefinition("circ_mv", "流通市值", "核心行情", unit="元"),
     MetricDefinition("pe_ratio", "市盈TTM", "核心行情"),
+    MetricDefinition(
+        "pe_ratio_percentile_250d",
+        "市盈TTM 250日分位",
+        "核心行情",
+        unit="%",
+        description="当前市盈TTM在近 250 个交易日正 PE 样本中的历史分位，用于刻画高估值/高预期状态",
+    ),
     MetricDefinition("open", "开盘价", "K线图", unit="元"),
     MetricDefinition("high", "最高价", "K线图", unit="元"),
     MetricDefinition("low", "最低价", "K线图", unit="元"),
@@ -60,6 +68,104 @@ METRIC_DEFINITIONS: List[MetricDefinition] = [
         "额外",
         unit="%",
         description="当前判断日前 20 个交易日的复利累计涨幅，不包含当前判断日",
+    ),
+    MetricDefinition(
+        "bias_ma5_pct",
+        "偏离MA5",
+        "趋势起涨",
+        unit="%",
+        description="收盘价相对 MA5 的偏离幅度，用于过滤已经明显追高的趋势股",
+    ),
+    MetricDefinition(
+        "ma_bullish_alignment_signal",
+        "均线多头排列信号",
+        "趋势起涨",
+        description="收盘价 > MA5 > MA10 > MA20 > MA30 时记为 1，否则记为 0",
+    ),
+    MetricDefinition(
+        "ma_uptrend_signal",
+        "均线上行信号",
+        "趋势起涨",
+        description="MA5、MA10 和 MA20 均相对近几日抬升时记为 1，否则记为 0",
+    ),
+    MetricDefinition(
+        "price_breakout_20d_signal",
+        "突破20日高点信号",
+        "趋势起涨",
+        description="收盘价突破前 20 个交易日最高价时记为 1，否则记为 0",
+    ),
+    MetricDefinition(
+        "prior_10d_breakout_20d_count",
+        "前10日20日突破次数",
+        "趋势起涨",
+        description="当前判断日前 10 个交易日内突破 20 日高点的次数，用于识别冷却后的首次突破",
+    ),
+    MetricDefinition(
+        "price_breakout_60d_signal",
+        "突破60日高点信号",
+        "趋势起涨",
+        description="收盘价突破前 60 个交易日最高价时记为 1，否则记为 0",
+    ),
+    MetricDefinition(
+        "volume_expansion_20d_ratio",
+        "成交量/20日均量",
+        "趋势起涨",
+        unit="倍",
+        description="当日成交量相对 20 日均量的倍数",
+    ),
+    MetricDefinition(
+        "volume_expansion_signal",
+        "放量确认信号",
+        "趋势起涨",
+        description="成交量至少达到 20 日均量 1.2 倍时记为 1，否则记为 0",
+    ),
+    MetricDefinition(
+        "trend_start_signal",
+        "趋势起涨信号",
+        "趋势起涨",
+        description="同时满足多头排列、均线上行、20/60 日突破、放量、MACD 多头且偏离 MA5 不超过 15% 时记为 1",
+    ),
+    MetricDefinition(
+        "trend_live_setup_score",
+        "实盘起涨观察分",
+        "趋势起涨",
+        description="仅使用当前及历史数据，对 MACD 转强、均线修复、放量、RSI 转强和 20 日高位突破进行加权打分",
+    ),
+    MetricDefinition(
+        "trend_live_watch_signal",
+        "实盘起涨观察信号",
+        "趋势起涨",
+        description="实盘起涨观察分达到 7 分、未触发过热风险和失效条件时记为 1",
+    ),
+    MetricDefinition(
+        "trend_live_confirm_signal",
+        "实盘起涨确认信号",
+        "趋势起涨",
+        description="观察分达到 9 分，同时具备 20 日高位突破、放量、MACD 多头且未过热时记为 1",
+    ),
+    MetricDefinition(
+        "trend_overheat_risk_score",
+        "趋势追高风险分",
+        "趋势起涨",
+        description="根据前 5/20 日涨幅、MA5 乖离、RSI 过热和放量长阳一致性计算追高风险分",
+    ),
+    MetricDefinition(
+        "trend_overheat_risk_signal",
+        "趋势追高风险信号",
+        "趋势起涨",
+        description="趋势追高风险分达到 3 分时记为 1，用于过滤已进入明显加速段的候选股",
+    ),
+    MetricDefinition(
+        "trend_failure_signal",
+        "趋势起涨失效信号",
+        "趋势起涨",
+        description="收盘跌破 MA20，或跌破 MA10 且 MACD 转弱，或大跌并跌破 MA5 时记为 1",
+    ),
+    MetricDefinition(
+        "history_trading_days_count",
+        "历史交易日数",
+        "趋势起涨",
+        description="当前股票在本轮历史窗口内截至判断日的交易日序号，用于区分成熟股与新股/次新股形态",
     ),
     MetricDefinition("amplitude", "振幅", "K线图", unit="%"),
     MetricDefinition("limit_up_price", "涨幅限价", "K线图", unit="元"),
@@ -221,6 +327,26 @@ def _rsi(close: pd.Series, period: int) -> pd.Series:
     rsi = rsi.mask((gains == 0) & (losses == 0), 50)
     rsi = rsi.mask((losses == 0) & (gains > 0), 100)
     return rsi
+
+
+def _rolling_positive_percentile_rank(
+    series: pd.Series,
+    *,
+    window: int,
+    min_periods: int,
+) -> pd.Series:
+    values = pd.to_numeric(series, errors="coerce").to_numpy(dtype=float, copy=False)
+    result = np.full(len(values), np.nan)
+    for index, current in enumerate(values):
+        if not np.isfinite(current) or current <= 0:
+            continue
+        start = max(0, index - window + 1)
+        window_values = values[start:index + 1]
+        valid = window_values[np.isfinite(window_values) & (window_values > 0)]
+        if len(valid) < min_periods:
+            continue
+        result[index] = float(np.sum(valid <= current) / len(valid) * 100)
+    return pd.Series(result, index=series.index)
 
 
 def _normalize_ratio_percent(value: Any) -> Optional[float]:
@@ -491,6 +617,17 @@ def build_metric_frame(
     if "date" in df.columns:
         df = df.sort_values("date", ascending=True).reset_index(drop=True)
 
+    df["history_trading_days_count"] = pd.Series(range(1, len(df) + 1), index=df.index, dtype="float64")
+
+    if "pe_ratio" in df.columns:
+        df["pe_ratio_percentile_250d"] = _rolling_positive_percentile_rank(
+            df["pe_ratio"],
+            window=250,
+            min_periods=80,
+        )
+    else:
+        df["pe_ratio_percentile_250d"] = pd.NA
+
     close = pd.to_numeric(df["close"], errors="coerce")
     volume = df["volume"] if "volume" in df.columns else pd.Series(dtype="float64")
     amount = df["amount"] if "amount" in df.columns else pd.Series(dtype="float64")
@@ -538,6 +675,49 @@ def build_metric_frame(
     for window in (5, 10, 20, 30, 60):
         df[f"ma{window}"] = close.rolling(window=window, min_periods=window).mean()
 
+    df["bias_ma5_pct"] = (close - df["ma5"]) / df["ma5"].replace(0, pd.NA) * 100
+    ma_columns = ["ma5", "ma10", "ma20", "ma30"]
+    ma_ready = df[ma_columns].notna().all(axis=1) & close.notna()
+    ma_bullish = (
+        (close > df["ma5"])
+        & (df["ma5"] > df["ma10"])
+        & (df["ma10"] > df["ma20"])
+        & (df["ma20"] > df["ma30"])
+    )
+    df["ma_bullish_alignment_signal"] = ma_bullish.astype(float)
+    df.loc[~ma_ready, "ma_bullish_alignment_signal"] = pd.NA
+
+    ma_uptrend_ready = (
+        df["ma5"].notna()
+        & df["ma10"].notna()
+        & df["ma20"].notna()
+        & df["ma5"].shift(3).notna()
+        & df["ma10"].shift(3).notna()
+        & df["ma20"].shift(5).notna()
+    )
+    ma_uptrend = (
+        (df["ma5"] > df["ma5"].shift(3))
+        & (df["ma10"] > df["ma10"].shift(3))
+        & (df["ma20"] > df["ma20"].shift(5))
+    )
+    df["ma_uptrend_signal"] = ma_uptrend.astype(float)
+    df.loc[~ma_uptrend_ready, "ma_uptrend_signal"] = pd.NA
+
+    for window in (20, 60):
+        prior_high = high.rolling(window=window, min_periods=window).max().shift(1)
+        signal_key = f"price_breakout_{window}d_signal"
+        breakout = close > prior_high
+        df[signal_key] = breakout.astype(float)
+        df.loc[prior_high.isna() | close.isna(), signal_key] = pd.NA
+    df["prior_10d_breakout_20d_count"] = (
+        pd.to_numeric(df["price_breakout_20d_signal"], errors="coerce")
+        .fillna(0)
+        .shift(1)
+        .rolling(window=10, min_periods=1)
+        .sum()
+        .fillna(0)
+    )
+
     for window in (5, 10, 20):
         if "volume" in df.columns:
             df[f"volume_ma{window}"] = volume.rolling(window=window, min_periods=window).mean()
@@ -546,6 +726,14 @@ def build_metric_frame(
             df["volume_ratio"] = pd.NA
         computed_volume_ratio = volume / df["volume_ma5"].replace(0, pd.NA)
         df["volume_ratio"] = pd.to_numeric(df["volume_ratio"], errors="coerce").fillna(computed_volume_ratio)
+    if "volume" in df.columns and "volume_ma20" in df.columns:
+        df["volume_expansion_20d_ratio"] = volume / df["volume_ma20"].replace(0, pd.NA)
+        volume_expansion = pd.to_numeric(df["volume_expansion_20d_ratio"], errors="coerce") >= 1.2
+        df["volume_expansion_signal"] = volume_expansion.astype(float)
+        df.loc[df["volume_expansion_20d_ratio"].isna(), "volume_expansion_signal"] = pd.NA
+    else:
+        df["volume_expansion_20d_ratio"] = pd.NA
+        df["volume_expansion_signal"] = pd.NA
 
     for window in (5, 10):
         if "amount" in df.columns:
@@ -559,6 +747,135 @@ def build_metric_frame(
     df["rsi6"] = _rsi(close, 6)
     df["rsi12"] = _rsi(close, 12)
     df["rsi24"] = _rsi(close, 24)
+
+    ma_bullish_signal = pd.to_numeric(df["ma_bullish_alignment_signal"], errors="coerce")
+    ma_uptrend_signal = pd.to_numeric(df["ma_uptrend_signal"], errors="coerce")
+    breakout_20d_signal = pd.to_numeric(df["price_breakout_20d_signal"], errors="coerce")
+    breakout_60d_signal = pd.to_numeric(df["price_breakout_60d_signal"], errors="coerce")
+    volume_expansion_signal = pd.to_numeric(df["volume_expansion_signal"], errors="coerce")
+    bias_ma5 = pd.to_numeric(df["bias_ma5_pct"], errors="coerce")
+    macd_ready = df["macd_dif"].notna() & df["macd_dea"].notna() & df["macd"].notna()
+    macd_bullish = (df["macd_dif"] > df["macd_dea"]) & (df["macd_dif"] > 0) & (df["macd"] > 0)
+    breakout_available = breakout_20d_signal.notna() | breakout_60d_signal.notna()
+    breakout_confirmed = breakout_20d_signal.eq(1) | breakout_60d_signal.eq(1)
+    trend_start = (
+        ma_bullish_signal.eq(1)
+        & ma_uptrend_signal.eq(1)
+        & breakout_confirmed
+        & volume_expansion_signal.eq(1)
+        & macd_bullish
+        & bias_ma5.between(0, 15)
+    )
+    trend_start_ready = (
+        ma_bullish_signal.notna()
+        & ma_uptrend_signal.notna()
+        & breakout_available
+        & volume_expansion_signal.notna()
+        & bias_ma5.notna()
+        & macd_ready
+    )
+    df["trend_start_signal"] = trend_start.astype(float)
+    df.loc[~trend_start_ready, "trend_start_signal"] = pd.NA
+
+    volume_ratio = pd.to_numeric(
+        df["volume_ratio"] if "volume_ratio" in df.columns else pd.Series(pd.NA, index=df.index),
+        errors="coerce",
+    )
+    volume_expansion_20d_ratio = pd.to_numeric(df["volume_expansion_20d_ratio"], errors="coerce")
+    volume_pulse_ratio = pd.concat(
+        [volume_ratio, volume_expansion_20d_ratio],
+        axis=1,
+    ).max(axis=1, skipna=True)
+    prior_20d_high = high.rolling(window=20, min_periods=20).max().shift(1)
+    near_20d_high = close >= prior_20d_high * 0.95
+    price_breakout_20d = breakout_20d_signal.eq(1)
+    ma5_above_ma10 = df["ma5"] > df["ma10"]
+    ma10_above_ma20 = df["ma10"] > df["ma20"]
+    close_above_ma20 = close > df["ma20"]
+    ma5_cross_up = ma5_above_ma10 & (df["ma5"].shift(1) <= df["ma10"].shift(1))
+    macd_cross_up = (
+        ((df["macd_dif"] > df["macd_dea"]) & (df["macd_dif"].shift(1) <= df["macd_dea"].shift(1)))
+        | ((df["macd"] > 0) & (df["macd"].shift(1) <= 0))
+    )
+    macd_turning_up = (
+        (df["macd_dif"] > df["macd_dif"].shift(1))
+        & (df["macd"] > df["macd"].shift(1))
+    )
+    rsi6 = pd.to_numeric(df["rsi6"], errors="coerce")
+    prev_5d_return = pd.to_numeric(df["prev_5d_return_pct"], errors="coerce")
+    prev_20d_return = pd.to_numeric(df["prev_20d_return_pct"], errors="coerce")
+    pct_chg = pd.to_numeric(df["pct_chg"], errors="coerce")
+
+    live_ready = (
+        close.notna()
+        & df["ma5"].notna()
+        & df["ma10"].notna()
+        & df["ma20"].notna()
+        & prior_20d_high.notna()
+        & volume_pulse_ratio.notna()
+        & rsi6.notna()
+        & macd_ready
+    )
+    setup_score = pd.Series(0.0, index=df.index)
+    setup_score += macd_cross_up.fillna(False).astype(float) * 2
+    setup_score += (macd_turning_up & ~macd_cross_up.fillna(False)).fillna(False).astype(float)
+    setup_score += ma5_cross_up.fillna(False).astype(float) * 2
+    setup_score += (ma5_above_ma10 & ~ma5_cross_up.fillna(False)).fillna(False).astype(float)
+    setup_score += close_above_ma20.fillna(False).astype(float)
+    setup_score += ma10_above_ma20.fillna(False).astype(float)
+    setup_score += volume_pulse_ratio.ge(1.2).fillna(False).astype(float) * 2
+    setup_score += (volume_pulse_ratio.ge(1.0) & volume_pulse_ratio.lt(1.2)).fillna(False).astype(float)
+    setup_score += rsi6.between(55, 88).fillna(False).astype(float) * 2
+    setup_score += rsi6.between(50, 55, inclusive="left").fillna(False).astype(float)
+    setup_score += price_breakout_20d.fillna(False).astype(float) * 2
+    setup_score += (near_20d_high & ~price_breakout_20d.fillna(False)).fillna(False).astype(float)
+    setup_score += ma_uptrend_signal.eq(1).fillna(False).astype(float)
+
+    overheat_score = pd.Series(0.0, index=df.index)
+    overheat_score += prev_5d_return.ge(35).fillna(False).astype(float) * 2
+    overheat_score += prev_20d_return.ge(80).fillna(False).astype(float)
+    overheat_score += bias_ma5.gt(15).fillna(False).astype(float) * 2
+    overheat_score += rsi6.gt(88).fillna(False).astype(float)
+    overheat_score += pct_chg.ge(9).fillna(False).astype(float)
+    overheat_score += (
+        volume_pulse_ratio.ge(3.0)
+        & pct_chg.ge(7)
+    ).fillna(False).astype(float)
+
+    failure = (
+        (close < df["ma20"])
+        | ((close < df["ma10"]) & (df["macd_dif"] < df["macd_dea"]))
+        | (pct_chg.le(-7) & (close < df["ma5"]))
+    )
+    watch_signal = (
+        setup_score.ge(7)
+        & overheat_score.le(2)
+        & ~failure.fillna(False)
+    )
+    confirm_signal = (
+        setup_score.ge(9)
+        & (price_breakout_20d | trend_start.eq(True))
+        & volume_pulse_ratio.ge(1.2)
+        & (macd_bullish | macd_cross_up)
+        & overheat_score.le(2)
+        & ~failure.fillna(False)
+    )
+
+    df["trend_live_setup_score"] = setup_score
+    df["trend_live_watch_signal"] = watch_signal.astype(float)
+    df["trend_live_confirm_signal"] = confirm_signal.astype(float)
+    df["trend_overheat_risk_score"] = overheat_score
+    df["trend_overheat_risk_signal"] = overheat_score.ge(3).astype(float)
+    df["trend_failure_signal"] = failure.astype(float)
+    for column in (
+        "trend_live_setup_score",
+        "trend_live_watch_signal",
+        "trend_live_confirm_signal",
+        "trend_overheat_risk_score",
+        "trend_overheat_risk_signal",
+        "trend_failure_signal",
+    ):
+        df.loc[~live_ready, column] = pd.NA
 
     if quote and len(df) > 0:
         latest_index = df.index[-1]

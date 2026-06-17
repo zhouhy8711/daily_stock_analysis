@@ -695,6 +695,10 @@ class Config:
     schedule_enabled: bool = False            # 是否启用定时任务
     schedule_time: str = "18:00"              # 每日推送时间（HH:MM 格式）
     schedule_run_immediately: bool = True     # 启动时是否立即执行一次
+    qfq_corporate_action_refresh_enabled: bool = True
+    qfq_corporate_action_refresh_after: str = "16:30"
+    qfq_corporate_action_refresh_lookback_days: int = 60
+    qfq_corporate_action_refresh_interval_seconds: int = 1800
     run_immediately: bool = True              # 启动时是否立即执行一次（非定时模式）
     market_review_enabled: bool = True        # 是否启用大盘复盘
     # 大盘复盘市场区域：cn(A股)、us(美股)、both(两者)，us 适合仅关注美股的用户
@@ -1420,6 +1424,25 @@ class Config:
             ).lower() == 'true',
             schedule_time=(schedule_time_value or '18:00').strip() or '18:00',
             schedule_run_immediately=schedule_run_immediately,
+            qfq_corporate_action_refresh_enabled=parse_env_bool(
+                os.getenv('QFQ_CORPORATE_ACTION_REFRESH_ENABLED'),
+                default=True,
+            ),
+            qfq_corporate_action_refresh_after=(
+                os.getenv('QFQ_CORPORATE_ACTION_REFRESH_AFTER', '16:30').strip() or '16:30'
+            ),
+            qfq_corporate_action_refresh_lookback_days=parse_env_int(
+                os.getenv('QFQ_CORPORATE_ACTION_REFRESH_LOOKBACK_DAYS'),
+                60,
+                field_name='QFQ_CORPORATE_ACTION_REFRESH_LOOKBACK_DAYS',
+                minimum=1,
+            ),
+            qfq_corporate_action_refresh_interval_seconds=parse_env_int(
+                os.getenv('QFQ_CORPORATE_ACTION_REFRESH_INTERVAL_SECONDS'),
+                1800,
+                field_name='QFQ_CORPORATE_ACTION_REFRESH_INTERVAL_SECONDS',
+                minimum=30,
+            ),
             run_immediately=legacy_run_immediately,
             market_review_enabled=os.getenv('MARKET_REVIEW_ENABLED', 'true').lower() == 'true',
             market_review_region=cls._parse_market_review_region(

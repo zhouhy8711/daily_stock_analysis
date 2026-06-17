@@ -697,6 +697,7 @@ describe('BacktestPage', () => {
     render(<BacktestPage mode="live" />);
 
     expect(await screen.findByText('实测结果')).toBeInTheDocument();
+    await screen.findByText('1 / 1');
     vi.useFakeTimers();
     try {
       vi.setSystemTime(new Date('2026-05-07T00:45:00Z'));
@@ -706,15 +707,27 @@ describe('BacktestPage', () => {
         await Promise.resolve();
         await Promise.resolve();
       });
+
+      expect(rulesApi.runBatchAsync).toHaveBeenCalledTimes(1);
+      expect(rulesApi.getRun).not.toHaveBeenCalled();
+      expect(rulesApi.getRunMatches).not.toHaveBeenCalled();
+      expect(rulesApi.notifyRunMatches).not.toHaveBeenCalled();
+      expect(screen.getByText(/09:30 前仅预热历史数据/)).toBeInTheDocument();
+      expect(screen.getByText(/历史缓存命中 2\/2/)).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: '停止实测' })).toBeInTheDocument();
+
+      vi.setSystemTime(new Date('2026-05-07T00:46:00Z'));
+      await act(async () => {
+        vi.advanceTimersByTime(30_000);
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      expect(rulesApi.runBatchAsync).toHaveBeenCalledTimes(1);
+
+      fireEvent.click(screen.getByRole('button', { name: '停止实测' }));
     } finally {
       vi.useRealTimers();
     }
-
-    expect(rulesApi.getRun).not.toHaveBeenCalled();
-    expect(rulesApi.getRunMatches).not.toHaveBeenCalled();
-    expect(rulesApi.notifyRunMatches).not.toHaveBeenCalled();
-    expect(screen.getByText(/09:30 前仅预热历史数据/)).toBeInTheDocument();
-    expect(screen.getByText(/历史缓存命中 2\/2/)).toBeInTheDocument();
   });
 
   it('polls async preopen history prewarm until it completes', async () => {
@@ -759,6 +772,7 @@ describe('BacktestPage', () => {
     render(<BacktestPage mode="live" />);
 
     expect(await screen.findByText('实测结果')).toBeInTheDocument();
+    await screen.findByText('1 / 1');
     vi.useFakeTimers();
     try {
       vi.setSystemTime(new Date('2026-05-07T00:45:00Z'));
@@ -767,16 +781,116 @@ describe('BacktestPage', () => {
         await Promise.resolve();
         await Promise.resolve();
         await Promise.resolve();
+        await Promise.resolve();
+        await Promise.resolve();
+        await Promise.resolve();
       });
+
+      expect(rulesApi.getRun).toHaveBeenCalledWith(88);
+      expect(rulesApi.getRunMatches).not.toHaveBeenCalled();
+      expect(rulesApi.notifyRunMatches).not.toHaveBeenCalled();
+      expect(screen.getByText(/开盘前历史缓存预热已启动：0\/2/)).toBeInTheDocument();
+      expect(screen.getByText(/历史缓存命中 2\/2/)).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: '停止实测' })).toBeInTheDocument();
+      fireEvent.click(screen.getByRole('button', { name: '停止实测' }));
     } finally {
       vi.useRealTimers();
     }
+  });
 
-    expect(rulesApi.getRun).toHaveBeenCalledWith(88);
-    expect(rulesApi.getRunMatches).not.toHaveBeenCalled();
-    expect(rulesApi.notifyRunMatches).not.toHaveBeenCalled();
-    expect(screen.getByText(/开盘前历史缓存预热已启动：0\/2/)).toBeInTheDocument();
-    expect(screen.getByText(/历史缓存命中 2\/2/)).toBeInTheDocument();
+  it('continues a preopen live session into the first real scan after market opens', async () => {
+    vi.mocked(rulesApi.runBatchAsync)
+      .mockResolvedValueOnce({
+        runId: 88,
+        ruleId: 7,
+        ruleIds: [7],
+        ruleNames: ['放量观察'],
+        status: 'completed',
+        targetCount: 2,
+        completedCount: 2,
+        matchCount: 0,
+        eventCount: 0,
+        mode: 'latest',
+        durationMs: 12,
+        matches: [],
+        errors: [],
+        prewarmOnly: true,
+        prewarmHitCount: 2,
+        prewarmMissCount: 0,
+      })
+      .mockResolvedValueOnce({
+        runId: 89,
+        ruleId: 7,
+        ruleIds: [7],
+        ruleNames: ['放量观察'],
+        status: 'running',
+        targetCount: 2,
+        completedCount: 0,
+        matchCount: 0,
+        eventCount: 0,
+        mode: 'latest',
+        durationMs: 0,
+        matches: [],
+        errors: [],
+        snapshotId: '2026-05-07T09:31:00',
+      });
+    vi.mocked(rulesApi.getRun).mockResolvedValueOnce({
+      id: 89,
+      runIds: [89],
+      ruleId: 7,
+      ruleIds: [7],
+      ruleName: '放量观察',
+      ruleNames: ['放量观察'],
+      status: 'completed',
+      targetCount: 2,
+      completedCount: 2,
+      matchCount: 0,
+      eventCount: 0,
+      startedAt: '2026-05-07T01:31:00Z',
+      finishedAt: '2026-05-07T01:31:10Z',
+      durationMs: 10,
+      snapshotId: '2026-05-07T09:31:00',
+    });
+    vi.mocked(rulesApi.getRunMatches).mockResolvedValueOnce([]);
+
+    render(<BacktestPage mode="live" />);
+
+    expect(await screen.findByText('实测结果')).toBeInTheDocument();
+    await screen.findByText('1 / 1');
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-05-07T00:45:00Z'));
+      fireEvent.click(screen.getByRole('button', { name: '运行实测' }));
+      await act(async () => {
+        await Promise.resolve();
+        await Promise.resolve();
+        await Promise.resolve();
+        await Promise.resolve();
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+
+      expect(rulesApi.runBatchAsync).toHaveBeenCalledTimes(1);
+
+      vi.setSystemTime(new Date('2026-05-07T01:31:00Z'));
+      await act(async () => {
+        vi.advanceTimersByTime(30_000);
+        await Promise.resolve();
+        await Promise.resolve();
+        await Promise.resolve();
+        await Promise.resolve();
+        await Promise.resolve();
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+
+      expect(rulesApi.runBatchAsync).toHaveBeenCalledTimes(2);
+      expect(rulesApi.getRun).toHaveBeenCalledWith(89);
+      expect(rulesApi.getRunMatches).toHaveBeenCalledWith(89);
+      fireEvent.click(screen.getByRole('button', { name: '停止实测' }));
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('keeps an active live run retryable when progress polling times out', async () => {
@@ -827,6 +941,7 @@ describe('BacktestPage', () => {
       expect(rulesApi.getRun).toHaveBeenCalledTimes(2);
       expect(rulesApi.getRunMatches).toHaveBeenCalledWith(12);
       expect(screen.getByRole('tab', { name: /运行结果/ })).toHaveAttribute('aria-selected', 'true');
+      fireEvent.click(screen.getByRole('button', { name: '停止实测' }));
     } finally {
       vi.useRealTimers();
     }
@@ -882,6 +997,7 @@ describe('BacktestPage', () => {
       expect(rulesApi.getRunMatches).toHaveBeenCalledTimes(2);
       expect(rulesApi.runBatchAsync).toHaveBeenCalledTimes(1);
       expect(screen.getByRole('tab', { name: /运行结果/ })).toHaveAttribute('aria-selected', 'true');
+      fireEvent.click(screen.getByRole('button', { name: '停止实测' }));
     } finally {
       vi.useRealTimers();
     }
@@ -1511,7 +1627,77 @@ describe('BacktestPage', () => {
     expect(screen.getAllByText('300274.SZ').length).toBeGreaterThan(0);
   });
 
-  it('sorts backtest result rows by date descending and stock id ascending', async () => {
+  it('keeps displayed history results when reloading the same run times out', async () => {
+    vi.mocked(rulesApi.getRunMatches)
+      .mockResolvedValueOnce(multiEventMatches)
+      .mockRejectedValueOnce(createRequestTimeoutError());
+    vi.mocked(rulesApi.listRuns).mockResolvedValue([{
+      id: 11,
+      ruleId: 7,
+      ruleName: '放量观察',
+      status: 'completed',
+      targetCount: 2,
+      matchCount: 1,
+      eventCount: 3,
+      startedAt: '2026-05-03T09:30:00',
+      finishedAt: '2026-05-03T09:31:00',
+      durationMs: 1000,
+    }]);
+    render(<BacktestPage />);
+
+    const historyLabel = await screen.findByText('#11 放量观察');
+    expect(screen.getByText('2026-05-01')).toBeInTheDocument();
+
+    fireEvent.click(historyLabel.closest('button') as HTMLButtonElement);
+    expect(await screen.findByText(/命中明细读取暂时超时，已保留当前 #11 的已加载结果/)).toBeInTheDocument();
+    expect(screen.queryByText('请求本地服务超时')).not.toBeInTheDocument();
+    expect(screen.getByText('2026-05-01')).toBeInTheDocument();
+  });
+
+  it('keeps displayed history results when a background page refresh times out', async () => {
+    vi.mocked(rulesApi.getRunMatches).mockResolvedValueOnce(multiEventMatches);
+    vi.mocked(rulesApi.listRuns).mockResolvedValue([{
+      id: 11,
+      ruleId: 7,
+      ruleName: '放量观察',
+      status: 'completed',
+      targetCount: 2,
+      matchCount: 1,
+      eventCount: 3,
+      startedAt: '2026-05-03T09:30:00',
+      finishedAt: '2026-05-03T09:31:00',
+      durationMs: 1000,
+    }]);
+    const view = render(<BacktestPage />);
+
+    expect(await screen.findByText('#11 放量观察')).toBeInTheDocument();
+    expect(screen.getByText('2026-05-01')).toBeInTheDocument();
+
+    vi.mocked(historyApi.getList).mockRejectedValueOnce(createRequestTimeoutError());
+    stockIndexHookState.current = {
+      index: [{
+        canonicalCode: '300274.SZ',
+        displayCode: '300274.SZ',
+        nameZh: '阳光电源',
+        market: 'CN',
+        assetType: 'stock',
+        active: true,
+        industry: '电力设备',
+      }],
+      loading: false,
+      error: null,
+      fallback: false,
+      loaded: true,
+    };
+
+    view.rerender(<BacktestPage />);
+
+    expect(await screen.findByText(/结果读取接口暂时超时，已保留当前 #11 的已加载结果/)).toBeInTheDocument();
+    expect(screen.queryByText('请求本地服务超时')).not.toBeInTheDocument();
+    expect(screen.getByText('2026-05-01')).toBeInTheDocument();
+  });
+
+  it('sorts backtest result rows by stock id ascending and date descending within the same stock', async () => {
     vi.mocked(rulesApi.getRunMatches).mockResolvedValueOnce([
       makeBacktestMatch('603375', '盛景微', ['2025-11-17', '2026-04-30']),
       makeBacktestMatch('600126.SH', '杭钢股份', ['2026-03-12']),
@@ -1536,14 +1722,193 @@ describe('BacktestPage', () => {
     const rows = within(group).getAllByRole('row').slice(1);
     expect(rows).toHaveLength(4);
 
-    expect(within(rows[0]).getByText('603375')).toBeInTheDocument();
-    expect(within(rows[0]).getByText('2026-04-30')).toBeInTheDocument();
+    expect(within(rows[0]).getByText('000333.SZ')).toBeInTheDocument();
+    expect(within(rows[0]).getByText('2025-11-17')).toBeInTheDocument();
     expect(within(rows[1]).getByText('600126.SH')).toBeInTheDocument();
     expect(within(rows[1]).getByText('2026-03-12')).toBeInTheDocument();
-    expect(within(rows[2]).getByText('000333.SZ')).toBeInTheDocument();
-    expect(within(rows[2]).getByText('2025-11-17')).toBeInTheDocument();
+    expect(within(rows[2]).getByText('603375')).toBeInTheDocument();
+    expect(within(rows[2]).getByText('2026-04-30')).toBeInTheDocument();
     expect(within(rows[3]).getByText('603375')).toBeInTheDocument();
     expect(within(rows[3]).getByText('2025-11-17')).toBeInTheDocument();
+  });
+
+  it('paginates large rule result groups to avoid rendering every hit row at once', async () => {
+    const largeMatches = Array.from({ length: 255 }, (_, index) => {
+      const code = String(index + 1).padStart(6, '0');
+      return makeBacktestMatch(code, `股票${index + 1}`, ['2026-05-01']);
+    });
+    vi.mocked(rulesApi.getRunMatches).mockResolvedValueOnce(largeMatches);
+    vi.mocked(rulesApi.listRuns).mockResolvedValue([{
+      id: 14,
+      ruleId: 7,
+      ruleName: '放量观察',
+      status: 'completed',
+      targetCount: 255,
+      matchCount: 255,
+      eventCount: 255,
+      startedAt: '2026-05-03T09:30:00',
+      finishedAt: '2026-05-03T09:31:00',
+      durationMs: 1000,
+    }]);
+
+    render(<BacktestPage />);
+
+    const group = await screen.findByTestId('backtest-rule-group-7');
+    expect(within(group).getAllByRole('row')).toHaveLength(251);
+    expect(within(group).getByText('显示 1-250 / 255')).toBeInTheDocument();
+    expect(within(group).getByText('000001')).toBeInTheDocument();
+    expect(within(group).getByText('000250')).toBeInTheDocument();
+    expect(within(group).queryByText('000251')).not.toBeInTheDocument();
+
+    fireEvent.click(within(group).getByRole('button', { name: '下一页' }));
+
+    expect(within(group).getAllByRole('row')).toHaveLength(6);
+    expect(within(group).getByText('显示 251-255 / 255')).toBeInTheDocument();
+    expect(within(group).getByText('000251')).toBeInTheDocument();
+    expect(within(group).getByText('000255')).toBeInTheDocument();
+    expect(within(group).queryByText('000250')).not.toBeInTheDocument();
+  }, 10_000);
+
+  it('stacks result table sorting from the stock, industry, and date headers', async () => {
+    stockIndexHookState.current = {
+      index: [
+        {
+          canonicalCode: '603375.SH',
+          displayCode: '603375',
+          nameZh: '盛景微',
+          market: 'CN',
+          assetType: 'stock',
+          active: true,
+          industry: 'A行业',
+        },
+        {
+          canonicalCode: '600126.SH',
+          displayCode: '600126.SH',
+          nameZh: '杭钢股份',
+          market: 'CN',
+          assetType: 'stock',
+          active: true,
+          industry: 'A行业',
+        },
+        {
+          canonicalCode: '000333.SZ',
+          displayCode: '000333.SZ',
+          nameZh: '美的集团',
+          market: 'CN',
+          assetType: 'stock',
+          active: true,
+          industry: 'B行业',
+        },
+      ],
+      loading: false,
+      error: null,
+      fallback: false,
+      loaded: true,
+    };
+    vi.mocked(rulesApi.getRunMatches).mockResolvedValueOnce([
+      makeBacktestMatch('603375', '盛景微', ['2026-04-30']),
+      makeBacktestMatch('600126.SH', '杭钢股份', ['2026-03-12', '2025-11-17']),
+      makeBacktestMatch('000333.SZ', '美的集团', ['2026-05-01']),
+    ]);
+    vi.mocked(rulesApi.listRuns).mockResolvedValue([{
+      id: 13,
+      ruleId: 7,
+      ruleName: '放量观察',
+      status: 'completed',
+      targetCount: 3,
+      matchCount: 3,
+      eventCount: 4,
+      startedAt: '2026-05-03T09:30:00',
+      finishedAt: '2026-05-03T09:31:00',
+      durationMs: 1000,
+    }]);
+
+    render(<BacktestPage />);
+
+    const group = await screen.findByTestId('backtest-rule-group-7');
+    const rows = () => within(group).getAllByRole('row').slice(1);
+
+    expect(within(rows()[0]).getByText('000333.SZ')).toBeInTheDocument();
+    expect(within(rows()[0]).getByText('B行业')).toBeInTheDocument();
+    expect(within(rows()[0]).getByText('2026-05-01')).toBeInTheDocument();
+
+    fireEvent.click(within(group).getByRole('button', { name: '行业' }));
+    expect(within(rows()[0]).getByText('600126.SH')).toBeInTheDocument();
+    expect(within(rows()[0]).getByText('A行业')).toBeInTheDocument();
+    expect(within(rows()[0]).getByText('2026-03-12')).toBeInTheDocument();
+
+    fireEvent.click(within(group).getByRole('button', { name: '股票' }));
+    fireEvent.click(within(group).getByRole('button', { name: '股票' }));
+    expect(within(rows()[0]).getByText('603375')).toBeInTheDocument();
+    expect(within(rows()[0]).getByText('A行业')).toBeInTheDocument();
+    expect(within(rows()[1]).getByText('600126.SH')).toBeInTheDocument();
+    expect(within(rows()[1]).getByText('2026-03-12')).toBeInTheDocument();
+
+    fireEvent.click(within(group).getByRole('button', { name: '日期' }));
+    expect(within(rows()[0]).getByText('603375')).toBeInTheDocument();
+    expect(within(rows()[1]).getByText('600126.SH')).toBeInTheDocument();
+    expect(within(rows()[1]).getByText('2025-11-17')).toBeInTheDocument();
+    expect(within(rows()[2]).getByText('600126.SH')).toBeInTheDocument();
+    expect(within(rows()[2]).getByText('2026-03-12')).toBeInTheDocument();
+
+    fireEvent.click(within(group).getByRole('button', { name: '日期' }));
+    expect(within(rows()[0]).getByText('603375')).toBeInTheDocument();
+    expect(within(rows()[1]).getByText('600126.SH')).toBeInTheDocument();
+    expect(within(rows()[1]).getByText('2026-03-12')).toBeInTheDocument();
+    expect(within(rows()[2]).getByText('600126.SH')).toBeInTheDocument();
+    expect(within(rows()[2]).getByText('2025-11-17')).toBeInTheDocument();
+    expect(within(rows()[3]).getByText('000333.SZ')).toBeInTheDocument();
+    expect(within(rows()[3]).getByText('B行业')).toBeInTheDocument();
+
+    let exportedBlob: Blob | null = null;
+    const originalCreateObjectUrl = URL.createObjectURL;
+    const originalRevokeObjectUrl = URL.revokeObjectURL;
+    const createObjectUrl = vi.fn((blob: Blob) => {
+      exportedBlob = blob;
+      return 'blob:backtest-export';
+    });
+    const revokeObjectUrl = vi.fn();
+    const anchorClick = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => undefined);
+    Object.defineProperty(URL, 'createObjectURL', { configurable: true, value: createObjectUrl });
+    Object.defineProperty(URL, 'revokeObjectURL', { configurable: true, value: revokeObjectUrl });
+    try {
+      fireEvent.click(within(group).getByRole('button', { name: /下载规则 #7 放量观察 命中数据/ }));
+
+      expect(createObjectUrl).toHaveBeenCalledTimes(1);
+      expect(anchorClick).toHaveBeenCalledTimes(1);
+      const anchor = anchorClick.mock.contexts[0] as HTMLAnchorElement;
+      expect(anchor.download).toMatch(/^回测命中_run-13_规则7_放量观察\.xlsx$/);
+      expect(exportedBlob).not.toBeNull();
+      expect(exportedBlob!.type).toBe('application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+      const xlsxBytes = new Uint8Array(await exportedBlob!.arrayBuffer());
+      expect([...xlsxBytes.slice(0, 4)]).toEqual([0x50, 0x4b, 0x03, 0x04]);
+      const xlsxText = new TextDecoder().decode(xlsxBytes);
+      expect(xlsxText).toContain('[Content_Types].xml');
+      expect(xlsxText).toContain('xl/workbook.xml');
+      expect(xlsxText).toContain('xl/worksheets/sheet1.xml');
+      const cells = [...xlsxText.matchAll(/<t>([^<]*)<\/t>/g)].map((match) => match[1]);
+      expect(cells.slice(0, 15)).toEqual([
+        '股票',
+        '行业',
+        '日期',
+        '603375 盛景微',
+        'A行业',
+        '2026-04-30',
+        '600126.SH 杭钢股份',
+        'A行业',
+        '2026-03-12',
+        '600126.SH 杭钢股份',
+        'A行业',
+        '2025-11-17',
+        '000333.SZ 美的集团',
+        'B行业',
+        '2026-05-01',
+      ]);
+    } finally {
+      anchorClick.mockRestore();
+      Object.defineProperty(URL, 'createObjectURL', { configurable: true, value: originalCreateObjectUrl });
+      Object.defineProperty(URL, 'revokeObjectURL', { configurable: true, value: originalRevokeObjectUrl });
+    }
   });
 
   it('clears stale result rows when selecting a running persisted run', async () => {
@@ -1626,6 +1991,8 @@ describe('BacktestPage', () => {
     expect(await screen.findByRole('dialog', { name: '指标分析' })).toBeInTheDocument();
     expect(screen.getByText('命中日 2026-05-01')).toBeInTheDocument();
     expect(screen.getByTestId('indicator-hit-highlight-2026-05-01')).toBeInTheDocument();
+    expect(screen.getByTestId('indicator-chart-bar-2026-05-02')).toBeInTheDocument();
+    expect(screen.getByTestId('indicator-volume-bar-2026-05-02')).toBeInTheDocument();
     expect(stocksApi.getHistory).toHaveBeenCalledWith('300274.SZ', expect.any(Number), 'daily', 'db_only');
     expect(stocksApi.getIndicatorMetrics).toHaveBeenCalledWith(
       '300274.SZ',

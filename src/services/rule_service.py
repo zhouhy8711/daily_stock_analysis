@@ -9,12 +9,13 @@ import json
 import logging
 import threading
 import time
-from contextlib import nullcontext
+from contextlib import ExitStack, nullcontext
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import pandas as pd
+from sqlalchemy import select
 from sqlalchemy.exc import OperationalError
 
 from src.config import get_config
@@ -30,7 +31,7 @@ from src.rules.engine import (
 )
 from src.rules.metrics import METRIC_BY_KEY, build_metric_frame, get_metric_registry
 from src.services.stock_service import StockService
-from src.storage import EARNINGS_GAP_DAILY_METRIC_COLUMNS
+from src.storage import EARNINGS_GAP_DAILY_METRIC_COLUMNS, StockDaily
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +68,8 @@ RULE_PROGRESS_MEDIUM_BATCH_SIZE = 100
 RULE_PROGRESS_MIN_INTERVAL_SECONDS = 5.0
 RULE_RUN_HISTORY_CACHE_TTL_SECONDS = 15 * 60
 RULE_RUN_HISTORY_CACHE_MAX_ENTRIES = 8
+RULE_RUN_HISTORY_CACHE_MAX_STOCKS = 1000
+RULE_SERVICE_PROCESS_STARTED_AT = datetime.now()
 _RULE_RUN_HISTORY_CACHE_LOCK = threading.RLock()
 _RULE_RUN_HISTORY_CACHE: Dict[str, Dict[str, Any]] = {}
 _LIVE_RULE_RUN_HISTORY_CACHE_LOCK = threading.RLock()
@@ -127,6 +130,17 @@ FAST_LATEST_REPRICED_CHIP_METRIC_KEYS = {
     "profit_trapped_spread",
 }
 FAST_LATEST_METRIC_KEYS = FAST_LATEST_QUOTE_METRIC_KEYS | FAST_LATEST_CHIP_METRIC_KEYS
+REALTIME_DAILY_PRICE_SCALED_FIELDS = ("pe_ratio", "total_mv", "circ_mv")
+REALTIME_DAILY_CARRY_FORWARD_FIELDS = (
+    "total_shares",
+    "float_shares",
+    "deducted_net_profit_yoy_pct",
+    "deducted_net_profit_qoq_pct",
+    "announcement_next_day_gap_pct",
+    "announcement_next_day_volume_ratio",
+    "announcement_next_day_gap_unfilled",
+    "net_profit_gap_signal",
+)
 
 
 def _model_to_dict(value: Any) -> Dict[str, Any]:
@@ -555,6 +569,7 @@ class RuleService:
         )
         run_key = self._build_batch_run_key(
             normalized_rule_ids,
+            self._build_rule_definition_fingerprints(prepared),
             run_mode,
             run_data_policy,
             date_from,
@@ -671,6 +686,16 @@ class RuleService:
         return response, context
 
     def _cleanup_stale_running_runs(self) -> None:
+        orphan_cleanup = getattr(self.repo, "fail_running_runs_started_before", None)
+        if callable(orphan_cleanup):
+            try:
+                orphaned = int(orphan_cleanup(RULE_SERVICE_PROCESS_STARTED_AT) or 0)
+            except Exception as exc:
+                logger.warning("清理重启遗留规则回测任务失败: %s", exc)
+            else:
+                if orphaned:
+                    logger.info("已清理重启遗留规则回测任务: count=%s", orphaned)
+
         cleanup = getattr(self.repo, "fail_stale_running_runs", None)
         if not callable(cleanup):
             return
@@ -1207,16 +1232,31 @@ class RuleService:
         data_policy: str,
         stock_codes: List[str],
     ):
-        if (
-            run_mode != "latest"
-            or data_policy not in {"snapshot_only", "db_only"}
-            or len(stock_codes) < LIVE_SNAPSHOT_READY_TARGET_THRESHOLD
-        ):
+        is_large_rule_run = len(stock_codes) >= LIVE_SNAPSHOT_READY_TARGET_THRESHOLD
+        should_pause_realtime_archive = (
+            is_large_rule_run
+            and run_mode == "latest"
+            and data_policy in {"snapshot_only", "db_only"}
+        )
+        should_pause_daily_archive = is_large_rule_run
+        if not should_pause_realtime_archive and not should_pause_daily_archive:
             return nullcontext()
-        pauser = getattr(self.stock_service, "pause_realtime_quote_intraday_archive", None)
-        if not callable(pauser):
-            return nullcontext()
-        return pauser("rule_live_scan")
+        stack = ExitStack()
+        if should_pause_realtime_archive:
+            archive_pauser = getattr(self.stock_service, "pause_realtime_quote_intraday_archive", None)
+            prefetch_pauser = getattr(self.stock_service, "pause_realtime_quote_prefetch", None)
+            if callable(archive_pauser):
+                stack.enter_context(archive_pauser("rule_live_scan"))
+            if callable(prefetch_pauser):
+                stack.enter_context(prefetch_pauser("rule_live_scan"))
+        if should_pause_daily_archive:
+            try:
+                from src.services.intraday_daily_archive_service import pause_intraday_daily_archive
+
+                stack.enter_context(pause_intraday_daily_archive("rule_run"))
+            except Exception as exc:
+                logger.debug("暂停收盘归档后台任务失败，继续执行规则回测: %s", exc)
+        return stack
 
     def _prepare_batch_scan_cache(
         self,
@@ -1248,11 +1288,16 @@ class RuleService:
             end_before_date=end_before_date,
             live_cache_key=live_cache_key,
         )
-        quote_by_code = (
-            self._load_batch_quote_cache(stock_codes, data_policy)
-            if run_mode == "latest"
-            else {}
-        )
+        quote_by_code: Dict[str, Dict[str, Any]] = {}
+        if run_mode == "latest":
+            if data_policy == "db_only":
+                quote_by_code = self._load_fast_latest_quote_cache(
+                    stock_codes,
+                    data_policy,
+                    as_of=trading_calendar.get_market_now("cn").date(),
+                )
+            else:
+                quote_by_code = self._load_batch_quote_cache(stock_codes, data_policy)
         logger.info(
             "规则实测数据预热完成: stocks=%s history_hit=%s quote_hit=%s mode=%s policy=%s",
             len(stock_codes),
@@ -1588,6 +1633,11 @@ class RuleService:
                 if payload
             }, end_before_date)
         normalized_live_cache_key = self._normalize_live_cache_key(live_cache_key)
+        should_use_shared_cache = (
+            bool(normalized_live_cache_key)
+            or len(list(dict.fromkeys(str(code or "").strip().upper() for code in stock_codes if str(code or "").strip())))
+            <= RULE_RUN_HISTORY_CACHE_MAX_STOCKS
+        )
         cache_key = self._build_rule_history_cache_key(stock_codes, days_by_code, data_policy)
         now = time.monotonic()
         if normalized_live_cache_key:
@@ -1618,6 +1668,23 @@ class RuleService:
                     "history_by_code": self._copy_history_cache(normalized_history),
                 }
             return self._copy_history_cache(normalized_history)
+
+        if not should_use_shared_cache:
+            logger.info(
+                "规则历史缓存跳过共享常驻: stocks=%s policy=%s threshold=%s",
+                len(stock_codes),
+                data_policy,
+                RULE_RUN_HISTORY_CACHE_MAX_STOCKS,
+            )
+            history_by_code = loader(stock_codes, days_by_code, data_policy=data_policy)
+            normalized_history = {
+                str(code or "").strip().upper(): payload
+                for code, payload in (history_by_code or {}).items()
+                if payload
+            }
+            if end_before_date:
+                return self._filter_history_cache_before_date(normalized_history, end_before_date)
+            return normalized_history
 
         with _RULE_RUN_HISTORY_CACHE_LOCK:
             self._prune_rule_history_cache(now)
@@ -2084,8 +2151,19 @@ class RuleService:
         }
 
     @staticmethod
+    def _build_rule_definition_fingerprints(
+        prepared: List[tuple[int, Dict[str, Any], Dict[str, Any], List[str]]],
+    ) -> List[str]:
+        fingerprints: List[str] = []
+        for rule_id, _rule, definition, _stock_codes in prepared:
+            raw = json.dumps(definition or {}, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+            fingerprints.append(f"{int(rule_id)}:{hashlib.sha256(raw.encode('utf-8')).hexdigest()}")
+        return fingerprints
+
+    @staticmethod
     def _build_batch_run_key(
         rule_ids: List[int],
+        rule_fingerprints: List[str],
         run_mode: str,
         data_policy: str,
         start_date: Optional[date],
@@ -2095,6 +2173,7 @@ class RuleService:
     ) -> str:
         payload = {
             "rule_ids": [int(rule_id) for rule_id in rule_ids],
+            "rule_fingerprints": list(rule_fingerprints or []),
             "mode": run_mode,
             "data_policy": data_policy,
             "start_date": start_date.isoformat() if start_date else None,
@@ -3228,6 +3307,44 @@ class RuleService:
             return datetime.now().date()
 
     @classmethod
+    def _enrich_realtime_daily_row_from_reference(
+        cls,
+        realtime_row: Dict[str, Any],
+        reference_row: Optional[Dict[str, Any]],
+        quote: Dict[str, Any],
+    ) -> None:
+        if not realtime_row:
+            return
+
+        reference = reference_row or {}
+        current_close = cls._to_optional_float(realtime_row.get("close"))
+        reference_close = cls._to_optional_float(reference.get("close"))
+        price_ratio = (
+            current_close / reference_close
+            if current_close is not None and reference_close is not None and reference_close > 0
+            else None
+        )
+
+        for field in REALTIME_DAILY_PRICE_SCALED_FIELDS:
+            quote_value = cls._to_optional_float(quote.get(field))
+            if quote_value is not None:
+                realtime_row[field] = quote_value
+                continue
+            reference_value = cls._to_optional_float(reference.get(field))
+            if reference_value is None:
+                continue
+            realtime_row[field] = reference_value * price_ratio if price_ratio is not None else reference_value
+
+        for field in REALTIME_DAILY_CARRY_FORWARD_FIELDS:
+            quote_value = cls._to_optional_float(quote.get(field))
+            if quote_value is not None:
+                realtime_row[field] = quote_value
+                continue
+            reference_value = reference.get(field)
+            if reference_value not in (None, ""):
+                realtime_row[field] = reference_value
+
+    @classmethod
     def _sync_latest_history_rows_with_quote(
         cls,
         stock_code: str,
@@ -3263,6 +3380,8 @@ class RuleService:
             evaluation_date,
             previous_close,
         )
+        reference_row = rows[-1] if rows else None
+        cls._enrich_realtime_daily_row_from_reference(realtime_row, reference_row, quote)
         realtime_row["date"] = evaluation_date.isoformat()
         realtime_row["snapshot_id"] = quote.get("snapshot_id")
         realtime_row["snapshot_time"] = quote.get("snapshot_time")
@@ -3283,7 +3402,13 @@ class RuleService:
         start_date: Optional[date] = None,
         end_date: Optional[date] = None,
     ) -> List[Dict[str, Any]]:
-        events = evaluate_rule_history(definition, metric_frame)
+        evaluation_indices = self._resolve_history_evaluation_indices(
+            metric_frame,
+            lookback_days,
+            start_date,
+            end_date,
+        )
+        events = evaluate_rule_history(definition, metric_frame, indices=evaluation_indices)
         if not events:
             return []
         cutoff = datetime.now().date() - timedelta(days=lookback_days)
@@ -3302,6 +3427,37 @@ class RuleService:
                 continue
             filtered_events.append(event)
         return filtered_events
+
+    @staticmethod
+    def _resolve_history_evaluation_indices(
+        metric_frame: pd.DataFrame,
+        lookback_days: int,
+        start_date: Optional[date] = None,
+        end_date: Optional[date] = None,
+    ) -> Optional[List[int]]:
+        if metric_frame.empty or "date" not in metric_frame.columns:
+            return None
+
+        parsed_dates = pd.to_datetime(metric_frame["date"], errors="coerce")
+        if parsed_dates.isna().all():
+            return None
+
+        lower_bound = start_date
+        if lower_bound is None:
+            lower_bound = datetime.now().date() - timedelta(days=lookback_days)
+
+        indices: List[int] = []
+        for index, parsed in enumerate(parsed_dates):
+            if pd.isna(parsed):
+                indices.append(index)
+                continue
+            row_date = parsed.date()
+            if lower_bound and row_date < lower_bound:
+                continue
+            if end_date and row_date > end_date:
+                continue
+            indices.append(index)
+        return indices
 
     def _get_earnings_gap_events_for_context(
         self,
@@ -3735,12 +3891,39 @@ class RuleService:
             except Exception as exc:
                 logger.warning("读取 A 股股票索引失败，无法解析所有 A 股范围: %s", exc)
                 codes = []
+            codes = self._merge_stock_daily_a_share_codes(codes)
         else:
             codes = []
         normalized = self._normalize_codes(codes)
         if scope == "all_a_shares" and not normalized:
             raise RuleValidationError("A 股股票索引为空，无法运行所有 A 股范围")
         return normalized[:MAX_RULE_TARGET_CODES]
+
+    def _merge_stock_daily_a_share_codes(self, codes: List[Any]) -> List[str]:
+        merged = self._normalize_codes(codes)
+        seen = set(merged)
+        db = getattr(getattr(getattr(self, "stock_service", None), "repo", None), "db", None)
+        get_session = getattr(db, "get_session", None)
+        if not callable(get_session):
+            return merged
+        try:
+            with get_session() as session:
+                rows = session.execute(
+                    select(StockDaily.code)
+                    .distinct()
+                    .order_by(StockDaily.code)
+                ).scalars().all()
+        except Exception as exc:
+            logger.debug("读取 stock_daily A 股代码补充股票池失败: %s", exc)
+            return merged
+
+        for raw_code in rows:
+            normalized = self._normalize_scan_stock_code(raw_code)
+            if not normalized or normalized in seen or not self._is_cn_a_share_code(normalized):
+                continue
+            seen.add(normalized)
+            merged.append(normalized)
+        return merged
 
     @staticmethod
     def _normalize_codes(codes: List[Any]) -> List[str]:

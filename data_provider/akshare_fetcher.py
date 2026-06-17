@@ -252,6 +252,15 @@ def _to_sina_tx_symbol(stock_code: str) -> str:
     return f"sz{base}"
 
 
+def _convert_a_share_daily_volume_to_lots(df: pd.DataFrame) -> pd.DataFrame:
+    """AkShare A-share daily history returns volume in shares; stock_daily stores lots."""
+    if df is None or df.empty or "成交量" not in df.columns:
+        return df
+    normalized = df.copy()
+    normalized["成交量"] = pd.to_numeric(normalized["成交量"], errors="coerce") / 100
+    return normalized
+
+
 def _classify_realtime_http_error(exc: Exception) -> Tuple[str, str]:
     """
     Classify Sina/Tencent realtime quote failures into stable categories.
@@ -492,7 +501,7 @@ class AkshareFetcher(BaseFetcher):
 
             if df is not None and not df.empty:
                 logger.info(f"[API返回] ak.stock_zh_a_hist 成功: {len(df)} 行, 耗时 {api_elapsed:.2f}s")
-                return df
+                return _convert_a_share_daily_volume_to_lots(df)
             else:
                 logger.warning(f"[API返回] ak.stock_zh_a_hist 返回空数据")
                 return pd.DataFrame()
@@ -546,7 +555,7 @@ class AkshareFetcher(BaseFetcher):
                 if 'turnover' in df.columns:
                     df['换手率'] = pd.to_numeric(df['turnover'], errors='coerce') * 100
 
-                return df
+                return _convert_a_share_daily_volume_to_lots(df)
             return pd.DataFrame()
 
         except Exception as e:
@@ -589,7 +598,7 @@ class AkshareFetcher(BaseFetcher):
                     df['涨跌幅'] = df['收盘'].pct_change() * 100
                     df['涨跌幅'] = df['涨跌幅'].fillna(0)
 
-                return df
+                return _convert_a_share_daily_volume_to_lots(df)
             return pd.DataFrame()
 
         except Exception as e:

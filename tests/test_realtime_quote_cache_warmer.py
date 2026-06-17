@@ -7,6 +7,7 @@ from src.services.realtime_quote_cache_warmer import (
     DEFAULT_WARM_INTERVAL_SECONDS,
     RealtimeQuoteCacheWarmer,
 )
+from src.services.stock_service import pause_realtime_quote_prefetch
 
 
 class _WarmService:
@@ -119,3 +120,25 @@ def test_realtime_quote_cache_warmer_skips_when_a_share_market_closed() -> None:
     assert service.calls == 0
     assert result["status"] == "skipped"
     assert result["reason"] == "a_share_market_closed"
+
+
+def test_realtime_quote_cache_warmer_skips_when_prefetch_paused() -> None:
+    service = _WarmService()
+    warmer = RealtimeQuoteCacheWarmer(service_factory=lambda: service)
+
+    with patch(
+        "src.services.realtime_quote_cache_warmer.get_config",
+        return_value=SimpleNamespace(
+            prefetch_realtime_quotes=True,
+            enable_realtime_quote=True,
+            realtime_quote_cache_seconds=30,
+        ),
+    ), patch(
+        "src.services.realtime_quote_cache_warmer.trading_calendar.is_market_live_session_open",
+        return_value=True,
+    ), pause_realtime_quote_prefetch("rule_live_scan"):
+        result = warmer.run_once(reason="background", force_refresh=True)
+
+    assert service.calls == 0
+    assert result["status"] == "skipped"
+    assert result["reason"] == "prefetch_paused:rule_live_scan"

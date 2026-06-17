@@ -8,6 +8,7 @@ import os
 import sys
 import threading
 import time
+from contextlib import contextmanager
 from datetime import date, datetime, timedelta, time as dt_time
 from typing import Any, Callable, Dict, Optional
 
@@ -23,10 +24,37 @@ DEFAULT_INTRADAY_ARCHIVE_INTERVAL_SECONDS = 30 * 60
 DEFAULT_INTRADAY_ARCHIVE_AFTER = dt_time(16, 0)
 
 _RUN_LOCK = threading.Lock()
+_ARCHIVE_PAUSE_LOCK = threading.RLock()
+_ARCHIVE_PAUSE_DEPTH = 0
+_ARCHIVE_PAUSE_REASON: Optional[str] = None
+
+
+@contextmanager
+def pause_intraday_daily_archive(reason: str = "rule_run"):
+    """Temporarily let user-facing rule runs take priority over archive work."""
+    global _ARCHIVE_PAUSE_DEPTH
+    global _ARCHIVE_PAUSE_REASON
+    with _ARCHIVE_PAUSE_LOCK:
+        _ARCHIVE_PAUSE_DEPTH += 1
+        _ARCHIVE_PAUSE_REASON = reason
+    try:
+        yield
+    finally:
+        with _ARCHIVE_PAUSE_LOCK:
+            _ARCHIVE_PAUSE_DEPTH = max(0, _ARCHIVE_PAUSE_DEPTH - 1)
+            if _ARCHIVE_PAUSE_DEPTH == 0:
+                _ARCHIVE_PAUSE_REASON = None
+
+
+def _intraday_daily_archive_pause_reason() -> Optional[str]:
+    with _ARCHIVE_PAUSE_LOCK:
+        if _ARCHIVE_PAUSE_DEPTH <= 0:
+            return None
+        return _ARCHIVE_PAUSE_REASON or "paused"
 
 
 class IntradayDailyArchiveService:
-    """Archive same-day intraday rows to stock_daily after the A-share close."""
+    """Refresh official same-day daily rows after the A-share close."""
 
     def __init__(
         self,
@@ -63,7 +91,7 @@ class IntradayDailyArchiveService:
             return False
 
         row = rows[0]
-        source = getattr(row, "data_source", None) or "intraday_hot_table"
+        source = getattr(row, "data_source", None) or "stock_daily"
         enriched = enrich_daily_history_with_quote_fields(
             pd.DataFrame([row.to_dict()]),
             code,
@@ -86,6 +114,53 @@ class IntradayDailyArchiveService:
 
         self.db.save_daily_data(enriched, code, data_source=source)
         return True
+
+    def _refresh_official_daily_history(self, code: str, target_date: date) -> bool:
+        try:
+            from data_provider.base import DataFetcherManager
+
+            manager = DataFetcherManager()
+            df, source = manager.get_daily_data(
+                stock_code=code,
+                start_date=target_date.isoformat(),
+                end_date=target_date.isoformat(),
+                days=5,
+            )
+        except Exception as exc:
+            logger.warning(
+                "[分钟热表收盘归档] %s %s 正式日线刷新失败: %s",
+                target_date.isoformat(),
+                code,
+                exc,
+            )
+            return False
+
+        if df is None or df.empty:
+            logger.info("[分钟热表收盘归档] %s %s 正式日线为空", target_date.isoformat(), code)
+            return False
+
+        filtered = df.copy()
+        if "date" not in filtered.columns:
+            logger.warning("[分钟热表收盘归档] %s %s 正式日线缺少 date 列", target_date.isoformat(), code)
+            return False
+        parsed_dates = pd.to_datetime(filtered["date"], errors="coerce")
+        filtered = filtered[parsed_dates.dt.date == target_date]
+        if filtered.empty:
+            logger.info("[分钟热表收盘归档] %s %s 正式日线未覆盖目标日", target_date.isoformat(), code)
+            return False
+
+        if self.db._is_provisional_daily_source(source):
+            logger.warning(
+                "[分钟热表收盘归档] %s %s 拒绝临时源作为正式日线: source=%s",
+                target_date.isoformat(),
+                code,
+                source,
+            )
+            return False
+
+        saved = self.db.save_daily_data(filtered, code, data_source=source or "official_daily")
+        rows = self.db.get_data_range(code, target_date, target_date)
+        return saved > 0 or bool(rows)
 
     def _refresh_missing_daily_valuations(self, codes: list[str], target_date: date) -> int:
         if len(codes) > 1 and self._quote_loader is None:
@@ -148,6 +223,23 @@ class IntradayDailyArchiveService:
         now = current_time or self._now_provider()
         market_now = trading_calendar.get_market_now("cn", now)
         target_date = market_now.date()
+        pause_reason = _intraday_daily_archive_pause_reason()
+        if pause_reason is not None:
+            return {
+                "status": "skipped",
+                "reason": "paused",
+                "pause_reason": pause_reason,
+                "trade_date": target_date.isoformat(),
+                "market_time": market_now.strftime("%H:%M:%S"),
+                "scanned_code_count": 0,
+                "archived_code_count": 0,
+                "skipped_completed_count": 0,
+                "purged_row_count": 0,
+                "failed_code_count": 0,
+                "failed_codes": [],
+                "valuation_refreshed_count": 0,
+                "chip_synced_count": 0,
+            }
 
         if not trading_calendar.is_market_open("cn", target_date):
             return {
@@ -170,12 +262,10 @@ class IntradayDailyArchiveService:
         if not codes:
             valuation_codes = self.db.get_daily_codes_missing_valuation(
                 trade_date=target_date,
-                data_source="intraday_hot_table",
             )
             valuation_refreshed_count = self._refresh_missing_daily_valuations(valuation_codes, target_date)
             chip_codes = self.db.get_daily_codes_missing_chip_snapshot(
                 trade_date=target_date,
-                data_source="intraday_hot_table",
             )
             chip_synced_count = self._sync_missing_chip_daily(chip_codes, target_date)
             if valuation_refreshed_count or chip_synced_count:
@@ -235,12 +325,20 @@ class IntradayDailyArchiveService:
         archived_codes = []
         failed_codes = []
         valuation_refreshed_count = 0
+        paused_reason = None
         for code in pending_codes:
-            try:
-                self.db.archive_intraday_minutes_to_daily(
-                    trade_date=target_date,
-                    codes=[code],
+            paused_reason = _intraday_daily_archive_pause_reason()
+            if paused_reason is not None:
+                logger.info(
+                    "[分钟热表收盘归档] 已暂停，等待前台任务完成: reason=%s trade_date=%s archived=%s remaining=%s",
+                    paused_reason,
+                    target_date.isoformat(),
+                    len(archived_codes),
+                    max(0, len(pending_codes) - len(archived_codes) - len(failed_codes)),
                 )
+                break
+            try:
+                self._refresh_official_daily_history(code, target_date)
                 if self.db.has_today_data(code, target_date):
                     archived_codes.append(code)
                     if self._refresh_daily_valuation(code, target_date):
@@ -248,7 +346,7 @@ class IntradayDailyArchiveService:
                 else:
                     failed_codes.append({
                         "code": code,
-                        "reason": "daily_row_missing_after_archive",
+                        "reason": "official_daily_unavailable",
                     })
             except Exception as exc:
                 failed_codes.append({"code": code, "reason": str(exc)})
@@ -263,7 +361,6 @@ class IntradayDailyArchiveService:
         chip_codes = sorted(set(archived_codes) | set(
             self.db.get_daily_codes_missing_chip_snapshot(
                 trade_date=target_date,
-                data_source="intraday_hot_table",
             )
         ))
         chip_synced_count = self._sync_missing_chip_daily(chip_codes, target_date)
@@ -274,7 +371,9 @@ class IntradayDailyArchiveService:
         )
 
         status = "completed"
-        if failed_codes and archived_codes:
+        if paused_reason is not None:
+            status = "partial" if archived_codes else "skipped"
+        elif failed_codes and archived_codes:
             status = "partial"
         elif failed_codes and not archived_codes:
             status = "failed"
@@ -292,6 +391,9 @@ class IntradayDailyArchiveService:
             "valuation_refreshed_count": valuation_refreshed_count,
             "chip_synced_count": chip_synced_count,
         }
+        if paused_reason is not None:
+            result["reason"] = "paused"
+            result["pause_reason"] = paused_reason
         logger.info(
             "[分钟热表收盘归档] reason=%s status=%s trade_date=%s scanned=%s "
             "archived=%s skipped_completed=%s valuation_refreshed=%s chip_synced=%s purged_rows=%s failed=%s",

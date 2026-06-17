@@ -12,7 +12,7 @@ from typing import Any, Callable, Dict, Optional
 
 from src.config import get_config
 from src.core import trading_calendar
-from src.services.stock_service import StockService
+from src.services.stock_service import StockService, realtime_quote_prefetch_pause_reason
 
 logger = logging.getLogger(__name__)
 
@@ -122,6 +122,19 @@ class RealtimeQuoteCacheWarmer:
             result = {
                 "status": "skipped",
                 "reason": "a_share_market_closed",
+                "requested_count": 0,
+                "cached_before": 0,
+                "fetched_count": 0,
+                "failed_count": 0,
+            }
+            self._log_result(result, reason=reason)
+            return result
+
+        pause_reason = realtime_quote_prefetch_pause_reason()
+        if pause_reason:
+            result = {
+                "status": "skipped",
+                "reason": f"prefetch_paused:{pause_reason}",
                 "requested_count": 0,
                 "cached_before": 0,
                 "fetched_count": 0,

@@ -83,6 +83,9 @@ CHIP_DAILY_DERIVED_METRIC_COLUMNS = (
     "chip_concentration_90_avg_30d",
     "chip_concentration_90_avg_60d",
 )
+PROVISIONAL_DAILY_DATA_SOURCES = frozenset({
+    "intraday_hot_table",
+})
 
 # SQLAlchemy ORM 基类
 Base = declarative_base()
@@ -1174,17 +1177,96 @@ class DatabaseManager:
         if inferred_shares <= 0 or inferred_lots <= 0:
             return volume_value
 
-        if (
-            DatabaseManager._relative_gap(volume_value, inferred_shares) <= 0.2
-            and DatabaseManager._relative_gap(volume_value, inferred_lots) > 0.2
-        ):
-            return volume_value / 100
+        candidates = (
+            volume_value,
+            volume_value * 100,
+            volume_value / 100,
+        )
+        best = min(candidates, key=lambda candidate: DatabaseManager._relative_gap(candidate, inferred_lots))
+        if DatabaseManager._relative_gap(best, inferred_lots) <= 0.2:
+            return round(best, 2)
         return volume_value
 
     @staticmethod
     def _is_cn_regular_intraday_minute(value: datetime) -> bool:
         minute = value.hour * 60 + value.minute
         return ((9 * 60 + 30) <= minute <= (11 * 60 + 30)) or ((13 * 60) <= minute <= (15 * 60))
+
+    @staticmethod
+    def _is_intraday_hot_table_source(value: Any) -> bool:
+        return str(value or "").strip() == "intraday_hot_table"
+
+    @staticmethod
+    def _is_provisional_daily_source(value: Any) -> bool:
+        return str(value or "").strip() in PROVISIONAL_DAILY_DATA_SOURCES
+
+    @staticmethod
+    def _canonical_daily_source_filter():
+        return or_(
+            StockDaily.data_source.is_(None),
+            StockDaily.data_source.notin_(tuple(PROVISIONAL_DAILY_DATA_SOURCES)),
+        )
+
+    @staticmethod
+    def _is_cn_market_open_date(target_date: date) -> bool:
+        try:
+            from src.core import trading_calendar
+
+            return trading_calendar.is_market_open("cn", target_date)
+        except Exception:
+            return target_date.weekday() < 5
+
+    @staticmethod
+    def _intraday_archive_change_limit_pct(stock_code: str) -> float:
+        code = DatabaseManager._normalize_stock_code(stock_code)
+        if code.startswith(("92", "43", "81", "82", "83", "87", "88")):
+            return 35.0
+        if code.startswith(("300", "301", "688")):
+            return 25.0
+        return 12.0
+
+    @classmethod
+    def _intraday_daily_bar_is_plausible(
+        cls,
+        *,
+        stock_code: str,
+        target_date: date,
+        bar: Dict[str, Any],
+        previous_close: Optional[float],
+    ) -> Tuple[bool, str]:
+        close_price = cls._to_optional_float(bar.get("close"))
+        open_price = cls._to_optional_float(bar.get("open"))
+        high_price = cls._to_optional_float(bar.get("high"))
+        low_price = cls._to_optional_float(bar.get("low"))
+        volume = cls._to_optional_float(bar.get("volume"))
+        amount = cls._to_optional_float(bar.get("amount"))
+
+        if close_price is None or close_price <= 0:
+            return False, "invalid_close"
+        if high_price is not None and low_price is not None and high_price < low_price:
+            return False, "invalid_ohlc_range"
+        if high_price is not None and (open_price is not None and high_price < open_price or high_price < close_price):
+            return False, "invalid_high"
+        if low_price is not None and (open_price is not None and low_price > open_price or low_price > close_price):
+            return False, "invalid_low"
+
+        if (volume is None or volume <= 0) and (amount is None or amount <= 0):
+            return False, "zero_volume_amount"
+
+        if cls._is_cn_equity_code(stock_code) and amount and amount > 0 and volume and volume > 0:
+            implied_price = amount / (volume * 100)
+            lower_bound = (low_price or close_price) * 0.75
+            upper_bound = (high_price or close_price) * 1.25
+            if implied_price < lower_bound or implied_price > upper_bound:
+                return False, "amount_volume_price_mismatch"
+
+        if previous_close is not None and previous_close > 0:
+            change_pct = (close_price - previous_close) / previous_close * 100
+            limit_pct = cls._intraday_archive_change_limit_pct(stock_code)
+            if abs(change_pct) > limit_pct:
+                return False, f"price_jump_{change_pct:.2f}%_over_{limit_pct:.0f}%"
+
+        return True, "ok"
     
     def get_session(self) -> Session:
         """
@@ -1235,6 +1317,9 @@ class DatabaseManager:
         """
         if target_date is None:
             target_date = date.today()
+        normalized_code = self._normalize_stock_code(code)
+        if not normalized_code:
+            return False
         # 注意：这里的 target_date 语义是“自然日”，而不是“最新交易日”。
         # 在周末/节假日/非交易日运行时，即使数据库已有最新交易日数据，这里也会返回 False。
         # 该行为目前保留（按需求不改逻辑）。
@@ -1243,7 +1328,7 @@ class DatabaseManager:
             result = session.execute(
                 select(StockDaily).where(
                     and_(
-                        StockDaily.code == code,
+                        StockDaily.code == normalized_code,
                         StockDaily.date == target_date
                     )
                 )
@@ -1268,10 +1353,13 @@ class DatabaseManager:
         Returns:
             StockDaily 对象列表（按日期降序）
         """
+        normalized_code = self._normalize_stock_code(code)
+        if not normalized_code:
+            return []
         with self.get_session() as session:
             results = session.execute(
                 select(StockDaily)
-                .where(StockDaily.code == code)
+                .where(StockDaily.code == normalized_code)
                 .order_by(desc(StockDaily.date))
                 .limit(days)
             ).scalars().all()
@@ -1283,21 +1371,39 @@ class DatabaseManager:
         codes: List[str],
         start_date: date,
         end_date: date,
+        limit_by_code: Optional[Dict[str, int]] = None,
     ) -> Dict[str, List[Dict[str, Any]]]:
         """Bulk-read daily bars for many codes, grouped by stored code."""
         normalized_codes = list(dict.fromkeys(
-            str(code or "").strip()
+            self._normalize_stock_code(code)
             for code in codes
             if str(code or "").strip()
         ))
+        normalized_codes = [code for code in normalized_codes if code]
         if not normalized_codes:
             return {}
 
+        normalized_limits = {
+            self._normalize_stock_code(code): max(0, int(limit or 0))
+            for code, limit in (limit_by_code or {}).items()
+            if str(code or "").strip()
+        }
+        normalized_limits = {
+            code: limit
+            for code, limit in normalized_limits.items()
+            if code and limit > 0
+        }
+        use_per_code_limit = bool(normalized_limits)
         rows_by_code: Dict[str, List[Dict[str, Any]]] = {code: [] for code in normalized_codes}
         chunk_size = 500
         with self.get_session() as session:
             for i in range(0, len(normalized_codes), chunk_size):
                 chunk = normalized_codes[i : i + chunk_size]
+                order_by = (
+                    (StockDaily.code, desc(StockDaily.date))
+                    if use_per_code_limit
+                    else (StockDaily.code, StockDaily.date)
+                )
                 rows = session.execute(
                     select(StockDaily)
                     .where(
@@ -1307,10 +1413,18 @@ class DatabaseManager:
                             StockDaily.date <= end_date,
                         )
                     )
-                    .order_by(StockDaily.code, StockDaily.date)
-                ).scalars().all()
+                    .order_by(*order_by)
+                ).scalars().yield_per(1000)
                 for row in rows:
-                    rows_by_code.setdefault(row.code, []).append(row.to_dict())
+                    bucket = rows_by_code.setdefault(row.code, [])
+                    if use_per_code_limit:
+                        limit = normalized_limits.get(row.code)
+                        if limit is not None and len(bucket) >= limit:
+                            continue
+                    bucket.append(row.to_dict())
+        if use_per_code_limit:
+            for rows in rows_by_code.values():
+                rows.reverse()
         return rows_by_code
 
     def save_news_intel(
@@ -1801,12 +1915,15 @@ class DatabaseManager:
         Returns:
             StockDaily 对象列表
         """
+        normalized_code = self._normalize_stock_code(code)
+        if not normalized_code:
+            return []
         with self.get_session() as session:
             results = session.execute(
                 select(StockDaily)
                 .where(
                     and_(
-                        StockDaily.code == code,
+                        StockDaily.code == normalized_code,
                         StockDaily.date >= start_date,
                         StockDaily.date <= end_date
                     )
@@ -1852,12 +1969,15 @@ class DatabaseManager:
         end_date: date,
     ) -> List[Dict[str, Any]]:
         """读取指定区间内的筹码峰日缓存，按日期升序返回。"""
+        normalized_code = self._normalize_stock_code(code)
+        if not normalized_code:
+            return []
         with self.get_session() as session:
             rows = session.execute(
                 select(StockChipDaily)
                 .where(
                     and_(
-                        StockChipDaily.code == code,
+                        StockChipDaily.code == normalized_code,
                         StockChipDaily.date >= start_date,
                         StockChipDaily.date <= end_date,
                     )
@@ -1872,8 +1992,11 @@ class DatabaseManager:
         as_of: Optional[date] = None,
     ) -> Optional[Dict[str, Any]]:
         """读取 as_of 当天或之前最近一条筹码峰日缓存。"""
+        normalized_code = self._normalize_stock_code(code)
+        if not normalized_code:
+            return None
         with self.get_session() as session:
-            conditions = [StockChipDaily.code == code]
+            conditions = [StockChipDaily.code == normalized_code]
             if as_of is not None:
                 conditions.append(StockChipDaily.date <= as_of)
             row = session.execute(
@@ -1937,7 +2060,8 @@ class DatabaseManager:
         data_source: Optional[str] = None,
     ) -> int:
         """批量 upsert 每日筹码峰快照，返回本次新增条数。"""
-        if not code or not snapshots:
+        normalized_code = self._normalize_stock_code(code)
+        if not normalized_code or not snapshots:
             return 0
 
         now = datetime.now()
@@ -1963,7 +2087,7 @@ class DatabaseManager:
                 return shape_metrics.get(metric_key) if value is None else value
 
             records_by_date[row_date] = {
-                "code": code,
+                "code": normalized_code,
                 "date": row_date,
                 "source": data_source or snapshot.get("source"),
                 "profit_ratio": self._normalize_sql_value(snapshot.get("profit_ratio")),
@@ -2029,7 +2153,7 @@ class DatabaseManager:
                 session.execute(
                     select(StockChipDaily.date).where(
                         and_(
-                            StockChipDaily.code == code,
+                            StockChipDaily.code == normalized_code,
                             StockChipDaily.date.in_(batch_dates),
                         )
                     )
@@ -2075,7 +2199,7 @@ class DatabaseManager:
                 for row in session.execute(
                     select(StockChipDaily).where(
                         and_(
-                            StockChipDaily.code == code,
+                            StockChipDaily.code == normalized_code,
                             StockChipDaily.date.in_(batch_dates),
                         )
                     )
@@ -2108,7 +2232,7 @@ class DatabaseManager:
             return new_count
 
         return self._run_write_transaction(
-            f"save_chip_daily_snapshots[{code}]",
+            f"save_chip_daily_snapshots[{normalized_code}]",
             _write,
         )
 
@@ -2221,7 +2345,16 @@ class DatabaseManager:
                 existing = existing_rows.get(code)
                 previous = previous_by_code.get(code)
                 price = sample["price"]
-                prev_cumulative_volume = previous.cumulative_volume if previous else None
+                prev_cumulative_volume = (
+                    self._normalize_cn_volume_to_lots(
+                        code,
+                        previous.cumulative_volume,
+                        previous.cumulative_amount,
+                        previous.close,
+                    )
+                    if previous
+                    else None
+                )
                 prev_cumulative_amount = previous.cumulative_amount if previous else None
                 cumulative_volume = sample.get("cumulative_volume")
                 cumulative_amount = sample.get("cumulative_amount")
@@ -2642,6 +2775,28 @@ class DatabaseManager:
                     if open_price is None and first is not None:
                         open_price = self._to_optional_float(first.close)
                     snapshot_time = last.snapshot_time
+                    amount_value = (
+                        self._to_optional_float(getattr(last, "cumulative_amount", None))
+                        or self._to_optional_float(row.amount)
+                        or 0
+                    )
+                    cumulative_volume = self._normalize_cn_volume_to_lots(
+                        stock_code,
+                        getattr(last, "cumulative_volume", None),
+                        amount_value,
+                        last.close,
+                    )
+                    aggregate_volume = self._normalize_cn_volume_to_lots(
+                        stock_code,
+                        row.volume,
+                        amount_value,
+                        last.close,
+                    )
+                    volume_value = (
+                        cumulative_volume
+                        if cumulative_volume is not None and cumulative_volume > 0
+                        else aggregate_volume
+                    )
                     result[stock_code] = {
                         "stock_code": stock_code,
                         "stock_name": None,
@@ -2649,8 +2804,8 @@ class DatabaseManager:
                         "open": open_price or last.close,
                         "high": row.high or last.close,
                         "low": row.low or last.close,
-                        "volume": row.volume or 0,
-                        "amount": row.amount or 0,
+                        "volume": volume_value or 0,
+                        "amount": amount_value,
                         "turnover_rate": last.turnover_rate,
                         "change_percent": last.change_percent,
                         "quote_time": last.minute_ts.isoformat(),
@@ -2687,8 +2842,31 @@ class DatabaseManager:
         for row in rows:
             by_code.setdefault(row.code, []).append(row)
 
-        previous_close_by_code: Dict[str, float] = {}
+        if (
+            by_code
+            and all(self._is_cn_equity_code(code) for code in by_code.keys())
+            and not self._is_cn_market_open_date(target_date)
+        ):
+            logger.warning(
+                "跳过非交易日分钟热表归档: trade_date=%s codes=%s",
+                target_date.isoformat(),
+                len(by_code),
+            )
+            return 0
+
+        existing_daily_by_code: Dict[str, StockDaily] = {}
+        previous_daily_by_code: Dict[str, StockDaily] = {}
         with self.get_session() as session:
+            existing_rows = session.execute(
+                select(StockDaily).where(
+                    and_(
+                        StockDaily.code.in_(list(by_code.keys())),
+                        StockDaily.date == target_date,
+                    )
+                )
+            ).scalars().all()
+            existing_daily_by_code = {row.code: row for row in existing_rows}
+
             previous_rows = session.execute(
                 select(StockDaily)
                 .where(
@@ -2701,17 +2879,28 @@ class DatabaseManager:
                 .order_by(StockDaily.code, desc(StockDaily.date))
             ).scalars().all()
         for row in previous_rows:
-            if row.code not in previous_close_by_code and row.close is not None and row.close > 0:
-                previous_close_by_code[row.code] = row.close
+            if row.code not in previous_daily_by_code and row.close is not None and row.close > 0:
+                previous_daily_by_code[row.code] = row
 
         saved_total = 0
         for stock_code, stock_rows in by_code.items():
+            existing_daily = existing_daily_by_code.get(stock_code)
+            if existing_daily is not None and not self._is_intraday_hot_table_source(existing_daily.data_source):
+                logger.info(
+                    "保留已有正式日线，跳过分钟热表覆盖: code=%s date=%s source=%s",
+                    stock_code,
+                    target_date.isoformat(),
+                    existing_daily.data_source,
+                )
+                continue
+
             first = stock_rows[0]
             last = stock_rows[-1]
             open_price = first.open
             close_price = last.close
             pct_chg = None
-            previous_close = previous_close_by_code.get(stock_code)
+            previous_daily = previous_daily_by_code.get(stock_code)
+            previous_close = previous_daily.close if previous_daily is not None else None
             if previous_close not in (None, 0) and close_price is not None:
                 pct_chg = (close_price - previous_close) / previous_close * 100
             elif last.change_percent is not None:
@@ -2727,7 +2916,7 @@ class DatabaseManager:
                 )
                 for row in stock_rows
             )
-            df = pd.DataFrame([{
+            daily_bar = {
                 "date": target_date,
                 "open": open_price,
                 "high": max((row.high for row in stock_rows if row.high is not None), default=None),
@@ -2737,7 +2926,26 @@ class DatabaseManager:
                 "amount": sum((row.amount or 0) for row in stock_rows),
                 "pct_chg": pct_chg,
                 "turnover_rate": last.turnover_rate,
-            }])
+            }
+            plausible, reason = self._intraday_daily_bar_is_plausible(
+                stock_code=stock_code,
+                target_date=target_date,
+                bar=daily_bar,
+                previous_close=previous_close,
+            )
+            if not plausible:
+                logger.warning(
+                    "跳过可疑分钟热表日线归档: code=%s date=%s reason=%s previous_close=%s close=%s source=%s",
+                    stock_code,
+                    target_date.isoformat(),
+                    reason,
+                    previous_close,
+                    close_price,
+                    getattr(last, "source", None),
+                )
+                continue
+
+            df = pd.DataFrame([daily_bar])
             saved_total += self.save_daily_data(df, stock_code, data_source="intraday_hot_table")
         return saved_total
 
@@ -2819,6 +3027,8 @@ class DatabaseManager:
         ]
         if data_source:
             conditions.append(StockDaily.data_source == data_source)
+        else:
+            conditions.append(self._canonical_daily_source_filter())
 
         with self.get_session() as session:
             rows = session.execute(
@@ -2840,6 +3050,8 @@ class DatabaseManager:
         daily_conditions = [StockDaily.date == target_date]
         if data_source:
             daily_conditions.append(StockDaily.data_source == data_source)
+        else:
+            daily_conditions.append(self._canonical_daily_source_filter())
 
         with self.get_session() as session:
             daily_codes = set(
@@ -2878,6 +3090,7 @@ class DatabaseManager:
 
         daily_conditions = [
             StockDaily.date == target_date,
+            self._canonical_daily_source_filter(),
             StockDaily.open.is_not(None),
             StockDaily.high.is_not(None),
             StockDaily.low.is_not(None),
@@ -3073,6 +3286,7 @@ class DatabaseManager:
         保存日线数据到数据库
         
         策略：
+        - `stock_daily` 是正式日线表，拒绝写入分钟热表等临时行情源
         - 按 `(code, date)` 做批量 UPSERT，已存在记录会覆盖更新
         - 同一批次内若存在重复日期，以最后一条记录为准
         - SQLite 分支按 chunk 写入以避免绑定参数上限
@@ -3088,6 +3302,18 @@ class DatabaseManager:
         if df is None or df.empty:
             logger.warning(f"保存数据为空，跳过 {code}")
             return 0
+        if self._is_provisional_daily_source(data_source):
+            logger.warning(
+                "拒绝将临时行情源写入正式日线表: code=%s source=%s rows=%s",
+                code,
+                data_source,
+                len(df.index),
+            )
+            return 0
+        normalized_code = self._normalize_stock_code(code)
+        if not normalized_code:
+            logger.warning("保存数据股票代码为空，跳过: %s", code)
+            return 0
 
         try:
             from src.rules.metrics import build_metric_frame
@@ -3102,15 +3328,34 @@ class DatabaseManager:
         records_by_date: Dict[date, Dict[str, Any]] = {}
         for row in df.to_dict(orient='records'):
             row_date = self._normalize_daily_date(row.get('date'))
+            close_value = self._normalize_sql_value(row.get('close'))
+            amount_value = self._normalize_sql_value(row.get('amount'))
+            volume_value = self._normalize_sql_value(row.get('volume'))
+            volume_value = self._normalize_cn_volume_to_lots(
+                normalized_code,
+                volume_value,
+                amount_value,
+                close_value,
+            )
+            amount_number = self._to_optional_float(amount_value)
+            volume_number = self._to_optional_float(volume_value)
+            if (volume_number is None or volume_number <= 0) and (amount_number is None or amount_number <= 0):
+                logger.debug(
+                    "跳过成交量和成交额均为空的正式日线: code=%s date=%s source=%s",
+                    normalized_code,
+                    row_date,
+                    data_source,
+                )
+                continue
             records_by_date[row_date] = {
-                'code': code,
+                'code': normalized_code,
                 'date': row_date,
                 'open': self._normalize_sql_value(row.get('open')),
                 'high': self._normalize_sql_value(row.get('high')),
                 'low': self._normalize_sql_value(row.get('low')),
-                'close': self._normalize_sql_value(row.get('close')),
-                'volume': self._normalize_sql_value(row.get('volume')),
-                'amount': self._normalize_sql_value(row.get('amount')),
+                'close': close_value,
+                'volume': volume_value,
+                'amount': amount_value,
                 'pct_chg': self._normalize_sql_value(row.get('pct_chg')),
                 'turnover_rate': self._normalize_sql_value(row.get('turnover_rate')),
                 'pe_ratio': self._normalize_sql_value(row.get('pe_ratio')),
@@ -3155,7 +3400,7 @@ class DatabaseManager:
                         session.execute(
                             select(StockDaily.date).where(
                                 and_(
-                                    StockDaily.code == code,
+                                    StockDaily.code == normalized_code,
                                     StockDaily.date.in_(chunk_dates),
                                 )
                             )
@@ -3205,7 +3450,7 @@ class DatabaseManager:
                     for row in session.execute(
                         select(StockDaily).where(
                             and_(
-                                StockDaily.code == code,
+                                StockDaily.code == normalized_code,
                                 StockDaily.date.in_(batch_dates),
                             )
                         )
@@ -3246,13 +3491,13 @@ class DatabaseManager:
 
         try:
             saved_count = self._run_write_transaction(
-                f"save_daily_data[{code}]",
+                f"save_daily_data[{normalized_code}]",
                 _write,
             )
-            logger.info(f"保存 {code} 数据成功，新增 {saved_count} 条")
+            logger.info(f"保存 {normalized_code} 数据成功，新增 {saved_count} 条")
             return saved_count
         except Exception as e:
-            logger.error(f"保存 {code} 数据失败: {e}")
+            logger.error(f"保存 {normalized_code} 数据失败: {e}")
             raise
     
     def get_analysis_context(

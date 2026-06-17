@@ -16,6 +16,7 @@ from src.storage import DatabaseManager
 from src.services.stock_service import (
     StockService,
     _clear_realtime_quote_cache,
+    _normalize_cn_volume_to_lots,
     _replace_realtime_quote_snapshot,
     _realtime_quote_cache_size,
     get_realtime_quote_cache_stats,
@@ -318,6 +319,41 @@ def test_realtime_quote_derives_turnover_when_provider_reports_zero() -> None:
     assert result["volume"] == 2000
     assert result["float_shares"] == 1_000_000_000
     assert result["turnover_rate"] == pytest.approx(0.02)
+
+
+def test_realtime_quote_normalizes_wanshou_volume_to_lots() -> None:
+    manager = _FakeManager()
+    manager.quote.price = 11.30
+    manager.quote.volume = 7988.2
+    manager.quote.amount = 905_740_000.0
+
+    with patch("data_provider.base.DataFetcherManager", return_value=manager):
+        result = StockService().get_realtime_quote("600519")
+
+    assert result is not None
+    assert result["volume"] == pytest.approx(798_820.0)
+
+
+@pytest.mark.parametrize(
+    ("stock_code", "volume", "amount", "price", "expected"),
+    [
+        ("600519", 1_000, 1_000_000, 10.0, 1_000.0),
+        ("600519", 10, 1_000_000, 10.0, 1_000.0),
+        ("600519", 100_000, 1_000_000, 10.0, 1_000.0),
+        ("AAPL", 10, 1_000_000, 10.0, 10.0),
+        ("600519", 10, None, 10.0, 10.0),
+        ("600519", 10, 1_000_000, None, 10.0),
+        ("600519", 7, 1_000_000, 10.0, 7.0),
+    ],
+)
+def test_stock_service_cn_volume_normalizer_candidates_and_fallbacks(
+    stock_code,
+    volume,
+    amount,
+    price,
+    expected,
+) -> None:
+    assert _normalize_cn_volume_to_lots(stock_code, volume, amount, price) == expected
 
 
 def test_realtime_quote_uses_cache_within_time_bucket() -> None:
@@ -715,6 +751,55 @@ def test_data_provider_realtime_cache_seconds_reads_config() -> None:
     with patch("src.config.get_config", return_value=SimpleNamespace(realtime_quote_cache_seconds=17, realtime_cache_ttl=99)):
         assert refresh_efinance_ttl(efinance_cache) == 17
         assert refresh_akshare_ttl(akshare_cache) == 17
+
+
+def test_efinance_realtime_volume_normalizes_wanshou_to_lots() -> None:
+    from data_provider.efinance_fetcher import (
+        EfinanceFetcher,
+        _realtime_cache,
+        _realtime_cache_lock,
+    )
+
+    fake_df = pd.DataFrame({
+        "股票代码": ["000001"],
+        "股票名称": ["平安银行"],
+        "最新价": [11.30],
+        "涨跌幅": [0.0],
+        "涨跌额": [0.0],
+        "成交量": [7988.2],
+        "成交额": [905_740_000.0],
+        "换手率": [0.1],
+        "振幅": [1.0],
+        "最高": [11.35],
+        "最低": [11.25],
+        "开盘": [11.30],
+        "昨收": [11.30],
+    })
+    fake_efinance = SimpleNamespace(
+        stock=SimpleNamespace(get_realtime_quotes=lambda *_args, **_kwargs: fake_df)
+    )
+    fetcher = EfinanceFetcher()
+
+    with _realtime_cache_lock:
+        _realtime_cache["data"] = None
+        _realtime_cache["timestamp"] = 0
+
+    try:
+        with (
+            patch.dict(sys.modules, {"efinance": fake_efinance}),
+            patch("src.config.get_config", return_value=SimpleNamespace(realtime_cache_ttl=30)),
+            patch("data_provider.efinance_fetcher.time.time", return_value=1000),
+            patch.object(fetcher, "_set_random_user_agent", return_value=None),
+            patch.object(fetcher, "_enforce_rate_limit", return_value=None),
+        ):
+            quote = fetcher.get_realtime_quote("000001")
+
+        assert quote is not None
+        assert quote.volume == pytest.approx(798_820.0)
+    finally:
+        with _realtime_cache_lock:
+            _realtime_cache["data"] = None
+            _realtime_cache["timestamp"] = 0
 
 
 def test_efinance_realtime_cache_coalesces_concurrent_refreshes() -> None:

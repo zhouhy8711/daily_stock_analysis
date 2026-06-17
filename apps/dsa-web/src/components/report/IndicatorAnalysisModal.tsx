@@ -60,6 +60,7 @@ type IndicatorAnalysisModalProps = {
   reportChangePct?: number;
   initialDate?: string;
   initialHistoryDays?: number;
+  historicalCutoffDate?: string | null;
   dataMode?: IndicatorAnalysisDataMode;
   onClose: () => void;
 };
@@ -71,6 +72,7 @@ type IndicatorAnalysisViewProps = {
   reportChangePct?: number;
   initialDate?: string;
   initialHistoryDays?: number;
+  historicalCutoffDate?: string | null;
   dataMode?: IndicatorAnalysisDataMode;
   onClose?: () => void;
   variant?: 'page' | 'modal';
@@ -5260,6 +5262,7 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
   stockName,
   initialDate,
   initialHistoryDays,
+  historicalCutoffDate,
   dataMode = 'realtime',
   onClose,
   variant = 'page',
@@ -5284,6 +5287,9 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
   const lastWindowResetKeyRef = useRef<string | null>(null);
   const marketKind = useMemo(() => getMarketKind(stockCode), [stockCode]);
   const initialDateKey = normalizeDateKey(initialDate);
+  const historicalCutoffDateKey = historicalCutoffDate === null
+    ? null
+    : normalizeDateKey(historicalCutoffDate ?? initialDate);
   const isHistoricalMode = dataMode === 'historical';
   const dailyHistoryDays = Math.max(1, Math.min(MAX_DAILY_HISTORY_DAYS, Math.round(initialHistoryDays ?? DEFAULT_DAILY_HISTORY_DAYS)));
   const dailyHistoryRequestDays = MAX_DAILY_HISTORY_DAYS;
@@ -5565,7 +5571,7 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
 
     const loadInitialData = async () => {
       const [historyResult, quoteResult, metricsResult] = await Promise.allSettled([
-        getHistoryForDataMode(stockCode, dailyHistoryRequestDays, 'daily', 'daily', dataMode, initialDateKey),
+        getHistoryForDataMode(stockCode, dailyHistoryRequestDays, 'daily', 'daily', dataMode, historicalCutoffDateKey),
         isHistoricalMode ? Promise.resolve(null) : stocksApi.getQuote(stockCode, 'cache_only'),
         isHistoricalMode
           ? stocksApi.getIndicatorMetrics(
@@ -5635,7 +5641,7 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
     return () => {
       ignore = true;
     };
-  }, [dailyHistoryDays, dailyHistoryRequestDays, dataMode, initialDateKey, isHistoricalMode, marketKind, refreshMetricsForTradeDate, refreshQuoteWithDefaultPolicy, stockCode]);
+  }, [dailyHistoryDays, dailyHistoryRequestDays, dataMode, historicalCutoffDateKey, initialDateKey, isHistoricalMode, marketKind, refreshMetricsForTradeDate, refreshQuoteWithDefaultPolicy, stockCode]);
 
   const selectedCachedState = historyCache[selectedPeriod];
   const dailyCachedState = historyCache.daily;
@@ -5669,7 +5675,7 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
 
     let ignore = false;
     const selectedMeta = getPeriodMeta(selectedPeriod);
-    getHistoryForDataMode(stockCode, selectedMeta.days, selectedMeta.requestPeriod, selectedPeriod, dataMode, initialDateKey)
+    getHistoryForDataMode(stockCode, selectedMeta.days, selectedMeta.requestPeriod, selectedPeriod, dataMode, historicalCutoffDateKey)
       .then((periodResponse) => {
         if (ignore) {
           return;
@@ -5731,7 +5737,7 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
     return () => {
       ignore = true;
     };
-  }, [dataMode, initialDateKey, isHistoricalMode, marketKind, refreshMetricsForTradeDate, selectedCachedState, selectedPeriod, stockCode]);
+  }, [dataMode, historicalCutoffDateKey, isHistoricalMode, marketKind, refreshMetricsForTradeDate, selectedCachedState, selectedPeriod, stockCode]);
 
   useEffect(() => {
     if (
@@ -5755,7 +5761,7 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
       oneMinuteRefreshInFlightRef.current = true;
       try {
         const [historyResult, quoteResult] = await Promise.allSettled([
-          getHistoryForDataMode(stockCode, oneMinuteMeta.days, oneMinuteMeta.requestPeriod, selectedPeriod, dataMode, initialDateKey),
+          getHistoryForDataMode(stockCode, oneMinuteMeta.days, oneMinuteMeta.requestPeriod, selectedPeriod, dataMode, historicalCutoffDateKey),
           stocksApi.getQuote(stockCode, 'cache_only'),
         ]);
 
@@ -5823,7 +5829,7 @@ export const IndicatorAnalysisView: React.FC<IndicatorAnalysisViewProps> = ({
       oneMinuteRefreshInFlightRef.current = false;
       window.clearInterval(intervalId);
     };
-  }, [dataMode, initialDateKey, isHistoricalMode, marketKind, refreshMetricsForTradeDate, selectedCachedState, selectedPeriod, stockCode]);
+  }, [dataMode, historicalCutoffDateKey, isHistoricalMode, marketKind, refreshMetricsForTradeDate, selectedCachedState, selectedPeriod, stockCode]);
 
   useEffect(() => {
     if (isHistoricalMode || isLoading || selectedPeriod === '1m' || selectedPeriod === 'timeshare') {

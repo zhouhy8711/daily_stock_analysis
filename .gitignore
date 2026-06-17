@@ -48,10 +48,15 @@ env/
 
 # 数据和日志
 /data/
+outputs/
 logs/
 reports/
+memory/
 skill_out/
 *.db
+*.db-wal
+*.db-shm
+*.db.bak.*
 *.sqlite
 *.sqlite3
 

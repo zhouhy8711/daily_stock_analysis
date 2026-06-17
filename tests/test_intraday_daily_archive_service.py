@@ -8,6 +8,7 @@ import pandas as pd
 from src.services.intraday_daily_archive_service import (
     DEFAULT_INTRADAY_ARCHIVE_INTERVAL_SECONDS,
     IntradayDailyArchiveService,
+    pause_intraday_daily_archive,
 )
 from src.storage import DatabaseManager
 
@@ -47,6 +48,34 @@ def _seed_intraday_rows(db: DatabaseManager) -> None:
     )
 
 
+def _patch_official_daily(
+    monkeypatch,
+    target_date: date,
+    *,
+    source: str = "EfinanceFetcher",
+    close: float = 12.0,
+) -> None:
+    df = pd.DataFrame([
+        {
+            "date": target_date,
+            "open": 10.0,
+            "high": max(12.0, close),
+            "low": 9.8,
+            "close": close,
+            "volume": 1300,
+            "amount": close * 1300 * 100,
+            "pct_chg": 2.0,
+            "turnover_rate": 0.8,
+        }
+    ])
+
+    class FakeDataFetcherManager:
+        def get_daily_data(self, stock_code, start_date=None, end_date=None, days=30):
+            return df, source
+
+    monkeypatch.setattr("data_provider.base.DataFetcherManager", FakeDataFetcherManager)
+
+
 def _seed_daily_history_for_chip(db: DatabaseManager, target_date: date) -> None:
     db.save_daily_data(
         pd.DataFrame([
@@ -79,7 +108,7 @@ def _seed_daily_history_for_chip(db: DatabaseManager, target_date: date) -> None
             }
         ]),
         "600519",
-        data_source="intraday_hot_table",
+        data_source="EfinanceFetcher",
     )
 
 
@@ -100,12 +129,13 @@ def test_intraday_daily_archive_skips_before_four_pm() -> None:
         DatabaseManager.reset_instance()
 
 
-def test_intraday_daily_archive_archives_and_purges_after_four_pm() -> None:
+def test_intraday_daily_archive_refreshes_official_daily_and_purges_after_four_pm(monkeypatch) -> None:
     DatabaseManager.reset_instance()
     db = DatabaseManager(db_url="sqlite:///:memory:")
     target_date = datetime(2026, 5, 7).date()
     try:
         _seed_intraday_rows(db)
+        _patch_official_daily(monkeypatch, target_date)
         service = IntradayDailyArchiveService(db_manager=db, quote_loader=lambda code: None)
 
         result = service.run_once(current_time=datetime(2026, 5, 7, 16, 5, 0))
@@ -121,7 +151,7 @@ def test_intraday_daily_archive_archives_and_purges_after_four_pm() -> None:
         assert daily_rows[0].date == target_date
         assert daily_rows[0].open == 10.0
         assert daily_rows[0].close == 12.0
-        assert daily_rows[0].data_source == "intraday_hot_table"
+        assert daily_rows[0].data_source == "EfinanceFetcher"
     finally:
         DatabaseManager.reset_instance()
 
@@ -215,6 +245,7 @@ def test_intraday_daily_archive_backfills_daily_valuation_after_archive(monkeypa
     monkeypatch.setattr(StockService, "get_realtime_quote", fake_get_realtime_quote)
     try:
         _seed_intraday_rows(db)
+        _patch_official_daily(monkeypatch, target_date)
         service = IntradayDailyArchiveService(db_manager=db)
 
         result = service.run_once(current_time=datetime(2026, 5, 7, 16, 5, 0))
@@ -292,9 +323,9 @@ def test_intraday_daily_archive_refreshes_existing_daily_valuation_without_hot_r
                     "amount": 15000,
                     "pct_chg": 20.0,
                 }
-            ]),
-            "600519",
-            data_source="intraday_hot_table",
+        ]),
+        "600519",
+        data_source="EfinanceFetcher",
         )
         service = IntradayDailyArchiveService(db_manager=db)
 
@@ -328,6 +359,24 @@ def test_intraday_daily_archive_syncs_missing_chip_daily_without_hot_rows() -> N
         assert result["chip_synced_count"] == 1
         assert len(rows) == 1
         assert rows[0]["date"] == target_date.isoformat()
+    finally:
+        DatabaseManager.reset_instance()
+
+
+def test_intraday_daily_archive_skips_while_paused() -> None:
+    DatabaseManager.reset_instance()
+    db = DatabaseManager(db_url="sqlite:///:memory:")
+    try:
+        _seed_intraday_rows(db)
+        service = IntradayDailyArchiveService(db_manager=db, quote_loader=lambda code: None)
+
+        with pause_intraday_daily_archive("unit-test"):
+            result = service.run_once(current_time=datetime(2026, 5, 7, 16, 5, 0))
+
+        assert result["status"] == "skipped"
+        assert result["reason"] == "paused"
+        assert result["pause_reason"] == "unit-test"
+        assert db.get_intraday_minute_codes(trade_date=datetime(2026, 5, 7).date()) == ["600519"]
     finally:
         DatabaseManager.reset_instance()
 

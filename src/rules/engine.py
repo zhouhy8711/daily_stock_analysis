@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import math
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import pandas as pd
 
@@ -407,18 +407,49 @@ def evaluate_rule_at_index(definition: Dict[str, Any], metric_frame: pd.DataFram
     }
 
 
+def _rule_may_match_at_index(definition: Dict[str, Any], metric_frame: pd.DataFrame, index: int) -> bool:
+    """Fast boolean pass for history scans; full details are built only for hits."""
+    if metric_frame.empty or index < 0 or index >= len(metric_frame):
+        return False
+    for group in definition.get("groups") or []:
+        conditions = group.get("conditions") or []
+        if not conditions:
+            continue
+        group_matched = True
+        for condition in conditions:
+            if not evaluate_condition(metric_frame, condition, index).get("matched"):
+                group_matched = False
+                break
+        if group_matched:
+            return True
+    return False
+
+
 def evaluate_rule(definition: Dict[str, Any], metric_frame: pd.DataFrame) -> Dict[str, Any]:
     """Evaluate a rule definition on the latest row of a metric frame."""
     return evaluate_rule_at_index(definition, metric_frame, len(metric_frame) - 1)
 
 
-def evaluate_rule_history(definition: Dict[str, Any], metric_frame: pd.DataFrame) -> List[Dict[str, Any]]:
+def evaluate_rule_history(
+    definition: Dict[str, Any],
+    metric_frame: pd.DataFrame,
+    indices: Optional[Iterable[int]] = None,
+) -> List[Dict[str, Any]]:
     """Evaluate a rule definition across all rows and return matched events."""
     if metric_frame.empty:
         return []
 
     events: List[Dict[str, Any]] = []
-    for index in range(len(metric_frame)):
+    row_indices = range(len(metric_frame)) if indices is None else indices
+    for raw_index in row_indices:
+        try:
+            index = int(raw_index)
+        except (TypeError, ValueError):
+            continue
+        if index < 0 or index >= len(metric_frame):
+            continue
+        if not _rule_may_match_at_index(definition, metric_frame, index):
+            continue
         result = evaluate_rule_at_index(definition, metric_frame, index)
         if not result.get("matched"):
             continue

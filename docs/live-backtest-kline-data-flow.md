@@ -105,7 +105,7 @@ flowchart LR
 
 ### 规则运行数据预热
 
-异步规则实测/回测启动后，后端会根据选中规则、股票范围和 lookback 天数，一次性从 `stock_daily` 批量读取所需日线窗口并放入进程内缓存。回测和普通规则运行使用短期通用缓存；Web 实测会额外生成 `live_cache_key`，后端把当天之前的历史日线、基础筹码分布缓存和财务事件派生缓存写入仅实测使用的 live 缓存，不受通用缓存 TTL 影响；每一轮实测都会先用最新分钟热表行情合成当前判断日 K 线，再优先基于该 K 线重算当日筹码分布，缺少换手率等必要字段时才退回到按最新价重估获利盘，避免复用上一轮价格或前一交易日筹码日期。A 股交易日 09:30 前触发实测时只进入 `prewarm_only`：读取当天之前的历史日线并刷新 live 缓存，不读取分钟热表、不评估命中、不推送通知；09:30 后同规则和股票会复用该 live 缓存，再从 `stock_intraday_minute` 聚合实时 quote 做真正实测。用户点击「停止实测」时前端调用 `DELETE /api/v1/rules/live-cache/{live_cache_key}` 清理本次 live 缓存；如果页面异常关闭，组件卸载时也会尽力清理。大规模实测运行期间，后台实时行情预热仍会刷新内存快照，但会临时跳过 `stock_intraday_minute` 归档写入，避免归档事务抢占规则结果落库。
+异步规则实测/回测启动后，后端会根据选中规则、股票范围和 lookback 天数，一次性从 `stock_daily` 批量读取所需日线窗口并放入进程内缓存。回测和普通规则运行使用短期通用缓存；Web 实测会额外生成 `live_cache_key`，后端把当天之前的历史日线、基础筹码分布缓存和财务事件派生缓存写入仅实测使用的 live 缓存，不受通用缓存 TTL 影响；每一轮实测都会先用最新分钟热表行情合成当前判断日 K 线，再优先基于该 K 线重算当日筹码分布，缺少换手率等必要字段时才退回到按最新价重估获利盘，避免复用上一轮价格或前一交易日筹码日期。A 股交易日 09:30 前触发实测时只进入 `prewarm_only`：读取当天之前的历史日线并刷新 live 缓存，不读取分钟热表、不评估命中、不推送通知；09:30 后同规则和股票会复用该 live 缓存，再从 `stock_intraday_minute` 聚合实时 quote 做真正实测。用户点击「停止实测」时前端调用 `DELETE /api/v1/rules/live-cache/{live_cache_key}` 清理本次 live 缓存；如果页面异常关闭，组件卸载时也会尽力清理。大规模实测运行期间，后台全市场实时行情预热会跳过新一轮远程抓取，分钟热表归档也会临时暂停，避免低优先级 quote 抓取和归档抢占实测资源。
 
 ### 数据库表
 
@@ -200,6 +200,7 @@ POST /api/v1/rules/run-batch/async
 8. `_sync_latest_history_rows_with_quote()` 根据 `snapshot_time/quote_time/update_time` 解析判断日，把分钟热表 quote 合成为最新日线点：
    - 若 `stock_daily` 最后一日就是判断日，更新最后一行。
    - 若最后一日早于判断日，追加一条虚拟实时日 K。
+   - 分钟热表 quote 不包含 PE、市值、股本和部分财务事件字段时，虚拟点会从上一行本地日线缓存兜底；其中 PE、总市值、流通市值按实时价相对参考收盘价同步缩放，确保实测规则的估值分位条件可在盘中计算。
    - 虚拟点带 `snapshot_id`、`snapshot_time`、`data_source`；分钟热表 fallback 的 `data_source` 为 `intraday_hot_table`。
 9. `build_metric_frame()` 把日线、quote 和筹码指标合成指标 DataFrame，计算 MA、MACD、RSI、前 N 日收益、成交量均线、资金流估算等规则可用字段。
 10. `evaluate_rule_at_index()` 只评估最后一行。

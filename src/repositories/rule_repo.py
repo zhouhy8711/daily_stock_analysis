@@ -13,6 +13,7 @@ from src.storage import DatabaseManager, StockRule, StockRuleMatch, StockRuleRun
 
 RULE_BATCH_META_PREFIX = "__rule_batch_meta__:"
 RULE_STALE_RUNNING_AFTER = timedelta(hours=6)
+RULE_RUN_LIST_EVENT_RECOUNT_MAX_MATCHES = 1000
 T = TypeVar("T")
 
 
@@ -192,6 +193,7 @@ class RuleRepository:
                 metadata, _public_error = _decode_rule_batch_metadata(row.error)
                 if metadata.get("run_key") == run_key:
                     item = self.run_to_dict(row, rule_name)
+                    item["event_count"] = self._load_run_event_count(session, row.id, int(row.match_count or 0))
                     item["reused_run"] = True
                     return item
         return None
@@ -211,6 +213,24 @@ class RuleRepository:
             if isinstance(matched_dates, list):
                 total += len(matched_dates)
         return total
+
+    def _load_run_event_count(
+        self,
+        session: Any,
+        run_id: int,
+        match_count: int,
+        *,
+        max_recount_matches: Optional[int] = None,
+    ) -> int:
+        if match_count <= 0:
+            return 0
+        if max_recount_matches is not None and match_count > max_recount_matches:
+            return int(match_count)
+        snapshot_json_values = session.execute(
+            select(StockRuleMatch.snapshot_json).where(StockRuleMatch.run_id == run_id)
+        ).scalars().all()
+        counted = self._count_event_rows_from_snapshots(list(snapshot_json_values))
+        return int(counted or match_count)
 
     @staticmethod
     def _snapshot_has_live_metadata(snapshot_json: Optional[str]) -> bool:
@@ -414,10 +434,12 @@ class RuleRepository:
             items: List[Dict[str, Any]] = []
             for run, rule_name in rows:
                 item = self.run_to_dict(run, rule_name)
-                snapshot_json_values = session.execute(
-                    select(StockRuleMatch.snapshot_json).where(StockRuleMatch.run_id == run.id)
-                ).scalars().all()
-                item["event_count"] = self._count_event_rows_from_snapshots(list(snapshot_json_values))
+                item["event_count"] = self._load_run_event_count(
+                    session,
+                    run.id,
+                    int(run.match_count or 0),
+                    max_recount_matches=RULE_RUN_LIST_EVENT_RECOUNT_MAX_MATCHES,
+                )
                 match_rules = session.execute(
                     select(StockRuleMatch.rule_id, StockRule.name)
                     .join(StockRule, StockRule.id == StockRuleMatch.rule_id)
@@ -447,10 +469,7 @@ class RuleRepository:
                 return None
             run, rule_name = row
             item = self.run_to_dict(run, rule_name)
-            snapshot_json_values = session.execute(
-                select(StockRuleMatch.snapshot_json).where(StockRuleMatch.run_id == run.id)
-            ).scalars().all()
-            item["event_count"] = self._count_event_rows_from_snapshots(list(snapshot_json_values))
+            item["event_count"] = self._load_run_event_count(session, run.id, int(run.match_count or 0))
             return item
 
     def get_rule(self, rule_id: int) -> Optional[Dict[str, Any]]:
@@ -639,6 +658,31 @@ class RuleRepository:
             return len(rows)
 
         return self._run_write_transaction("stock_rule_run.fail_stale", write)
+
+    def fail_running_runs_started_before(
+        self,
+        cutoff: datetime,
+        *,
+        now: Optional[datetime] = None,
+        message: str = "服务已重启，上一进程中的后台回测已自动标记失败",
+    ) -> int:
+        current_time = now or datetime.now()
+
+        def write(session) -> int:
+            rows = session.execute(
+                select(StockRuleRun).where(
+                    StockRuleRun.status == "running",
+                    StockRuleRun.started_at < cutoff,
+                )
+            ).scalars().all()
+            for row in rows:
+                row.status = "failed"
+                row.finished_at = current_time
+                row.duration_ms = int((current_time - row.started_at).total_seconds() * 1000) if row.started_at else None
+                row.error = _append_run_error(row.error, message)
+            return len(rows)
+
+        return self._run_write_transaction("stock_rule_run.fail_orphaned", write)
 
     def list_matches(self, run_id: int) -> List[Dict[str, Any]]:
         with self.db.get_session() as session:

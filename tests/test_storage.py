@@ -15,7 +15,7 @@ from sqlalchemy.sql import func
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from src.config import Config
-from src.storage import DatabaseManager, StockDaily
+from src.storage import DatabaseManager, StockDaily, StockIntradayMinute
 
 class TestStorage(unittest.TestCase):
     
@@ -99,6 +99,37 @@ class TestStorage(unittest.TestCase):
         self.assertEqual({item["session_id"] for item in sessions}, {"feishu_u1", "feishu_u1:ask_600519"})
 
         DatabaseManager.reset_instance()
+
+    def test_get_daily_data_range_by_codes_can_limit_latest_rows_per_code(self):
+        DatabaseManager.reset_instance()
+        db = DatabaseManager(db_url="sqlite:///:memory:")
+        try:
+            rows = []
+            for day in range(1, 6):
+                rows.append({
+                    "date": date(2026, 5, day),
+                    "open": float(day),
+                    "high": float(day + 1),
+                    "low": float(day - 1),
+                    "close": float(day),
+                    "volume": day * 1000,
+                    "amount": day * 10000,
+                })
+            db.save_daily_data(pd.DataFrame(rows), "600519", data_source="unit-test")
+
+            limited = db.get_daily_data_range_by_codes(
+                ["600519"],
+                date(2026, 5, 1),
+                date(2026, 5, 5),
+                limit_by_code={"600519": 2},
+            )
+
+            self.assertEqual(
+                [row["date"] for row in limited["600519"]],
+                [date(2026, 5, 4), date(2026, 5, 5)],
+            )
+        finally:
+            DatabaseManager.reset_instance()
 
     def test_save_daily_data_persists_optional_market_metrics_and_keeps_existing_on_null_update(self):
         DatabaseManager.reset_instance()
@@ -362,7 +393,7 @@ class TestStorage(unittest.TestCase):
             finally:
                 DatabaseManager.reset_instance()
 
-    def test_intraday_minute_hot_table_upserts_and_archives_to_daily(self):
+    def test_intraday_minute_hot_table_upserts_but_does_not_write_stock_daily(self):
         DatabaseManager.reset_instance()
         db = DatabaseManager(db_url="sqlite:///:memory:")
         snapshot_time = datetime(2026, 5, 7, 10, 30, 12)
@@ -370,12 +401,12 @@ class TestStorage(unittest.TestCase):
             pd.DataFrame([
                 {
                     "date": date(2026, 5, 6),
-                    "open": 9.4,
-                    "high": 9.6,
-                    "low": 9.3,
-                    "close": 9.5,
+                    "open": 10.8,
+                    "high": 11.2,
+                    "low": 10.7,
+                    "close": 11.0,
                     "volume": 1000,
-                    "amount": 950000,
+                    "amount": 1100000,
                     "pct_chg": -1.0,
                 }
             ]),
@@ -431,16 +462,338 @@ class TestStorage(unittest.TestCase):
         self.assertEqual(summary["snapshot_time"], snapshot_time.replace(second=30).isoformat())
 
         archived = db.archive_intraday_minutes_to_daily(trade_date=snapshot_time.date(), codes=["600519"])
-        daily_rows = db.get_latest_data("600519", days=1)
+        daily_rows = db.get_data_range("600519", snapshot_time.date(), snapshot_time.date())
 
-        self.assertEqual(archived, 1)
-        self.assertEqual(len(daily_rows), 1)
-        self.assertEqual(daily_rows[0].open, 10.0)
-        self.assertEqual(daily_rows[0].close, 12.0)
-        self.assertAlmostEqual(daily_rows[0].pct_chg, (12.0 - 9.5) / 9.5 * 100)
-        self.assertEqual(daily_rows[0].data_source, "intraday_hot_table")
+        self.assertEqual(archived, 0)
+        self.assertEqual(daily_rows, [])
 
         DatabaseManager.reset_instance()
+
+    def test_save_daily_data_rejects_intraday_hot_table_source(self):
+        DatabaseManager.reset_instance()
+        db = DatabaseManager(db_url="sqlite:///:memory:")
+        target_date = date(2026, 5, 7)
+
+        try:
+            saved = db.save_daily_data(
+                pd.DataFrame([
+                    {
+                        "date": target_date,
+                        "open": 10.0,
+                        "high": 12.0,
+                        "low": 9.8,
+                        "close": 12.0,
+                        "volume": 1300,
+                        "amount": 1560000,
+                    }
+                ]),
+                "600519",
+                data_source="intraday_hot_table",
+            )
+            daily_rows = db.get_data_range("600519", target_date, target_date)
+
+            self.assertEqual(saved, 0)
+            self.assertEqual(daily_rows, [])
+        finally:
+            DatabaseManager.reset_instance()
+
+    def test_save_daily_data_normalizes_cn_share_volume_to_lots(self):
+        DatabaseManager.reset_instance()
+        db = DatabaseManager(db_url="sqlite:///:memory:")
+        target_date = date(2026, 5, 7)
+
+        try:
+            db.save_daily_data(
+                pd.DataFrame([
+                    {
+                        "date": target_date,
+                        "open": 10.0,
+                        "high": 10.5,
+                        "low": 9.8,
+                        "close": 10.0,
+                        "volume": 100_000,
+                        "amount": 1_000_000,
+                    }
+                ]),
+                "600519",
+                data_source="AkshareFetcher",
+            )
+
+            rows = db.get_data_range("600519", target_date, target_date)
+
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0].volume, 1000.0)
+        finally:
+            DatabaseManager.reset_instance()
+
+    def test_cn_volume_normalizer_handles_lots_wanshou_shares_and_safe_fallbacks(self):
+        cases = [
+            ("000001", 1_000, 1_000_000, 10.0, 1_000.0, "already lots"),
+            ("000001", 10, 1_000_000, 10.0, 1_000.0, "wanshou to lots"),
+            ("000001", 100_000, 1_000_000, 10.0, 1_000.0, "shares to lots"),
+            ("AAPL", 10, 1_000_000, 10.0, 10.0, "non cn unchanged"),
+            ("000001", 10, None, 10.0, 10.0, "missing amount unchanged"),
+            ("000001", 10, 1_000_000, None, 10.0, "missing price unchanged"),
+            ("000001", 7, 1_000_000, 10.0, 7.0, "ambiguous mismatch unchanged"),
+        ]
+
+        for code, volume, amount, price, expected, label in cases:
+            with self.subTest(label=label):
+                self.assertEqual(
+                    DatabaseManager._normalize_cn_volume_to_lots(code, volume, amount, price),
+                    expected,
+                )
+
+    def test_save_daily_data_skips_zero_volume_and_amount_rows(self):
+        DatabaseManager.reset_instance()
+        db = DatabaseManager(db_url="sqlite:///:memory:")
+        target_date = date(2026, 5, 7)
+
+        try:
+            saved = db.save_daily_data(
+                pd.DataFrame([
+                    {
+                        "date": target_date,
+                        "open": 10.0,
+                        "high": 10.5,
+                        "low": 9.8,
+                        "close": 10.2,
+                        "volume": 0,
+                        "amount": 0,
+                    }
+                ]),
+                "600519",
+                data_source="AkshareFetcher",
+            )
+
+            rows = db.get_data_range("600519", target_date, target_date)
+
+            self.assertEqual(saved, 0)
+            self.assertEqual(rows, [])
+        finally:
+            DatabaseManager.reset_instance()
+
+    def test_save_daily_data_canonicalizes_a_share_code(self):
+        DatabaseManager.reset_instance()
+        db = DatabaseManager(db_url="sqlite:///:memory:")
+        target_date = date(2026, 5, 7)
+
+        try:
+            first = db.save_daily_data(
+                pd.DataFrame([
+                    {
+                        "date": target_date,
+                        "open": 10.0,
+                        "high": 11.0,
+                        "low": 9.8,
+                        "close": 10.5,
+                        "volume": 1000,
+                        "amount": 1_050_000,
+                    }
+                ]),
+                "688498.SH",
+                data_source="EfinanceFetcher",
+            )
+            second = db.save_daily_data(
+                pd.DataFrame([
+                    {
+                        "date": target_date,
+                        "open": 10.1,
+                        "high": 11.2,
+                        "low": 10.0,
+                        "close": 10.8,
+                        "volume": 1200,
+                        "amount": 1_296_000,
+                    }
+                ]),
+                "688498",
+                data_source="AkshareFetcher",
+            )
+
+            rows = db.get_data_range("SH688498", target_date, target_date)
+            batch = db.get_daily_data_range_by_codes(["688498.SH"], target_date, target_date)
+
+            self.assertEqual(first, 1)
+            self.assertEqual(second, 0)
+            self.assertTrue(db.has_today_data("688498.SH", target_date))
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0].code, "688498")
+            self.assertEqual(rows[0].close, 10.8)
+            self.assertEqual(set(batch.keys()), {"688498"})
+            self.assertEqual(batch["688498"][0]["code"], "688498")
+        finally:
+            DatabaseManager.reset_instance()
+
+    def test_completed_daily_archive_ignores_legacy_intraday_hot_table_rows(self):
+        DatabaseManager.reset_instance()
+        db = DatabaseManager(db_url="sqlite:///:memory:")
+        target_date = date(2026, 5, 7)
+
+        try:
+            with db.session_scope() as session:
+                session.add(
+                    StockDaily(
+                        code="600519",
+                        date=target_date,
+                        open=10.0,
+                        high=12.0,
+                        low=9.8,
+                        close=12.0,
+                        volume=1300,
+                        amount=1560000,
+                        pe_ratio=20.0,
+                        total_mv=1_200_000_000.0,
+                        circ_mv=900_000_000.0,
+                        total_shares=100_000_000.0,
+                        float_shares=75_000_000.0,
+                        data_source="intraday_hot_table",
+                    )
+                )
+            db.save_chip_daily_snapshots(
+                "600519",
+                [
+                    {
+                        "date": target_date,
+                        "profit_ratio": 0.8,
+                        "avg_cost": 10.5,
+                        "cost_90_low": 9.0,
+                        "cost_90_high": 12.0,
+                        "concentration_90": 0.25,
+                        "distribution": [{"price": 10.5, "percent": 1.0}],
+                    }
+                ],
+                data_source="local_chip_model:intraday_hot_table",
+            )
+
+            completed = db.get_completed_daily_archive_codes(
+                trade_date=target_date,
+                codes=["600519"],
+            )
+
+            self.assertEqual(completed, [])
+        finally:
+            DatabaseManager.reset_instance()
+
+    def test_intraday_archive_skips_closed_cn_market_date(self):
+        DatabaseManager.reset_instance()
+        db = DatabaseManager(db_url="sqlite:///:memory:")
+        snapshot_time = datetime(2026, 5, 9, 10, 30, 12)
+
+        try:
+            db.save_intraday_quote_samples(
+                [
+                    {
+                        "stock_code": "600519",
+                        "current_price": 1500.0,
+                        "volume": 1000,
+                        "amount": 1500000,
+                        "source": "snapshot",
+                    }
+                ],
+                snapshot_id="20260509103012",
+                snapshot_time=snapshot_time,
+            )
+
+            archived = db.archive_intraday_minutes_to_daily(trade_date=snapshot_time.date(), codes=["600519"])
+            daily_rows = db.get_data_range("600519", snapshot_time.date(), snapshot_time.date())
+
+            self.assertEqual(archived, 0)
+            self.assertEqual(daily_rows, [])
+        finally:
+            DatabaseManager.reset_instance()
+
+    def test_intraday_archive_preserves_existing_official_daily_row(self):
+        DatabaseManager.reset_instance()
+        db = DatabaseManager(db_url="sqlite:///:memory:")
+        target_date = date(2026, 5, 7)
+
+        try:
+            db.save_daily_data(
+                pd.DataFrame([
+                    {
+                        "date": target_date,
+                        "open": 1500.0,
+                        "high": 1510.0,
+                        "low": 1490.0,
+                        "close": 1505.0,
+                        "volume": 1000,
+                        "amount": 150500000,
+                    }
+                ]),
+                "600519",
+                data_source="EfinanceFetcher",
+            )
+            db.save_intraday_quote_samples(
+                [
+                    {
+                        "stock_code": "600519",
+                        "current_price": 1400.0,
+                        "volume": 1000,
+                        "amount": 140000000,
+                        "source": "snapshot",
+                    }
+                ],
+                snapshot_id="20260507103012",
+                snapshot_time=datetime(2026, 5, 7, 10, 30, 12),
+            )
+
+            archived = db.archive_intraday_minutes_to_daily(trade_date=target_date, codes=["600519"])
+            daily_rows = db.get_data_range("600519", target_date, target_date)
+
+            self.assertEqual(archived, 0)
+            self.assertEqual(len(daily_rows), 1)
+            self.assertEqual(daily_rows[0].close, 1505.0)
+            self.assertEqual(daily_rows[0].data_source, "EfinanceFetcher")
+        finally:
+            DatabaseManager.reset_instance()
+
+    def test_intraday_archive_rejects_amount_volume_price_mismatch(self):
+        DatabaseManager.reset_instance()
+        db = DatabaseManager(db_url="sqlite:///:memory:")
+        target_date = date(2026, 6, 1)
+
+        try:
+            db.save_daily_data(
+                pd.DataFrame([
+                    {
+                        "date": date(2026, 5, 29),
+                        "open": 4.08,
+                        "high": 4.08,
+                        "low": 4.08,
+                        "close": 4.08,
+                        "volume": 0,
+                        "amount": 0,
+                    }
+                ]),
+                "600421",
+                data_source="EfinanceFetcher",
+            )
+            db.save_intraday_minute_dataframe(
+                pd.DataFrame([
+                    {
+                        "date": datetime(2026, 6, 1, 14, 59),
+                        "open": 0.35,
+                        "high": 0.4,
+                        "low": 0.35,
+                        "close": 0.4,
+                        "volume": 4541.64,
+                        "amount": 13551180.0,
+                        "change_percent": -90.2,
+                    }
+                ]),
+                "600421",
+                data_source="unit",
+                snapshot_id="bad-price",
+                snapshot_time=datetime(2026, 6, 1, 14, 59),
+            )
+
+            archived = db.archive_intraday_minutes_to_daily(trade_date=target_date, codes=["600421"])
+            daily_rows = db.get_data_range("600421", target_date, target_date)
+
+            self.assertEqual(archived, 0)
+            self.assertEqual(daily_rows, [])
+        finally:
+            DatabaseManager.reset_instance()
 
     def test_intraday_minute_latest_quotes_batch_filters_regular_session_and_refreshes(self):
         DatabaseManager.reset_instance()
@@ -583,7 +936,7 @@ class TestStorage(unittest.TestCase):
 
         DatabaseManager.reset_instance()
 
-    def test_intraday_quote_samples_normalize_raw_share_volume_before_archive(self):
+    def test_intraday_quote_samples_normalize_raw_share_volume_without_daily_archive(self):
         DatabaseManager.reset_instance()
         db = DatabaseManager(db_url="sqlite:///:memory:")
         first_time = datetime(2026, 5, 7, 10, 0, 0)
@@ -619,11 +972,133 @@ class TestStorage(unittest.TestCase):
 
             minute_df = db.get_intraday_minute_data("000001", trade_date=first_time.date())
             archived = db.archive_intraday_minutes_to_daily(trade_date=first_time.date(), codes=["000001"])
-            daily_rows = db.get_latest_data("000001", days=1)
+            daily_rows = db.get_data_range("000001", first_time.date(), first_time.date())
 
             self.assertEqual(list(minute_df["volume"]), [1000.0, 300.0])
-            self.assertEqual(archived, 1)
-            self.assertEqual(daily_rows[0].volume, 1300.0)
+            self.assertEqual(archived, 0)
+            self.assertEqual(daily_rows, [])
+        finally:
+            DatabaseManager.reset_instance()
+
+    def test_intraday_quote_samples_normalize_wanshou_volume_to_lots(self):
+        DatabaseManager.reset_instance()
+        db = DatabaseManager(db_url="sqlite:///:memory:")
+        snapshot_time = datetime(2026, 5, 7, 10, 0, 0)
+
+        try:
+            db.save_intraday_quote_samples(
+                [
+                    {
+                        "stock_code": "000001",
+                        "current_price": 11.30,
+                        "volume": 7988.2,
+                        "amount": 905_740_000.0,
+                        "source": "snapshot",
+                    }
+                ],
+                snapshot_id="20260507100000",
+                snapshot_time=snapshot_time,
+            )
+
+            minute_df = db.get_intraday_minute_data("000001", trade_date=snapshot_time.date())
+            quotes = db.get_intraday_minute_latest_quotes_batch(["000001"], trade_date=snapshot_time.date())
+
+            self.assertEqual(len(minute_df), 1)
+            self.assertAlmostEqual(minute_df.iloc[0]["volume"], 798_820.0, places=2)
+            self.assertAlmostEqual(quotes["000001"]["volume"], 798_820.0, places=2)
+        finally:
+            DatabaseManager.reset_instance()
+
+    def test_intraday_latest_quotes_batch_normalizes_legacy_wanshou_cumulative_volume(self):
+        DatabaseManager.reset_instance()
+        db = DatabaseManager(db_url="sqlite:///:memory:")
+        target_date = date(2026, 6, 15)
+        snapshot_time = datetime(2026, 6, 15, 14, 59, 17)
+
+        try:
+            with db.session_scope() as session:
+                session.add(
+                    StockIntradayMinute(
+                        code="301070",
+                        trade_date=target_date,
+                        minute_ts=datetime(2026, 6, 15, 14, 59),
+                        open=74.55,
+                        high=74.55,
+                        low=74.55,
+                        close=74.55,
+                        volume=14983.63,
+                        amount=406_180_000.0,
+                        cumulative_volume=554.63,
+                        cumulative_amount=406_180_000.0,
+                        change_percent=6.74,
+                        source="snapshot",
+                        snapshot_id="20260615145917",
+                        snapshot_time=snapshot_time,
+                    )
+                )
+
+            quotes = db.get_intraday_minute_latest_quotes_batch(["301070"], trade_date=target_date)
+
+            self.assertAlmostEqual(quotes["301070"]["volume"], 55_463.0, places=2)
+            self.assertEqual(quotes["301070"]["amount"], 406_180_000.0)
+            self.assertEqual(quotes["301070"]["snapshot_id"], "20260615145917")
+        finally:
+            DatabaseManager.reset_instance()
+
+    def test_intraday_quote_samples_normalize_legacy_previous_cumulative_before_delta(self):
+        DatabaseManager.reset_instance()
+        db = DatabaseManager(db_url="sqlite:///:memory:")
+        target_date = date(2026, 5, 7)
+
+        try:
+            with db.session_scope() as session:
+                session.add(
+                    StockIntradayMinute(
+                        code="000001",
+                        trade_date=target_date,
+                        minute_ts=datetime(2026, 5, 7, 9, 59),
+                        open=11.30,
+                        high=11.30,
+                        low=11.30,
+                        close=11.30,
+                        volume=7988.2,
+                        amount=905_740_000.0,
+                        cumulative_volume=7988.2,
+                        cumulative_amount=905_740_000.0,
+                        source="snapshot",
+                        snapshot_id="legacy",
+                        snapshot_time=datetime(2026, 5, 7, 9, 59),
+                    )
+                )
+
+            db.save_intraday_quote_samples(
+                [
+                    {
+                        "stock_code": "000001",
+                        "current_price": 11.30,
+                        "volume": 8000.2,
+                        "amount": 907_100_000.0,
+                        "source": "snapshot",
+                    }
+                ],
+                snapshot_id="20260507100000",
+                snapshot_time=datetime(2026, 5, 7, 10, 0),
+            )
+
+            minute_df = db.get_intraday_minute_data("000001", trade_date=target_date)
+            latest = minute_df[minute_df["date"] == pd.Timestamp("2026-05-07 10:00:00")].iloc[0]
+            with db.session_scope() as session:
+                latest_row = session.execute(
+                    select(StockIntradayMinute).where(
+                        StockIntradayMinute.code == "000001",
+                        StockIntradayMinute.trade_date == target_date,
+                        StockIntradayMinute.minute_ts == datetime(2026, 5, 7, 10, 0),
+                    )
+                ).scalar_one()
+                latest_cumulative_volume = latest_row.cumulative_volume
+
+            self.assertAlmostEqual(latest["volume"], 1_200.0, places=2)
+            self.assertAlmostEqual(latest_cumulative_volume, 800_020.0, places=2)
         finally:
             DatabaseManager.reset_instance()
 
@@ -800,6 +1275,49 @@ class TestStorage(unittest.TestCase):
         self.assertEqual(early_batch_latest, {})
 
         DatabaseManager.reset_instance()
+
+    def test_stock_chip_daily_snapshots_canonicalize_a_share_code(self):
+        DatabaseManager.reset_instance()
+        db = DatabaseManager(db_url="sqlite:///:memory:")
+
+        try:
+            first = db.save_chip_daily_snapshots(
+                "688498.SH",
+                [
+                    {
+                        "date": "2026-05-07",
+                        "profit_ratio": 0.8,
+                        "avg_cost": 10.5,
+                        "distribution": [{"price": 10.5, "percent": 1.0}],
+                    }
+                ],
+                data_source="unit",
+            )
+            second = db.save_chip_daily_snapshots(
+                "688498",
+                [
+                    {
+                        "date": "2026-05-07",
+                        "profit_ratio": 0.9,
+                        "avg_cost": 10.8,
+                        "distribution": [{"price": 10.8, "percent": 1.0}],
+                    }
+                ],
+                data_source="unit",
+            )
+
+            rows = db.get_chip_daily_range("SH688498", date(2026, 5, 1), date(2026, 5, 10))
+            latest = db.get_latest_chip_daily("688498.SH", as_of=date(2026, 5, 8))
+
+            self.assertEqual(first, 1)
+            self.assertEqual(second, 0)
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["code"], "688498")
+            self.assertEqual(rows[0]["avg_cost"], 10.8)
+            self.assertEqual(latest["code"], "688498")
+            self.assertEqual(latest["profit_ratio"], 0.9)
+        finally:
+            DatabaseManager.reset_instance()
 
     def test_save_daily_data_sqlite_concurrent_same_code_date_counts_only_new_rows(self):
         DatabaseManager.reset_instance()

@@ -917,6 +917,31 @@ def main() -> int:
                 "name": "intraday_daily_archive",
             })
 
+            from src.services.qfq_corporate_action_refresh_service import (
+                DEFAULT_QFQ_CORPORATE_ACTION_REFRESH_INTERVAL_SECONDS,
+                run_qfq_corporate_action_refresh_once,
+            )
+
+            def qfq_corporate_action_refresh_task():
+                run_qfq_corporate_action_refresh_once(reason="schedule_background")
+
+            qfq_refresh_interval_seconds = max(
+                30,
+                int(
+                    getattr(
+                        config,
+                        "qfq_corporate_action_refresh_interval_seconds",
+                        DEFAULT_QFQ_CORPORATE_ACTION_REFRESH_INTERVAL_SECONDS,
+                    )
+                ),
+            )
+            background_tasks.append({
+                "task": qfq_corporate_action_refresh_task,
+                "interval_seconds": qfq_refresh_interval_seconds,
+                "run_immediately": True,
+                "name": "qfq_corporate_action_refresh",
+            })
+
             if getattr(config, 'agent_event_monitor_enabled', False):
                 from src.agent.events import build_event_monitor_from_config, run_event_monitor_once
 

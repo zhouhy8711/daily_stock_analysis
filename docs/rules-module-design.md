@@ -120,8 +120,9 @@
 
 第一版按指标分析页的大图表区域分组支持，并与指标分析页可点加号加入规则的指标保持同一套 key：
 
-- 核心行情：`current_price`、`change`、`change_percent`、`total_mv`、`circ_mv`、`pe_ratio`
+- 核心行情：`current_price`、`change`、`change_percent`、`total_mv`、`circ_mv`、`pe_ratio`、`pe_ratio_percentile_250d`（市盈TTM 250日分位）
 - K线图：`open`、`high`、`low`、`close`、`prev_close`、`pct_chg`、`amplitude`、`price_range_30d_pct`、`price_range_60d_pct`、`limit_up_price`、`limit_down_price`、`price_speed`、`entrust_ratio`、`ma5`、`ma10`、`ma20`、`ma30`、`ma60`、`volume_ratio`、`total_shares`、`float_shares`
+- 趋势起涨：`bias_ma5_pct`（偏离 MA5）、`ma_bullish_alignment_signal`（均线多头排列）、`ma_uptrend_signal`（均线上行）、`price_breakout_20d_signal`（突破 20 日高点）、`prior_10d_breakout_20d_count`（前 10 日 20 日突破次数）、`price_breakout_60d_signal`（突破 60 日高点）、`volume_expansion_20d_ratio`（成交量 / 20 日均量）、`volume_expansion_signal`（放量确认）、`trend_start_signal`（趋势起涨复合信号）、`trend_live_setup_score`（实盘起涨观察分）、`trend_live_watch_signal`（实盘起涨观察信号）、`trend_live_confirm_signal`（实盘起涨确认信号）、`trend_overheat_risk_score`（趋势追高风险分）、`trend_overheat_risk_signal`（趋势追高风险信号）、`trend_failure_signal`（趋势起涨失效信号）、`history_trading_days_count`（历史交易日数）
 - 成交量图：`volume`、`after_hours_volume`、`amount`、`after_hours_amount`、`volume_ma5`、`volume_ma10`、`volume_ma20`、`amount_ma5`、`amount_ma10`
 - MACD图：`ema12`、`ema26`、`macd_dif`、`macd_dea`、`macd`
 - RSI图：`rsi6`、`rsi12`、`rsi24`
@@ -132,6 +133,23 @@
 
 财务事件类指标在规则扫描时会写入 `stock_daily` 对应公告后首个交易日，并同步到本轮规则扫描的 `history_by_code` 与 `earnings_gap_metrics_by_code` 缓存；后续 DB-only 回测和 K 线缓存读取可复用这些指标。
 - 额外：`prev_5d_return_pct`（前5日累计涨幅，不含当前判断日）、`prev_20d_return_pct`（前20日累计涨幅，不含当前判断日）
+
+`trend_start_signal` 用于把趋势股起涨点抽象成可回测条件：收盘价站上 MA5，且 MA5 > MA10 > MA20 > MA30，MA5/10/20 同步上行；收盘价突破前 20 日或 60 日高点；当日成交量至少为 20 日均量的 1.2 倍；MACD 满足 DIF > DEA > 0 且柱体为正；同时收盘价偏离 MA5 不超过 15%，避免把已经明显过热的连续加速段当作初始起涨点。
+
+`trend_live_*` 指标用于把复盘中的“起涨前技术共振”改写成实盘可执行规则，计算时只读取当前及过去 K 线，不使用未来涨幅：
+
+- `trend_live_setup_score` 按 MACD 金叉/翻红或同步抬升、MA5 上穿或高于 MA10、收盘站上 MA20、MA10 高于 MA20、量比或成交量相对 20 日均量放大、RSI6 回到强势区、接近或突破 20 日高位、MA5/10/20 同步上行进行加权，分数越高说明起涨共振越充分。
+- `trend_live_watch_signal` 在观察分达到 7 分、未过热且未失效时记为 1，适合作为加入观察池或触发问股分析的条件。
+- `trend_live_confirm_signal` 在观察分达到 9 分，并同时满足 20 日高位突破、放量、MACD 多头或当日转强、未过热且未失效时记为 1，适合作为更严格的实测/回测命中条件。
+- `trend_overheat_risk_score` 会根据前 5 日涨幅超过 35%、前 20 日涨幅超过 80%、偏离 MA5 超过 15%、RSI6 超过 88、单日涨幅过大、放量长阳一致性等追高特征加分；`trend_overheat_risk_signal` 在风险分达到 3 分时记为 1。
+- `trend_failure_signal` 在收盘跌破 MA20，或跌破 MA10 且 MACD 转弱，或大跌并跌破 MA5 时记为 1，适合用于取消观察、退出规则或风控过滤。
+
+`pe_ratio_percentile_250d` 用近 250 个交易日的正 PE 样本计算当前 PE 分位。用于从“技术突破很多”中继续筛出高估值/高预期状态的股票；如果历史不足 80 个正 PE 样本，指标为空，规则条件不会误命中。
+
+截图趋势起涨综合规则当前包含两个互斥的固定形态分支：
+
+- 成熟趋势股分支：要求高 PE（`pe_ratio >= 50`）且 250 日 PE 分位 `>= 90`，20 个交易日未突破后的首次 20 日高点突破，并同时满足放量、MACD 多头、MACD 柱上升、MA 上行、RSI 强势但不过热、MA5 乖离受控、前 5/20 日涨幅不过热。
+- 新股/次新股分支：用于历史交易日数 20-80 天、无法形成 250 日 PE 分位的股票，要求 20 日突破、前 10 日未出现 20 日突破、MACD 多头、成交量不低于 20 日均量 0.8 倍、RSI 强势、MA5 乖离处于 4%-30%、前 5 日涨幅不超过 50%、当日涨幅 4%-20%、未触发趋势失效。
 
 财务事件指标会在规则扫描时尝试读取公开财务数据源的扣非净利报告事件，并把事件映射到公告后的第一个交易日。以“净利润断层”为例，可配置为：扣非净利同比 `>= 100`、扣非净利环比 `>= 50`、公告次日跳空缺口 `>= 3`、公告次日量能 / 前 5 日均量 `>= 1.5`、公告次日缺口未回补 `= 1`。若数据源缺少公告日期或扣非净利字段，对应股票不会误判命中。
 
@@ -250,7 +268,7 @@
 - 支持手动运行并展示命中股票与历史命中日期。
 - 支持“最新日扫描”和“历史回测”两种运行模式，避免只看最新交易日的监控与逐日回测混用同一语义。
 - Web 实测与后端 `latest + db_only` 运行只在 A 股交易日 15:00 及以前触发，休市后不再用旧本地行情重复生成命中结果；每次实测使用独立 `live_cache_key` 建立 live 数据缓存，09:30 前触发时只预热选中规则和股票需要的当天前历史日线缓存，并返回 `prewarm_only`，不读取分钟热表、不评估命中、不通知；9:30 后实测 quote 从 `stock_intraday_minute` 聚合，并持续复用该 live 缓存中的历史、基础筹码分布和财务事件派生数据，当前判断日会先合成实时 K 线并重算当日筹码分布，缺少换手率时才按最新价重估基础获利盘兜底；停止实测时清理对应缓存；实测不读实时快照或远程行情源。
-- Web 规则历史回测使用异步后台任务执行；执行中持续展示已完成股票数 / 总股票数，全部完成后再加载命中结果。多规则回测按股票共享一次历史行情读取与指标帧构建，未使用筹码类指标时跳过筹码计算。规则实测和回测统一强制 `db_only`，只读 `stock_daily`、`stock_intraday_minute`、`stock_chip_daily` 及已落库财务派生字段；缺失数据需通过离线任务或补数据脚本补齐。点击命中记录打开指标弹窗时也使用历史 DB-only 模式，不触发实时行情、资金流、主力持仓或筹码 HTTP 请求。
+- Web 规则历史回测使用异步后台任务执行；执行中持续展示已完成股票数 / 总股票数，全部完成后再加载命中结果。多规则回测按股票共享一次历史行情读取与指标帧构建，未使用筹码类指标时跳过筹码计算。规则实测和回测统一强制 `db_only`，只读 `stock_daily`、`stock_intraday_minute`、`stock_chip_daily` 及已落库财务派生字段；缺失数据需通过离线任务或补数据脚本补齐。点击命中记录打开指标弹窗时也使用历史 DB-only 模式，不触发实时行情、资金流、主力持仓或筹码 HTTP 请求；命中日仍作为红色高亮和筹码快照锚点，K 线、成交量与 MACD 图保留命中日之后已落库的交易日，便于观察后续表现；命中表的股票、行业和日期表头可点击切换升降序排序。
 
 第二期再做：
 
