@@ -24,10 +24,20 @@ import { getParsedApiError, type ParsedApiError } from '../api/error';
 import { historyApi } from '../api/history';
 import { rulesApi } from '../api/rules';
 import { systemConfigApi } from '../api/systemConfig';
+import { tenantsApi } from '../api/tenants';
 import { ApiErrorAlert, Badge, Button, ConfirmDialog, EmptyState, InlineAlert } from '../components/common';
 import { IndicatorAnalysisModal } from '../components/report';
+import { useTenant } from '../contexts/TenantContext';
 import { useStockIndex } from '../hooks/useStockIndex';
-import type { RuleItem, RuleMatchItem, RuleMetricItem, RuleRunHistoryItem, RuleTargetScope } from '../types/rules';
+import type {
+  RuleItem,
+  RuleMatchItem,
+  RuleMetricItem,
+  RuleRunHistoryItem,
+  RuleRunTenantRef,
+  RuleTargetScope,
+  TenantRuleRunItem,
+} from '../types/rules';
 import type { RealtimeCacheStatsResponse } from '../types/systemConfig';
 import type { StockIndexItem } from '../types/stockIndex';
 import { getOneYearAgoInShanghai, getRecentStartDate, getTodayInShanghai } from '../utils/format';
@@ -161,6 +171,17 @@ type RunProgressState = {
   stage: string;
 };
 
+type LiveActiveTenantRun = {
+  tenantKey: string;
+  tenantName: string;
+  runId: number;
+  ruleId: number;
+  ruleIds: number[];
+  ruleNames: string[];
+  lastCompletedCount: number;
+  prewarmOnly: boolean;
+};
+
 type ExecutionLogEntry = {
   id: string;
   time: string;
@@ -212,6 +233,19 @@ const backtestRuntimeListeners: Record<BacktestPageMode, Set<BacktestRuntimeList
   live: new Set<BacktestRuntimeListener>(),
 };
 
+// eslint-disable-next-line react-refresh/only-export-components -- test helper resets module-level runtime state
+export function __resetBacktestPageRuntimeForTests(): void {
+  if (import.meta.env.MODE !== 'test') {
+    return;
+  }
+  backtestRuntimeStates.backtest = createEmptyBacktestRuntimeState();
+  backtestRuntimeStates.live = createEmptyBacktestRuntimeState();
+  (['backtest', 'live'] as BacktestPageMode[]).forEach((mode) => {
+    const snapshot = cloneBacktestRuntimeState(mode);
+    backtestRuntimeListeners[mode].forEach((listener) => listener(snapshot));
+  });
+}
+
 function cloneBacktestRuntimeState(
   mode: BacktestPageMode,
   state: BacktestRuntimeState = backtestRuntimeStates[mode],
@@ -236,6 +270,88 @@ function hasBacktestRuntimeSession(mode: BacktestPageMode): boolean {
     || state.runError !== null
     || state.runWarning !== null
   );
+}
+
+function mergeTenantRuleLists(ruleGroups: RuleItem[][]): RuleItem[] {
+  const byId = new Map<number, RuleItem>();
+  for (const group of ruleGroups) {
+    for (const rule of group) {
+      if (!byId.has(rule.id)) {
+        byId.set(rule.id, rule);
+      }
+    }
+  }
+  return Array.from(byId.values()).sort((a, b) => {
+    if (Number(a.isShared) !== Number(b.isShared)) {
+      return Number(a.isShared) - Number(b.isShared);
+    }
+    return b.id - a.id;
+  });
+}
+
+function normalizeTenantRuns(responseTenantRuns: TenantRuleRunItem[] | undefined, fallback: {
+  runId: number;
+  tenantKey?: string | null;
+  tenantName?: string | null;
+  ruleId: number;
+  ruleIds?: number[];
+  ruleNames?: string[];
+  completedCount?: number;
+  prewarmOnly?: boolean;
+}): LiveActiveTenantRun[] {
+  const tenantRuns = responseTenantRuns && responseTenantRuns.length > 0
+    ? responseTenantRuns
+    : [{
+      tenantKey: fallback.tenantKey || '',
+      tenantName: fallback.tenantName || fallback.tenantKey || '当前租户',
+      runId: fallback.runId,
+      ruleId: fallback.ruleId,
+      ruleIds: fallback.ruleIds,
+      ruleNames: fallback.ruleNames,
+      completedCount: fallback.completedCount,
+      prewarmOnly: fallback.prewarmOnly,
+    } as TenantRuleRunItem];
+
+  return tenantRuns
+    .filter((item) => item.runId > 0 && item.tenantKey)
+    .map((item) => ({
+      tenantKey: item.tenantKey,
+      tenantName: item.tenantName || item.tenantKey,
+      runId: item.runId,
+      ruleId: item.ruleId,
+      ruleIds: item.ruleIds ?? [],
+      ruleNames: item.ruleNames ?? [],
+      lastCompletedCount: item.completedCount ?? 0,
+      prewarmOnly: Boolean(item.prewarmOnly),
+    }));
+}
+
+function tenantRefsFromActiveRuns(tenantRuns: LiveActiveTenantRun[]): RuleRunTenantRef[] {
+  return tenantRuns
+    .filter((item) => item.runId > 0)
+    .map((item) => ({
+      tenantKey: item.tenantKey,
+      tenantName: item.tenantName,
+      runId: item.runId,
+      ruleId: item.ruleId,
+      ruleIds: item.ruleIds,
+      ruleNames: item.ruleNames,
+    }));
+}
+
+function mergeRunTenantRefs(...groups: RuleRunTenantRef[][]): RuleRunTenantRef[] {
+  const seen = new Set<string>();
+  const merged: RuleRunTenantRef[] = [];
+  for (const group of groups) {
+    for (const ref of group) {
+      if (ref.runId <= 0) continue;
+      const key = `${ref.tenantKey || ''}:${ref.runId}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      merged.push(ref);
+    }
+  }
+  return merged;
 }
 
 function updateBacktestRuntime(
@@ -1439,6 +1555,37 @@ function getRunIds(run: RuleRunHistoryItem): number[] {
   return run.id > 0 ? [run.id] : [];
 }
 
+function getRunTenantRefs(run: RuleRunHistoryItem): RuleRunTenantRef[] {
+  const tenantRefs = Array.isArray(run.tenantRuns)
+    ? run.tenantRuns
+      .filter((item) => item.runId > 0)
+      .map((item) => ({
+        tenantKey: item.tenantKey || undefined,
+        tenantName: item.tenantName || undefined,
+        runId: item.runId,
+        ruleId: item.ruleId,
+        ruleIds: item.ruleIds,
+        ruleNames: item.ruleNames,
+      }))
+    : [];
+  if (tenantRefs.length > 0) {
+    return tenantRefs;
+  }
+  return getRunIds(run).map((runId) => ({ runId }));
+}
+
+function getRunMatchesForRef(ref: RuleRunTenantRef): Promise<RuleMatchItem[]> {
+  return ref.tenantKey
+    ? rulesApi.getRunMatches(ref.runId, ref.tenantKey)
+    : rulesApi.getRunMatches(ref.runId);
+}
+
+function deleteRunForRef(ref: RuleRunTenantRef): Promise<void> {
+  return ref.tenantKey
+    ? rulesApi.deleteRun(ref.runId, ref.tenantKey)
+    : rulesApi.deleteRun(ref.runId);
+}
+
 function getRuleIdsForRun(run: RuleRunHistoryItem | null): number[] {
   if (!run) return [];
   if (Array.isArray(run.ruleIds) && run.ruleIds.length > 0) {
@@ -1596,7 +1743,7 @@ function hydrateTarget(
 }
 
 const scopeOptions: Array<{ value: BacktestTargetScope; label: string }> = [
-  { value: 'watchlist', label: '自选股 STOCK_LIST' },
+  { value: 'watchlist', label: '租户股票池' },
   { value: 'all_a_shares', label: '所有 A 股' },
   { value: 'industry', label: '按行业' },
   { value: 'custom', label: '自定义股票列表' },
@@ -1641,8 +1788,13 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
     loading: isLoadingStockIndex,
     error: stockIndexError,
   } = useStockIndex();
+  const { tenants, currentTenant, tenantConfig, setSwitchLocked } = useTenant();
+  const tenantKeyRef = useRef(currentTenant?.key ?? '');
   const [rules, setRules] = useState<RuleItem[]>([]);
   const [metrics, setMetrics] = useState<RuleMetricItem[]>([]);
+  const [runTenantKeys, setRunTenantKeys] = useState<string[]>(() => (
+    currentTenant?.key ? [currentTenant.key] : []
+  ));
   const [selectedRuleIds, setSelectedRuleIds] = useState<number[]>([]);
   const [targetScope, setTargetScope] = useState<BacktestTargetScope>('watchlist');
   const [targetCodes, setTargetCodes] = useState<string[]>([]);
@@ -1710,15 +1862,43 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
     executionTime: string;
     runStartedAt: string;
     runRuleNames: string[];
+    tenantRuns: LiveActiveTenantRun[];
     lastCompletedCount: number;
     prewarmOnly: boolean;
   } | null>(null);
+  const liveCacheTenantKeysRef = useRef<string[]>(runTenantKeys);
   const liveLatestSnapshotIdRef = useRef<string | null>(null);
   const liveResultRowsRef = useRef<RuleRunEventRow[]>(displayRows);
   const liveRunIdsRef = useRef<number[]>(selectedRun ? getRunIds(selectedRun) : []);
+  const liveRunTenantRefsRef = useRef<RuleRunTenantRef[]>(selectedRun ? getRunTenantRefs(selectedRun) : []);
   const selectedRunRef = useRef<RuleRunHistoryItem | null>(selectedRun);
   const displayRowsRef = useRef<RuleRunEventRow[]>(displayRows);
   const logScrollerRef = useRef<HTMLDivElement | null>(null);
+
+  const activeTenantOptions = useMemo(
+    () => tenants.filter((tenant) => tenant.isActive),
+    [tenants],
+  );
+  const selectedRunTenantKeys = useMemo(() => {
+    if (isLiveMode && activeTenantOptions.length > 0) {
+      return activeTenantOptions.map((tenant) => tenant.key);
+    }
+    const activeKeys = new Set(activeTenantOptions.map((tenant) => tenant.key));
+    const selected = runTenantKeys.filter((key) => activeKeys.has(key));
+    if (selected.length > 0) {
+      return selected;
+    }
+    return currentTenant?.key ? [currentTenant.key] : [];
+  }, [activeTenantOptions, currentTenant?.key, isLiveMode, runTenantKeys]);
+  const selectedRunTenantNames = useMemo(
+    () => selectedRunTenantKeys.map((key) => (
+      activeTenantOptions.find((tenant) => tenant.key === key)?.name ?? key
+    )),
+    [activeTenantOptions, selectedRunTenantKeys],
+  );
+  const selectedRunTenantSummary = selectedRunTenantNames.length === activeTenantOptions.length && activeTenantOptions.length > 1
+    ? `全部租户（${selectedRunTenantNames.length}）`
+    : selectedRunTenantNames.join('、') || '当前租户';
 
   const setRunHistory = useCallback((action: React.SetStateAction<RuleRunHistoryItem[]>) => {
     updateBacktestRuntime(mode, (current) => ({
@@ -1802,6 +1982,33 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
     };
   }, [mode]);
 
+  useEffect(() => {
+    const tenantKey = currentTenant?.key ?? '';
+    if (!tenantKey || tenantKeyRef.current === tenantKey) {
+      return;
+    }
+    tenantKeyRef.current = tenantKey;
+    if (!backtestRuntimeStates[mode].isRunning) {
+      updateBacktestRuntime(mode, () => createEmptyBacktestRuntimeState());
+      setRunTenantKeys([tenantKey]);
+    }
+  }, [currentTenant?.key, mode]);
+
+  useEffect(() => {
+    if (!isRunning && currentTenant?.key && runTenantKeys.length === 0) {
+      setRunTenantKeys([currentTenant.key]);
+    }
+  }, [currentTenant?.key, isRunning, runTenantKeys.length]);
+
+  useEffect(() => {
+    liveCacheTenantKeysRef.current = selectedRunTenantKeys;
+  }, [selectedRunTenantKeys]);
+
+  useEffect(() => {
+    setSwitchLocked(isRunning);
+    return () => setSwitchLocked(false);
+  }, [isRunning, setSwitchLocked]);
+
   useEffect(() => () => {
     if (import.meta.env.MODE === 'test' && !backtestRuntimeStates[mode].isRunning) {
       backtestRuntimeStates[mode] = createEmptyBacktestRuntimeState();
@@ -1830,7 +2037,10 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
     const activeRun = liveActiveRunRef.current;
     liveCacheKeyRef.current = null;
     if (liveCacheKey && !activeRun) {
-      void rulesApi.clearLiveCache(liveCacheKey);
+      const tenantKeys = liveCacheTenantKeysRef.current.length > 0
+        ? liveCacheTenantKeysRef.current
+        : [currentTenant?.key].filter(Boolean) as string[];
+      void Promise.all(tenantKeys.map((tenantKey) => rulesApi.clearLiveCache(liveCacheKey, tenantKey)));
     }
     liveActiveRunRef.current = null;
     liveTestSessionRef.current = null;
@@ -1839,12 +2049,13 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
       setIsRunning(false);
       setRunProgressById({});
     }
-  }, [clearLiveTestInterval, isLiveMode, setIsRunning, setRunProgressById]);
+  }, [clearLiveTestInterval, currentTenant?.key, isLiveMode, setIsRunning, setRunProgressById]);
 
   useEffect(() => {
     if (!isLiveMode) return;
     liveResultRowsRef.current = displayRows;
     liveRunIdsRef.current = selectedRun ? getRunIds(selectedRun) : [];
+    liveRunTenantRefsRef.current = selectedRun ? getRunTenantRefs(selectedRun) : [];
   }, [displayRows, isLiveMode, selectedRun]);
 
   useEffect(() => {
@@ -1892,6 +2103,10 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
     () => formatStockListText(targetCodes, stockLookup),
     [stockLookup, targetCodes],
   );
+  const buildRuntimeTarget = useCallback(() => ({
+    scope: targetScope === 'industry' ? 'custom' : targetScope,
+    stockCodes: targetScope === 'watchlist' ? [] : targetCodes,
+  }), [targetCodes, targetScope]);
   const selectableRules = useMemo(
     () => rules.filter((rule) => rule.isActive),
     [rules],
@@ -1956,11 +2171,11 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
     );
   const headerControlGridClass = isLiveMode
     ? targetScope === 'industry'
-      ? 'grid min-w-0 gap-3 sm:grid-cols-2 xl:grid-cols-[12rem_12rem]'
-      : 'grid min-w-0 gap-3 sm:grid-cols-2 xl:grid-cols-[12rem]'
+      ? 'grid min-w-0 gap-3 sm:grid-cols-2 xl:grid-cols-[12rem_12rem_12rem]'
+      : 'grid min-w-0 gap-3 sm:grid-cols-2 xl:grid-cols-[12rem_12rem]'
     : targetScope === 'industry'
-      ? 'grid min-w-0 gap-3 sm:grid-cols-2 xl:grid-cols-[12rem_12rem_10rem_10rem]'
-      : 'grid min-w-0 gap-3 sm:grid-cols-2 xl:grid-cols-[12rem_10rem_10rem]';
+      ? 'grid min-w-0 gap-3 sm:grid-cols-2 xl:grid-cols-[12rem_12rem_12rem_10rem_10rem]'
+      : 'grid min-w-0 gap-3 sm:grid-cols-2 xl:grid-cols-[12rem_12rem_10rem_10rem]';
   const activeRunEventCount = runRows.length;
   const targetListReadOnly = targetScope !== 'custom';
   const stockListIndustryOptions = useMemo(
@@ -2083,8 +2298,8 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
     setSelectedRow(null);
     setIndicatorSelection(null);
     try {
-      const runIds = getRunIds(run);
-      const matchGroups = await Promise.all(runIds.map((runId) => rulesApi.getRunMatches(runId)));
+      const runRefs = getRunTenantRefs(run);
+      const matchGroups = await Promise.all(runRefs.map(getRunMatchesForRef));
       const matches = matchGroups.flat();
       const nextRows = flattenMatches(matches, {
         runId: run.id,
@@ -2100,7 +2315,7 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
       const parsedError = getParsedApiError(err);
       const currentSelectedRun = selectedRunRef.current;
       const currentRows = displayRowsRef.current;
-      const runIds = new Set(getRunIds(run));
+      const runIds = new Set(getRunTenantRefs(run).map((item) => item.runId));
       const hasReusableRowsForRun = currentSelectedRun?.id === run.id
         && currentRows.some((row) => row.runId == null || runIds.has(row.runId));
       if (hasReusableRowsForRun && isTransientLiveTestReadError(parsedError)) {
@@ -2131,8 +2346,9 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
 
     setDeletingRunId(run.id);
     try {
-      const deleteRunIds = getRunIds(run);
-      await Promise.all(deleteRunIds.map((runId) => rulesApi.deleteRun(runId)));
+      const deleteRunRefs = getRunTenantRefs(run);
+      const deleteRunIds = deleteRunRefs.map((item) => item.runId);
+      await Promise.all(deleteRunRefs.map(deleteRunForRef));
       setRunHistory((current) => current.filter((item) => item.id !== run.id));
       setRunProgressById((current) => {
         const next = { ...current };
@@ -2176,23 +2392,36 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
   ]);
 
   const loadData = useCallback(async () => {
+    if (!currentTenant?.key) {
+      return;
+    }
+    const runTenantKeysForLoad = selectedRunTenantKeys.length > 0
+      ? selectedRunTenantKeys
+      : [currentTenant.key];
     setIsLoading(true);
     setPageError(null);
     try {
-      const [metricItems, ruleItems, config, persistedRuns, history] = await Promise.all([
+      const [metricItems, tenantRuleGroups, persistedRuns, history, runTenantConfigs] = await Promise.all([
         rulesApi.getMetrics(),
-        rulesApi.list(),
-        systemConfigApi.getConfig(false),
-        isLiveMode ? Promise.resolve([]) : rulesApi.listRuns(30),
+        Promise.all(runTenantKeysForLoad.map((tenantKey) => rulesApi.list(tenantKey))),
+        isLiveMode || runTenantKeysForLoad.length !== 1
+          ? Promise.resolve([])
+          : rulesApi.listRuns(30, runTenantKeysForLoad[0]),
         historyApi.getList({
           startDate: getRecentStartDate(30),
           endDate: getTodayInShanghai(),
           page: 1,
           limit: WATCHLIST_HISTORY_LIMIT,
         }),
+        Promise.all(runTenantKeysForLoad.map((tenantKey) => (
+          tenantKey === currentTenant.key && tenantConfig
+            ? Promise.resolve(tenantConfig)
+            : tenantsApi.getConfig(tenantKey)
+        ))),
       ]);
+      const ruleItems = mergeTenantRuleLists(tenantRuleGroups);
       const configuredWatchlistCodes = parseWatchlistValue(
-        config.items.find((item) => item.key === 'STOCK_LIST')?.value ?? '',
+        runTenantConfigs.flatMap((config) => config.stockList ?? []).join(','),
       );
       const nextWatchlistItems = buildCurrentWatchlistItems(configuredWatchlistCodes, history.items);
       const nextWatchlistCodes = nextWatchlistItems.map((item) => item.code);
@@ -2201,6 +2430,7 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
         .sort(compareStockIndexById)
         .map(getStockDisplayCode)));
       const groupedPersistedRuns = groupLegacyRunHistory(persistedRuns);
+      const activeRuleIds = ruleItems.filter((item) => item.isActive).map((item) => item.id);
       const firstRule = ruleItems.find((item) => item.isActive);
       const shouldHydratePersistedRuns = !isLiveMode && !hasBacktestRuntimeSession(mode);
       let persistedSelectedRun = shouldHydratePersistedRuns
@@ -2220,9 +2450,9 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
         }];
         if (persistedSelectedRun.id > 0 && persistedSelectedRun.status !== 'running') {
           try {
-            const persistedRunIds = getRunIds(persistedSelectedRun);
+            const persistedRunRefs = getRunTenantRefs(persistedSelectedRun);
             const persistedMatchGroups = await Promise.all(
-              persistedRunIds.map((runId) => rulesApi.getRunMatches(runId)),
+              persistedRunRefs.map(getRunMatchesForRef),
             );
             const persistedMatches = persistedMatchGroups.flat();
             persistedRows = flattenMatches(persistedMatches, {
@@ -2275,7 +2505,7 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
         setRunWarning(null);
         setRunError(null);
       }
-      setSelectedRuleIds(firstRule ? [firstRule.id] : []);
+      setSelectedRuleIds(isLiveMode ? activeRuleIds : firstRule ? [firstRule.id] : []);
       applyTargetFromRule(firstRule, nextWatchlistCodes, nextAllAshareCodes);
     } catch (err) {
       setPageError(getParsedApiError(err));
@@ -2295,13 +2525,28 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
     setRunWarning,
     setSelectedRun,
     stockIndex,
+    currentTenant?.key,
+    selectedRunTenantKeys,
+    tenantConfig,
   ]);
 
   useEffect(() => {
     void loadData();
   }, [loadData]);
 
+  const handleRunTenantChange = (value: string) => {
+    if (isRunning) return;
+    if (value === '__all__') {
+      setRunTenantKeys(activeTenantOptions.map((tenant) => tenant.key));
+      return;
+    }
+    if (value) {
+      setRunTenantKeys([value]);
+    }
+  };
+
   const toggleRule = (ruleId: number) => {
+    if (isRunning) return;
     const rule = selectableRules.find((item) => item.id === ruleId);
     if (!rule) return;
     const isSelected = selectedRuleIds.includes(ruleId);
@@ -2315,6 +2560,7 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
   };
 
   const selectAllRules = () => {
+    if (isRunning) return;
     setSelectedRuleIds(selectableRules.map((rule) => rule.id));
     if (selectedRuleIds.length === 0) {
       applyTargetFromRule(selectableRules[0], watchlistCodes, allAshareCodes);
@@ -2322,6 +2568,7 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
   };
 
   const clearSelectedRules = () => {
+    if (isRunning) return;
     setSelectedRuleIds([]);
   };
 
@@ -2424,7 +2671,10 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
       : current));
     appendExecutionLog(message, level);
     if (liveCacheKey && !activeRun) {
-      void rulesApi.clearLiveCache(liveCacheKey).then(() => {
+      const tenantKeys = liveCacheTenantKeysRef.current.length > 0
+        ? liveCacheTenantKeysRef.current
+        : selectedRunTenantKeys;
+      void Promise.all(tenantKeys.map((tenantKey) => rulesApi.clearLiveCache(liveCacheKey, tenantKey))).then(() => {
         appendExecutionLog('本次实测数据缓存已清理');
       }).catch((error) => {
         const parsedError = getParsedApiError(error);
@@ -2433,7 +2683,7 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
     } else if (liveCacheKey && activeRun) {
       appendExecutionLog(`后台实测 #${activeRun.runId} 仍在执行，已暂缓清理本次实测数据缓存`, 'warning');
     }
-  }, [appendExecutionLog, clearLiveTestInterval, setIsRunning, setRunProgressById, setSelectedRun]);
+  }, [appendExecutionLog, clearLiveTestInterval, selectedRunTenantKeys, setIsRunning, setRunProgressById, setSelectedRun]);
 
   const runLiveTestCycle = useCallback(async (
     sessionId: number,
@@ -2476,13 +2726,22 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
           ruleIds: selectedRuleIds,
           mode: 'latest',
           dataPolicy: 'db_only',
+          tenantKeys: selectedRunTenantKeys,
           liveCacheKey: liveCacheKeyRef.current ?? undefined,
-          target: {
-            scope: targetScope === 'industry' ? 'custom' : targetScope,
-            stockCodes: targetCodes,
-          },
+          target: buildRuntimeTarget(),
         });
         if (liveTestSessionRef.current !== sessionId) return;
+        const tenantRuns = normalizeTenantRuns(startedRun.tenantRuns, {
+          runId: startedRun.runId,
+          tenantKey: startedRun.tenantKey || selectedRunTenantKeys[0],
+          tenantName: selectedRunTenantNames[0],
+          ruleId: startedRun.ruleId,
+          ruleIds: startedRun.ruleIds,
+          ruleNames: startedRun.ruleNames,
+          completedCount: startedRun.completedCount,
+          prewarmOnly: startedRun.prewarmOnly,
+        });
+        const runLabel = tenantRuns.length > 1 ? `${tenantRuns.length} 个租户任务` : `#${startedRun.runId}`;
         const totalCount = Math.max(0, startedRun.targetCount || targetCodes.length);
         if (startedRun.prewarmOnly && startedRun.status !== 'running') {
           const hitCount = startedRun.prewarmHitCount ?? startedRun.completedCount ?? 0;
@@ -2510,6 +2769,7 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
           executionTime: cycleExecutionTime,
           runStartedAt,
           runRuleNames,
+          tenantRuns,
           lastCompletedCount: startedRun.completedCount ?? 0,
           prewarmOnly: Boolean(startedRun.prewarmOnly),
         };
@@ -2518,15 +2778,15 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
         liveTransientReadErrorCountRef.current = 0;
         const startCompleted = startedRun.completedCount ?? 0;
         const startStage = activeRun.prewarmOnly
-          ? `#${startedRun.runId} 历史缓存预热 ${startCompleted}/${totalCount}`
-          : `#${startedRun.runId} 执行完成 ${startCompleted}/${totalCount}`;
+          ? `${runLabel} 历史缓存预热 ${startCompleted}/${totalCount}`
+          : `${runLabel} 执行完成 ${startCompleted}/${totalCount}`;
         updateRunProgress(sessionId, startedRun.status === 'running' ? 1 : 100, startStage);
         appendExecutionLog(
           startedRun.reusedRun
-            ? `#${startedRun.runId} 已有同快照实测任务，复用当前结果`
+            ? `${runLabel} 已有同快照实测任务，复用当前结果`
             : activeRun.prewarmOnly
-              ? `#${startedRun.runId} 开盘前历史缓存预热已启动：${startCompleted}/${totalCount}`
-              : `#${startedRun.runId} 后台实测已启动：执行完成 ${startCompleted}/${totalCount}`,
+              ? `${runLabel} 开盘前历史缓存预热已启动：${startCompleted}/${totalCount}`
+              : `${runLabel} 后台实测已启动：执行完成 ${startCompleted}/${totalCount}`,
           startedRun.reusedRun ? 'info' : 'info',
         );
         setPageError(null);
@@ -2534,18 +2794,83 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
 
       cyclePhase = 'poll';
       cycleRunId = activeRun.runId;
-      const run = await rulesApi.getRun(activeRun.runId);
+      const tenantRunStates = await Promise.all(activeRun.tenantRuns.map(async (tenantRun) => ({
+        tenantRun,
+        run: await rulesApi.getRun(tenantRun.runId, tenantRun.tenantKey),
+      })));
       if (liveTestSessionRef.current !== sessionId) return;
       liveTransientReadErrorCountRef.current = 0;
-      const nextTotal = Math.max(0, run.targetCount || targetCodes.length);
-      const completed = Math.min(nextTotal, Math.max(0, run.completedCount || 0));
-      const isStillRunning = run.status === 'running';
-      const isPrewarmRun = activeRun.prewarmOnly || Boolean(run.prewarmOnly);
+      const nextTotal = Math.max(0, tenantRunStates.reduce((sum, item) => sum + (item.run.targetCount || 0), 0) || targetCodes.length);
+      const completed = Math.min(
+        nextTotal,
+        Math.max(0, tenantRunStates.reduce((sum, item) => sum + (item.run.completedCount || 0), 0)),
+      );
+      const isStillRunning = tenantRunStates.some((item) => item.run.status === 'running');
+      const isPrewarmRun = activeRun.prewarmOnly || tenantRunStates.every((item) => Boolean(item.run.prewarmOnly));
+      const runIds = tenantRunStates.map((item) => item.tenantRun.runId);
+      const aggregateStatus = isStillRunning
+        ? 'running'
+        : tenantRunStates.some((item) => ['failed', 'partial'].includes(item.run.status))
+          ? 'partial'
+          : 'completed';
+      const aggregateError = tenantRunStates
+        .map((item) => item.run.error ? `${item.tenantRun.tenantName}: ${item.run.error}` : '')
+        .filter(Boolean)
+        .join('；');
+      const aggregateRuleIds = Array.from(new Set(tenantRunStates.flatMap((item) => (
+        item.run.ruleIds && item.run.ruleIds.length > 0 ? item.run.ruleIds : item.tenantRun.ruleIds
+      ))));
+      const aggregateRuleNames = Array.from(new Set(tenantRunStates.flatMap((item) => (
+        item.run.ruleNames && item.run.ruleNames.length > 0 ? item.run.ruleNames : item.tenantRun.ruleNames
+      ))));
+      const primaryRun = tenantRunStates[0]?.run;
+      const aggregateSnapshotId = tenantRunStates.find((item) => item.run.snapshotId)?.run.snapshotId ?? null;
+      const finishedAtValues = tenantRunStates
+        .map((item) => item.run.finishedAt)
+        .filter((value): value is string => Boolean(value))
+        .sort();
+      const run: RuleRunHistoryItem = {
+        id: activeRun.runId,
+        runIds,
+        tenantRuns: tenantRefsFromActiveRuns(activeRun.tenantRuns),
+        ruleId: primaryRun?.ruleId ?? activeRun.tenantRuns[0]?.ruleId ?? selectedRuleIds[0],
+        ruleIds: aggregateRuleIds,
+        ruleNames: aggregateRuleNames,
+        ruleName: aggregateRuleIds.length > 1 ? `多规则实测（${aggregateRuleIds.length} 条）` : aggregateRuleNames[0] ?? null,
+        status: aggregateStatus,
+        targetCount: nextTotal,
+        completedCount: completed,
+        matchCount: tenantRunStates.reduce((sum, item) => sum + (item.run.matchCount || 0), 0),
+        eventCount: tenantRunStates.reduce((sum, item) => sum + (item.run.eventCount || 0), 0),
+        error: aggregateError || null,
+        startedAt: runStartedAt,
+        finishedAt: tenantRunStates.every((item) => item.run.finishedAt)
+          ? finishedAtValues[finishedAtValues.length - 1] ?? null
+          : null,
+        durationMs: Math.max(...tenantRunStates.map((item) => item.run.durationMs ?? 0), 0),
+        snapshotId: aggregateSnapshotId,
+        snapshotTime: tenantRunStates.find((item) => item.run.snapshotTime)?.run.snapshotTime ?? null,
+        snapshotAgeSeconds: primaryRun?.snapshotAgeSeconds ?? null,
+        quoteHitCount: tenantRunStates.reduce((sum, item) => sum + (item.run.quoteHitCount || 0), 0),
+        quoteMissCount: tenantRunStates.reduce((sum, item) => sum + (item.run.quoteMissCount || 0), 0),
+        prewarmOnly: isPrewarmRun,
+        prewarmHitCount: tenantRunStates.reduce((sum, item) => sum + (item.run.prewarmHitCount || 0), 0),
+        prewarmMissCount: tenantRunStates.reduce((sum, item) => sum + (item.run.prewarmMissCount || 0), 0),
+        fastLatestScan: tenantRunStates.some((item) => Boolean(item.run.fastLatestScan)),
+        skippedCount: tenantRunStates.reduce((sum, item) => sum + (item.run.skippedCount || 0), 0),
+        skipCounts: tenantRunStates.reduce<Record<string, number>>((acc, item) => {
+          Object.entries(item.run.skipCounts || {}).forEach(([key, count]) => {
+            acc[key] = (acc[key] || 0) + count;
+          });
+          return acc;
+        }, {}),
+      };
       const progress = nextTotal > 0
         ? Math.min(isStillRunning ? 99 : 100, Math.round((completed / nextTotal) * 100))
         : isStillRunning ? 50 : 100;
       const progressLabel = isPrewarmRun ? '历史缓存预热' : '执行完成';
-      const stage = isStillRunning ? `#${activeRun.runId} ${progressLabel} ${completed}/${nextTotal}` : `#${activeRun.runId} ${progressLabel} ${nextTotal}/${nextTotal}`;
+      const runLabel = activeRun.tenantRuns.length > 1 ? `${activeRun.tenantRuns.length} 个租户任务` : `#${activeRun.runId}`;
+      const stage = isStillRunning ? `${runLabel} ${progressLabel} ${completed}/${nextTotal}` : `${runLabel} ${progressLabel} ${nextTotal}/${nextTotal}`;
       updateRunProgress(sessionId, progress, stage);
       if (completed !== activeRun.lastCompletedCount) {
         activeRun.lastCompletedCount = completed;
@@ -2553,12 +2878,12 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
       }
       if (isStillRunning) return;
 
-      if (run.status === 'failed') {
+      if (tenantRunStates.every((item) => item.run.status === 'failed')) {
         liveActiveRunRef.current = null;
         const failureMessage = run.error || '实测执行失败';
         setRunError(getParsedApiError(new Error(failureMessage)));
         setRunWarning(null);
-        appendExecutionLog(`#${activeRun.runId} 实测失败：${failureMessage}`, 'error');
+        appendExecutionLog(`${runLabel} 实测失败：${failureMessage}`, 'error');
         setActiveResultTab('logs');
         return;
       }
@@ -2599,7 +2924,11 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
         }
       }
       cyclePhase = 'matches';
-      const matches = await rulesApi.getRunMatches(activeRun.runId);
+      const tenantMatchGroups = await Promise.all(tenantRunStates.map(async (item) => ({
+        tenantRun: item.tenantRun,
+        run: item.run,
+        matches: await rulesApi.getRunMatches(item.tenantRun.runId, item.tenantRun.tenantKey),
+      })));
       if (liveTestSessionRef.current !== sessionId) return;
       liveTransientReadErrorCountRef.current = 0;
       if (run.snapshotId) {
@@ -2609,6 +2938,7 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
       const resultRuleIds = run.ruleIds && run.ruleIds.length > 0 ? run.ruleIds : selectedRuleIds;
       const resultRuleNames = run.ruleNames && run.ruleNames.length > 0 ? run.ruleNames : activeRun.runRuleNames;
       const resultRuleName = resultRuleIds.length > 1 ? `多规则实测（${resultRuleIds.length} 条）` : resultRuleNames[0] ?? null;
+      const matches = tenantMatchGroups.flatMap((item) => item.matches);
       const nextRows = flattenMatches(matches, {
         runId: activeRun.runId,
         ruleId: run.ruleId,
@@ -2617,12 +2947,17 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
         finishedAt: now,
       });
       const cumulativeRows = [...nextRows, ...liveResultRowsRef.current];
-      const cumulativeRunIds = Array.from(new Set([activeRun.runId, ...liveRunIdsRef.current]));
+      const childRunIds = tenantRunStates.map((item) => item.tenantRun.runId);
+      const childRunRefs = tenantRefsFromActiveRuns(activeRun.tenantRuns);
+      const cumulativeRunIds = Array.from(new Set([...childRunIds, ...liveRunIdsRef.current]));
+      const cumulativeRunRefs = mergeRunTenantRefs(childRunRefs, liveRunTenantRefsRef.current);
       liveResultRowsRef.current = cumulativeRows;
       liveRunIdsRef.current = cumulativeRunIds;
+      liveRunTenantRefsRef.current = cumulativeRunRefs;
       const runMeta: RuleRunHistoryItem = {
         id: sessionId,
         runIds: cumulativeRunIds,
+        tenantRuns: cumulativeRunRefs,
         ruleId: run.ruleId,
         ruleIds: resultRuleIds,
         ruleName: resultRuleName,
@@ -2659,19 +2994,26 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
         appendExecutionLog(`第 ${activeRun.cycleIndex} 次快路径跳过 ${run.skippedCount ?? 0} 只：${skipSummary}`, 'warning');
       }
       if (nextRows.length > 0) {
-        void rulesApi.notifyRunMatches(activeRun.runId, {
-          executionTime: activeRun.executionTime,
-          ruleIds: resultRuleIds,
-          ruleNames: resultRuleNames,
-          compact: isLiveCompactMode,
-        }).then((notification) => {
+        void Promise.all(tenantMatchGroups
+          .filter((item) => item.matches.length > 0)
+          .map(async (item) => {
+            const notification = await rulesApi.notifyRunMatches(item.tenantRun.runId, {
+              executionTime: activeRun.executionTime,
+              ruleIds: item.run.ruleIds && item.run.ruleIds.length > 0 ? item.run.ruleIds : item.tenantRun.ruleIds,
+              ruleNames: item.run.ruleNames && item.run.ruleNames.length > 0 ? item.run.ruleNames : item.tenantRun.ruleNames,
+              compact: isLiveCompactMode,
+            }, item.tenantRun.tenantKey);
+            return { tenantRun: item.tenantRun, notification };
+          })).then((notifications) => {
           if (liveTestSessionRef.current !== sessionId) return;
-          appendExecutionLog(
-            notification.sent
-              ? `第 ${activeRun.cycleIndex} 次实测命中已推送通知：${notification.eventCount} 条`
-              : `第 ${activeRun.cycleIndex} 次实测命中未推送通知：${notification.message}`,
-            notification.sent ? 'success' : notification.deduplicated ? 'info' : 'warning',
-          );
+          notifications.forEach(({ tenantRun, notification }) => {
+            appendExecutionLog(
+              notification.sent
+                ? `第 ${activeRun.cycleIndex} 次 ${tenantRun.tenantName} 实测命中已推送通知：${notification.eventCount} 条`
+                : `第 ${activeRun.cycleIndex} 次 ${tenantRun.tenantName} 实测命中未推送通知：${notification.message}`,
+              notification.sent ? 'success' : notification.deduplicated ? 'info' : 'warning',
+            );
+          });
         }).catch((notifyError) => {
           if (liveTestSessionRef.current !== sessionId) return;
           const parsedNotifyError = getParsedApiError(notifyError);
@@ -2743,7 +3085,10 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
   }, [
     appendExecutionLog,
     isLiveCompactMode,
+    buildRuntimeTarget,
     selectedRuleIds,
+    selectedRunTenantKeys,
+    selectedRunTenantNames,
     setActiveResultTab,
     setDisplayRows,
     setRunError,
@@ -2751,7 +3096,6 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
     setSelectedRun,
     stopLiveTest,
     targetCodes,
-    targetScope,
     updateRunProgress,
   ]);
 
@@ -2795,6 +3139,8 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
     liveLatestSnapshotIdRef.current = null;
     liveResultRowsRef.current = [];
     liveRunIdsRef.current = [];
+    liveRunTenantRefsRef.current = [];
+    liveCacheTenantKeysRef.current = selectedRunTenantKeys;
     setIsRunning(true);
     setRunError(null);
     setRunWarning(null);
@@ -2803,7 +3149,7 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
     setDisplayRows([]);
     setSelectedRun(temporaryRun);
     setActiveResultTab('logs');
-    appendExecutionLog(`开始实测：${selectedRuleIds.length} 条规则，${targetCodes.length} 只股票，${isLiveCompactMode ? '精简模式' : '完整模式'}，实时模式会每 ${LIVE_TEST_POLL_INTERVAL_MS / 1000} 秒重新触发一次`);
+    appendExecutionLog(`开始实测：${selectedRunTenantSummary}，${selectedRuleIds.length} 条规则，${targetCodes.length} 只股票，${isLiveCompactMode ? '精简模式' : '完整模式'}，实时模式会每 ${LIVE_TEST_POLL_INTERVAL_MS / 1000} 秒重新触发一次`);
 
     const shouldReportSnapshotStats = targetScope === 'all_a_shares' || targetCodes.length >= 1000;
     if (shouldReportSnapshotStats) {
@@ -2845,6 +3191,8 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
     runDisabled,
     runLiveTestCycle,
     selectedRuleIds,
+    selectedRunTenantKeys,
+    selectedRunTenantSummary,
     setActiveResultTab,
     setDisplayRows,
     setExecutionLogs,
@@ -2868,7 +3216,7 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
     setSelectedRun(null);
     setActiveResultTab('logs');
     const runStartedAt = new Date().toISOString();
-    appendExecutionLog(`开始回测：${selectedRuleIds.length} 条规则，${targetCodes.length} 只股票，时间范围 ${startDate || '不限'} 至 ${endDate || '不限'}`);
+    appendExecutionLog(`开始回测：${selectedRunTenantSummary}，${selectedRuleIds.length} 条规则，${targetCodes.length} 只股票，时间范围 ${startDate || '不限'} 至 ${endDate || '不限'}`);
     let currentTemporaryRunId: number | null = null;
     let keepRunningAfterRequest = false;
     try {
@@ -2901,22 +3249,33 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
         ruleIds: selectedRuleIds,
         mode: 'history',
         dataPolicy: 'db_only',
-        target: {
-          scope: targetScope === 'industry' ? 'custom' : targetScope,
-          stockCodes: targetCodes,
-        },
+        tenantKeys: selectedRunTenantKeys,
+        target: buildRuntimeTarget(),
         startDate,
         endDate,
       });
 
+      const tenantRuns = normalizeTenantRuns(startedRun.tenantRuns, {
+        runId: startedRun.runId,
+        tenantKey: startedRun.tenantKey || selectedRunTenantKeys[0],
+        tenantName: selectedRunTenantNames[0],
+        ruleId: startedRun.ruleId,
+        ruleIds: startedRun.ruleIds,
+        ruleNames: startedRun.ruleNames,
+        completedCount: startedRun.completedCount,
+        prewarmOnly: startedRun.prewarmOnly,
+      });
       const runId = startedRun.runId;
+      const childRunIds = tenantRuns.map((item) => item.runId);
+      const runLabel = tenantRuns.length > 1 ? `${tenantRuns.length} 个租户任务` : `#${runId}`;
       const resultRuleIds = startedRun.ruleIds && startedRun.ruleIds.length > 0 ? startedRun.ruleIds : selectedRuleIds;
       const resultRuleNames = startedRun.ruleNames && startedRun.ruleNames.length > 0 ? startedRun.ruleNames : runRuleNames;
       const resultRuleName = resultRuleIds.length > 1 ? `多规则回测（${resultRuleIds.length} 条）` : resultRuleNames[0] ?? null;
       const totalCount = Math.max(0, startedRun.targetCount || targetCodes.length);
       const runningRun: RuleRunHistoryItem = {
         id: runId,
-        runIds: [runId],
+        runIds: childRunIds,
+        tenantRuns: tenantRefsFromActiveRuns(tenantRuns),
         ruleId: startedRun.ruleId,
         ruleIds: resultRuleIds,
         ruleName: resultRuleName,
@@ -2941,7 +3300,7 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
       });
       currentTemporaryRunId = null;
       keepRunningAfterRequest = true;
-      appendExecutionLog(`#${runId} 后台回测已启动：执行完成 0/${totalCount}`);
+      appendExecutionLog(`${runLabel} 后台回测已启动：执行完成 0/${totalCount}`);
       setPageError(null);
 
       let pollInFlight = false;
@@ -2951,47 +3310,84 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
         if (pollInFlight || pollingFinished) return;
         pollInFlight = true;
         try {
-          const run = await rulesApi.getRun(runId);
-          const nextTotal = Math.max(0, run.targetCount || totalCount);
-          const completed = Math.min(nextTotal, Math.max(0, run.completedCount || 0));
-          const isStillRunning = run.status === 'running';
+          const tenantRunStates = await Promise.all(tenantRuns.map(async (tenantRun) => ({
+            tenantRun,
+            run: await rulesApi.getRun(tenantRun.runId, tenantRun.tenantKey),
+          })));
+          const nextTotal = Math.max(0, tenantRunStates.reduce((sum, item) => sum + (item.run.targetCount || 0), 0) || totalCount);
+          const completed = Math.min(
+            nextTotal,
+            Math.max(0, tenantRunStates.reduce((sum, item) => sum + (item.run.completedCount || 0), 0)),
+          );
+          const isStillRunning = tenantRunStates.some((item) => item.run.status === 'running');
+          const aggregateStatus = isStillRunning
+            ? 'running'
+            : tenantRunStates.some((item) => ['failed', 'partial'].includes(item.run.status))
+              ? 'partial'
+              : 'completed';
+          const aggregateError = tenantRunStates
+            .map((item) => item.run.error ? `${item.tenantRun.tenantName}: ${item.run.error}` : '')
+            .filter(Boolean)
+            .join('；');
+          const aggregateRuleIds = Array.from(new Set(tenantRunStates.flatMap((item) => (
+            item.run.ruleIds && item.run.ruleIds.length > 0 ? item.run.ruleIds : item.tenantRun.ruleIds
+          ))));
+          const aggregateRuleNames = Array.from(new Set(tenantRunStates.flatMap((item) => (
+            item.run.ruleNames && item.run.ruleNames.length > 0 ? item.run.ruleNames : item.tenantRun.ruleNames
+          ))));
+          const primaryRun = tenantRunStates[0]?.run;
+          const run: RuleRunHistoryItem = {
+            ...runningRun,
+            id: runId,
+            runIds: childRunIds,
+            ruleId: primaryRun?.ruleId ?? startedRun.ruleId,
+            ruleIds: aggregateRuleIds.length > 0 ? aggregateRuleIds : resultRuleIds,
+            ruleNames: aggregateRuleNames.length > 0 ? aggregateRuleNames : resultRuleNames,
+            ruleName: (aggregateRuleIds.length > 1 ? `多规则回测（${aggregateRuleIds.length} 条）` : aggregateRuleNames[0]) ?? resultRuleName,
+            status: aggregateStatus,
+            targetCount: nextTotal,
+            completedCount: completed,
+            matchCount: tenantRunStates.reduce((sum, item) => sum + (item.run.matchCount || 0), 0),
+            eventCount: tenantRunStates.reduce((sum, item) => sum + (item.run.eventCount || 0), 0),
+            error: aggregateError || null,
+            durationMs: Math.max(...tenantRunStates.map((item) => item.run.durationMs ?? 0), 0),
+            snapshotId: tenantRunStates.find((item) => item.run.snapshotId)?.run.snapshotId ?? null,
+            snapshotTime: tenantRunStates.find((item) => item.run.snapshotTime)?.run.snapshotTime ?? null,
+            snapshotAgeSeconds: primaryRun?.snapshotAgeSeconds ?? null,
+            quoteHitCount: tenantRunStates.reduce((sum, item) => sum + (item.run.quoteHitCount || 0), 0),
+            quoteMissCount: tenantRunStates.reduce((sum, item) => sum + (item.run.quoteMissCount || 0), 0),
+          };
           const progress = nextTotal > 0
             ? Math.min(isStillRunning ? 99 : 100, Math.round((completed / nextTotal) * 100))
             : isStillRunning ? 50 : 100;
           const stage = isStillRunning ? `执行完成 ${completed}/${nextTotal}` : `执行完成 ${nextTotal}/${nextTotal}`;
           updateRunProgress(runId, progress, stage);
-          const nextRun: RuleRunHistoryItem = {
-            ...runningRun,
-            ...run,
-            runIds: [runId],
-            ruleIds: run.ruleIds && run.ruleIds.length > 0 ? run.ruleIds : resultRuleIds,
-            ruleNames: run.ruleNames && run.ruleNames.length > 0 ? run.ruleNames : resultRuleNames,
-            ruleName: run.ruleName ?? resultRuleName,
-            completedCount: completed,
-            targetCount: nextTotal,
-          };
+          const nextRun = run;
           setSelectedRun(nextRun);
           setRunHistory((current) => current.map((item) => (item.id === runId ? nextRun : item)));
           if (completed !== lastCompletedCount) {
             lastCompletedCount = completed;
-            appendExecutionLog(`#${runId} ${stage}`);
+            appendExecutionLog(`${runLabel} ${stage}`);
           }
           if (isStillRunning) return;
 
           updateRunProgress(runId, 100, stage);
-          if (run.status === 'failed') {
+          if (tenantRunStates.every((item) => item.run.status === 'failed')) {
             pollingFinished = true;
             clearRunHeartbeat();
             const failureMessage = run.error || '回测执行失败';
             setRunError(getParsedApiError(new Error(failureMessage)));
             setRunWarning(null);
-            appendExecutionLog(`#${runId} 回测失败：${failureMessage}`, 'error');
+            appendExecutionLog(`${runLabel} 回测失败：${failureMessage}`, 'error');
             setActiveResultTab('logs');
             setIsRunning(false);
             return;
           }
 
-          const matches = await rulesApi.getRunMatches(runId);
+          const matchGroups = await Promise.all(tenantRunStates.map((item) => (
+            rulesApi.getRunMatches(item.tenantRun.runId, item.tenantRun.tenantKey)
+          )));
+          const matches = matchGroups.flat();
           const nextRows = flattenMatches(matches, {
             runId,
             ruleId: nextRun.ruleId,
@@ -3005,12 +3401,13 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
           setSelectedRun(finalRun);
           setDisplayRows(nextRows);
           setRunHistory((current) => current.map((item) => (item.id === runId ? finalRun : item)));
-          setRules(await rulesApi.list());
+          const refreshedRuleGroups = await Promise.all(selectedRunTenantKeys.map((tenantKey) => rulesApi.list(tenantKey)));
+          setRules(mergeTenantRuleLists(refreshedRuleGroups));
           setRunWarning(run.error || null);
           pollingFinished = true;
           clearRunHeartbeat();
           appendExecutionLog(
-            `#${runId} 本次回测完成：共 ${nextRows.length} 条命中记录`,
+            `${runLabel} 本次回测完成：共 ${nextRows.length} 条命中记录`,
             run.status === 'partial' || run.error ? 'warning' : 'success',
           );
           setActiveResultTab('results');
@@ -3451,6 +3848,30 @@ const BacktestPage: React.FC<BacktestPageProps> = ({ mode = 'backtest' }) => {
 
           <div className="grid min-w-0 gap-3">
             <div className={headerControlGridClass}>
+              <label className="flex min-w-0 flex-col gap-1 text-xs text-muted-text">
+                <span>运行租户</span>
+                <select
+                  value={
+                    selectedRunTenantKeys.length === activeTenantOptions.length && activeTenantOptions.length > 1
+                      ? '__all__'
+                      : selectedRunTenantKeys[0] ?? currentTenant?.key ?? ''
+                  }
+                  onChange={(event) => handleRunTenantChange(event.target.value)}
+                  disabled={isLiveMode || isRunning || activeTenantOptions.length === 0}
+                  className={INPUT_CLASS}
+                >
+                  {activeTenantOptions.length > 1 ? (
+                    <option value="__all__" className="bg-elevated text-foreground">
+                      全部租户
+                    </option>
+                  ) : null}
+                  {activeTenantOptions.map((tenant) => (
+                    <option key={tenant.key} value={tenant.key} className="bg-elevated text-foreground">
+                      {tenant.name}
+                    </option>
+                  ))}
+                </select>
+              </label>
               <label className="flex min-w-0 flex-col gap-1 text-xs text-muted-text">
                 <span>股票范围</span>
                 <select

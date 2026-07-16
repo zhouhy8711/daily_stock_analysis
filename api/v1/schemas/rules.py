@@ -74,6 +74,10 @@ class RuleRunRequest(BaseModel):
     end_date: Optional[date] = Field(None, description="Optional backtest end date")
     data_policy: str = Field("db_only", description="规则实测/回测强制只读本地数据库数据")
     live_cache_key: Optional[str] = Field(None, description="Live-test only data cache key")
+    tenant_keys: List[str] = Field(
+        default_factory=list,
+        description="Optional tenant keys to run in one orchestrated request; empty means current tenant",
+    )
 
 
 class RuleBatchRunRequest(RuleRunRequest):
@@ -99,6 +103,7 @@ class RuleRunNotifyResponse(BaseModel):
 
 class RuleRunHistoryItem(BaseModel):
     id: int
+    tenant_id: Optional[int] = None
     rule_id: int
     rule_ids: List[int] = Field(default_factory=list)
     rule_name: Optional[str] = None
@@ -121,6 +126,9 @@ class RuleRunHistoryItem(BaseModel):
     prewarm_only: bool = False
     prewarm_hit_count: int = 0
     prewarm_miss_count: int = 0
+    fast_latest_scan: bool = False
+    skipped_count: int = 0
+    skip_counts: Dict[str, int] = Field(default_factory=dict)
 
 
 class RuleRunHistoryResponse(BaseModel):
@@ -129,6 +137,10 @@ class RuleRunHistoryResponse(BaseModel):
 
 class RuleItem(BaseModel):
     id: int
+    tenant_id: Optional[int] = None
+    tenant_key: Optional[str] = None
+    visibility: str = "tenant"
+    is_shared: bool = False
     name: str
     description: Optional[str] = None
     is_active: bool
@@ -163,6 +175,7 @@ class RuleMetricRegistryResponse(BaseModel):
 
 
 class RuleMatchItem(BaseModel):
+    tenant_id: Optional[int] = None
     run_id: Optional[int] = None
     rule_id: Optional[int] = None
     stock_code: str
@@ -174,8 +187,29 @@ class RuleMatchItem(BaseModel):
     explanation: Optional[str] = None
 
 
+class TenantRuleRunItem(BaseModel):
+    tenant_id: int
+    tenant_key: str
+    tenant_name: str
+    run_id: int
+    rule_id: int
+    rule_ids: List[int] = Field(default_factory=list)
+    rule_names: List[str] = Field(default_factory=list)
+    status: str
+    target_count: int = 0
+    completed_count: int = 0
+    match_count: int = 0
+    event_count: int = 0
+    reused_run: bool = False
+    prewarm_only: bool = False
+    error: Optional[str] = None
+
+
 class RuleRunResponse(BaseModel):
     run_id: int
+    run_ids: List[int] = Field(default_factory=list)
+    tenant_id: Optional[int] = None
+    tenant_key: Optional[str] = None
     rule_id: int
     rule_ids: List[int] = Field(default_factory=list)
     rule_names: List[str] = Field(default_factory=list)
@@ -197,6 +231,10 @@ class RuleRunResponse(BaseModel):
     prewarm_only: bool = False
     prewarm_hit_count: int = 0
     prewarm_miss_count: int = 0
+    fast_latest_scan: bool = False
+    skipped_count: int = 0
+    skip_counts: Dict[str, int] = Field(default_factory=dict)
+    tenant_runs: List[TenantRuleRunItem] = Field(default_factory=list)
 
 
 class RuleRunMatchListResponse(BaseModel):

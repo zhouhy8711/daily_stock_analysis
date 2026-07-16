@@ -4,14 +4,26 @@
 from __future__ import annotations
 
 import json
+import time
 from datetime import datetime, timedelta
 from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar
 
 from sqlalchemy import delete, desc, func, or_, select, update
+from sqlalchemy.exc import IntegrityError
 
-from src.storage import DatabaseManager, StockRule, StockRuleMatch, StockRuleRun
+from src.storage import (
+    DatabaseManager,
+    SharedRuleMatch,
+    SharedRuleRun,
+    StockRule,
+    StockRuleMatch,
+    StockRuleMatchLink,
+    StockRuleRun,
+    StockRuleRunSegment,
+)
 
 RULE_BATCH_META_PREFIX = "__rule_batch_meta__:"
+RULE_BATCH_META_RESERVED_KEYS = {"rule_ids", "rule_names", "errors", "completed_count"}
 RULE_STALE_RUNNING_AFTER = timedelta(hours=6)
 RULE_RUN_LIST_EVENT_RECOUNT_MAX_MATCHES = 1000
 T = TypeVar("T")
@@ -76,8 +88,16 @@ def _append_run_error(existing_error: Optional[str], message: str) -> str:
 class RuleRepository:
     """DB access layer for the stock rule domain."""
 
-    def __init__(self, db_manager: Optional[DatabaseManager] = None):
+    def __init__(
+        self,
+        db_manager: Optional[DatabaseManager] = None,
+        *,
+        tenant_id: Optional[int] = None,
+        tenant_key: Optional[str] = None,
+    ):
         self.db = db_manager or DatabaseManager.get_instance()
+        self.tenant_id = int(tenant_id) if tenant_id is not None else None
+        self.tenant_key = tenant_key
 
     def _run_write_transaction(self, operation_name: str, write_operation: Callable[[Any], T]) -> T:
         runner = getattr(self.db, "_run_write_transaction", None)
@@ -88,11 +108,44 @@ class RuleRepository:
             session.commit()
             return result
 
-    @staticmethod
-    def rule_to_dict(row: StockRule) -> Dict[str, Any]:
+    def _tenant_run_conditions(self) -> List[Any]:
+        if self.tenant_id is None:
+            return []
+        return [StockRuleRun.tenant_id == self.tenant_id]
+
+    def _tenant_match_conditions(self) -> List[Any]:
+        if self.tenant_id is None:
+            return []
+        return [StockRuleMatch.tenant_id == self.tenant_id]
+
+    def _tenant_match_link_conditions(self) -> List[Any]:
+        if self.tenant_id is None:
+            return []
+        return [StockRuleMatchLink.tenant_id == self.tenant_id]
+
+    def _tenant_segment_conditions(self) -> List[Any]:
+        if self.tenant_id is None:
+            return []
+        return [StockRuleRunSegment.tenant_id == self.tenant_id]
+
+    def _visible_rule_condition(self) -> Any:
+        if self.tenant_id is None:
+            return True
+        return or_(
+            StockRule.tenant_id == self.tenant_id,
+            StockRule.tenant_id.is_(None),
+        )
+
+    def rule_to_dict(self, row: StockRule) -> Dict[str, Any]:
         definition = _json_loads(row.definition_json, {})
+        tenant_id = getattr(row, "tenant_id", None)
+        visibility = str(getattr(row, "visibility", None) or "shared")
         return {
             "id": row.id,
+            "tenant_id": tenant_id,
+            "tenant_key": self.tenant_key if tenant_id == self.tenant_id and tenant_id is not None else None,
+            "visibility": visibility,
+            "is_shared": tenant_id is None or visibility == "shared",
             "name": row.name,
             "description": row.description,
             "is_active": bool(row.is_active),
@@ -108,15 +161,16 @@ class RuleRepository:
 
     def list_rules(self) -> List[Dict[str, Any]]:
         with self.db.get_session() as session:
+            run_conditions = self._tenant_run_conditions()
             last_run_at = (
                 select(func.max(StockRuleRun.started_at))
-                .where(StockRuleRun.rule_id == StockRule.id)
+                .where(StockRuleRun.rule_id == StockRule.id, *run_conditions)
                 .correlate(StockRule)
                 .scalar_subquery()
             )
             last_match_count = (
                 select(StockRuleRun.match_count)
-                .where(StockRuleRun.rule_id == StockRule.id)
+                .where(StockRuleRun.rule_id == StockRule.id, *run_conditions)
                 .order_by(desc(StockRuleRun.started_at))
                 .limit(1)
                 .correlate(StockRule)
@@ -124,7 +178,7 @@ class RuleRepository:
             )
             rows = session.execute(
                 select(StockRule, last_run_at, last_match_count)
-                .where(StockRule.is_disable.is_(False))
+                .where(StockRule.is_disable.is_(False), self._visible_rule_condition())
                 .order_by(desc(StockRule.updated_at), desc(StockRule.id))
             ).all()
             items: List[Dict[str, Any]] = []
@@ -146,6 +200,7 @@ class RuleRepository:
         )
         return {
             "id": row.id,
+            "tenant_id": getattr(row, "tenant_id", None),
             "rule_id": row.rule_id,
             "rule_ids": rule_ids,
             "rule_name": f"多规则回测（{len(rule_ids)} 条）" if len(rule_ids) > 1 else rule_name,
@@ -185,7 +240,7 @@ class RuleRepository:
             rows = session.execute(
                 select(StockRuleRun, StockRule.name)
                 .join(StockRule, StockRule.id == StockRuleRun.rule_id)
-                .where(StockRuleRun.status.in_(("running", "completed", "partial")))
+                .where(StockRuleRun.status.in_(("running", "completed", "partial")), *self._tenant_run_conditions())
                 .order_by(desc(StockRuleRun.started_at), desc(StockRuleRun.id))
                 .limit(100)
             ).all()
@@ -227,8 +282,20 @@ class RuleRepository:
         if max_recount_matches is not None and match_count > max_recount_matches:
             return int(match_count)
         snapshot_json_values = session.execute(
-            select(StockRuleMatch.snapshot_json).where(StockRuleMatch.run_id == run_id)
+            select(StockRuleMatch.snapshot_json).where(
+                StockRuleMatch.run_id == run_id,
+                *self._tenant_match_conditions(),
+            )
         ).scalars().all()
+        shared_snapshot_json_values = session.execute(
+            select(SharedRuleMatch.snapshot_json)
+            .join(StockRuleMatchLink, StockRuleMatchLink.shared_match_id == SharedRuleMatch.id)
+            .where(
+                StockRuleMatchLink.run_id == run_id,
+                *self._tenant_match_link_conditions(),
+            )
+        ).scalars().all()
+        snapshot_json_values = list(snapshot_json_values) + list(shared_snapshot_json_values)
         counted = self._count_event_rows_from_snapshots(list(snapshot_json_values))
         return int(counted or match_count)
 
@@ -313,11 +380,28 @@ class RuleRepository:
                 keys.add((day, int(rule_id), normalized_stock_code))
         return tuple(sorted(keys))
 
+    def _load_run_match_signature_rows(self, session: Any, run_id: int) -> List[Tuple[int, str, Optional[str]]]:
+        legacy_rows = session.execute(
+            select(StockRuleMatch.rule_id, StockRuleMatch.stock_code, StockRuleMatch.snapshot_json)
+            .where(StockRuleMatch.run_id == run_id, *self._tenant_match_conditions())
+            .order_by(StockRuleMatch.id.asc())
+        ).all()
+        shared_rows = session.execute(
+            select(StockRuleMatchLink.rule_id, SharedRuleMatch.stock_code, SharedRuleMatch.snapshot_json)
+            .join(SharedRuleMatch, SharedRuleMatch.id == StockRuleMatchLink.shared_match_id)
+            .where(StockRuleMatchLink.run_id == run_id, *self._tenant_match_link_conditions())
+            .order_by(StockRuleMatchLink.id.asc())
+        ).all()
+        return [
+            (int(rule_id), str(stock_code), snapshot_json)
+            for rule_id, stock_code, snapshot_json in [*legacy_rows, *shared_rows]
+        ]
+
     def get_previous_live_match_signature(self, run_id: int) -> Optional[Dict[str, Any]]:
         """Return today's previous live-test rule/stock signature before run_id."""
         with self.db.get_session() as session:
             current = session.execute(
-                select(StockRuleRun).where(StockRuleRun.id == run_id).limit(1)
+                select(StockRuleRun).where(StockRuleRun.id == run_id, *self._tenant_run_conditions()).limit(1)
             ).scalar_one_or_none()
             if current is None or current.started_at is None:
                 return None
@@ -330,6 +414,7 @@ class RuleRepository:
                     StockRuleRun.id != run_id,
                     StockRuleRun.status.in_(("completed", "partial")),
                     StockRuleRun.match_count > 0,
+                    *self._tenant_run_conditions(),
                     StockRuleRun.started_at >= day_start,
                     StockRuleRun.started_at < next_day_start,
                     or_(
@@ -341,15 +426,7 @@ class RuleRepository:
             ).scalars().all()
 
             for previous_run_id in previous_run_ids:
-                rows = session.execute(
-                    select(StockRuleMatch.rule_id, StockRuleMatch.stock_code, StockRuleMatch.snapshot_json)
-                    .where(StockRuleMatch.run_id == previous_run_id)
-                    .order_by(StockRuleMatch.id.asc())
-                ).all()
-                row_values = [
-                    (int(rule_id), str(stock_code), snapshot_json)
-                    for rule_id, stock_code, snapshot_json in rows
-                ]
+                row_values = self._load_run_match_signature_rows(session, int(previous_run_id))
                 if not row_values:
                     continue
                 if not any(
@@ -369,7 +446,7 @@ class RuleRepository:
         """Return all same-day previous live-test match keys before run_id."""
         with self.db.get_session() as session:
             current = session.execute(
-                select(StockRuleRun).where(StockRuleRun.id == run_id).limit(1)
+                select(StockRuleRun).where(StockRuleRun.id == run_id, *self._tenant_run_conditions()).limit(1)
             ).scalar_one_or_none()
             if current is None or current.started_at is None:
                 return None
@@ -382,6 +459,7 @@ class RuleRepository:
                     StockRuleRun.id != run_id,
                     StockRuleRun.status.in_(("completed", "partial")),
                     StockRuleRun.match_count > 0,
+                    *self._tenant_run_conditions(),
                     StockRuleRun.started_at >= day_start,
                     StockRuleRun.started_at < next_day_start,
                     or_(
@@ -395,15 +473,7 @@ class RuleRepository:
             all_keys = set()
             live_run_ids: List[int] = []
             for previous_run_id in previous_run_ids:
-                rows = session.execute(
-                    select(StockRuleMatch.rule_id, StockRuleMatch.stock_code, StockRuleMatch.snapshot_json)
-                    .where(StockRuleMatch.run_id == previous_run_id)
-                    .order_by(StockRuleMatch.id.asc())
-                ).all()
-                row_values = [
-                    (int(rule_id), str(stock_code), snapshot_json)
-                    for rule_id, stock_code, snapshot_json in rows
-                ]
+                row_values = self._load_run_match_signature_rows(session, int(previous_run_id))
                 if not row_values:
                     continue
                 if not any(
@@ -428,6 +498,7 @@ class RuleRepository:
             rows = session.execute(
                 select(StockRuleRun, StockRule.name)
                 .join(StockRule, StockRule.id == StockRuleRun.rule_id)
+                .where(*self._tenant_run_conditions())
                 .order_by(desc(StockRuleRun.started_at), desc(StockRuleRun.id))
                 .limit(limit)
             ).all()
@@ -443,10 +514,27 @@ class RuleRepository:
                 match_rules = session.execute(
                     select(StockRuleMatch.rule_id, StockRule.name)
                     .join(StockRule, StockRule.id == StockRuleMatch.rule_id)
-                    .where(StockRuleMatch.run_id == run.id)
+                    .where(StockRuleMatch.run_id == run.id, *self._tenant_match_conditions())
                     .distinct()
                     .order_by(StockRuleMatch.rule_id.asc())
                 ).all()
+                shared_match_rules = session.execute(
+                    select(StockRuleMatchLink.rule_id, StockRule.name)
+                    .join(StockRule, StockRule.id == StockRuleMatchLink.rule_id)
+                    .where(StockRuleMatchLink.run_id == run.id, *self._tenant_match_link_conditions())
+                    .distinct()
+                    .order_by(StockRuleMatchLink.rule_id.asc())
+                ).all()
+                if shared_match_rules:
+                    existing_rule_ids = {int(rule_id) for rule_id, _ in match_rules}
+                    match_rules = [
+                        *match_rules,
+                        *[
+                            (rule_id, name)
+                            for rule_id, name in shared_match_rules
+                            if int(rule_id) not in existing_rule_ids
+                        ],
+                    ]
                 if match_rules and len(item.get("rule_ids") or []) <= 1:
                     rule_ids = [int(rule_id) for rule_id, _ in match_rules]
                     rule_names = [str(name) for _, name in match_rules if name]
@@ -462,7 +550,7 @@ class RuleRepository:
             row = session.execute(
                 select(StockRuleRun, StockRule.name)
                 .join(StockRule, StockRule.id == StockRuleRun.rule_id)
-                .where(StockRuleRun.id == run_id)
+                .where(StockRuleRun.id == run_id, *self._tenant_run_conditions())
                 .limit(1)
             ).one_or_none()
             if row is None:
@@ -474,7 +562,12 @@ class RuleRepository:
 
     def get_rule(self, rule_id: int) -> Optional[Dict[str, Any]]:
         with self.db.get_session() as session:
-            row = session.execute(select(StockRule).where(StockRule.id == rule_id).limit(1)).scalar_one_or_none()
+            row = session.execute(
+                select(StockRule).where(
+                    StockRule.id == rule_id,
+                    self._visible_rule_condition(),
+                ).limit(1)
+            ).scalar_one_or_none()
             return self.rule_to_dict(row) if row else None
 
     def create_rule(self, data: Dict[str, Any]) -> Dict[str, Any]:
@@ -482,6 +575,8 @@ class RuleRepository:
         target = definition.get("target") or {}
         with self.db.get_session() as session:
             row = StockRule(
+                tenant_id=self.tenant_id,
+                visibility="tenant" if self.tenant_id is not None else "shared",
                 name=data["name"],
                 description=data.get("description"),
                 is_active=bool(data.get("is_active", True)),
@@ -497,9 +592,42 @@ class RuleRepository:
             session.refresh(row)
             return self.rule_to_dict(row)
 
+    def clone_rule(self, rule_id: int) -> Optional[Dict[str, Any]]:
+        with self.db.get_session() as session:
+            source = session.execute(
+                select(StockRule).where(
+                    StockRule.id == rule_id,
+                    self._visible_rule_condition(),
+                ).limit(1)
+            ).scalar_one_or_none()
+            if source is None:
+                return None
+            row = StockRule(
+                tenant_id=self.tenant_id,
+                visibility="tenant" if self.tenant_id is not None else "shared",
+                name=f"{source.name}（副本）",
+                description=source.description,
+                is_active=bool(source.is_active),
+                is_disable=False,
+                period=source.period,
+                lookback_days=int(source.lookback_days or 120),
+                target_scope=source.target_scope,
+                target_codes_json=source.target_codes_json,
+                definition_json=source.definition_json,
+            )
+            session.add(row)
+            session.commit()
+            session.refresh(row)
+            return self.rule_to_dict(row)
+
     def update_rule(self, rule_id: int, data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         with self.db.get_session() as session:
-            row = session.execute(select(StockRule).where(StockRule.id == rule_id).limit(1)).scalar_one_or_none()
+            row = session.execute(
+                select(StockRule).where(
+                    StockRule.id == rule_id,
+                    self._visible_rule_condition(),
+                ).limit(1)
+            ).scalar_one_or_none()
             if row is None:
                 return None
 
@@ -526,33 +654,261 @@ class RuleRepository:
 
     def delete_rule(self, rule_id: int) -> bool:
         with self.db.get_session() as session:
-            row = session.execute(select(StockRule).where(StockRule.id == rule_id).limit(1)).scalar_one_or_none()
+            row = session.execute(
+                select(StockRule).where(
+                    StockRule.id == rule_id,
+                    self._visible_rule_condition(),
+                ).limit(1)
+            ).scalar_one_or_none()
             if row is None:
                 return False
-            session.execute(delete(StockRuleMatch).where(StockRuleMatch.rule_id == rule_id))
-            session.execute(delete(StockRuleRun).where(StockRuleRun.rule_id == rule_id))
+            session.execute(delete(StockRuleMatchLink).where(
+                StockRuleMatchLink.rule_id == rule_id,
+                *self._tenant_match_link_conditions(),
+            ))
+            session.execute(delete(StockRuleMatch).where(
+                StockRuleMatch.rule_id == rule_id,
+                *self._tenant_match_conditions(),
+            ))
+            session.execute(delete(StockRuleRunSegment).where(
+                StockRuleRunSegment.run_id.in_(
+                    select(StockRuleRun.id).where(
+                        StockRuleRun.rule_id == rule_id,
+                        *self._tenant_run_conditions(),
+                    )
+                ),
+                *self._tenant_segment_conditions(),
+            ))
+            session.execute(delete(StockRuleRun).where(
+                StockRuleRun.rule_id == rule_id,
+                *self._tenant_run_conditions(),
+            ))
             session.delete(row)
             session.commit()
             return True
 
     def delete_run(self, run_id: int) -> bool:
         with self.db.get_session() as session:
-            row = session.execute(select(StockRuleRun).where(StockRuleRun.id == run_id).limit(1)).scalar_one_or_none()
+            row = session.execute(
+                select(StockRuleRun).where(
+                    StockRuleRun.id == run_id,
+                    *self._tenant_run_conditions(),
+                ).limit(1)
+            ).scalar_one_or_none()
             if row is None:
                 return False
-            session.execute(delete(StockRuleMatch).where(StockRuleMatch.run_id == run_id))
+            session.execute(delete(StockRuleMatchLink).where(
+                StockRuleMatchLink.run_id == run_id,
+                *self._tenant_match_link_conditions(),
+            ))
+            session.execute(delete(StockRuleRunSegment).where(
+                StockRuleRunSegment.run_id == run_id,
+                *self._tenant_segment_conditions(),
+            ))
+            session.execute(delete(StockRuleMatch).where(
+                StockRuleMatch.run_id == run_id,
+                *self._tenant_match_conditions(),
+            ))
             session.delete(row)
             session.commit()
             return True
 
     def create_run(self, rule_id: int, target_count: int, error: Optional[str] = None) -> int:
-        def write(session) -> int:
-            row = StockRuleRun(rule_id=rule_id, target_count=target_count, status="running", error=error)
+        def write(session) -> Tuple[int, bool]:
+            row = StockRuleRun(
+                tenant_id=self.tenant_id,
+                rule_id=rule_id,
+                target_count=target_count,
+                status="running",
+                error=error,
+            )
             session.add(row)
             session.flush()
             return int(row.id)
 
         return self._run_write_transaction("stock_rule_run.create", write)
+
+    def create_run_segment(
+        self,
+        *,
+        run_id: int,
+        segment_key: str,
+        segment_type: str,
+        rule_ids: List[int],
+        rule_fingerprints: List[str],
+        stock_codes: List[str],
+        shared_run_id: Optional[int] = None,
+    ) -> int:
+        def write(session) -> int:
+            row = StockRuleRunSegment(
+                tenant_id=self.tenant_id,
+                run_id=int(run_id),
+                shared_run_id=int(shared_run_id) if shared_run_id is not None else None,
+                segment_key=str(segment_key),
+                segment_type=str(segment_type or "private"),
+                rule_ids_json=_json_dumps([int(rule_id) for rule_id in rule_ids]),
+                rule_fingerprints_json=_json_dumps(list(rule_fingerprints or [])),
+                stock_codes_json=_json_dumps([str(code or "").strip().upper() for code in stock_codes]),
+                status="running",
+                target_count=len(list(dict.fromkeys(stock_codes))),
+                completed_count=0,
+                match_count=0,
+                created_at=datetime.now(),
+                updated_at=datetime.now(),
+            )
+            session.add(row)
+            session.flush()
+            return int(row.id)
+
+        return self._run_write_transaction("stock_rule_run_segment.create", write)
+
+    def create_shared_run(
+        self,
+        *,
+        execution_key: str,
+        mode: str,
+        data_policy: str,
+        target_count: int,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> int:
+        shared_run_id, _created = self.create_shared_run_with_state(
+            execution_key=execution_key,
+            mode=mode,
+            data_policy=data_policy,
+            target_count=target_count,
+            metadata=metadata,
+        )
+        return shared_run_id
+
+    def create_shared_run_with_state(
+        self,
+        *,
+        execution_key: str,
+        mode: str,
+        data_policy: str,
+        target_count: int,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[int, bool]:
+        def write(session) -> int:
+            existing = session.execute(
+                select(SharedRuleRun).where(SharedRuleRun.execution_key == execution_key).limit(1)
+            ).scalar_one_or_none()
+            if existing is not None:
+                return int(existing.id), False
+            row = SharedRuleRun(
+                execution_key=str(execution_key),
+                status="running",
+                mode=str(mode or "history"),
+                data_policy=str(data_policy or "db_only"),
+                target_count=max(0, int(target_count or 0)),
+                completed_count=0,
+                match_count=0,
+                metadata_json=_json_dumps(metadata or {}),
+                started_at=datetime.now(),
+            )
+            session.add(row)
+            session.flush()
+            return int(row.id), True
+
+        try:
+            return self._run_write_transaction("shared_rule_run.create", write)
+        except IntegrityError:
+            with self.db.get_session() as session:
+                existing = session.execute(
+                    select(SharedRuleRun).where(SharedRuleRun.execution_key == execution_key).limit(1)
+                ).scalar_one_or_none()
+                if existing is not None:
+                    return int(existing.id), False
+            raise
+
+    @staticmethod
+    def _shared_run_to_dict(row: SharedRuleRun) -> Dict[str, Any]:
+        return {
+            "id": int(row.id),
+            "execution_key": row.execution_key,
+            "status": row.status,
+            "mode": row.mode,
+            "data_policy": row.data_policy,
+            "target_count": int(row.target_count or 0),
+            "completed_count": int(row.completed_count or 0),
+            "match_count": int(row.match_count or 0),
+            "error": row.error,
+            "metadata": _json_loads(row.metadata_json, {}),
+            "started_at": row.started_at.isoformat() if row.started_at else None,
+            "finished_at": row.finished_at.isoformat() if row.finished_at else None,
+            "duration_ms": row.duration_ms,
+        }
+
+    def find_shared_run_by_key(self, execution_key: str) -> Optional[Dict[str, Any]]:
+        if not execution_key:
+            return None
+        with self.db.get_session() as session:
+            row = session.execute(
+                select(SharedRuleRun)
+                .where(SharedRuleRun.execution_key == execution_key)
+                .limit(1)
+            ).scalar_one_or_none()
+            return self._shared_run_to_dict(row) if row is not None else None
+
+    def find_completed_shared_run_by_key(self, execution_key: str) -> Optional[Dict[str, Any]]:
+        if not execution_key:
+            return None
+        with self.db.get_session() as session:
+            row = session.execute(
+                select(SharedRuleRun)
+                .where(
+                    SharedRuleRun.execution_key == execution_key,
+                    SharedRuleRun.status.in_(("completed", "partial")),
+                )
+                .limit(1)
+            ).scalar_one_or_none()
+            if row is None:
+                return None
+            return self._shared_run_to_dict(row)
+
+    def wait_for_completed_shared_run_by_key(
+        self,
+        execution_key: str,
+        *,
+        timeout_seconds: float,
+        poll_interval_seconds: float = 1.0,
+    ) -> Optional[Dict[str, Any]]:
+        if not execution_key or timeout_seconds <= 0:
+            return self.find_completed_shared_run_by_key(execution_key)
+        deadline = time.monotonic() + max(0.0, float(timeout_seconds))
+        interval = max(0.05, float(poll_interval_seconds))
+        while True:
+            completed = self.find_completed_shared_run_by_key(execution_key)
+            if completed is not None:
+                return completed
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            time.sleep(min(interval, remaining))
+
+    def update_shared_run_progress(
+        self,
+        *,
+        shared_run_id: int,
+        completed_count: int,
+        metadata: Optional[Dict[str, Any]] = None,
+        error: Optional[str] = None,
+    ) -> None:
+        def write(session) -> None:
+            values: Dict[str, Any] = {
+                "completed_count": max(0, int(completed_count or 0)),
+            }
+            if metadata is not None:
+                values["metadata_json"] = _json_dumps(metadata)
+            if error is not None:
+                values["error"] = error
+            session.execute(
+                update(SharedRuleRun)
+                .where(SharedRuleRun.id == int(shared_run_id), SharedRuleRun.status == "running")
+                .values(**values)
+            )
+
+        self._run_write_transaction("shared_rule_run.progress", write)
 
     def update_run_progress(
         self,
@@ -564,27 +920,33 @@ class RuleRepository:
         errors: Optional[List[str]] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> None:
+        extra_metadata = {
+            key: value
+            for key, value in dict(metadata or {}).items()
+            if key not in RULE_BATCH_META_RESERVED_KEYS
+        }
+
         def write(session) -> None:
             session.execute(
                 update(StockRuleRun)
-                .where(StockRuleRun.id == run_id, StockRuleRun.status == "running")
+                .where(StockRuleRun.id == run_id, StockRuleRun.status == "running", *self._tenant_run_conditions())
                 .values(error=encode_rule_batch_metadata(
                     rule_ids,
                     rule_names,
                     errors or [],
                     completed_count=completed_count,
-                    **(metadata or {}),
+                    **extra_metadata,
                 ))
             )
 
         self._run_write_transaction("stock_rule_run.progress", write)
 
-    @staticmethod
-    def _build_match_row(run_id: int, rule_id: int, match: Dict[str, Any], created_at: datetime) -> StockRuleMatch:
+    def _build_match_row(self, run_id: int, rule_id: int, match: Dict[str, Any], created_at: datetime) -> StockRuleMatch:
         snapshot = dict(match.get("snapshot") or {})
         snapshot["_matched_dates"] = match.get("matched_dates") or []
         snapshot["_matched_events"] = match.get("matched_events") or []
         return StockRuleMatch(
+            tenant_id=self.tenant_id,
             run_id=run_id,
             rule_id=int(match.get("rule_id") or rule_id),
             stock_code=match["stock_code"],
@@ -594,6 +956,163 @@ class RuleRepository:
             explanation=match.get("explanation"),
             created_at=created_at,
         )
+
+    @staticmethod
+    def _build_shared_match_row(shared_run_id: int, rule_id: int, match: Dict[str, Any], created_at: datetime) -> SharedRuleMatch:
+        snapshot = dict(match.get("snapshot") or {})
+        snapshot["_matched_dates"] = match.get("matched_dates") or []
+        snapshot["_matched_events"] = match.get("matched_events") or []
+        return SharedRuleMatch(
+            shared_run_id=int(shared_run_id),
+            source_rule_id=int(match.get("rule_id") or rule_id),
+            rule_fingerprint=str(match.get("rule_fingerprint") or ""),
+            stock_code=match["stock_code"],
+            stock_name=match.get("stock_name"),
+            matched_groups_json=_json_dumps(match.get("matched_groups") or []),
+            snapshot_json=_json_dumps(snapshot),
+            explanation=match.get("explanation"),
+            created_at=created_at,
+        )
+
+    @staticmethod
+    def _shared_match_row_to_dict(row: SharedRuleMatch) -> Dict[str, Any]:
+        snapshot = _json_loads(row.snapshot_json, {}) or {}
+        return {
+            "id": int(row.id),
+            "shared_run_id": int(row.shared_run_id),
+            "source_rule_id": int(row.source_rule_id),
+            "rule_fingerprint": row.rule_fingerprint,
+            "stock_code": row.stock_code,
+            "stock_name": row.stock_name,
+            "matched_groups": _json_loads(row.matched_groups_json, []),
+            "matched_dates": snapshot.get("_matched_dates") or [],
+            "matched_events": snapshot.get("_matched_events") or [],
+            "snapshot": {key: value for key, value in snapshot.items() if key not in {"_matched_dates", "_matched_events"}},
+            "explanation": row.explanation,
+            "created_at": row.created_at.isoformat() if row.created_at else None,
+        }
+
+    def finish_shared_run(
+        self,
+        *,
+        shared_run_id: int,
+        rule_id: int,
+        status: str,
+        started_at: datetime,
+        matches: List[Dict[str, Any]],
+        metadata: Optional[Dict[str, Any]] = None,
+        error: Optional[str] = None,
+    ) -> Tuple[List[Dict[str, Any]], int]:
+        finished_at = datetime.now()
+        duration_ms = int((finished_at - started_at).total_seconds() * 1000)
+
+        def write(session) -> Tuple[List[Dict[str, Any]], int]:
+            result = session.execute(
+                update(SharedRuleRun)
+                .where(SharedRuleRun.id == int(shared_run_id))
+                .values(
+                    status=status,
+                    completed_count=int((metadata or {}).get("completed_count") or 0),
+                    match_count=len(matches),
+                    error=error,
+                    metadata_json=_json_dumps(metadata or {}),
+                    finished_at=finished_at,
+                    duration_ms=duration_ms,
+                )
+            )
+            if result.rowcount == 0:
+                return ([], 0)
+            session.execute(delete(SharedRuleMatch).where(SharedRuleMatch.shared_run_id == int(shared_run_id)))
+            rows = [
+                self._build_shared_match_row(shared_run_id, rule_id, match, finished_at)
+                for match in matches
+            ]
+            if rows:
+                session.add_all(rows)
+                session.flush()
+            return ([self._shared_match_row_to_dict(row) for row in rows], duration_ms)
+
+        return self._run_write_transaction("shared_rule_run.finish", write)
+
+    def list_shared_matches(self, shared_run_id: int) -> List[Dict[str, Any]]:
+        with self.db.get_session() as session:
+            rows = session.execute(
+                select(SharedRuleMatch)
+                .where(SharedRuleMatch.shared_run_id == int(shared_run_id))
+                .order_by(SharedRuleMatch.id.asc())
+            ).scalars().all()
+            return [self._shared_match_row_to_dict(row) for row in rows]
+
+    def finish_projected_run(
+        self,
+        *,
+        run_id: int,
+        rule_id: int,
+        status: str,
+        started_at: datetime,
+        matches: List[Dict[str, Any]],
+        shared_links: List[Dict[str, Any]],
+        error: Optional[str] = None,
+    ) -> Tuple[int, int]:
+        finished_at = datetime.now()
+        duration_ms = int((finished_at - started_at).total_seconds() * 1000)
+
+        def write(session) -> Tuple[int, int]:
+            total_matches = len(matches) + len(shared_links)
+            result = session.execute(
+                update(StockRuleRun)
+                .where(StockRuleRun.id == run_id, *self._tenant_run_conditions())
+                .values(
+                    status=status,
+                    match_count=total_matches,
+                    error=error,
+                    finished_at=finished_at,
+                    duration_ms=duration_ms,
+                )
+            )
+            if result.rowcount == 0:
+                return (0, 0)
+
+            session.execute(delete(StockRuleMatch).where(
+                StockRuleMatch.run_id == run_id,
+                *self._tenant_match_conditions(),
+            ))
+            session.execute(delete(StockRuleMatchLink).where(
+                StockRuleMatchLink.run_id == run_id,
+                *self._tenant_match_link_conditions(),
+            ))
+            private_rows = [
+                self._build_match_row(run_id, rule_id, match, finished_at)
+                for match in matches
+            ]
+            if private_rows:
+                session.bulk_save_objects(private_rows)
+            link_rows = [
+                StockRuleMatchLink(
+                    tenant_id=self.tenant_id,
+                    run_id=run_id,
+                    rule_id=int(link["rule_id"]),
+                    shared_run_id=int(link["shared_run_id"]),
+                    shared_match_id=int(link["shared_match_id"]),
+                    stock_code=str(link["stock_code"]).strip().upper(),
+                    created_at=finished_at,
+                )
+                for link in shared_links
+            ]
+            if link_rows:
+                session.bulk_save_objects(link_rows)
+            session.execute(
+                update(StockRuleRunSegment)
+                .where(StockRuleRunSegment.run_id == run_id, *self._tenant_segment_conditions())
+                .values(
+                    status=status,
+                    completed_count=StockRuleRunSegment.target_count,
+                    updated_at=finished_at,
+                )
+            )
+            return (total_matches, duration_ms)
+
+        return self._run_write_transaction("stock_rule_run.finish_projected", write)
 
     def finish_run(
         self,
@@ -611,7 +1130,7 @@ class RuleRepository:
         def write(session) -> Tuple[int, int]:
             result = session.execute(
                 update(StockRuleRun)
-                .where(StockRuleRun.id == run_id)
+                .where(StockRuleRun.id == run_id, *self._tenant_run_conditions())
                 .values(
                     status=status,
                     match_count=len(matches),
@@ -648,6 +1167,7 @@ class RuleRepository:
                 select(StockRuleRun).where(
                     StockRuleRun.status == "running",
                     StockRuleRun.started_at < cutoff,
+                    *self._tenant_run_conditions(),
                 )
             ).scalars().all()
             for row in rows:
@@ -673,6 +1193,7 @@ class RuleRepository:
                 select(StockRuleRun).where(
                     StockRuleRun.status == "running",
                     StockRuleRun.started_at < cutoff,
+                    *self._tenant_run_conditions(),
                 )
             ).scalars().all()
             for row in rows:
@@ -686,16 +1207,19 @@ class RuleRepository:
 
     def list_matches(self, run_id: int) -> List[Dict[str, Any]]:
         with self.db.get_session() as session:
-            rows = session.execute(
-                select(StockRuleMatch).where(StockRuleMatch.run_id == run_id).order_by(StockRuleMatch.id.asc())
+            private_rows = session.execute(
+                select(StockRuleMatch)
+                .where(StockRuleMatch.run_id == run_id, *self._tenant_match_conditions())
+                .order_by(StockRuleMatch.id.asc())
             ).scalars().all()
             items: List[Dict[str, Any]] = []
-            for row in rows:
+            for row in private_rows:
                 snapshot = _json_loads(row.snapshot_json, {}) or {}
                 matched_dates = snapshot.pop("_matched_dates", [])
                 matched_events = snapshot.pop("_matched_events", [])
                 items.append({
                     "id": row.id,
+                    "tenant_id": getattr(row, "tenant_id", None),
                     "run_id": row.run_id,
                     "rule_id": row.rule_id,
                     "stock_code": row.stock_code,
@@ -706,5 +1230,33 @@ class RuleRepository:
                     "snapshot": snapshot,
                     "explanation": row.explanation,
                     "created_at": row.created_at.isoformat() if row.created_at else None,
+                })
+            shared_rows = session.execute(
+                select(StockRuleMatchLink, SharedRuleMatch)
+                .join(SharedRuleMatch, SharedRuleMatch.id == StockRuleMatchLink.shared_match_id)
+                .where(StockRuleMatchLink.run_id == run_id, *self._tenant_match_link_conditions())
+                .order_by(StockRuleMatchLink.id.asc())
+            ).all()
+            for link, shared in shared_rows:
+                snapshot = _json_loads(shared.snapshot_json, {}) or {}
+                matched_dates = snapshot.pop("_matched_dates", [])
+                matched_events = snapshot.pop("_matched_events", [])
+                items.append({
+                    "id": int(link.id),
+                    "tenant_id": getattr(link, "tenant_id", None),
+                    "run_id": int(link.run_id),
+                    "rule_id": int(link.rule_id),
+                    "stock_code": shared.stock_code,
+                    "stock_name": shared.stock_name,
+                    "matched_dates": matched_dates,
+                    "matched_events": matched_events,
+                    "matched_groups": _json_loads(shared.matched_groups_json, []),
+                    "snapshot": snapshot,
+                    "explanation": shared.explanation,
+                    "created_at": link.created_at.isoformat() if link.created_at else (
+                        shared.created_at.isoformat() if shared.created_at else None
+                    ),
+                    "shared_run_id": int(link.shared_run_id),
+                    "shared_match_id": int(link.shared_match_id),
                 })
             return items

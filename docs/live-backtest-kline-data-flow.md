@@ -8,6 +8,8 @@
 
 另有一套后端「AI 分析记录回测」接口在 `/api/v1/backtest/*`，它不是 Web「回测」页当前使用的规则回测链路，但也是后端回测能力的一部分，本文单独列出，避免概念混淆。
 
+规则、实测和 Web 规则回测支持业务租户。前端会在规则编辑、列表、历史查询等 API 请求中携带 `X-DSA-Tenant: <tenant_key>`；缺省时后端使用默认租户 `default`。规则实测固定覆盖全部活跃租户，规则默认全选但可手动调整本次运行规则；后端收到 `mode=latest` 且未传 `tenant_keys` 的批量运行请求时，也会默认扩展为全部活跃租户。规则回测运行请求可以传入 `tenant_keys` 选择单租户或全部租户，一次启动多个租户子运行并按租户分别写历史、去重、清缓存和推送飞书。AI 分析记录回测 `/api/v1/backtest/*` 第一版不租户化，仍保持全局历史分析记录视角。
+
 ## 关键入口
 
 | 功能 | 前端入口 | API 入口 | 后端主链路 |
@@ -105,7 +107,7 @@ flowchart LR
 
 ### 规则运行数据预热
 
-异步规则实测/回测启动后，后端会根据选中规则、股票范围和 lookback 天数，一次性从 `stock_daily` 批量读取所需日线窗口并放入进程内缓存。回测和普通规则运行使用短期通用缓存；Web 实测会额外生成 `live_cache_key`，后端把当天之前的历史日线、基础筹码分布缓存和财务事件派生缓存写入仅实测使用的 live 缓存，不受通用缓存 TTL 影响；每一轮实测都会先用最新分钟热表行情合成当前判断日 K 线，再优先基于该 K 线重算当日筹码分布，缺少换手率等必要字段时才退回到按最新价重估获利盘，避免复用上一轮价格或前一交易日筹码日期。A 股交易日 09:30 前触发实测时只进入 `prewarm_only`：读取当天之前的历史日线并刷新 live 缓存，不读取分钟热表、不评估命中、不推送通知；09:30 后同规则和股票会复用该 live 缓存，再从 `stock_intraday_minute` 聚合实时 quote 做真正实测。用户点击「停止实测」时前端调用 `DELETE /api/v1/rules/live-cache/{live_cache_key}` 清理本次 live 缓存；如果页面异常关闭，组件卸载时也会尽力清理。大规模实测运行期间，后台全市场实时行情预热会跳过新一轮远程抓取，分钟热表归档也会临时暂停，避免低优先级 quote 抓取和归档抢占实测资源。
+异步规则实测/回测启动后，后端会根据选中规则、股票范围和 lookback 天数，一次性从 `stock_daily` 批量读取所需日线窗口并放入进程内缓存。回测和普通规则运行使用短期通用缓存；Web 实测会额外生成 `live_cache_key`，后端把当天之前的历史日线、基础筹码分布缓存和财务事件派生缓存写入仅实测使用的 live 缓存，不受通用缓存 TTL 影响；每一轮实测都会先用最新分钟热表行情合成当前判断日 K 线，再优先基于该 K 线重算当日筹码分布，缺少换手率等必要字段时才退回到按最新价重估获利盘，避免复用上一轮价格或前一交易日筹码日期。多租户真扫描中，可共享的逻辑会使用按实测 session 稳定的 `shared:` live cache key 和股票并集扫描一次，不随每轮快照生成新的共享 cache；不能合并的租户私有逻辑继续使用 `tenant:<tenant_key>:` cache key。A 股交易日 09:30 前触发实测时只进入 `prewarm_only`：按租户刷新各自 live 缓存中的当天之前历史日线，不读取分钟热表、不评估命中、不推送通知；09:30 后同规则和股票会复用该 live 缓存，再从 `stock_intraday_minute` 聚合实时 quote 做真正实测。用户点击「停止实测」时前端调用 `DELETE /api/v1/rules/live-cache/{live_cache_key}` 清理本次 live 缓存；后端会同时清理该 session 下的租户 cache 和 `shared:` cache。如果页面异常关闭，组件卸载时也会尽力清理。大规模实测运行期间，后台全市场实时行情预热会跳过新一轮远程抓取，分钟热表归档也会临时暂停，避免低优先级 quote 抓取和归档抢占实测资源。
 
 ### 数据库表
 
@@ -114,9 +116,15 @@ flowchart LR
 | `stock_daily` | `StockDaily` | 日 K 缓存；规则实测/规则回测/AI 回测/首页日 K 都会读。远程日线刷新后 upsert 到这里。 |
 | `stock_intraday_minute` | `StockIntradayMinute` | 当日分钟热表；后台 quote 预热采样和按需分钟 K 回源都会写入；首页指标页的 1m/分时/分钟 K 优先读它。 |
 | `stock_chip_daily` | `StockChipDaily` | 筹码峰日缓存；指标扩展数据的 `cache_only/db_only` 会读，远程筹码或本地模型同步后会写。 |
+| `tenants` | `Tenant` | 业务租户元数据；升级时自动创建 `default` 租户。 |
+| `tenant_configs` | `TenantConfig` | 租户股票池和租户级飞书 Webhook 配置。 |
 | `stock_rules` | `StockRule` | 用户配置的规则定义、目标范围、lookback。 |
-| `stock_rule_runs` | `StockRuleRun` | 规则实测/规则回测运行记录、状态、进度、错误和汇总命中数。 |
-| `stock_rule_matches` | `StockRuleMatch` | 规则命中明细，保存匹配股票、指标快照、命中事件和解释文本。 |
+| `stock_rule_runs` | `StockRuleRun` | 规则实测/规则回测运行记录、状态、进度、错误和汇总命中数；按 `tenant_id` 隔离。 |
+| `stock_rule_matches` | `StockRuleMatch` | 租户私有扫描的规则命中明细，保存匹配股票、指标快照、命中事件和解释文本；按 `tenant_id` 隔离。 |
+| `shared_rule_runs` | `SharedRuleRun` | 多租户共享逻辑的物理执行记录；执行 key 不包含租户，包含逻辑指纹、模式、日期、快照和股票并集。 |
+| `shared_rule_matches` | `SharedRuleMatch` | 共享执行产生的命中快照，只保存一份大 JSON 结果。 |
+| `stock_rule_run_segments` | `StockRuleRunSegment` | 租户 run 到共享/私有执行片段的映射和片段进度。 |
+| `stock_rule_match_links` | `StockRuleMatchLink` | 租户 run/rule 到共享 match 的投影 link；删除某个租户 run 只删除 link，不删除共享快照。 |
 | `analysis_history` | `AnalysisHistory` | AI 股票分析历史；AI 分析记录回测从这里取候选记录。 |
 | `backtest_results` | `BacktestResult` | AI 分析记录回测逐条评估结果。 |
 | `backtest_summaries` | `BacktestSummary` | AI 分析记录回测的整体/单股汇总指标。 |
@@ -130,8 +138,8 @@ flowchart LR
 页面加载时会并行获取：
 
 1. `GET /api/v1/rules/metrics`：规则指标注册表。
-2. `GET /api/v1/rules`：规则列表，后端读 `stock_rules` 并附带最近运行摘要。
-3. 系统配置：用于读取 `STOCK_LIST` 等自选股配置。
+2. `GET /api/v1/rules`：规则列表，实测页按全部活跃租户读取可见规则并默认选中全部启用规则，用户可在运行前取消部分规则；共享规则在多个租户中按同一规则 ID 合并展示，租户独有规则保留各自 ID。
+3. `GET /api/v1/tenants/{tenant_key}/config`：用于读取全部活跃运行租户的股票池和飞书 Webhook 配置；watchlist 展示为这些租户股票池并集。
 4. `GET /api/v1/history`：用于在配置自选为空时补充最近分析过的股票。
 5. 前端本地 `stocks.index.json`：用于 A 股全量/行业目标范围。
 
@@ -146,33 +154,36 @@ flowchart LR
 POST /api/v1/rules/run-batch/async
 {
   "rule_ids": [1, 2],
+  "tenant_keys": ["default", "quant_team"],
   "mode": "latest",
   "data_policy": "db_only",
   "target": {
-    "scope": "custom",
-    "stock_codes": ["600519", "300750"]
+    "scope": "watchlist",
+    "stock_codes": []
   }
 }
 ```
 
-5. 若返回 `prewarm_only=true`，前端只写入预热日志并结束本轮，不轮询命中、不汇总、不通知。
-6. 真扫描返回后前端按 `snapshot_id` 去重；相同快照不重复汇总，旧快照不覆盖新快照。
-7. 精简模式开启时，前端结果列表按「命中日 + 规则 + 股票」只保留一条命中；关闭后恢复逐轮累计展示。
-8. 若本轮有命中，前端继续调用 `POST /api/v1/rules/runs/{run_id}/notify` 推送通知，并传入当前精简模式开关。后端在精简模式下会按同一天「命中日 + 规则 + 股票」过滤今日已推送过的命中；关闭后使用原来的上一轮组合完全一致去重逻辑。
-9. 点击「停止实测」后，前端停止轮询并调用 `DELETE /api/v1/rules/live-cache/{live_cache_key}` 清理本次实测专用数据缓存。
+5. 后端返回父响应和 `tenant_runs` 子运行列表；前端用父响应展示一次任务，用子运行的 `tenant_key + run_id` 并行轮询各租户进度。
+6. 若所有子运行返回 `prewarm_only=true`，前端只写入预热日志并结束本轮，不轮询命中、不汇总、不通知。
+7. 真扫描返回后前端按 `snapshot_id` 去重；相同快照不重复汇总，旧快照不覆盖新快照。
+8. 精简模式开启时，前端结果列表按「命中日 + 规则 + 股票」只保留一条命中；关闭后恢复逐轮累计展示。
+9. 若某个租户子运行有命中，前端用该子运行的 `tenant_key` 调用 `POST /api/v1/rules/runs/{run_id}/notify`。后端使用该租户飞书配置，并在精简模式下按同一天「命中日 + 规则 + 股票」过滤今日已推送过的命中；关闭后使用原来的上一轮组合完全一致去重逻辑。
+10. 点击「停止实测」后，前端停止轮询并按本次运行租户逐个调用 `DELETE /api/v1/rules/live-cache/{live_cache_key}` 清理本次实测专用数据缓存。
 
 ### 后端规则准备
 
-`api/v1/endpoints/rules.py` 接收请求后进入 `RuleService.start_run_rules()`：
+`api/v1/endpoints/rules.py` 接收请求后会先解析运行租户范围：`mode=latest` 不传 `tenant_keys` 时默认使用全部活跃租户；`mode=history` 不传时使用当前 `X-DSA-Tenant`，传多个租户或 `all/*` 时按所选租户运行。端点会先为每个租户生成 `RuleService.prepare_rule_run_plan()`，再按共享 planner 合并共同逻辑，最后聚合父响应。
 
 1. 校验 `mode` 只能是 `latest/history`，实测固定为 `latest`。
 2. 校验 `data_policy`，规则实测和规则回测会在服务端统一强制为 `db_only`。
-3. 通过 `RuleRepository.get_rule()` 从 `stock_rules` 读取规则定义。
+3. 每个租户子运行通过 `RuleRepository.get_rule()` 从 `stock_rules` 读取该租户可见规则：共享规则和本租户独有规则可见，其他租户独有规则不可见；请求中选了但该租户不可见的规则会被跳过。
 4. `validate_definition()` 校验第一版规则只支持 `daily` 周期、至少一个条件组、目标范围合法、指标 key/operator 合法。
-5. 目标股票优先使用前端传入的 `target.stock_codes`；没有显式代码时，`watchlist` 从 `STOCK_LIST` 取。
+5. 目标股票优先使用前端传入的 `target.stock_codes`；没有显式代码时，`watchlist` 在每个租户子运行中从该租户 `tenant_configs.stock_list_json` 取。默认租户升级时会从全局 `STOCK_LIST` 初始化，新租户默认股票池为空。
 6. `_validate_live_snapshot_session()` 如果目标全部是 A 股，会再次校验实测时间窗口：交易日 15:00 及以前可触发，15:00 之后或非交易日返回错误。
 7. 09:30 前的 A 股实测写入 `prewarm_only` 运行记录并立即完成，只预热当天之前的规则历史数据缓存。
-8. 09:30 后的真扫描由 `RuleRepository.create_run()` 写入 `stock_rule_runs`，初始状态为 `running`。
+8. 09:30 后的真扫描由 `RuleRepository.create_run()` 为每个租户写入自己的 `stock_rule_runs`，初始状态为 `running`。
+9. 多租户异步运行会按“规则逻辑指纹（不含 target 股票列表）+ 模式 + 日期范围 + 快照”分组；同组目标股票取并集，写入一条 `shared_rule_runs` 并只扫描一次。并发启动相同多租户批次时，不先复用单租户 running run，而是用共享执行锁、`shared_rule_runs.execution_key` 和创建者状态做物理执行去重；非创建者不持有进程内锁等待数据库完成结果，避免同进程等待闭环，多 worker 场景也会优先复用已完成 shared run。命中写入 `shared_rule_matches` 后，再通过 `stock_rule_match_links` fan-out 到各租户 run。单消费者或无法合并的规则保留旧的私有扫描，命中仍写入 `stock_rule_matches`。
 
 ### 单股数据获取
 
@@ -219,6 +230,13 @@ POST /api/v1/rules/run-batch/async
 4. API 直接把本轮 matches 返回给前端。
 5. 前端按执行时间折叠展示；通知接口再从 `stock_rule_matches` 读取命中明细并发送。
 
+租户隔离点：
+
+- `stock_rules.tenant_id IS NULL AND visibility=shared` 的共享规则对所有租户可见，但在租户工作区只读；前端提供“克隆”把它复制为当前租户的 `visibility=tenant` 规则。
+- `stock_rule_runs` 查询、删除、同日实测去重和 run reuse 都带子运行所属 `tenant_id` 条件；共享命中通过 `stock_rule_match_links.tenant_id` 投影，避免不同租户看到彼此命中。
+- Web 实测的租户私有 `live_cache_key` 在后端会加入租户前缀；09:30 后的共享执行使用 `shared:` 前缀，避免同一共同逻辑按租户重复扫描。
+- 规则实测通知会用子运行归属租户的飞书 Webhook 覆盖全局飞书配置；一次全租户实测会按有命中的租户分别推送到各自飞书群，非飞书渠道第一版仍沿用全局配置。
+
 ## Web 规则回测数据链路
 
 Web「回测」页当前是规则历史扫描，不是 AI 分析记录回测。
@@ -235,20 +253,23 @@ Web「回测」页当前是规则历史扫描，不是 AI 分析记录回测。
 POST /api/v1/rules/run-batch/async
 {
   "rule_ids": [1, 2],
+  "tenant_keys": ["default", "quant_team"],
   "mode": "history",
   "target": {
-    "scope": "custom",
-    "stock_codes": ["600519", "300750"]
+    "scope": "watchlist",
+    "stock_codes": []
   },
   "start_date": "2026-01-01",
   "end_date": "2026-05-01"
 }
 ```
 
-前端随后每 5 秒轮询：
+前端随后每 5 秒按 `tenant_runs` 中的 `tenant_key + run_id` 轮询：
 
 - `GET /api/v1/rules/runs/{run_id}`：读运行状态和进度。
 - 完成后 `GET /api/v1/rules/runs/{run_id}/matches`：读命中明细。
+
+多租户父运行本身不额外落一条全局历史；持久化历史仍落在每个租户自己的 `stock_rule_runs` 中。页面刷新后的自动历史恢复按当前单租户工作区读取，跨租户父运行需要分别切换租户查看子运行历史。
 
 ### 后端启动与进度
 
@@ -299,7 +320,8 @@ POST /api/v1/rules/run-batch/async
 与实测相同，最终落到：
 
 - `stock_rule_runs`：运行状态、进度、错误、命中数量。
-- `stock_rule_matches`：每只命中股票的事件、快照和解释。
+- `stock_rule_matches`：租户私有扫描的每只命中股票事件、快照和解释。
+- `shared_rule_matches` + `stock_rule_match_links`：共享扫描的物理命中和租户投影。
 
 差异是：
 

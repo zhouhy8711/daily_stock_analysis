@@ -577,7 +577,7 @@ FEISHU_WEBHOOK_URL=https://open.feishu.cn/open-apis/bot/v2/hook/your_hook_token
    - **Signature verification enabled**: copy the secret shown in Feishu into `FEISHU_WEBHOOK_SECRET`. **Both sides must be enabled or disabled together** — if Feishu has signing on but `FEISHU_WEBHOOK_SECRET` is missing (or vice versa), every request will be rejected.
    - **Keyword enabled**: copy the exact same keyword into `FEISHU_WEBHOOK_KEYWORD`. The app will prepend it to every message automatically; no need to change report templates.
    - **IP allowlist enabled**: make sure the outbound IP of your runtime (local / Docker / GitHub Actions each have different IPs) is on the allowlist.
-4. The Web rule live-test page pushes matched rules, stocks, and condition values to every configured notification channel when a new realtime snapshot hits. Its Compact Mode is on by default, so the same rule and stock only appears and pushes once per day; turning it off restores per-cycle accumulated results and the previous "skip only when the whole previous set is unchanged" notification logic. The Feishu channel uses `FEISHU_WEBHOOK_URL`.
+4. The Web rule live-test page pushes matched rules, stocks, and condition values to the notification channel of the tenant that owns the child run. Its Compact Mode is on by default, so the same rule and stock only appears and pushes once per day; turning it off restores per-cycle accumulated results and the previous "skip only when the whole previous set is unchanged" notification logic. The Feishu channel uses the child run tenant's Webhook settings first and does not fall back to the global `FEISHU_WEBHOOK_URL` when the tenant leaves Feishu empty.
 5. `FEISHU_APP_ID` / `FEISHU_APP_SECRET` are for Feishu app / Stream Bot / cloud document flows only — they do **not** trigger group webhook notifications and must not be used instead of `FEISHU_WEBHOOK_URL`.
 
 **Common failure causes:**
@@ -738,6 +738,23 @@ System defaults to AkShare (free), also supports other data sources:
 - Free, no configuration needed
 - Supports US/HK stock data
 - US stock historical and real-time data prefer YFinance by default to avoid technical indicator errors from AkShare's US stock adjustment issues. If YFinance is rate-limited and Efinance/Longbridge are unavailable, historical daily bars fall back to AkShare/Sina as the last resort so Web indicator analysis can still render.
+
+---
+
+## Business Tenants
+
+The Web workspace supports business tenants while keeping the existing single-admin login model. v1 does not add users, members, roles, or permission matrices.
+
+- Upgrades automatically create the default tenant `default`; existing rules become shared rules, and existing rule runs/matches belong to the default tenant.
+- The Web sidebar can switch the current tenant for rule management, tenant configuration, and single-tenant history queries. Rule lists show the current tenant's owned rules plus shared rules by default.
+- The Web live-test page always runs all active tenants and selects all enabled rules by default, while the rule selector remains adjustable before starting. The Web rule backtest page keeps the Run Tenants selector. Choosing all tenants sends one run request, and the backend creates tenant child runs: each tenant executes only its visible selected rules, while run history, matches, and notifications belong to that tenant.
+- Shared rules are visible to every tenant but read-only in a tenant workspace; clone one before editing it as a tenant-owned rule.
+- The Settings page Tenant Management card maintains tenant name, tenant stock pool, and Feishu Webhook URL/Secret/keyword/`FEISHU_MAX_BYTES`.
+- `scope=watchlist` rule targets and Web live/backtest default targets use the child run tenant's stock pool first. The default tenant is initialized from global `STOCK_LIST`; new tenants start with an empty pool.
+- Rule live-test notifications override global Feishu fields with the child run tenant's Feishu Webhook settings. An all-tenant live test pushes each tenant's hits to that tenant's Feishu group. Non-Feishu channels still use global configuration in v1.
+- AI analysis-history backtest APIs under `/api/v1/backtest/*` are not tenant-scoped in v1 and still use global analysis history.
+
+No new `.env` variable is required. Tenant data is stored in SQLite tables `tenants`, `tenant_configs`, and rule table `tenant_id` columns. Deleting a tenant deactivates it and does not physically remove historical data.
 
 ---
 
@@ -923,6 +940,15 @@ FastAPI provides RESTful API service for configuration management and triggering
 | `/api/v1/backtest/results` | GET | Query backtest results (paginated) |
 | `/api/v1/backtest/performance` | GET | Get overall backtest performance |
 | `/api/v1/backtest/performance/{code}` | GET | Get per-stock backtest performance |
+| `/api/v1/tenants` | GET/POST | List or create business tenants |
+| `/api/v1/tenants/{tenant_key}` | PUT/DELETE | Update or deactivate a business tenant |
+| `/api/v1/tenants/{tenant_key}/config` | GET/PUT | Read or update tenant stock pool and tenant Feishu Webhook settings |
+| `/api/v1/rules` | GET/POST | List or create rules; rule APIs support `X-DSA-Tenant` and default to the default tenant when omitted |
+| `/api/v1/rules/{rule_id}/clone` | POST | Clone a shared rule into the current tenant |
+| `/api/v1/rules/{rule_id}/run` | POST | Run one rule under the current tenant |
+| `/api/v1/rules/run-batch` | POST | Run rule batches synchronously; optional `tenant_keys` starts multiple tenant child runs in one request; rule live/backtest runs force `data_policy=db_only` and remain tenant-isolated |
+| `/api/v1/rules/run-batch/async` | POST | Start async rule live/backtest batches; optional `tenant_keys` returns `tenant_runs`, which the Web pages aggregate while polling child progress and loading matches |
+| `/api/v1/rules/live-cache/{live_cache_key}` | DELETE | Clear one Web live-test session cache under the request tenant and the same session's `shared:` cache; all-tenant live-test stop calls this once per tenant |
 | `/api/v1/agent/skill-output/{filename}` | GET | View Markdown results generated by background custom Codex skill jobs |
 | `/api/health` | GET | Health check |
 | `/docs` | GET | API Swagger documentation |

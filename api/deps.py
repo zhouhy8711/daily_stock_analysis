@@ -18,6 +18,14 @@ from sqlalchemy.orm import Session
 from src.storage import DatabaseManager
 from src.config import get_config, Config
 from src.services.system_config_service import SystemConfigService
+from src.services.tenant_service import (
+    TenantContext,
+    TenantInactiveError,
+    TenantNotFoundError,
+    TenantService,
+    TenantValidationError,
+)
+from fastapi import HTTPException
 
 
 def get_db() -> Generator[Session, None, None]:
@@ -69,3 +77,35 @@ def get_system_config_service(request: Request) -> SystemConfigService:
         service = SystemConfigService()
         request.app.state.system_config_service = service
     return service
+
+
+def get_tenant_service(request: Request) -> TenantService:
+    """Get app-lifecycle shared TenantService instance."""
+    service = getattr(request.app.state, "tenant_service", None)
+    if service is None:
+        service = TenantService()
+        request.app.state.tenant_service = service
+    return service
+
+
+def get_tenant_context(request: Request) -> TenantContext:
+    """Resolve the current business tenant from X-DSA-Tenant."""
+    service = get_tenant_service(request)
+    tenant_key = request.headers.get("X-DSA-Tenant")
+    try:
+        return service.resolve_context(tenant_key)
+    except TenantValidationError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "invalid_tenant", "message": str(exc)},
+        ) from exc
+    except TenantNotFoundError as exc:
+        raise HTTPException(
+            status_code=404,
+            detail={"error": "tenant_not_found", "message": str(exc)},
+        ) from exc
+    except TenantInactiveError as exc:
+        raise HTTPException(
+            status_code=403,
+            detail={"error": "tenant_inactive", "message": str(exc)},
+        ) from exc

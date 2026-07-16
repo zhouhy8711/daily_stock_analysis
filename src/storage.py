@@ -557,12 +557,45 @@ class BacktestSummary(Base):
     )
 
 
+class Tenant(Base):
+    """Business workspace used to isolate rule configuration and executions."""
+
+    __tablename__ = 'tenants'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    key = Column(String(64), nullable=False, unique=True, index=True)
+    name = Column(String(100), nullable=False)
+    description = Column(Text)
+    is_active = Column(Boolean, nullable=False, default=True, server_default="1", index=True)
+    is_default = Column(Boolean, nullable=False, default=False, server_default="0", index=True)
+    created_at = Column(DateTime, default=datetime.now, index=True)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now, index=True)
+
+
+class TenantConfig(Base):
+    """Tenant-scoped settings for rule defaults and Feishu delivery."""
+
+    __tablename__ = 'tenant_configs'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(Integer, ForeignKey('tenants.id'), nullable=False, unique=True, index=True)
+    stock_list_json = Column(Text)
+    feishu_webhook_url = Column(Text)
+    feishu_webhook_secret = Column(Text)
+    feishu_webhook_keyword = Column(String(100))
+    feishu_max_bytes = Column(Integer)
+    created_at = Column(DateTime, default=datetime.now, index=True)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now, index=True)
+
+
 class StockRule(Base):
     """User-defined stock screening rule."""
 
     __tablename__ = 'stock_rules'
 
     id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(Integer, ForeignKey('tenants.id'), nullable=True, index=True)
+    visibility = Column(String(16), nullable=False, default='shared', server_default='shared', index=True)
     name = Column(String(100), nullable=False)
     description = Column(Text)
     is_active = Column(Boolean, nullable=False, default=True, index=True)
@@ -582,6 +615,7 @@ class StockRuleRun(Base):
     __tablename__ = 'stock_rule_runs'
 
     id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(Integer, ForeignKey('tenants.id'), nullable=True, index=True)
     rule_id = Column(Integer, ForeignKey('stock_rules.id'), nullable=False, index=True)
     status = Column(String(16), nullable=False, default='running', index=True)
     target_count = Column(Integer, nullable=False, default=0)
@@ -592,6 +626,7 @@ class StockRuleRun(Base):
     duration_ms = Column(Integer)
 
     __table_args__ = (
+        Index('ix_stock_rule_run_tenant_started', 'tenant_id', 'started_at'),
         Index('ix_stock_rule_run_rule_started', 'rule_id', 'started_at'),
     )
 
@@ -602,6 +637,7 @@ class StockRuleMatch(Base):
     __tablename__ = 'stock_rule_matches'
 
     id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(Integer, ForeignKey('tenants.id'), nullable=True, index=True)
     run_id = Column(Integer, ForeignKey('stock_rule_runs.id'), nullable=False, index=True)
     rule_id = Column(Integer, ForeignKey('stock_rules.id'), nullable=False, index=True)
     stock_code = Column(String(16), nullable=False, index=True)
@@ -612,8 +648,111 @@ class StockRuleMatch(Base):
     created_at = Column(DateTime, default=datetime.now, index=True)
 
     __table_args__ = (
+        Index('ix_stock_rule_match_tenant_created', 'tenant_id', 'created_at'),
         Index('ix_stock_rule_match_rule_created', 'rule_id', 'created_at'),
         Index('ix_stock_rule_match_code_created', 'stock_code', 'created_at'),
+    )
+
+
+class SharedRuleRun(Base):
+    """Physical execution shared by multiple tenant-visible rule runs."""
+
+    __tablename__ = 'shared_rule_runs'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    execution_key = Column(String(64), nullable=False, unique=True, index=True)
+    status = Column(String(16), nullable=False, default='running', index=True)
+    mode = Column(String(16), nullable=False, default='history', index=True)
+    data_policy = Column(String(32), nullable=False, default='db_only')
+    target_count = Column(Integer, nullable=False, default=0)
+    completed_count = Column(Integer, nullable=False, default=0)
+    match_count = Column(Integer, nullable=False, default=0)
+    error = Column(Text)
+    metadata_json = Column(Text)
+    started_at = Column(DateTime, default=datetime.now, index=True)
+    finished_at = Column(DateTime)
+    duration_ms = Column(Integer)
+
+    __table_args__ = (
+        Index('ix_shared_rule_run_status_started', 'status', 'started_at'),
+    )
+
+
+class SharedRuleMatch(Base):
+    """Matched stock snapshot materialized once for shared rule execution."""
+
+    __tablename__ = 'shared_rule_matches'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    shared_run_id = Column(Integer, ForeignKey('shared_rule_runs.id'), nullable=False, index=True)
+    source_rule_id = Column(Integer, ForeignKey('stock_rules.id'), nullable=False, index=True)
+    rule_fingerprint = Column(String(64), nullable=False, index=True)
+    stock_code = Column(String(16), nullable=False, index=True)
+    stock_name = Column(String(80))
+    matched_groups_json = Column(Text)
+    snapshot_json = Column(Text)
+    explanation = Column(Text)
+    created_at = Column(DateTime, default=datetime.now, index=True)
+
+    __table_args__ = (
+        Index('ix_shared_rule_match_run_rule', 'shared_run_id', 'source_rule_id'),
+        Index('ix_shared_rule_match_run_code', 'shared_run_id', 'stock_code'),
+    )
+
+
+class StockRuleRunSegment(Base):
+    """Tenant-visible run segment pointing at shared or private execution work."""
+
+    __tablename__ = 'stock_rule_run_segments'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(Integer, ForeignKey('tenants.id'), nullable=True, index=True)
+    run_id = Column(Integer, ForeignKey('stock_rule_runs.id'), nullable=False, index=True)
+    shared_run_id = Column(Integer, ForeignKey('shared_rule_runs.id'), nullable=True, index=True)
+    segment_key = Column(String(64), nullable=False, index=True)
+    segment_type = Column(String(16), nullable=False, default='private', index=True)
+    rule_ids_json = Column(Text)
+    rule_fingerprints_json = Column(Text)
+    stock_codes_json = Column(Text)
+    status = Column(String(16), nullable=False, default='running', index=True)
+    target_count = Column(Integer, nullable=False, default=0)
+    completed_count = Column(Integer, nullable=False, default=0)
+    match_count = Column(Integer, nullable=False, default=0)
+    error = Column(Text)
+    created_at = Column(DateTime, default=datetime.now, index=True)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now, index=True)
+
+    __table_args__ = (
+        Index('ix_stock_rule_run_segment_run_type', 'run_id', 'segment_type'),
+        Index('ix_stock_rule_run_segment_tenant_run', 'tenant_id', 'run_id'),
+    )
+
+
+class StockRuleMatchLink(Base):
+    """Tenant projection of a shared rule match."""
+
+    __tablename__ = 'stock_rule_match_links'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(Integer, ForeignKey('tenants.id'), nullable=True, index=True)
+    run_id = Column(Integer, ForeignKey('stock_rule_runs.id'), nullable=False, index=True)
+    rule_id = Column(Integer, ForeignKey('stock_rules.id'), nullable=False, index=True)
+    shared_run_id = Column(Integer, ForeignKey('shared_rule_runs.id'), nullable=False, index=True)
+    shared_match_id = Column(Integer, ForeignKey('shared_rule_matches.id'), nullable=False, index=True)
+    stock_code = Column(String(16), nullable=False, index=True)
+    created_at = Column(DateTime, default=datetime.now, index=True)
+
+    __table_args__ = (
+        UniqueConstraint(
+            'tenant_id',
+            'run_id',
+            'rule_id',
+            'shared_match_id',
+            name='uix_stock_rule_match_link_projection',
+        ),
+        Index('ix_stock_rule_match_link_run_rule', 'run_id', 'rule_id'),
+        Index('ix_stock_rule_match_link_tenant_created', 'tenant_id', 'created_at'),
+        Index('ix_stock_rule_match_link_shared_run', 'shared_run_id', 'run_id'),
     )
 
 
@@ -986,6 +1125,54 @@ class DatabaseManager:
             **{column: "FLOAT" for column in DAILY_DERIVED_METRIC_COLUMNS},
         }
         with self._engine.begin() as connection:
+            now_text = datetime.now().isoformat(sep=" ", timespec="seconds")
+            default_tenant_row = connection.exec_driver_sql(
+                "SELECT id FROM tenants WHERE key = 'default' LIMIT 1"
+            ).fetchone()
+            if default_tenant_row is None:
+                connection.exec_driver_sql(
+                    """
+                    INSERT INTO tenants (key, name, description, is_active, is_default, created_at, updated_at)
+                    VALUES ('default', '默认租户', '升级兼容创建的默认业务租户', 1, 1, ?, ?)
+                    """,
+                    (now_text, now_text),
+                )
+                default_tenant_row = connection.exec_driver_sql(
+                    "SELECT id FROM tenants WHERE key = 'default' LIMIT 1"
+                ).fetchone()
+            else:
+                connection.exec_driver_sql(
+                    "UPDATE tenants SET is_active = 1, is_default = 1 WHERE key = 'default'"
+                )
+            default_tenant_id = int(default_tenant_row[0]) if default_tenant_row is not None else None
+
+            if default_tenant_id is not None:
+                default_config_row = connection.exec_driver_sql(
+                    "SELECT id FROM tenant_configs WHERE tenant_id = ? LIMIT 1",
+                    (default_tenant_id,),
+                ).fetchone()
+                if default_config_row is None:
+                    stock_list_json = json.dumps(
+                        list(getattr(get_config(), "stock_list", []) or []),
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    )
+                    connection.exec_driver_sql(
+                        """
+                        INSERT INTO tenant_configs (
+                            tenant_id, stock_list_json, feishu_max_bytes, created_at, updated_at
+                        )
+                        VALUES (?, ?, ?, ?, ?)
+                        """,
+                        (
+                            default_tenant_id,
+                            stock_list_json,
+                            int(getattr(get_config(), "feishu_max_bytes", 20000) or 20000),
+                            now_text,
+                            now_text,
+                        ),
+                    )
+
             existing_columns = {
                 str(row[1])
                 for row in connection.exec_driver_sql("PRAGMA table_info(stock_daily)").fetchall()
@@ -1000,14 +1187,185 @@ class DatabaseManager:
                 str(row[1])
                 for row in connection.exec_driver_sql("PRAGMA table_info(stock_rules)").fetchall()
             }
+            if stock_rule_columns and "tenant_id" not in stock_rule_columns:
+                connection.exec_driver_sql(
+                    "ALTER TABLE stock_rules ADD COLUMN tenant_id INTEGER"
+                )
+            if stock_rule_columns and "visibility" not in stock_rule_columns:
+                connection.exec_driver_sql(
+                    "ALTER TABLE stock_rules ADD COLUMN visibility VARCHAR(16) NOT NULL DEFAULT 'shared'"
+                )
             if stock_rule_columns and "is_disable" not in stock_rule_columns:
                 connection.exec_driver_sql(
                     "ALTER TABLE stock_rules ADD COLUMN is_disable BOOLEAN NOT NULL DEFAULT 0"
                 )
             if stock_rule_columns:
                 connection.exec_driver_sql(
+                    "UPDATE stock_rules SET visibility = 'shared' WHERE visibility IS NULL OR visibility = ''"
+                )
+                connection.exec_driver_sql(
                     "CREATE INDEX IF NOT EXISTS ix_stock_rules_is_disable ON stock_rules (is_disable)"
                 )
+                connection.exec_driver_sql(
+                    "CREATE INDEX IF NOT EXISTS ix_stock_rules_tenant_id ON stock_rules (tenant_id)"
+                )
+                connection.exec_driver_sql(
+                    "CREATE INDEX IF NOT EXISTS ix_stock_rules_visibility ON stock_rules (visibility)"
+                )
+
+            stock_rule_run_columns = {
+                str(row[1])
+                for row in connection.exec_driver_sql("PRAGMA table_info(stock_rule_runs)").fetchall()
+            }
+            if stock_rule_run_columns and "tenant_id" not in stock_rule_run_columns:
+                connection.exec_driver_sql(
+                    "ALTER TABLE stock_rule_runs ADD COLUMN tenant_id INTEGER"
+                )
+            if stock_rule_run_columns:
+                if default_tenant_id is not None:
+                    connection.exec_driver_sql(
+                        "UPDATE stock_rule_runs SET tenant_id = ? WHERE tenant_id IS NULL",
+                        (default_tenant_id,),
+                    )
+                connection.exec_driver_sql(
+                    "CREATE INDEX IF NOT EXISTS ix_stock_rule_runs_tenant_id ON stock_rule_runs (tenant_id)"
+                )
+                connection.exec_driver_sql(
+                    "CREATE INDEX IF NOT EXISTS ix_stock_rule_run_tenant_started ON stock_rule_runs (tenant_id, started_at)"
+                )
+
+            stock_rule_match_columns = {
+                str(row[1])
+                for row in connection.exec_driver_sql("PRAGMA table_info(stock_rule_matches)").fetchall()
+            }
+            if stock_rule_match_columns and "tenant_id" not in stock_rule_match_columns:
+                connection.exec_driver_sql(
+                    "ALTER TABLE stock_rule_matches ADD COLUMN tenant_id INTEGER"
+                )
+            if stock_rule_match_columns:
+                if default_tenant_id is not None:
+                    connection.exec_driver_sql(
+                        "UPDATE stock_rule_matches SET tenant_id = ? WHERE tenant_id IS NULL",
+                        (default_tenant_id,),
+                    )
+                connection.exec_driver_sql(
+                    "CREATE INDEX IF NOT EXISTS ix_stock_rule_matches_tenant_id ON stock_rule_matches (tenant_id)"
+                )
+                connection.exec_driver_sql(
+                    "CREATE INDEX IF NOT EXISTS ix_stock_rule_match_tenant_created ON stock_rule_matches (tenant_id, created_at)"
+                )
+
+            connection.exec_driver_sql(
+                """
+                CREATE TABLE IF NOT EXISTS shared_rule_runs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    execution_key VARCHAR(64) NOT NULL UNIQUE,
+                    status VARCHAR(16) NOT NULL DEFAULT 'running',
+                    mode VARCHAR(16) NOT NULL DEFAULT 'history',
+                    data_policy VARCHAR(32) NOT NULL DEFAULT 'db_only',
+                    target_count INTEGER NOT NULL DEFAULT 0,
+                    completed_count INTEGER NOT NULL DEFAULT 0,
+                    match_count INTEGER NOT NULL DEFAULT 0,
+                    error TEXT,
+                    metadata_json TEXT,
+                    started_at DATETIME,
+                    finished_at DATETIME,
+                    duration_ms INTEGER
+                )
+                """
+            )
+            connection.exec_driver_sql(
+                """
+                CREATE TABLE IF NOT EXISTS shared_rule_matches (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    shared_run_id INTEGER NOT NULL,
+                    source_rule_id INTEGER NOT NULL,
+                    rule_fingerprint VARCHAR(64) NOT NULL,
+                    stock_code VARCHAR(16) NOT NULL,
+                    stock_name VARCHAR(80),
+                    matched_groups_json TEXT,
+                    snapshot_json TEXT,
+                    explanation TEXT,
+                    created_at DATETIME,
+                    FOREIGN KEY(shared_run_id) REFERENCES shared_rule_runs (id),
+                    FOREIGN KEY(source_rule_id) REFERENCES stock_rules (id)
+                )
+                """
+            )
+            connection.exec_driver_sql(
+                """
+                CREATE TABLE IF NOT EXISTS stock_rule_run_segments (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    tenant_id INTEGER,
+                    run_id INTEGER NOT NULL,
+                    shared_run_id INTEGER,
+                    segment_key VARCHAR(64) NOT NULL,
+                    segment_type VARCHAR(16) NOT NULL DEFAULT 'private',
+                    rule_ids_json TEXT,
+                    rule_fingerprints_json TEXT,
+                    stock_codes_json TEXT,
+                    status VARCHAR(16) NOT NULL DEFAULT 'running',
+                    target_count INTEGER NOT NULL DEFAULT 0,
+                    completed_count INTEGER NOT NULL DEFAULT 0,
+                    match_count INTEGER NOT NULL DEFAULT 0,
+                    error TEXT,
+                    created_at DATETIME,
+                    updated_at DATETIME,
+                    FOREIGN KEY(tenant_id) REFERENCES tenants (id),
+                    FOREIGN KEY(run_id) REFERENCES stock_rule_runs (id),
+                    FOREIGN KEY(shared_run_id) REFERENCES shared_rule_runs (id)
+                )
+                """
+            )
+            connection.exec_driver_sql(
+                """
+                CREATE TABLE IF NOT EXISTS stock_rule_match_links (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    tenant_id INTEGER,
+                    run_id INTEGER NOT NULL,
+                    rule_id INTEGER NOT NULL,
+                    shared_run_id INTEGER NOT NULL,
+                    shared_match_id INTEGER NOT NULL,
+                    stock_code VARCHAR(16) NOT NULL,
+                    created_at DATETIME,
+                    FOREIGN KEY(tenant_id) REFERENCES tenants (id),
+                    FOREIGN KEY(run_id) REFERENCES stock_rule_runs (id),
+                    FOREIGN KEY(rule_id) REFERENCES stock_rules (id),
+                    FOREIGN KEY(shared_run_id) REFERENCES shared_rule_runs (id),
+                    FOREIGN KEY(shared_match_id) REFERENCES shared_rule_matches (id),
+                    CONSTRAINT uix_stock_rule_match_link_projection
+                        UNIQUE (tenant_id, run_id, rule_id, shared_match_id)
+                )
+                """
+            )
+            for index_sql in (
+                "CREATE INDEX IF NOT EXISTS ix_shared_rule_runs_execution_key ON shared_rule_runs (execution_key)",
+                "CREATE INDEX IF NOT EXISTS ix_shared_rule_runs_status ON shared_rule_runs (status)",
+                "CREATE INDEX IF NOT EXISTS ix_shared_rule_run_status_started ON shared_rule_runs (status, started_at)",
+                "CREATE INDEX IF NOT EXISTS ix_shared_rule_matches_shared_run_id ON shared_rule_matches (shared_run_id)",
+                "CREATE INDEX IF NOT EXISTS ix_shared_rule_matches_source_rule_id ON shared_rule_matches (source_rule_id)",
+                "CREATE INDEX IF NOT EXISTS ix_shared_rule_matches_rule_fingerprint ON shared_rule_matches (rule_fingerprint)",
+                "CREATE INDEX IF NOT EXISTS ix_shared_rule_matches_stock_code ON shared_rule_matches (stock_code)",
+                "CREATE INDEX IF NOT EXISTS ix_shared_rule_match_run_rule ON shared_rule_matches (shared_run_id, source_rule_id)",
+                "CREATE INDEX IF NOT EXISTS ix_shared_rule_match_run_code ON shared_rule_matches (shared_run_id, stock_code)",
+                "CREATE INDEX IF NOT EXISTS ix_stock_rule_run_segments_tenant_id ON stock_rule_run_segments (tenant_id)",
+                "CREATE INDEX IF NOT EXISTS ix_stock_rule_run_segments_run_id ON stock_rule_run_segments (run_id)",
+                "CREATE INDEX IF NOT EXISTS ix_stock_rule_run_segments_shared_run_id ON stock_rule_run_segments (shared_run_id)",
+                "CREATE INDEX IF NOT EXISTS ix_stock_rule_run_segments_segment_key ON stock_rule_run_segments (segment_key)",
+                "CREATE INDEX IF NOT EXISTS ix_stock_rule_run_segments_status ON stock_rule_run_segments (status)",
+                "CREATE INDEX IF NOT EXISTS ix_stock_rule_run_segment_run_type ON stock_rule_run_segments (run_id, segment_type)",
+                "CREATE INDEX IF NOT EXISTS ix_stock_rule_run_segment_tenant_run ON stock_rule_run_segments (tenant_id, run_id)",
+                "CREATE INDEX IF NOT EXISTS ix_stock_rule_match_links_tenant_id ON stock_rule_match_links (tenant_id)",
+                "CREATE INDEX IF NOT EXISTS ix_stock_rule_match_links_run_id ON stock_rule_match_links (run_id)",
+                "CREATE INDEX IF NOT EXISTS ix_stock_rule_match_links_rule_id ON stock_rule_match_links (rule_id)",
+                "CREATE INDEX IF NOT EXISTS ix_stock_rule_match_links_shared_run_id ON stock_rule_match_links (shared_run_id)",
+                "CREATE INDEX IF NOT EXISTS ix_stock_rule_match_links_shared_match_id ON stock_rule_match_links (shared_match_id)",
+                "CREATE INDEX IF NOT EXISTS ix_stock_rule_match_links_stock_code ON stock_rule_match_links (stock_code)",
+                "CREATE INDEX IF NOT EXISTS ix_stock_rule_match_link_run_rule ON stock_rule_match_links (run_id, rule_id)",
+                "CREATE INDEX IF NOT EXISTS ix_stock_rule_match_link_tenant_created ON stock_rule_match_links (tenant_id, created_at)",
+                "CREATE INDEX IF NOT EXISTS ix_stock_rule_match_link_shared_run ON stock_rule_match_links (shared_run_id, run_id)",
+            ):
+                connection.exec_driver_sql(index_sql)
 
             stock_chip_daily_columns = {
                 str(row[1])

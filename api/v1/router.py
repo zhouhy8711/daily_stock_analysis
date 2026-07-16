@@ -22,6 +22,7 @@ from api.v1.endpoints import (
     rules,
     stocks,
     system_config,
+    tenants,
     usage,
 )
 
@@ -68,6 +69,12 @@ router.include_router(
     system_config.router,
     prefix="/system",
     tags=["SystemConfig"]
+)
+
+router.include_router(
+    tenants.router,
+    prefix="/tenants",
+    tags=["Tenants"]
 )
 
 router.include_router(

@@ -684,7 +684,7 @@ FEISHU_WEBHOOK_URL=https://open.feishu.cn/open-apis/bot/v2/hook/your_hook_token
    - **开启了「签名校验」**：把飞书显示的 secret 填到 `FEISHU_WEBHOOK_SECRET`。两端必须同时启用或同时不填，否则飞书返回签名校验失败。
    - **开启了「关键词」**：把同一个关键词填到 `FEISHU_WEBHOOK_KEYWORD`；系统会自动在每条消息前补上，无需手动修改报告模板。
    - **开启了 IP 白名单**：确保当前运行环境的出口 IP 在白名单中（本地/Docker/GitHub Actions 出口 IP 各不相同）。
-4. Web 规则实测页在本地分钟热表新快照出现命中时，会向所有已配置通知渠道推送命中规则、股票和条件值；实测页「精简模式」默认开启，同一天同一规则和股票仅展示/推送首次命中，关闭后恢复逐轮累计展示，并沿用上一轮组合完全一致时跳过推送的旧逻辑；飞书渠道使用 `FEISHU_WEBHOOK_URL`。
+4. Web 规则实测页在本地分钟热表新快照出现命中时，会向命中子运行所属租户的通知渠道推送命中规则、股票和条件值；实测页「精简模式」默认开启，同一天同一规则和股票仅展示/推送首次命中，关闭后恢复逐轮累计展示，并沿用上一轮组合完全一致时跳过推送的旧逻辑；飞书渠道优先使用子运行所属租户设置页中配置的 Webhook，未按租户配置时不会回退误发全局 `FEISHU_WEBHOOK_URL`。
 5. `FEISHU_APP_ID` / `FEISHU_APP_SECRET` 是飞书应用 / Stream Bot / 云文档模式专用，不会触发群 Webhook 推送，不要用它们替代 `FEISHU_WEBHOOK_URL`。
 
 **常见失败原因：**
@@ -880,6 +880,23 @@ PUSHOVER_API_TOKEN=your_api_token
 1. 在 `.env` 中设置 `ENABLE_EASTMONEY_PATCH=true`
 2. 将 `MAX_WORKERS=1` 降低并发
 3. 若已配置 Tushare，可优先使用 Tushare 数据源
+
+---
+
+## 业务租户
+
+Web 工作台支持业务租户工作区，当前版本仍沿用单管理员登录体系，不引入多用户、成员和角色权限。
+
+- 升级时会自动创建默认租户 `default`；既有规则迁为共享规则库，既有规则运行和命中记录归属默认租户。
+- Web 侧边栏可切换当前租户，用于规则管理、租户配置和单租户历史查询；规则列表默认显示当前租户独有规则和共享规则。
+- Web 实测固定覆盖全部活跃租户，规则默认全选但可手动调整本次运行规则；Web 规则回测页的“运行租户”可选择当前租户或全部租户。选择全部租户时只发起一次运行请求，后端按租户生成子运行：每个租户只执行自己可见的所选规则，命中历史和通知都归属对应租户；并发启动相同多租户批次时，共同逻辑由共享执行 key、创建者状态和完成结果等待去重，不会因为单租户 run 复用而拆回重复私有扫描，也不会在同进程等待时持有共享执行锁。
+- 共享规则对所有租户可见，但在租户工作区只读；需要修改时先克隆为当前租户独有规则。
+- 设置页的“租户管理”可维护租户名称、租户股票池、飞书 Webhook URL/Secret/关键词和 `FEISHU_MAX_BYTES`。
+- `scope=watchlist` 的规则目标和 Web 实测/回测默认股票池优先使用运行子任务所属租户的股票池；默认租户初始化时会从全局 `STOCK_LIST` 迁入，新租户默认股票池为空。
+- 规则实测通知使用运行子任务所属租户的飞书 Webhook 覆盖全局飞书字段；一次全租户实测会把各租户命中分别推送到各自飞书群，非飞书渠道第一版仍沿用全局配置。
+- AI 分析记录回测 `/api/v1/backtest/*` 第一版不租户化，仍按全局历史分析记录计算。
+
+本功能不新增 `.env` 配置项。租户信息存储在 SQLite 表 `tenants`、`tenant_configs` 以及规则相关表的 `tenant_id` 字段中；删除租户采用停用，不物理删除历史数据。
 
 ---
 
@@ -1089,10 +1106,15 @@ FastAPI 提供 RESTful API 服务，支持配置管理和触发分析。
 | `/api/v1/backtest/results` | GET | 查询回测结果（分页） |
 | `/api/v1/backtest/performance` | GET | 获取整体回测表现 |
 | `/api/v1/backtest/performance/{code}` | GET | 获取单股回测表现 |
-| `/api/v1/rules/{rule_id}/run` | POST | 运行单条规则历史扫描 |
-| `/api/v1/rules/run-batch` | POST | 同步批量运行规则；规则实测/回测服务端强制 `data_policy=db_only`，只读本地库数据 |
-| `/api/v1/rules/run-batch/async` | POST | 异步批量运行规则；Web 回测/实测使用该接口启动后台任务，执行中可轮询已完成股票数 / 总股票数，全部完成后再读取命中结果；规则扫描只读本地库数据，缺失行情需通过离线预热或补数据任务补齐 |
-| `/api/v1/rules/live-cache/{live_cache_key}` | DELETE | 清理一次 Web 实测 session 专用的数据缓存 |
+| `/api/v1/tenants` | GET/POST | 查询或创建业务租户 |
+| `/api/v1/tenants/{tenant_key}` | PUT/DELETE | 更新或停用业务租户 |
+| `/api/v1/tenants/{tenant_key}/config` | GET/PUT | 查询或更新租户股票池与租户飞书 Webhook 配置 |
+| `/api/v1/rules` | GET/POST | 规则列表和创建规则；规则 API 支持 `X-DSA-Tenant`，缺省使用默认租户 |
+| `/api/v1/rules/{rule_id}/clone` | POST | 将共享规则克隆为当前租户独有规则 |
+| `/api/v1/rules/{rule_id}/run` | POST | 运行单条规则历史扫描；按当前租户过滤规则和运行记录 |
+| `/api/v1/rules/run-batch` | POST | 同步批量运行规则；可传 `tenant_keys` 一次运行多个租户子任务；规则实测/回测服务端强制 `data_policy=db_only`，只读本地库数据，并按子任务租户隔离 |
+| `/api/v1/rules/run-batch/async` | POST | 异步批量运行规则；Web 回测/实测使用该接口启动后台任务，可传 `tenant_keys` 返回 `tenant_runs` 子运行列表，前端聚合轮询进度并按租户读取命中结果 |
+| `/api/v1/rules/live-cache/{live_cache_key}` | DELETE | 清理一次 Web 实测 session 专用的数据缓存；后端按请求租户清理对应租户缓存，并同步清理同 session 的 `shared:` 共享缓存，全租户实测停止时前端会逐租户调用 |
 | `/api/v1/agent/skill-output/{filename}` | GET | 查看自定义 Codex skill 后台任务生成的 Markdown 结果 |
 | `/api/v1/stocks/extract-from-image` | POST | 从图片提取股票代码（multipart，超时 60s） |
 | `/api/v1/stocks/parse-import` | POST | 解析 CSV/Excel/剪贴板（multipart file 或 JSON `{"text":"..."}`，文件≤2MB，文本≤100KB） |

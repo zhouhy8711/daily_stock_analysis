@@ -7,6 +7,7 @@ import { useAgentChatStore } from '../../stores/agentChatStore';
 import { cn } from '../../utils/cn';
 import { ConfirmDialog } from '../common/ConfirmDialog';
 import { StatusDot } from '../common/StatusDot';
+import { TenantSelector } from '../tenant/TenantSelector';
 import { ThemeToggle } from '../theme/ThemeToggle';
 
 type SidebarNavProps = {
@@ -48,6 +49,8 @@ export const SidebarNav: React.FC<SidebarNavProps> = ({ collapsed = false, onNav
           <p className="min-w-0 truncate text-sm font-semibold text-foreground">必赢</p>
         ) : null}
       </div>
+
+      <TenantSelector collapsed={collapsed} />
 
       <nav className="flex flex-1 flex-col gap-1.5" aria-label="主导航">
         {NAV_ITEMS.map(({ key, label, to, icon: Icon, exact, badge }) => (

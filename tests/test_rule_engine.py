@@ -4,17 +4,31 @@ import sqlite3
 import threading
 import time
 from datetime import date, datetime, timedelta
+from types import SimpleNamespace
 from unittest import mock
 
-from sqlalchemy.exc import OperationalError
+from fastapi import BackgroundTasks
+from sqlalchemy.exc import IntegrityError, OperationalError
 
+from api.v1.endpoints import rules as rules_endpoint
+from api.v1.schemas.rules import RuleBatchRunRequest, RuleRunResponse, RuleTarget
 import src.services.rule_service as rule_service_module
 import src.rules.engine as rule_engine_module
 from src.rules.engine import evaluate_rule, evaluate_rule_history
 from src.rules.metrics import build_metric_frame, get_metric_registry
 from src.repositories.rule_repo import RuleRepository, _decode_rule_batch_metadata, encode_rule_batch_metadata
+from src.repositories.tenant_repo import TenantRepository
 from src.services.rule_service import RuleService, RuleValidationError
-from src.storage import DatabaseManager, StockDaily, StockRule, StockRuleMatch, StockRuleRun
+from src.services.tenant_service import TenantContext, TenantService
+from src.storage import (
+    DatabaseManager,
+    SharedRuleRun,
+    StockDaily,
+    StockRule,
+    StockRuleMatch,
+    StockRuleMatchLink,
+    StockRuleRun,
+)
 
 
 def _history():
@@ -25,6 +39,27 @@ def _history():
         {"date": "2026-04-04", "open": 12, "high": 14, "low": 12, "close": 13, "volume": 1800, "amount": 23400, "pct_chg": 8.33},
         {"date": "2026-04-05", "open": 13, "high": 15, "low": 13, "close": 14, "volume": 2500, "amount": 35000, "pct_chg": 7.69},
     ]
+
+
+def _simple_rule_definition(scope="custom", stock_codes=None):
+    return {
+        "period": "daily",
+        "lookback_days": 120,
+        "target": {"scope": scope, "stock_codes": stock_codes or ["600519"]},
+        "groups": [
+            {
+                "id": "g1",
+                "conditions": [
+                    {
+                        "id": "c1",
+                        "left": {"metric": "close"},
+                        "operator": ">",
+                        "right": {"type": "literal", "value": 0},
+                    }
+                ],
+            }
+        ],
+    }
 
 
 def test_rule_engine_matches_aggregate_condition():
@@ -405,6 +440,600 @@ def test_database_manager_adds_stock_rule_disable_column_for_existing_sqlite(tmp
         DatabaseManager.reset_instance()
 
 
+def test_database_manager_adds_tenant_columns_and_default_tenant_for_existing_sqlite(tmp_path):
+    DatabaseManager.reset_instance()
+    db_file = tmp_path / "legacy_tenant_rules.db"
+    with sqlite3.connect(db_file) as connection:
+        connection.execute(
+            """
+            CREATE TABLE stock_rules (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name VARCHAR(100) NOT NULL,
+                description TEXT,
+                is_active BOOLEAN NOT NULL DEFAULT 1,
+                period VARCHAR(16) NOT NULL DEFAULT 'daily',
+                lookback_days INTEGER NOT NULL DEFAULT 120,
+                target_scope VARCHAR(16) NOT NULL DEFAULT 'watchlist',
+                target_codes_json TEXT,
+                definition_json TEXT NOT NULL,
+                created_at DATETIME,
+                updated_at DATETIME
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE stock_rule_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                rule_id INTEGER NOT NULL,
+                status VARCHAR(16) NOT NULL DEFAULT 'running',
+                target_count INTEGER NOT NULL DEFAULT 0,
+                match_count INTEGER NOT NULL DEFAULT 0,
+                error TEXT,
+                started_at DATETIME,
+                finished_at DATETIME,
+                duration_ms INTEGER
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE stock_rule_matches (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id INTEGER NOT NULL,
+                rule_id INTEGER NOT NULL,
+                stock_code VARCHAR(16) NOT NULL,
+                stock_name VARCHAR(80),
+                matched_groups_json TEXT,
+                snapshot_json TEXT,
+                explanation TEXT,
+                created_at DATETIME
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO stock_rules (
+                id, name, period, lookback_days, target_scope, target_codes_json, definition_json
+            )
+            VALUES (1, '旧规则', 'daily', 120, 'custom', '[]', '{}')
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO stock_rule_runs (id, rule_id, status, target_count, match_count, started_at)
+            VALUES (10, 1, 'completed', 1, 1, '2026-05-08 10:00:00')
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO stock_rule_matches (id, run_id, rule_id, stock_code, matched_groups_json, snapshot_json)
+            VALUES (20, 10, 1, '600519', '[]', '{}')
+            """
+        )
+        connection.commit()
+
+    db = DatabaseManager(db_url=f"sqlite:///{db_file}")
+    try:
+        with db._engine.begin() as connection:
+            default_tenant_id = connection.exec_driver_sql(
+                "SELECT id FROM tenants WHERE key = 'default'"
+            ).scalar_one()
+            rule_row = connection.exec_driver_sql(
+                "SELECT tenant_id, visibility, is_disable FROM stock_rules WHERE id = 1"
+            ).fetchone()
+            run_tenant_id = connection.exec_driver_sql(
+                "SELECT tenant_id FROM stock_rule_runs WHERE id = 10"
+            ).scalar_one()
+            match_tenant_id = connection.exec_driver_sql(
+                "SELECT tenant_id FROM stock_rule_matches WHERE id = 20"
+            ).scalar_one()
+            tenant_config_count = connection.exec_driver_sql(
+                "SELECT COUNT(*) FROM tenant_configs WHERE tenant_id = ?",
+                (default_tenant_id,),
+            ).scalar_one()
+            shared_table_count = connection.exec_driver_sql(
+                """
+                SELECT COUNT(*)
+                FROM sqlite_master
+                WHERE type = 'table'
+                  AND name IN (
+                    'shared_rule_runs',
+                    'shared_rule_matches',
+                    'stock_rule_run_segments',
+                    'stock_rule_match_links'
+                  )
+                """
+            ).scalar_one()
+
+        assert rule_row[0] is None
+        assert rule_row[1] == "shared"
+        assert int(rule_row[2]) == 0
+        assert run_tenant_id == default_tenant_id
+        assert match_tenant_id == default_tenant_id
+        assert tenant_config_count == 1
+        assert shared_table_count == 4
+    finally:
+        DatabaseManager.reset_instance()
+
+
+def test_rule_repository_scopes_rules_runs_and_matches_by_tenant():
+    DatabaseManager.reset_instance()
+    db = DatabaseManager(db_url="sqlite:///:memory:")
+    try:
+        tenant_repo = TenantRepository(db)
+        default_tenant = tenant_repo.ensure_default_tenant()
+        other_tenant = tenant_repo.create_tenant({"key": "desk_b", "name": "Desk B"})
+        default_repo = RuleRepository(db, tenant_id=default_tenant["id"], tenant_key=default_tenant["key"])
+        other_repo = RuleRepository(db, tenant_id=other_tenant["id"], tenant_key=other_tenant["key"])
+
+        with db.get_session() as session:
+            shared_rule = StockRule(
+                name="共享规则",
+                tenant_id=None,
+                visibility="shared",
+                period="daily",
+                lookback_days=120,
+                target_scope="custom",
+                target_codes_json="[]",
+                definition_json=json.dumps(_simple_rule_definition()),
+            )
+            default_rule = StockRule(
+                name="默认租户规则",
+                tenant_id=default_tenant["id"],
+                visibility="tenant",
+                period="daily",
+                lookback_days=120,
+                target_scope="custom",
+                target_codes_json="[]",
+                definition_json=json.dumps(_simple_rule_definition()),
+            )
+            other_rule = StockRule(
+                name="其他租户规则",
+                tenant_id=other_tenant["id"],
+                visibility="tenant",
+                period="daily",
+                lookback_days=120,
+                target_scope="custom",
+                target_codes_json="[]",
+                definition_json=json.dumps(_simple_rule_definition()),
+            )
+            session.add_all([shared_rule, default_rule, other_rule])
+            session.commit()
+            session.refresh(shared_rule)
+            session.refresh(default_rule)
+            session.refresh(other_rule)
+            default_run = StockRuleRun(
+                tenant_id=default_tenant["id"],
+                rule_id=default_rule.id,
+                status="completed",
+                target_count=1,
+                match_count=1,
+            )
+            other_run = StockRuleRun(
+                tenant_id=other_tenant["id"],
+                rule_id=other_rule.id,
+                status="completed",
+                target_count=1,
+                match_count=1,
+            )
+            session.add_all([default_run, other_run])
+            session.commit()
+            session.refresh(default_run)
+            session.refresh(other_run)
+            session.add_all([
+                StockRuleMatch(
+                    tenant_id=default_tenant["id"],
+                    run_id=default_run.id,
+                    rule_id=default_rule.id,
+                    stock_code="600519",
+                    matched_groups_json="[]",
+                    snapshot_json="{}",
+                ),
+                StockRuleMatch(
+                    tenant_id=other_tenant["id"],
+                    run_id=other_run.id,
+                    rule_id=other_rule.id,
+                    stock_code="000001",
+                    matched_groups_json="[]",
+                    snapshot_json="{}",
+                ),
+            ])
+            session.commit()
+            shared_rule_id = shared_rule.id
+            default_run_id = default_run.id
+            other_run_id = other_run.id
+
+        assert [rule["name"] for rule in default_repo.list_rules()] == ["默认租户规则", "共享规则"]
+        assert [rule["name"] for rule in other_repo.list_rules()] == ["其他租户规则", "共享规则"]
+        assert default_repo.get_run(other_run_id) is None
+        assert other_repo.get_run(default_run_id) is None
+        assert default_repo.list_matches(default_run_id)[0]["stock_code"] == "600519"
+        assert other_repo.list_matches(other_run_id)[0]["stock_code"] == "000001"
+
+        cloned = default_repo.clone_rule(shared_rule_id)
+        assert cloned is not None
+        assert cloned["tenant_id"] == default_tenant["id"]
+        assert cloned["visibility"] == "tenant"
+        assert cloned["is_shared"] is False
+    finally:
+        DatabaseManager.reset_instance()
+
+
+def test_rule_repository_projects_shared_matches_to_tenant_runs():
+    DatabaseManager.reset_instance()
+    db = DatabaseManager(db_url="sqlite:///:memory:")
+    try:
+        tenant_repo = TenantRepository(db)
+        default_tenant = tenant_repo.ensure_default_tenant()
+        other_tenant = tenant_repo.create_tenant({"key": "quant_team", "name": "量化组"})
+        default_repo = RuleRepository(db, tenant_id=default_tenant["id"], tenant_key=default_tenant["key"])
+        other_repo = RuleRepository(db, tenant_id=other_tenant["id"], tenant_key=other_tenant["key"])
+        with db.get_session() as session:
+            rule = StockRule(
+                name="共享规则",
+                tenant_id=None,
+                visibility="shared",
+                period="daily",
+                lookback_days=120,
+                target_scope="custom",
+                target_codes_json="[]",
+                definition_json=json.dumps(_simple_rule_definition()),
+            )
+            session.add(rule)
+            session.commit()
+            session.refresh(rule)
+            rule_id = rule.id
+
+        default_run_id = default_repo.create_run(rule_id, 1)
+        other_run_id = other_repo.create_run(rule_id, 1)
+        shared_run_id = default_repo.create_shared_run(
+            execution_key="shared-once",
+            mode="history",
+            data_policy="db_only",
+            target_count=1,
+            metadata={"logic_fingerprint": "fp"},
+        )
+        shared_matches, _duration_ms = default_repo.finish_shared_run(
+            shared_run_id=shared_run_id,
+            rule_id=rule_id,
+            status="completed",
+            started_at=datetime(2026, 5, 8, 10, 0),
+            matches=[{
+                "rule_id": rule_id,
+                "rule_fingerprint": "fp",
+                "stock_code": "600519",
+                "stock_name": "贵州茅台",
+                "matched_groups": [{"id": "g1"}],
+                "matched_dates": ["2026-05-08"],
+                "matched_events": [{"date": "2026-05-08"}],
+                "snapshot": {"close": 100},
+                "explanation": "hit",
+            }],
+            metadata={"completed_count": 1},
+        )
+        link = {
+            "rule_id": rule_id,
+            "shared_run_id": shared_run_id,
+            "shared_match_id": shared_matches[0]["id"],
+            "stock_code": "600519",
+        }
+        default_repo.finish_projected_run(
+            run_id=default_run_id,
+            rule_id=rule_id,
+            status="completed",
+            started_at=datetime(2026, 5, 8, 10, 0),
+            matches=[],
+            shared_links=[link],
+            error=encode_rule_batch_metadata([rule_id], ["共享规则"], [], completed_count=1),
+        )
+        other_repo.finish_projected_run(
+            run_id=other_run_id,
+            rule_id=rule_id,
+            status="completed",
+            started_at=datetime(2026, 5, 8, 10, 0),
+            matches=[],
+            shared_links=[link],
+            error=encode_rule_batch_metadata([rule_id], ["共享规则"], [], completed_count=1),
+        )
+
+        default_matches = default_repo.list_matches(default_run_id)
+        other_matches = other_repo.list_matches(other_run_id)
+
+        assert default_matches[0]["stock_code"] == "600519"
+        assert default_matches[0]["shared_run_id"] == shared_run_id
+        assert default_repo.get_run(default_run_id)["event_count"] == 1
+        assert other_matches[0]["stock_name"] == "贵州茅台"
+
+        assert default_repo.delete_run(default_run_id) is True
+        with db.get_session() as session:
+            assert session.query(SharedRuleRun).count() == 1
+            assert session.query(StockRuleMatchLink).count() == 1
+        assert other_repo.list_matches(other_run_id)[0]["stock_code"] == "600519"
+    finally:
+        DatabaseManager.reset_instance()
+
+
+def test_rule_repository_create_shared_run_reuses_existing_after_integrity_conflict(monkeypatch):
+    DatabaseManager.reset_instance()
+    db = DatabaseManager(db_url="sqlite:///:memory:")
+    try:
+        repo = RuleRepository(db)
+        with db.get_session() as session:
+            row = SharedRuleRun(
+                execution_key="same-shared-execution",
+                status="running",
+                mode="history",
+                data_policy="db_only",
+                target_count=3,
+            )
+            session.add(row)
+            session.commit()
+            session.refresh(row)
+            existing_id = int(row.id)
+
+        def raise_integrity(_operation_name, _write_operation):
+            raise IntegrityError(
+                "INSERT INTO shared_rule_runs ...",
+                {},
+                Exception("UNIQUE constraint failed: shared_rule_runs.execution_key"),
+            )
+
+        monkeypatch.setattr(repo, "_run_write_transaction", raise_integrity)
+
+        assert repo.create_shared_run(
+            execution_key="same-shared-execution",
+            mode="history",
+            data_policy="db_only",
+            target_count=3,
+            metadata={},
+        ) == existing_id
+        shared_run_id, created = repo.create_shared_run_with_state(
+            execution_key="same-shared-execution",
+            mode="history",
+            data_policy="db_only",
+            target_count=3,
+            metadata={},
+        )
+        assert shared_run_id == existing_id
+        assert created is False
+    finally:
+        DatabaseManager.reset_instance()
+
+
+def test_rule_repository_waits_for_completed_shared_run_by_key(tmp_path):
+    DatabaseManager.reset_instance()
+    db = DatabaseManager(db_url=f"sqlite:///{tmp_path / 'shared-wait.db'}")
+    try:
+        repo = RuleRepository(db)
+        shared_run_id, created = repo.create_shared_run_with_state(
+            execution_key="wait-shared-execution",
+            mode="history",
+            data_policy="db_only",
+            target_count=1,
+            metadata={},
+        )
+        assert created is True
+
+        def finish_shared_run():
+            time.sleep(0.05)
+            repo.finish_shared_run(
+                shared_run_id=shared_run_id,
+                rule_id=1,
+                status="completed",
+                started_at=datetime.now(),
+                matches=[],
+                metadata={"completed_count": 1},
+            )
+
+        thread = threading.Thread(target=finish_shared_run)
+        thread.start()
+        try:
+            completed = repo.wait_for_completed_shared_run_by_key(
+                "wait-shared-execution",
+                timeout_seconds=1.0,
+                poll_interval_seconds=0.01,
+            )
+        finally:
+            thread.join(timeout=1)
+
+        assert completed is not None
+        assert completed["id"] == shared_run_id
+        assert completed["status"] == "completed"
+    finally:
+        DatabaseManager.reset_instance()
+
+
+def test_rule_service_blocks_shared_rule_update_and_delete_in_tenant_workspace():
+    DatabaseManager.reset_instance()
+    db = DatabaseManager(db_url="sqlite:///:memory:")
+    try:
+        tenant = TenantRepository(db).ensure_default_tenant()
+        repo = RuleRepository(db, tenant_id=tenant["id"], tenant_key=tenant["key"])
+        with db.get_session() as session:
+            row = StockRule(
+                name="共享规则",
+                tenant_id=None,
+                visibility="shared",
+                period="daily",
+                lookback_days=120,
+                target_scope="custom",
+                target_codes_json="[]",
+                definition_json=json.dumps(_simple_rule_definition()),
+            )
+            session.add(row)
+            session.commit()
+            session.refresh(row)
+            rule_id = row.id
+
+        service = RuleService(
+            repo=repo,
+            stock_service=mock.Mock(),
+            tenant_context=TenantContext(id=tenant["id"], key=tenant["key"], name=tenant["name"], is_default=True),
+        )
+
+        with mock.patch.object(repo, "update_rule") as update_rule:
+            with mock.patch.object(repo, "delete_rule") as delete_rule:
+                try:
+                    service.update_rule(rule_id, {"name": "新名称"})
+                    assert False, "expected shared update to fail"
+                except RuleValidationError:
+                    pass
+                try:
+                    service.delete_rule(rule_id)
+                    assert False, "expected shared delete to fail"
+                except RuleValidationError:
+                    pass
+
+        update_rule.assert_not_called()
+        delete_rule.assert_not_called()
+    finally:
+        DatabaseManager.reset_instance()
+
+
+def test_tenant_notification_config_default_falls_back_to_global(monkeypatch):
+    DatabaseManager.reset_instance()
+    db = DatabaseManager(db_url="sqlite:///:memory:")
+    try:
+        tenant_repo = TenantRepository(db)
+        default_tenant = tenant_repo.ensure_default_tenant()
+        other_tenant = tenant_repo.create_tenant({"key": "quant_team", "name": "量化组"})
+        global_config = SimpleNamespace(
+            feishu_webhook_url="https://global.example/webhook",
+            feishu_webhook_secret="global-secret",
+            feishu_webhook_keyword="global-keyword",
+            feishu_max_bytes=18000,
+        )
+        monkeypatch.setattr("src.services.tenant_service.get_config", lambda: global_config)
+        service = TenantService(tenant_repo)
+
+        default_config = service.build_notification_config(default_tenant["id"])
+        other_config = service.build_notification_config(other_tenant["id"])
+
+        assert default_config.feishu_webhook_url == "https://global.example/webhook"
+        assert default_config.feishu_webhook_secret == "global-secret"
+        assert default_config.feishu_webhook_keyword == "global-keyword"
+        assert other_config.feishu_webhook_url is None
+        assert other_config.feishu_webhook_secret is None
+
+        service.update_tenant_config(
+            "quant_team",
+            {
+                "feishu_webhook_url": "https://tenant.example/webhook",
+                "feishu_webhook_secret": "tenant-secret",
+                "feishu_webhook_keyword": "tenant-keyword",
+            },
+        )
+        configured_other = service.build_notification_config(other_tenant["id"])
+        assert configured_other.feishu_webhook_url == "https://tenant.example/webhook"
+        assert configured_other.feishu_webhook_secret == "tenant-secret"
+        assert configured_other.feishu_webhook_keyword == "tenant-keyword"
+    finally:
+        DatabaseManager.reset_instance()
+
+
+def test_latest_batch_run_without_tenant_keys_targets_all_active_tenants():
+    DatabaseManager.reset_instance()
+    db = DatabaseManager(db_url="sqlite:///:memory:")
+    try:
+        tenant_repo = TenantRepository(db)
+        default_tenant = tenant_repo.ensure_default_tenant()
+        tenant_repo.create_tenant({"key": "quant_team", "name": "量化组"})
+        tenant_repo.create_tenant({"key": "archived_team", "name": "归档组"})
+        tenant_repo.update_tenant("archived_team", {"is_active": False})
+        tenant_service = TenantService(tenant_repo)
+        current_tenant = TenantContext(
+            id=default_tenant["id"],
+            key=default_tenant["key"],
+            name=default_tenant["name"],
+            is_default=True,
+        )
+
+        live_payload = RuleBatchRunRequest(
+            rule_ids=[1, 2],
+            mode="latest",
+            target=RuleTarget(scope="watchlist", stock_codes=[]),
+        )
+        history_payload = RuleBatchRunRequest(
+            rule_ids=[1, 2],
+            mode="history",
+            target=RuleTarget(scope="watchlist", stock_codes=[]),
+        )
+
+        live_tenants = rules_endpoint._resolve_rule_run_tenants(
+            live_payload,
+            current_tenant,
+            tenant_service,
+        )
+        history_tenants = rules_endpoint._resolve_rule_run_tenants(
+            history_payload,
+            current_tenant,
+            tenant_service,
+        )
+
+        assert [tenant.key for tenant in live_tenants] == ["default", "quant_team"]
+        assert [tenant.key for tenant in history_tenants] == ["default"]
+    finally:
+        DatabaseManager.reset_instance()
+
+
+def test_rule_run_response_preserves_fast_latest_skip_metadata():
+    response = RuleRunResponse(
+        run_id=1,
+        run_ids=[1],
+        tenant_id=1,
+        tenant_key="default",
+        rule_id=7,
+        rule_ids=[7],
+        rule_names=["实测规则"],
+        status="partial",
+        target_count=3,
+        completed_count=3,
+        match_count=1,
+        event_count=1,
+        mode="latest",
+        fast_latest_scan=True,
+        skipped_count=2,
+        skip_counts={"history_cache_miss": 2},
+    )
+
+    payload = response.model_dump()
+
+    assert payload["fast_latest_scan"] is True
+    assert payload["skipped_count"] == 2
+    assert payload["skip_counts"] == {"history_cache_miss": 2}
+
+
+def test_rule_service_watchlist_uses_tenant_stock_list():
+    DatabaseManager.reset_instance()
+    db = DatabaseManager(db_url="sqlite:///:memory:")
+    try:
+        tenant_repo = TenantRepository(db)
+        tenant = tenant_repo.ensure_default_tenant()
+        tenant_repo.update_config(tenant["id"], {"stock_list": ["600519", "AAPL"]})
+        repo = RuleRepository(db, tenant_id=tenant["id"], tenant_key=tenant["key"])
+        definition = _simple_rule_definition(scope="watchlist")
+        definition["target"]["stock_codes"] = []
+        created_rule = repo.create_rule({
+            "name": "租户股票池规则",
+            "is_active": True,
+            "definition": definition,
+        })
+        tenant_service = TenantService(repo=tenant_repo)
+        service = RuleService(
+            repo=repo,
+            stock_service=mock.Mock(),
+            tenant_context=TenantContext(id=tenant["id"], key=tenant["key"], name=tenant["name"], is_default=True),
+            tenant_service=tenant_service,
+        )
+
+        _rule, _definition, stock_codes = service._prepare_rule_run(created_rule["id"], None)
+
+        assert stock_codes == ["600519", "AAPL"]
+    finally:
+        DatabaseManager.reset_instance()
+
+
 def test_rule_repository_list_rules_hides_disabled_rules():
     DatabaseManager.reset_instance()
     db = DatabaseManager(db_url="sqlite:///:memory:")
@@ -541,6 +1170,57 @@ def test_rule_repository_uses_database_retry_runner_for_run_writes():
 
     assert result == 42
     db._run_write_transaction.assert_called_once_with("stock_rule_run.test", write_operation)
+
+
+def test_rule_repository_update_progress_ignores_reserved_metadata_keys():
+    DatabaseManager.reset_instance()
+    db = DatabaseManager(db_url="sqlite:///:memory:")
+    try:
+        repo = RuleRepository(db)
+        with db.get_session() as session:
+            rule = StockRule(
+                name="进度规则",
+                period="daily",
+                lookback_days=120,
+                target_scope="custom",
+                target_codes_json="[]",
+                definition_json="{}",
+            )
+            session.add(rule)
+            session.commit()
+            session.refresh(rule)
+            rule_id = rule.id
+
+        run_id = repo.create_run(rule_id, target_count=5)
+        repo.update_run_progress(
+            run_id=run_id,
+            rule_ids=[rule_id],
+            rule_names=["进度规则"],
+            completed_count=2,
+            errors=["temporary miss"],
+            metadata={
+                "completed_count": 99,
+                "rule_ids": [999],
+                "rule_names": ["错误规则"],
+                "errors": ["wrong error"],
+                "run_key": "progress-key",
+                "skip_counts": {"history_cache_miss": 1},
+            },
+        )
+
+        with db.get_session() as session:
+            row = session.get(StockRuleRun, run_id)
+            metadata, public_error = _decode_rule_batch_metadata(row.error)
+
+        assert public_error == "temporary miss"
+        assert metadata["completed_count"] == 2
+        assert metadata["rule_ids"] == [rule_id]
+        assert metadata["rule_names"] == ["进度规则"]
+        assert metadata["errors"] == ["temporary miss"]
+        assert metadata["run_key"] == "progress-key"
+        assert metadata["skip_counts"] == {"history_cache_miss": 1}
+    finally:
+        DatabaseManager.reset_instance()
 
 
 def test_rule_repository_fail_stale_running_runs_marks_only_old_running_runs():
@@ -3194,6 +3874,82 @@ def test_rule_service_preopen_latest_only_prewarms_history_cache():
         rule_service_module._LIVE_RULE_RUN_SCAN_CACHE.clear()
 
 
+def test_shared_live_cache_key_stays_stable_for_one_live_session():
+    contexts = [
+        {
+            "tenant_key": "default",
+            "live_cache_key": "tenant:default:live-session",
+            "batch_metadata": {
+                "raw_live_cache_key": "live-session",
+                "snapshot_id": "snapshot-1",
+            },
+        },
+        {
+            "tenant_key": "quant_team",
+            "live_cache_key": "tenant:quant_team:live-session",
+            "batch_metadata": {
+                "raw_live_cache_key": "live-session",
+                "snapshot_id": "snapshot-1",
+            },
+        },
+    ]
+
+    first_key = rules_endpoint._build_shared_live_cache_key(contexts)
+    second_key = rules_endpoint._build_shared_live_cache_key([
+        {
+            **context,
+            "batch_metadata": {
+                **context["batch_metadata"],
+                "snapshot_id": "snapshot-2",
+            },
+        }
+        for context in contexts
+    ])
+
+    assert first_key == second_key
+    assert first_key is not None
+    assert first_key.startswith("shared:live-session:")
+
+
+def test_clear_live_rule_history_cache_removes_shared_session_cache():
+    rule_service_module._LIVE_RULE_RUN_HISTORY_CACHE.clear()
+    rule_service_module._LIVE_RULE_RUN_SCAN_CACHE.clear()
+    tenant = TenantContext(id=1, key="default", name="默认租户", is_default=True)
+    service = RuleService(repo=mock.Mock(), stock_service=mock.Mock(), tenant_context=tenant)
+    tenant_key = "tenant:default:live-session"
+    shared_key = "shared:live-session:abc123"
+    other_shared_key = "shared:other-session:abc123"
+    try:
+        rule_service_module._LIVE_RULE_RUN_HISTORY_CACHE[tenant_key] = {
+            "tenant-history": {"history_by_code": {"600519": {"data": []}}},
+        }
+        rule_service_module._LIVE_RULE_RUN_SCAN_CACHE[tenant_key] = {
+            "indicator_metrics_by_code": {"600519": {}},
+        }
+        rule_service_module._LIVE_RULE_RUN_HISTORY_CACHE[shared_key] = {
+            "shared-history": {"history_by_code": {"000001": {"data": []}}},
+        }
+        rule_service_module._LIVE_RULE_RUN_SCAN_CACHE[shared_key] = {
+            "chip_metrics_by_code": {"600519": {}, "000001": {}},
+        }
+        rule_service_module._LIVE_RULE_RUN_HISTORY_CACHE[other_shared_key] = {
+            "other-history": {"history_by_code": {"300750": {"data": []}}},
+        }
+
+        cleared = service.clear_live_rule_history_cache("live-session")
+
+        assert cleared["cleared_entries"] == 2
+        assert cleared["cleared_scan_entries"] == 3
+        assert tenant_key not in rule_service_module._LIVE_RULE_RUN_HISTORY_CACHE
+        assert tenant_key not in rule_service_module._LIVE_RULE_RUN_SCAN_CACHE
+        assert shared_key not in rule_service_module._LIVE_RULE_RUN_HISTORY_CACHE
+        assert shared_key not in rule_service_module._LIVE_RULE_RUN_SCAN_CACHE
+        assert other_shared_key in rule_service_module._LIVE_RULE_RUN_HISTORY_CACHE
+    finally:
+        rule_service_module._LIVE_RULE_RUN_HISTORY_CACHE.clear()
+        rule_service_module._LIVE_RULE_RUN_SCAN_CACHE.clear()
+
+
 def test_rule_service_preopen_prewarm_metadata_persists_in_repository():
     DatabaseManager.reset_instance()
     rule_service_module._RULE_RUN_HISTORY_CACHE.clear()
@@ -3242,6 +3998,470 @@ def test_rule_service_preopen_prewarm_metadata_persists_in_repository():
         rule_service_module._RULE_RUN_HISTORY_CACHE.clear()
         rule_service_module._LIVE_RULE_RUN_HISTORY_CACHE.clear()
         rule_service_module._LIVE_RULE_RUN_SCAN_CACHE.clear()
+
+
+def test_multi_tenant_async_rule_run_executes_shared_logic_once(monkeypatch):
+    DatabaseManager.reset_instance()
+    db = DatabaseManager(db_url="sqlite:///:memory:")
+    try:
+        tenant_repo = TenantRepository(db)
+        default_tenant = tenant_repo.ensure_default_tenant()
+        other_tenant = tenant_repo.create_tenant({"key": "quant_team", "name": "量化组"})
+        with db.get_session() as session:
+            rule = StockRule(
+                name="共享逻辑",
+                tenant_id=None,
+                visibility="shared",
+                period="daily",
+                lookback_days=120,
+                target_scope="custom",
+                target_codes_json="[]",
+                definition_json=json.dumps(_simple_rule_definition(stock_codes=["600519", "000001"])),
+            )
+            session.add(rule)
+            session.commit()
+            session.refresh(rule)
+            rule_id = rule.id
+
+        calls = []
+
+        def fake_execute(
+            self,
+            run_id,
+            prepared,
+            stock_codes,
+            run_mode,
+            date_from,
+            date_to,
+            data_policy,
+            rule_ids,
+            rule_names,
+            batch_metadata=None,
+            live_cache_key=None,
+            progress_callback=None,
+        ):
+            calls.append({
+                "run_id": run_id,
+                "rule_ids": list(rule_ids),
+                "stock_codes": list(stock_codes),
+                "live_cache_key": live_cache_key,
+            })
+            if progress_callback is not None:
+                progress_callback(len(stock_codes), {"fast_latest_scan": False, "skip_counts": {}, "skipped_count": 0}, [])
+            return ([{
+                "rule_id": prepared[0][0],
+                "stock_code": "600519",
+                "stock_name": "贵州茅台",
+                "matched_groups": [{"id": "g1"}],
+                "matched_dates": ["2026-05-08"],
+                "matched_events": [{"date": "2026-05-08"}],
+                "snapshot": {"close": 100},
+                "explanation": "hit",
+            }], [])
+
+        monkeypatch.setattr(RuleService, "_execute_batch_scan_by_stock", fake_execute)
+
+        tenants = [
+            TenantContext(
+                id=default_tenant["id"],
+                key=default_tenant["key"],
+                name=default_tenant["name"],
+                is_default=True,
+            ),
+            TenantContext(
+                id=other_tenant["id"],
+                key=other_tenant["key"],
+                name=other_tenant["name"],
+                is_default=False,
+            ),
+        ]
+        payload = RuleBatchRunRequest(
+            rule_ids=[rule_id],
+            mode="history",
+            target=RuleTarget(scope="custom", stock_codes=["600519", "000001"]),
+            tenant_keys=["default", "quant_team"],
+        )
+        background_tasks = BackgroundTasks()
+
+        response = rules_endpoint._start_async_rule_run_for_tenants(payload, tenants, background_tasks)
+        for task in background_tasks.tasks:
+            task.func(*task.args, **task.kwargs)
+
+        assert len(calls) == 1
+        assert calls[0]["run_id"] == 0
+        assert calls[0]["stock_codes"] == ["600519", "000001"]
+        assert response["run_ids"] == [item["run_id"] for item in response["tenant_runs"]]
+
+        run_by_tenant = {item["tenant_key"]: item["run_id"] for item in response["tenant_runs"]}
+        default_repo = RuleRepository(db, tenant_id=default_tenant["id"], tenant_key=default_tenant["key"])
+        other_repo = RuleRepository(db, tenant_id=other_tenant["id"], tenant_key=other_tenant["key"])
+        assert default_repo.get_run(run_by_tenant["default"])["status"] == "completed"
+        assert other_repo.get_run(run_by_tenant["quant_team"])["status"] == "completed"
+        assert default_repo.list_matches(run_by_tenant["default"])[0]["stock_code"] == "600519"
+        assert other_repo.list_matches(run_by_tenant["quant_team"])[0]["stock_code"] == "600519"
+        with db.get_session() as session:
+            assert session.query(SharedRuleRun).count() == 1
+            assert session.query(StockRuleMatchLink).count() == 2
+    finally:
+        DatabaseManager.reset_instance()
+
+
+def test_concurrent_multi_tenant_async_batches_share_completed_execution(monkeypatch, tmp_path):
+    DatabaseManager.reset_instance()
+    db_path = tmp_path / "rules-concurrency.db"
+    db = DatabaseManager(db_url=f"sqlite:///{db_path}")
+    try:
+        tenant_repo = TenantRepository(db)
+        default_tenant = tenant_repo.ensure_default_tenant()
+        other_tenant = tenant_repo.create_tenant({"key": "quant_team", "name": "量化组"})
+        with db.get_session() as session:
+            rule = StockRule(
+                name="并发共享逻辑",
+                tenant_id=None,
+                visibility="shared",
+                period="daily",
+                lookback_days=120,
+                target_scope="custom",
+                target_codes_json="[]",
+                definition_json=json.dumps(_simple_rule_definition(stock_codes=["600519", "000001"])),
+            )
+            session.add(rule)
+            session.commit()
+            session.refresh(rule)
+            rule_id = rule.id
+
+        calls = []
+        calls_lock = threading.Lock()
+        first_execute_entered = threading.Event()
+        release_execute = threading.Event()
+
+        def fake_execute(
+            self,
+            run_id,
+            prepared,
+            stock_codes,
+            run_mode,
+            date_from,
+            date_to,
+            data_policy,
+            rule_ids,
+            rule_names,
+            batch_metadata=None,
+            live_cache_key=None,
+            progress_callback=None,
+        ):
+            with calls_lock:
+                calls.append({
+                    "run_id": run_id,
+                    "rule_ids": list(rule_ids),
+                    "stock_codes": list(stock_codes),
+                })
+            first_execute_entered.set()
+            assert release_execute.wait(timeout=5), "shared execution was not released"
+            if progress_callback is not None:
+                progress_callback(len(stock_codes), {"fast_latest_scan": False, "skip_counts": {}, "skipped_count": 0}, [])
+            return ([{
+                "rule_id": prepared[0][0],
+                "stock_code": "600519",
+                "stock_name": "贵州茅台",
+                "matched_groups": [{"id": "g1"}],
+                "matched_dates": ["2026-05-08"],
+                "matched_events": [{"date": "2026-05-08"}],
+                "snapshot": {"close": 100},
+                "explanation": "hit",
+            }], [])
+
+        monkeypatch.setattr(RuleService, "_execute_batch_scan_by_stock", fake_execute)
+
+        tenants = [
+            TenantContext(
+                id=default_tenant["id"],
+                key=default_tenant["key"],
+                name=default_tenant["name"],
+                is_default=True,
+            ),
+            TenantContext(
+                id=other_tenant["id"],
+                key=other_tenant["key"],
+                name=other_tenant["name"],
+                is_default=False,
+            ),
+        ]
+        payload = RuleBatchRunRequest(
+            rule_ids=[rule_id],
+            mode="history",
+            target=RuleTarget(scope="custom", stock_codes=["600519", "000001"]),
+            tenant_keys=["default", "quant_team"],
+        )
+        planned_barrier = threading.Barrier(3, timeout=5)
+        results = []
+        errors = []
+        result_lock = threading.Lock()
+
+        def worker() -> None:
+            try:
+                background_tasks = BackgroundTasks()
+                response = rules_endpoint._start_async_rule_run_for_tenants(payload, tenants, background_tasks)
+                planned_barrier.wait()
+                for task in background_tasks.tasks:
+                    task.func(*task.args, **task.kwargs)
+                with result_lock:
+                    results.append(response)
+            except Exception as exc:  # pragma: no cover - collected for assertion
+                with result_lock:
+                    errors.append(exc)
+                try:
+                    planned_barrier.abort()
+                except Exception:
+                    pass
+
+        threads = [threading.Thread(target=worker, daemon=True) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        planned_barrier.wait()
+        assert first_execute_entered.wait(timeout=5)
+        time.sleep(0.05)
+        with calls_lock:
+            assert len(calls) == 1
+        release_execute.set()
+        for thread in threads:
+            thread.join(timeout=5)
+
+        assert all(not thread.is_alive() for thread in threads)
+        assert errors == []
+        assert len(results) == 2
+        with calls_lock:
+            assert len(calls) == 1
+            assert calls[0]["run_id"] == 0
+            assert calls[0]["stock_codes"] == ["600519", "000001"]
+
+        for response in results:
+            assert response["status"] == "running"
+            assert len(response["tenant_runs"]) == 2
+            for item in response["tenant_runs"]:
+                repo = RuleRepository(
+                    db,
+                    tenant_id=default_tenant["id"] if item["tenant_key"] == "default" else other_tenant["id"],
+                    tenant_key=item["tenant_key"],
+                )
+                persisted = repo.get_run(item["run_id"])
+                assert persisted["status"] == "completed"
+                assert repo.list_matches(item["run_id"])[0]["stock_code"] == "600519"
+
+        with db.get_session() as session:
+            assert session.query(SharedRuleRun).count() == 1
+            assert session.query(StockRuleMatchLink).count() == 4
+    finally:
+        release_execute.set()
+        DatabaseManager.reset_instance()
+
+
+def test_multi_tenant_sync_rule_run_executes_shared_logic_once(monkeypatch):
+    DatabaseManager.reset_instance()
+    db = DatabaseManager(db_url="sqlite:///:memory:")
+    try:
+        tenant_repo = TenantRepository(db)
+        default_tenant = tenant_repo.ensure_default_tenant()
+        other_tenant = tenant_repo.create_tenant({"key": "quant_team", "name": "量化组"})
+        with db.get_session() as session:
+            rule = StockRule(
+                name="同步共享逻辑",
+                tenant_id=None,
+                visibility="shared",
+                period="daily",
+                lookback_days=120,
+                target_scope="custom",
+                target_codes_json="[]",
+                definition_json=json.dumps(_simple_rule_definition(stock_codes=["600519", "000001"])),
+            )
+            session.add(rule)
+            session.commit()
+            session.refresh(rule)
+            rule_id = rule.id
+
+        calls = []
+
+        def fake_execute(
+            self,
+            run_id,
+            prepared,
+            stock_codes,
+            run_mode,
+            date_from,
+            date_to,
+            data_policy,
+            rule_ids,
+            rule_names,
+            batch_metadata=None,
+            live_cache_key=None,
+            progress_callback=None,
+        ):
+            calls.append({
+                "run_id": run_id,
+                "rule_ids": list(rule_ids),
+                "stock_codes": list(stock_codes),
+            })
+            if progress_callback is not None:
+                progress_callback(len(stock_codes), {"fast_latest_scan": False, "skip_counts": {}, "skipped_count": 0}, [])
+            return ([{
+                "rule_id": prepared[0][0],
+                "stock_code": "600519",
+                "stock_name": "贵州茅台",
+                "matched_groups": [{"id": "g1"}],
+                "matched_dates": ["2026-05-08"],
+                "matched_events": [{"date": "2026-05-08"}],
+                "snapshot": {"close": 100},
+                "explanation": "hit",
+            }], [])
+
+        monkeypatch.setattr(RuleService, "_execute_batch_scan_by_stock", fake_execute)
+
+        tenants = [
+            TenantContext(
+                id=default_tenant["id"],
+                key=default_tenant["key"],
+                name=default_tenant["name"],
+                is_default=True,
+            ),
+            TenantContext(
+                id=other_tenant["id"],
+                key=other_tenant["key"],
+                name=other_tenant["name"],
+                is_default=False,
+            ),
+        ]
+        payload = RuleBatchRunRequest(
+            rule_ids=[rule_id],
+            mode="history",
+            target=RuleTarget(scope="custom", stock_codes=["600519", "000001"]),
+            tenant_keys=["default", "quant_team"],
+        )
+
+        response = rules_endpoint._run_rules_for_tenants(payload, tenants)
+
+        assert len(calls) == 1
+        assert calls[0]["run_id"] == 0
+        assert calls[0]["stock_codes"] == ["600519", "000001"]
+        assert response["status"] == "completed"
+        assert response["run_ids"] == [item["run_id"] for item in response["tenant_runs"]]
+
+        run_by_tenant = {item["tenant_key"]: item["run_id"] for item in response["tenant_runs"]}
+        default_repo = RuleRepository(db, tenant_id=default_tenant["id"], tenant_key=default_tenant["key"])
+        other_repo = RuleRepository(db, tenant_id=other_tenant["id"], tenant_key=other_tenant["key"])
+        assert default_repo.get_run(run_by_tenant["default"])["status"] == "completed"
+        assert other_repo.get_run(run_by_tenant["quant_team"])["status"] == "completed"
+        with db.get_session() as session:
+            assert session.query(SharedRuleRun).count() == 1
+            assert session.query(StockRuleMatchLink).count() == 2
+    finally:
+        DatabaseManager.reset_instance()
+
+
+def test_multi_tenant_async_prewarm_uses_prewarm_path(monkeypatch):
+    DatabaseManager.reset_instance()
+    rule_service_module._RULE_RUN_HISTORY_CACHE.clear()
+    rule_service_module._LIVE_RULE_RUN_HISTORY_CACHE.clear()
+    rule_service_module._LIVE_RULE_RUN_SCAN_CACHE.clear()
+    db = DatabaseManager(db_url="sqlite:///:memory:")
+    try:
+        tenant_repo = TenantRepository(db)
+        default_tenant = tenant_repo.ensure_default_tenant()
+        other_tenant = tenant_repo.create_tenant({"key": "quant_team", "name": "量化组"})
+        with db.get_session() as session:
+            rule = StockRule(
+                name="预热共享规则",
+                tenant_id=None,
+                visibility="shared",
+                period="daily",
+                lookback_days=120,
+                target_scope="custom",
+                target_codes_json="[]",
+                definition_json=json.dumps(_simple_rule_definition(stock_codes=["600519", "000001"])),
+            )
+            session.add(rule)
+            session.commit()
+            session.refresh(rule)
+            rule_id = rule.id
+
+        prewarm_calls = []
+
+        def fake_prewarm(self, prepared, stock_codes, start_date, data_policy, *, live_cache_key=None):
+            prewarm_calls.append({
+                "stock_codes": list(stock_codes),
+                "data_policy": data_policy,
+                "live_cache_key": live_cache_key,
+            })
+            return {
+                "prewarm_only": True,
+                "prewarm_hit_count": len(stock_codes),
+                "prewarm_miss_count": 0,
+            }
+
+        def fail_execute(*_args, **_kwargs):
+            raise AssertionError("prewarm-only multi-tenant runs must not execute rule scan")
+
+        monkeypatch.setattr(RuleService, "_prewarm_rule_scan_cache", fake_prewarm)
+        monkeypatch.setattr(RuleService, "_execute_batch_scan_by_stock", fail_execute)
+
+        tenants = [
+            TenantContext(
+                id=default_tenant["id"],
+                key=default_tenant["key"],
+                name=default_tenant["name"],
+                is_default=True,
+            ),
+            TenantContext(
+                id=other_tenant["id"],
+                key=other_tenant["key"],
+                name=other_tenant["name"],
+                is_default=False,
+            ),
+        ]
+        payload = RuleBatchRunRequest(
+            rule_ids=[rule_id],
+            mode="latest",
+            target=RuleTarget(scope="custom", stock_codes=["600519", "000001"]),
+            data_policy="default",
+            live_cache_key="prewarm-session",
+            tenant_keys=["default", "quant_team"],
+        )
+        background_tasks = BackgroundTasks()
+
+        with mock.patch(
+            "src.services.rule_service.trading_calendar.get_market_now",
+            return_value=datetime(2026, 5, 8, 8, 45),
+        ), mock.patch(
+            "src.services.rule_service.trading_calendar.is_market_open",
+            return_value=True,
+        ):
+            response = rules_endpoint._start_async_rule_run_for_tenants(payload, tenants, background_tasks)
+            for task in background_tasks.tasks:
+                task.func(*task.args, **task.kwargs)
+
+        assert len(prewarm_calls) == 2
+        assert response["prewarm_only"] is True
+        run_by_tenant = {item["tenant_key"]: item["run_id"] for item in response["tenant_runs"]}
+        default_repo = RuleRepository(db, tenant_id=default_tenant["id"], tenant_key=default_tenant["key"])
+        other_repo = RuleRepository(db, tenant_id=other_tenant["id"], tenant_key=other_tenant["key"])
+        default_run = default_repo.get_run(run_by_tenant["default"])
+        other_run = other_repo.get_run(run_by_tenant["quant_team"])
+        assert default_run["status"] == "completed"
+        assert default_run["prewarm_only"] is True
+        assert default_run["match_count"] == 0
+        assert other_run["status"] == "completed"
+        assert other_run["prewarm_hit_count"] == 2
+    finally:
+        DatabaseManager.reset_instance()
+        rule_service_module._RULE_RUN_HISTORY_CACHE.clear()
+        rule_service_module._LIVE_RULE_RUN_HISTORY_CACHE.clear()
+        rule_service_module._LIVE_RULE_RUN_SCAN_CACHE.clear()
+
+
+def test_rule_logic_fingerprint_ignores_target_stock_universe():
+    first = _simple_rule_definition(stock_codes=["600519"])
+    second = _simple_rule_definition(stock_codes=["000001", "300750"])
+
+    assert RuleService._build_rule_logic_fingerprint(first) == RuleService._build_rule_logic_fingerprint(second)
 
 
 def test_rule_service_slow_latest_batch_preloads_intraday_hot_table_quotes():

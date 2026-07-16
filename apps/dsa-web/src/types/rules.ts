@@ -82,6 +82,10 @@ export type RuleDefinition = {
 
 export type RuleItem = {
   id: number;
+  tenantId?: number | null;
+  tenantKey?: string | null;
+  visibility?: 'shared' | 'tenant' | string;
+  isShared?: boolean;
   name: string;
   description?: string | null;
   isActive: boolean;
@@ -108,6 +112,7 @@ export type RuleMetricItem = {
 };
 
 export type RuleMatchItem = {
+  tenantId?: number | null;
   runId?: number;
   ruleId?: number;
   stockCode: string;
@@ -121,6 +126,9 @@ export type RuleMatchItem = {
 
 export type RuleRunResponse = {
   runId: number;
+  runIds?: number[];
+  tenantId?: number | null;
+  tenantKey?: string | null;
   ruleId: number;
   ruleIds?: number[];
   ruleNames?: string[];
@@ -145,6 +153,34 @@ export type RuleRunResponse = {
   fastLatestScan?: boolean;
   skippedCount?: number;
   skipCounts?: Record<string, number>;
+  tenantRuns?: TenantRuleRunItem[];
+};
+
+export type TenantRuleRunItem = {
+  tenantId: number;
+  tenantKey: string;
+  tenantName: string;
+  runId: number;
+  ruleId: number;
+  ruleIds?: number[];
+  ruleNames?: string[];
+  status: string;
+  targetCount: number;
+  completedCount?: number;
+  matchCount: number;
+  eventCount: number;
+  reusedRun?: boolean;
+  prewarmOnly?: boolean;
+  error?: string | null;
+};
+
+export type RuleRunTenantRef = {
+  tenantKey?: string | null;
+  tenantName?: string | null;
+  runId: number;
+  ruleId?: number;
+  ruleIds?: number[];
+  ruleNames?: string[];
 };
 
 export type RuleRunNotifyPayload = {
@@ -167,6 +203,7 @@ export type RuleRunNotifyResponse = {
 export type RuleRunPayload = {
   mode?: RuleRunMode;
   dataPolicy?: RuleDataPolicy;
+  tenantKeys?: string[];
   target?: {
     scope: RuleTargetScope;
     stockCodes: string[];
@@ -182,7 +219,9 @@ export type RuleBatchRunPayload = RuleRunPayload & {
 
 export type RuleRunHistoryItem = {
   id: number;
+  tenantId?: number | null;
   runIds?: number[];
+  tenantRuns?: RuleRunTenantRef[];
   ruleId: number;
   ruleIds?: number[];
   ruleName?: string | null;

@@ -10,6 +10,7 @@ import type {
   RuleMatchItem,
   RuleMetricItem,
   RuleRunHistoryItem,
+  RuleRunTenantRef,
   RuleRunNotifyPayload,
   RuleRunNotifyResponse,
   RuleRunPayload,
@@ -17,6 +18,7 @@ import type {
   RuleTargetScope,
   RuleUpdatePayload,
   RuleValueExpression,
+  TenantRuleRunItem,
 } from '../types/rules';
 
 const RULE_RUN_TIMEOUT_MS = 10 * 60 * 1000;
@@ -57,6 +59,10 @@ function toNumberRecord(value: unknown): Record<string, number> {
     }
     return acc;
   }, {});
+}
+
+function tenantRequestConfig(tenantKey?: string): Record<string, unknown> | undefined {
+  return tenantKey ? { headers: { 'X-DSA-Tenant': tenantKey } } : undefined;
 }
 
 function normalizeValueExpression(raw: unknown): RuleValueExpression {
@@ -178,6 +184,10 @@ function serializeDefinition(definition: RuleDefinition): Record<string, unknown
 function normalizeRule(raw: Record<string, unknown>): RuleItem {
   return {
     id: toNumber(raw.id),
+    tenantId: raw.tenant_id == null && raw.tenantId == null ? null : toNumber(raw.tenant_id ?? raw.tenantId),
+    tenantKey: toNullableString(raw.tenant_key ?? raw.tenantKey),
+    visibility: toString(raw.visibility || 'tenant'),
+    isShared: toBoolean(raw.is_shared ?? raw.isShared),
     name: toString(raw.name),
     description: toNullableString(raw.description),
     isActive: toBoolean(raw.is_active ?? raw.isActive),
@@ -216,6 +226,7 @@ function normalizeMatch(raw: Record<string, unknown>): RuleMatchItem {
   const matchedDates = raw.matched_dates ?? raw.matchedDates;
   const matchedEvents = raw.matched_events ?? raw.matchedEvents;
   return {
+    tenantId: raw.tenant_id == null && raw.tenantId == null ? null : toNumber(raw.tenant_id ?? raw.tenantId),
     runId: raw.run_id == null && raw.runId == null ? undefined : toNumber(raw.run_id ?? raw.runId),
     ruleId: raw.rule_id == null && raw.ruleId == null ? undefined : toNumber(raw.rule_id ?? raw.ruleId),
     stockCode: toString(raw.stock_code ?? raw.stockCode),
@@ -231,9 +242,14 @@ function normalizeMatch(raw: Record<string, unknown>): RuleMatchItem {
 }
 
 function normalizeRunHistory(raw: Record<string, unknown>): RuleRunHistoryItem {
+  const rawTenantRuns = Array.isArray(raw.tenant_runs ?? raw.tenantRuns)
+    ? raw.tenant_runs ?? raw.tenantRuns
+    : [];
   return {
     id: toNumber(raw.id),
+    tenantId: raw.tenant_id == null && raw.tenantId == null ? null : toNumber(raw.tenant_id ?? raw.tenantId),
     runIds: toNumberArray(raw.run_ids ?? raw.runIds),
+    tenantRuns: (rawTenantRuns as Array<Record<string, unknown>>).map(normalizeRunTenantRef),
     ruleId: toNumber(raw.rule_id ?? raw.ruleId),
     ruleIds: toNumberArray(raw.rule_ids ?? raw.ruleIds),
     ruleName: toNullableString(raw.rule_name ?? raw.ruleName),
@@ -264,6 +280,94 @@ function normalizeRunHistory(raw: Record<string, unknown>): RuleRunHistoryItem {
   };
 }
 
+function normalizeRunTenantRef(raw: Record<string, unknown>): RuleRunTenantRef {
+  return {
+    tenantKey: toNullableString(raw.tenant_key ?? raw.tenantKey),
+    tenantName: toNullableString(raw.tenant_name ?? raw.tenantName),
+    runId: toNumber(raw.run_id ?? raw.runId),
+    ruleId: raw.rule_id == null && raw.ruleId == null ? undefined : toNumber(raw.rule_id ?? raw.ruleId),
+    ruleIds: toNumberArray(raw.rule_ids ?? raw.ruleIds),
+    ruleNames: toStringArray(raw.rule_names ?? raw.ruleNames),
+  };
+}
+
+function withTenantRunFallback(run: RuleRunHistoryItem, tenantKey?: string): RuleRunHistoryItem {
+  if (!tenantKey || (Array.isArray(run.tenantRuns) && run.tenantRuns.length > 0)) {
+    return run;
+  }
+  const runIds = run.runIds && run.runIds.length > 0 ? run.runIds : run.id > 0 ? [run.id] : [];
+  if (runIds.length === 0) {
+    return run;
+  }
+  return {
+    ...run,
+    tenantRuns: runIds.map((runId) => ({ runId, tenantKey })),
+  };
+}
+
+function normalizeTenantRun(raw: Record<string, unknown>): TenantRuleRunItem {
+  return {
+    tenantId: toNumber(raw.tenant_id ?? raw.tenantId),
+    tenantKey: toString(raw.tenant_key ?? raw.tenantKey),
+    tenantName: toString(raw.tenant_name ?? raw.tenantName),
+    runId: toNumber(raw.run_id ?? raw.runId),
+    ruleId: toNumber(raw.rule_id ?? raw.ruleId),
+    ruleIds: toNumberArray(raw.rule_ids ?? raw.ruleIds),
+    ruleNames: toStringArray(raw.rule_names ?? raw.ruleNames),
+    status: toString(raw.status),
+    targetCount: toNumber(raw.target_count ?? raw.targetCount),
+    completedCount: toNumber(raw.completed_count ?? raw.completedCount),
+    matchCount: toNumber(raw.match_count ?? raw.matchCount),
+    eventCount: toNumber(raw.event_count ?? raw.eventCount),
+    reusedRun: toBoolean(raw.reused_run ?? raw.reusedRun),
+    prewarmOnly: toBoolean(raw.prewarm_only ?? raw.prewarmOnly),
+    error: toNullableString(raw.error),
+  };
+}
+
+function normalizeRunResponse(
+  raw: Record<string, unknown>,
+  fallbackMode?: string,
+): RuleRunResponse {
+  const rawMatches = Array.isArray(raw.matches) ? raw.matches : [];
+  const rawTenantRuns = Array.isArray(raw.tenant_runs ?? raw.tenantRuns)
+    ? raw.tenant_runs ?? raw.tenantRuns
+    : [];
+  return {
+    runId: toNumber(raw.run_id ?? raw.runId),
+    runIds: toNumberArray(raw.run_ids ?? raw.runIds),
+    tenantId: raw.tenant_id == null && raw.tenantId == null ? null : toNumber(raw.tenant_id ?? raw.tenantId),
+    tenantKey: toNullableString(raw.tenant_key ?? raw.tenantKey),
+    ruleId: toNumber(raw.rule_id ?? raw.ruleId),
+    ruleIds: toNumberArray(raw.rule_ids ?? raw.ruleIds),
+    ruleNames: toStringArray(raw.rule_names ?? raw.ruleNames),
+    status: toString(raw.status),
+    targetCount: toNumber(raw.target_count ?? raw.targetCount),
+    completedCount: toNumber(raw.completed_count ?? raw.completedCount),
+    matchCount: toNumber(raw.match_count ?? raw.matchCount),
+    eventCount: toNumber(raw.event_count ?? raw.eventCount),
+    mode: toString(raw.mode || fallbackMode || 'history'),
+    durationMs: toNumber(raw.duration_ms ?? raw.durationMs),
+    matches: (rawMatches as Array<Record<string, unknown>>).map(normalizeMatch),
+    errors: Array.isArray(raw.errors) ? raw.errors.map(toString) : [],
+    snapshotId: toNullableString(raw.snapshot_id ?? raw.snapshotId),
+    snapshotTime: toNullableString(raw.snapshot_time ?? raw.snapshotTime),
+    snapshotAgeSeconds: raw.snapshot_age_seconds == null && raw.snapshotAgeSeconds == null
+      ? null
+      : toNumber(raw.snapshot_age_seconds ?? raw.snapshotAgeSeconds),
+    quoteHitCount: toNumber(raw.quote_hit_count ?? raw.quoteHitCount),
+    quoteMissCount: toNumber(raw.quote_miss_count ?? raw.quoteMissCount),
+    reusedRun: toBoolean(raw.reused_run ?? raw.reusedRun),
+    prewarmOnly: toBoolean(raw.prewarm_only ?? raw.prewarmOnly),
+    prewarmHitCount: toNumber(raw.prewarm_hit_count ?? raw.prewarmHitCount),
+    prewarmMissCount: toNumber(raw.prewarm_miss_count ?? raw.prewarmMissCount),
+    fastLatestScan: toBoolean(raw.fast_latest_scan ?? raw.fastLatestScan),
+    skippedCount: toNumber(raw.skipped_count ?? raw.skippedCount),
+    skipCounts: toNumberRecord(raw.skip_counts ?? raw.skipCounts),
+    tenantRuns: (rawTenantRuns as Array<Record<string, unknown>>).map(normalizeTenantRun),
+  };
+}
+
 export const rulesApi = {
   async getMetrics(): Promise<RuleMetricItem[]> {
     const response = await apiClient.get<{ items?: Array<Record<string, unknown>> }>('/api/v1/rules/metrics');
@@ -278,8 +382,11 @@ export const rulesApi = {
     }));
   },
 
-  async list(): Promise<RuleItem[]> {
-    const response = await apiClient.get<{ items?: Array<Record<string, unknown>> }>('/api/v1/rules');
+  async list(tenantKey?: string): Promise<RuleItem[]> {
+    const response = await apiClient.get<{ items?: Array<Record<string, unknown>> }>(
+      '/api/v1/rules',
+      tenantRequestConfig(tenantKey),
+    );
     return (response.data.items ?? []).map(normalizeRule);
   },
 
@@ -296,36 +403,53 @@ export const rulesApi = {
     return normalizeRule(response.data);
   },
 
+  async clone(ruleId: number): Promise<RuleItem> {
+    const response = await apiClient.post<Record<string, unknown>>(
+      `/api/v1/rules/${encodeURIComponent(String(ruleId))}/clone`,
+    );
+    return normalizeRule(response.data);
+  },
+
   async delete(ruleId: number): Promise<void> {
     await apiClient.delete(`/api/v1/rules/${encodeURIComponent(String(ruleId))}`);
   },
 
-  async listRuns(limit = 30): Promise<RuleRunHistoryItem[]> {
+  async listRuns(limit = 30, tenantKey?: string): Promise<RuleRunHistoryItem[]> {
     const response = await apiClient.get<{ items?: Array<Record<string, unknown>> }>('/api/v1/rules/runs', {
       params: { limit },
+      ...(tenantKey ? { headers: { 'X-DSA-Tenant': tenantKey } } : {}),
     });
-    return (response.data.items ?? []).map(normalizeRunHistory);
+    return (response.data.items ?? []).map((item) => withTenantRunFallback(normalizeRunHistory(item), tenantKey));
   },
 
-  async getRun(runId: number): Promise<RuleRunHistoryItem> {
+  async getRun(runId: number, tenantKey?: string): Promise<RuleRunHistoryItem> {
     const response = await apiClient.get<Record<string, unknown>>(
       `/api/v1/rules/runs/${encodeURIComponent(String(runId))}`,
+      tenantRequestConfig(tenantKey),
     );
     return normalizeRunHistory(response.data);
   },
 
-  async getRunMatches(runId: number): Promise<RuleMatchItem[]> {
+  async getRunMatches(runId: number, tenantKey?: string): Promise<RuleMatchItem[]> {
     const response = await apiClient.get<{ items?: Array<Record<string, unknown>> }>(
       `/api/v1/rules/runs/${encodeURIComponent(String(runId))}/matches`,
+      tenantRequestConfig(tenantKey),
     );
     return (response.data.items ?? []).map(normalizeMatch);
   },
 
-  async deleteRun(runId: number): Promise<void> {
-    await apiClient.delete(`/api/v1/rules/runs/${encodeURIComponent(String(runId))}`);
+  async deleteRun(runId: number, tenantKey?: string): Promise<void> {
+    await apiClient.delete(
+      `/api/v1/rules/runs/${encodeURIComponent(String(runId))}`,
+      tenantRequestConfig(tenantKey),
+    );
   },
 
-  async notifyRunMatches(runId: number, payload?: RuleRunNotifyPayload): Promise<RuleRunNotifyResponse> {
+  async notifyRunMatches(
+    runId: number,
+    payload?: RuleRunNotifyPayload,
+    tenantKey?: string,
+  ): Promise<RuleRunNotifyResponse> {
     const response = await apiClient.post<Record<string, unknown>>(
       `/api/v1/rules/runs/${encodeURIComponent(String(runId))}/notify`,
       {
@@ -334,6 +458,7 @@ export const rulesApi = {
         rule_names: payload?.ruleNames || undefined,
         compact: payload?.compact ?? undefined,
       },
+      tenantRequestConfig(tenantKey),
     );
     return {
       sent: toBoolean(response.data.sent),
@@ -353,6 +478,7 @@ export const rulesApi = {
     const requestPayload = {
       mode: payload?.mode,
       data_policy: payload?.dataPolicy || undefined,
+      tenant_keys: payload?.tenantKeys && payload.tenantKeys.length > 0 ? payload.tenantKeys : undefined,
       target: payload?.target ? serializeRunTarget(payload.target) : undefined,
       start_date: payload?.startDate || undefined,
       end_date: payload?.endDate || undefined,
@@ -362,36 +488,7 @@ export const rulesApi = {
       requestPayload,
       { timeout: RULE_RUN_TIMEOUT_MS },
     );
-    const rawMatches = Array.isArray(response.data.matches) ? response.data.matches : [];
-    return {
-      runId: toNumber(response.data.run_id ?? response.data.runId),
-      ruleId: toNumber(response.data.rule_id ?? response.data.ruleId),
-      ruleIds: toNumberArray(response.data.rule_ids ?? response.data.ruleIds),
-      ruleNames: toStringArray(response.data.rule_names ?? response.data.ruleNames),
-      status: toString(response.data.status),
-      targetCount: toNumber(response.data.target_count ?? response.data.targetCount),
-      completedCount: toNumber(response.data.completed_count ?? response.data.completedCount),
-      matchCount: toNumber(response.data.match_count ?? response.data.matchCount),
-      eventCount: toNumber(response.data.event_count ?? response.data.eventCount),
-      mode: toString(response.data.mode || payload?.mode || 'history'),
-      durationMs: toNumber(response.data.duration_ms ?? response.data.durationMs),
-      matches: (rawMatches as Array<Record<string, unknown>>).map(normalizeMatch),
-      errors: Array.isArray(response.data.errors) ? response.data.errors.map(toString) : [],
-      snapshotId: toNullableString(response.data.snapshot_id ?? response.data.snapshotId),
-      snapshotTime: toNullableString(response.data.snapshot_time ?? response.data.snapshotTime),
-      snapshotAgeSeconds: response.data.snapshot_age_seconds == null && response.data.snapshotAgeSeconds == null
-        ? null
-        : toNumber(response.data.snapshot_age_seconds ?? response.data.snapshotAgeSeconds),
-      quoteHitCount: toNumber(response.data.quote_hit_count ?? response.data.quoteHitCount),
-      quoteMissCount: toNumber(response.data.quote_miss_count ?? response.data.quoteMissCount),
-      reusedRun: toBoolean(response.data.reused_run ?? response.data.reusedRun),
-      prewarmOnly: toBoolean(response.data.prewarm_only ?? response.data.prewarmOnly),
-      prewarmHitCount: toNumber(response.data.prewarm_hit_count ?? response.data.prewarmHitCount),
-      prewarmMissCount: toNumber(response.data.prewarm_miss_count ?? response.data.prewarmMissCount),
-      fastLatestScan: toBoolean(response.data.fast_latest_scan ?? response.data.fastLatestScan),
-      skippedCount: toNumber(response.data.skipped_count ?? response.data.skippedCount),
-      skipCounts: toNumberRecord(response.data.skip_counts ?? response.data.skipCounts),
-    };
+    return normalizeRunResponse(response.data, payload?.mode);
   },
 
   async runBatch(payload: RuleBatchRunPayload): Promise<RuleRunResponse> {
@@ -399,6 +496,7 @@ export const rulesApi = {
       rule_ids: payload.ruleIds,
       mode: payload.mode,
       data_policy: payload.dataPolicy || undefined,
+      tenant_keys: payload.tenantKeys && payload.tenantKeys.length > 0 ? payload.tenantKeys : undefined,
       target: payload.target ? serializeRunTarget(payload.target) : undefined,
       start_date: payload.startDate || undefined,
       end_date: payload.endDate || undefined,
@@ -409,36 +507,7 @@ export const rulesApi = {
       requestPayload,
       { timeout: RULE_RUN_TIMEOUT_MS },
     );
-    const rawMatches = Array.isArray(response.data.matches) ? response.data.matches : [];
-    return {
-      runId: toNumber(response.data.run_id ?? response.data.runId),
-      ruleId: toNumber(response.data.rule_id ?? response.data.ruleId),
-      ruleIds: toNumberArray(response.data.rule_ids ?? response.data.ruleIds),
-      ruleNames: toStringArray(response.data.rule_names ?? response.data.ruleNames),
-      status: toString(response.data.status),
-      targetCount: toNumber(response.data.target_count ?? response.data.targetCount),
-      completedCount: toNumber(response.data.completed_count ?? response.data.completedCount),
-      matchCount: toNumber(response.data.match_count ?? response.data.matchCount),
-      eventCount: toNumber(response.data.event_count ?? response.data.eventCount),
-      mode: toString(response.data.mode || payload.mode || 'history'),
-      durationMs: toNumber(response.data.duration_ms ?? response.data.durationMs),
-      matches: (rawMatches as Array<Record<string, unknown>>).map(normalizeMatch),
-      errors: Array.isArray(response.data.errors) ? response.data.errors.map(toString) : [],
-      snapshotId: toNullableString(response.data.snapshot_id ?? response.data.snapshotId),
-      snapshotTime: toNullableString(response.data.snapshot_time ?? response.data.snapshotTime),
-      snapshotAgeSeconds: response.data.snapshot_age_seconds == null && response.data.snapshotAgeSeconds == null
-        ? null
-        : toNumber(response.data.snapshot_age_seconds ?? response.data.snapshotAgeSeconds),
-      quoteHitCount: toNumber(response.data.quote_hit_count ?? response.data.quoteHitCount),
-      quoteMissCount: toNumber(response.data.quote_miss_count ?? response.data.quoteMissCount),
-      reusedRun: toBoolean(response.data.reused_run ?? response.data.reusedRun),
-      prewarmOnly: toBoolean(response.data.prewarm_only ?? response.data.prewarmOnly),
-      prewarmHitCount: toNumber(response.data.prewarm_hit_count ?? response.data.prewarmHitCount),
-      prewarmMissCount: toNumber(response.data.prewarm_miss_count ?? response.data.prewarmMissCount),
-      fastLatestScan: toBoolean(response.data.fast_latest_scan ?? response.data.fastLatestScan),
-      skippedCount: toNumber(response.data.skipped_count ?? response.data.skippedCount),
-      skipCounts: toNumberRecord(response.data.skip_counts ?? response.data.skipCounts),
-    };
+    return normalizeRunResponse(response.data, payload.mode);
   },
 
   async runBatchAsync(payload: RuleBatchRunPayload): Promise<RuleRunResponse> {
@@ -446,6 +515,7 @@ export const rulesApi = {
       rule_ids: payload.ruleIds,
       mode: payload.mode,
       data_policy: payload.dataPolicy || undefined,
+      tenant_keys: payload.tenantKeys && payload.tenantKeys.length > 0 ? payload.tenantKeys : undefined,
       target: payload.target ? serializeRunTarget(payload.target) : undefined,
       start_date: payload.startDate || undefined,
       end_date: payload.endDate || undefined,
@@ -456,39 +526,13 @@ export const rulesApi = {
       requestPayload,
       { timeout: RULE_RUN_TIMEOUT_MS },
     );
-    const rawMatches = Array.isArray(response.data.matches) ? response.data.matches : [];
-    return {
-      runId: toNumber(response.data.run_id ?? response.data.runId),
-      ruleId: toNumber(response.data.rule_id ?? response.data.ruleId),
-      ruleIds: toNumberArray(response.data.rule_ids ?? response.data.ruleIds),
-      ruleNames: toStringArray(response.data.rule_names ?? response.data.ruleNames),
-      status: toString(response.data.status),
-      targetCount: toNumber(response.data.target_count ?? response.data.targetCount),
-      completedCount: toNumber(response.data.completed_count ?? response.data.completedCount),
-      matchCount: toNumber(response.data.match_count ?? response.data.matchCount),
-      eventCount: toNumber(response.data.event_count ?? response.data.eventCount),
-      mode: toString(response.data.mode || payload.mode || 'history'),
-      durationMs: toNumber(response.data.duration_ms ?? response.data.durationMs),
-      matches: (rawMatches as Array<Record<string, unknown>>).map(normalizeMatch),
-      errors: Array.isArray(response.data.errors) ? response.data.errors.map(toString) : [],
-      snapshotId: toNullableString(response.data.snapshot_id ?? response.data.snapshotId),
-      snapshotTime: toNullableString(response.data.snapshot_time ?? response.data.snapshotTime),
-      snapshotAgeSeconds: response.data.snapshot_age_seconds == null && response.data.snapshotAgeSeconds == null
-        ? null
-        : toNumber(response.data.snapshot_age_seconds ?? response.data.snapshotAgeSeconds),
-      quoteHitCount: toNumber(response.data.quote_hit_count ?? response.data.quoteHitCount),
-      quoteMissCount: toNumber(response.data.quote_miss_count ?? response.data.quoteMissCount),
-      reusedRun: toBoolean(response.data.reused_run ?? response.data.reusedRun),
-      prewarmOnly: toBoolean(response.data.prewarm_only ?? response.data.prewarmOnly),
-      prewarmHitCount: toNumber(response.data.prewarm_hit_count ?? response.data.prewarmHitCount),
-      prewarmMissCount: toNumber(response.data.prewarm_miss_count ?? response.data.prewarmMissCount),
-      fastLatestScan: toBoolean(response.data.fast_latest_scan ?? response.data.fastLatestScan),
-      skippedCount: toNumber(response.data.skipped_count ?? response.data.skippedCount),
-      skipCounts: toNumberRecord(response.data.skip_counts ?? response.data.skipCounts),
-    };
+    return normalizeRunResponse(response.data, payload.mode);
   },
 
-  async clearLiveCache(liveCacheKey: string): Promise<void> {
-    await apiClient.delete(`/api/v1/rules/live-cache/${encodeURIComponent(liveCacheKey)}`);
+  async clearLiveCache(liveCacheKey: string, tenantKey?: string): Promise<void> {
+    await apiClient.delete(
+      `/api/v1/rules/live-cache/${encodeURIComponent(liveCacheKey)}`,
+      tenantRequestConfig(tenantKey),
+    );
   },
 };

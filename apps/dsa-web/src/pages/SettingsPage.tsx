@@ -14,6 +14,7 @@ import {
   SettingsField,
   SettingsLoading,
   SettingsSectionCard,
+  TenantSettingsCard,
 } from '../components/settings';
 import { WEB_BUILD_INFO } from '../utils/constants';
 import { getCategoryDescriptionZh } from '../utils/systemConfigI18n';
@@ -451,6 +452,9 @@ const SettingsPage: React.FC = () => {
                   ) : null}
                 </div>
               </SettingsSectionCard>
+            ) : null}
+            {activeCategory === 'base' ? (
+              <TenantSettingsCard />
             ) : null}
             {activeCategory === 'base' ? (
               <SettingsSectionCard

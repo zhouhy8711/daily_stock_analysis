@@ -1,5 +1,6 @@
 import axios from 'axios';
 import { API_BASE_URL } from '../utils/constants';
+import { getStoredTenantKey } from '../utils/tenantStorage';
 import { attachParsedApiError } from './error';
 
 const apiClient = axios.create({
@@ -9,6 +10,24 @@ const apiClient = axios.create({
   headers: {
     'Content-Type': 'application/json',
   },
+});
+
+apiClient.interceptors.request.use((config) => {
+  const tenantKey = getStoredTenantKey();
+  if (tenantKey) {
+    config.headers = config.headers ?? {};
+    const existingTenantHeader = typeof config.headers.get === 'function'
+      ? config.headers.get('X-DSA-Tenant')
+      : config.headers['X-DSA-Tenant'] ?? config.headers['x-dsa-tenant'];
+    if (!existingTenantHeader) {
+      if (typeof config.headers.set === 'function') {
+        config.headers.set('X-DSA-Tenant', tenantKey);
+      } else {
+        config.headers['X-DSA-Tenant'] = tenantKey;
+      }
+    }
+  }
+  return config;
 });
 
 apiClient.interceptors.response.use(

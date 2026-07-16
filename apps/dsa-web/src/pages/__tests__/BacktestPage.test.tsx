@@ -5,8 +5,9 @@ import { historyApi } from '../../api/history';
 import { rulesApi } from '../../api/rules';
 import { stocksApi, type KLineData, type KLinePeriod } from '../../api/stocks';
 import { systemConfigApi } from '../../api/systemConfig';
+import { tenantsApi } from '../../api/tenants';
 import type { StockIndexItem } from '../../types/stockIndex';
-import BacktestPage from '../BacktestPage';
+import BacktestPage, { __resetBacktestPageRuntimeForTests } from '../BacktestPage';
 
 const stockIndexHookState = vi.hoisted(() => ({
   current: {
@@ -17,6 +18,70 @@ const stockIndexHookState = vi.hoisted(() => ({
     loaded: true,
   },
 }));
+
+const tenantHookState = vi.hoisted(() => {
+  const defaultTenant = {
+    id: 1,
+    key: 'default',
+    name: '默认租户',
+    description: null,
+    isActive: true,
+    isDefault: true,
+  };
+  const quantTenant = {
+    id: 2,
+    key: 'quant_team',
+    name: '量化组',
+    description: null,
+    isActive: true,
+    isDefault: false,
+  };
+  const defaultConfig = {
+    tenant: {
+      id: 1,
+      key: 'default',
+      name: '默认租户',
+      isDefault: true,
+    },
+    maskToken: '',
+    stockList: ['300274.SZ', '688521.SH'],
+    feishuWebhookUrl: '',
+    feishuWebhookSecret: '',
+    feishuWebhookSecretExists: false,
+    feishuWebhookKeyword: '',
+    feishuMaxBytes: 18000,
+  };
+  const quantConfig = {
+    ...defaultConfig,
+    tenant: {
+      id: 2,
+      key: 'quant_team',
+      name: '量化组',
+      isDefault: false,
+    },
+    stockList: ['600519.SH'],
+  };
+  const makeContext = (tenants = [defaultTenant]) => ({
+    tenants,
+    currentTenant: defaultTenant,
+    tenantConfig: defaultConfig,
+    isLoading: false,
+    loadError: null,
+    switchLocked: false,
+    setCurrentTenantKey: vi.fn(),
+    setSwitchLocked: vi.fn(),
+    reloadTenants: vi.fn().mockResolvedValue(undefined),
+    reloadTenantConfig: vi.fn().mockResolvedValue(defaultConfig),
+  });
+  return {
+    defaultTenant,
+    quantTenant,
+    defaultConfig,
+    quantConfig,
+    current: makeContext(),
+    makeContext,
+  };
+});
 
 const rule = {
   id: 7,
@@ -356,6 +421,12 @@ vi.mock('../../api/systemConfig', () => ({
   },
 }));
 
+vi.mock('../../api/tenants', () => ({
+  tenantsApi: {
+    getConfig: vi.fn(),
+  },
+}));
+
 vi.mock('../../api/stocks', () => ({
   stocksApi: {
     getHistory: vi.fn(),
@@ -368,10 +439,16 @@ vi.mock('../../hooks/useStockIndex', () => ({
   useStockIndex: () => stockIndexHookState.current,
 }));
 
+vi.mock('../../contexts/TenantContext', () => ({
+  useTenant: () => tenantHookState.current,
+}));
+
 describe('BacktestPage', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     window.localStorage.clear();
+    __resetBacktestPageRuntimeForTests();
+    tenantHookState.current = tenantHookState.makeContext();
     stockIndexHookState.current = {
       index: [],
       loading: false,
@@ -522,6 +599,7 @@ describe('BacktestPage', () => {
       snapshotMissCount: 0,
       providerBreakdown: [],
     });
+    vi.mocked(tenantsApi.getConfig).mockResolvedValue(tenantHookState.defaultConfig);
     vi.mocked(historyApi.getList).mockResolvedValue({
       total: 2,
       page: 1,
@@ -640,15 +718,16 @@ describe('BacktestPage', () => {
         liveCacheKey: expect.stringMatching(/^live-\d+$/),
         target: {
           scope: 'watchlist',
-          stockCodes: ['300274.SZ', '688521.SH'],
+          stockCodes: [],
         },
+        tenantKeys: ['default'],
       });
       expect(rulesApi.notifyRunMatches).toHaveBeenCalledWith(12, {
         executionTime: expect.any(String),
         ruleIds: [7],
         ruleNames: ['放量观察'],
         compact: true,
-      });
+      }, 'default');
       expect(screen.getByRole('checkbox', { name: /精简模式/ })).toBeChecked();
       const executionGroupButton = screen.getByRole('button', {
         name: /展开执行时间 \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}，命中 1 条，完成时间 \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/,
@@ -670,8 +749,186 @@ describe('BacktestPage', () => {
       vi.useRealTimers();
     }
     await waitFor(() => {
-      expect(rulesApi.clearLiveCache).toHaveBeenCalledWith(expect.stringMatching(/^live-\d+$/));
+      expect(rulesApi.clearLiveCache).toHaveBeenCalledWith(expect.stringMatching(/^live-\d+$/), 'default');
     });
+  });
+
+  it('always runs live tests for all active tenants', async () => {
+    tenantHookState.current = tenantHookState.makeContext([
+      tenantHookState.defaultTenant,
+      tenantHookState.quantTenant,
+    ]);
+    vi.mocked(tenantsApi.getConfig).mockImplementation(async (tenantKey) => (
+      tenantKey === 'quant_team' ? tenantHookState.quantConfig : tenantHookState.defaultConfig
+    ));
+    vi.mocked(rulesApi.list).mockImplementation(async (tenantKey) => (
+      tenantKey === 'quant_team' ? [{ ...secondRule, id: 8, name: '量化私有规则' }] : [rule]
+    ));
+    vi.mocked(rulesApi.runBatchAsync).mockResolvedValueOnce({
+      runId: 88,
+      runIds: [88, 89],
+      tenantId: null,
+      ruleId: 8,
+      ruleIds: [8, 7],
+      ruleNames: ['量化私有规则', '放量观察'],
+      status: 'completed',
+      targetCount: 3,
+      completedCount: 3,
+      matchCount: 0,
+      eventCount: 0,
+      mode: 'latest',
+      durationMs: 1,
+      matches: [],
+      errors: [],
+      prewarmOnly: true,
+      tenantRuns: [
+        {
+          tenantId: 1,
+          tenantKey: 'default',
+          tenantName: '默认租户',
+          runId: 88,
+          ruleId: 7,
+          ruleIds: [7],
+          ruleNames: ['放量观察'],
+          status: 'completed',
+          targetCount: 2,
+          matchCount: 0,
+          eventCount: 0,
+          prewarmOnly: true,
+        },
+        {
+          tenantId: 2,
+          tenantKey: 'quant_team',
+          tenantName: '量化组',
+          runId: 89,
+          ruleId: 8,
+          ruleIds: [8],
+          ruleNames: ['量化私有规则'],
+          status: 'completed',
+          targetCount: 1,
+          matchCount: 0,
+          eventCount: 0,
+          prewarmOnly: true,
+        },
+      ],
+    });
+
+    render(<BacktestPage mode="live" />);
+
+    expect(await screen.findByText('2 / 2')).toBeInTheDocument();
+    const tenantSelect = screen.getByLabelText('运行租户');
+    expect(tenantSelect).toBeDisabled();
+    expect(tenantSelect).toHaveValue('__all__');
+    const runButton = screen.getByRole('button', { name: '运行实测' });
+    await waitFor(() => {
+      expect(runButton).toBeEnabled();
+    });
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-05-07T00:45:00Z'));
+      fireEvent.click(runButton);
+
+      await act(async () => {
+        await Promise.resolve();
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      const request = vi.mocked(rulesApi.runBatchAsync).mock.calls[0][0];
+      expect([...request.ruleIds].sort((left, right) => left - right)).toEqual([7, 8]);
+      expect(request.tenantKeys).toEqual(['default', 'quant_team']);
+      expect(request.mode).toBe('latest');
+      fireEvent.click(screen.getByRole('button', { name: '停止实测' }));
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('allows live tests to run selected rules across all active tenants', async () => {
+    tenantHookState.current = tenantHookState.makeContext([
+      tenantHookState.defaultTenant,
+      tenantHookState.quantTenant,
+    ]);
+    vi.mocked(tenantsApi.getConfig).mockImplementation(async (tenantKey) => (
+      tenantKey === 'quant_team' ? tenantHookState.quantConfig : tenantHookState.defaultConfig
+    ));
+    vi.mocked(rulesApi.list).mockImplementation(async (tenantKey) => (
+      tenantKey === 'quant_team' ? [{ ...secondRule, id: 8, name: '量化私有规则' }] : [rule]
+    ));
+    vi.mocked(rulesApi.runBatchAsync).mockResolvedValueOnce({
+      runId: 88,
+      runIds: [88],
+      tenantId: null,
+      ruleId: 7,
+      ruleIds: [7],
+      ruleNames: ['放量观察'],
+      status: 'completed',
+      targetCount: 2,
+      completedCount: 2,
+      matchCount: 0,
+      eventCount: 0,
+      mode: 'latest',
+      durationMs: 1,
+      matches: [],
+      errors: ['量化组(quant_team) 没有可运行的所选规则，已跳过'],
+      prewarmOnly: true,
+      tenantRuns: [
+        {
+          tenantId: 1,
+          tenantKey: 'default',
+          tenantName: '默认租户',
+          runId: 88,
+          ruleId: 7,
+          ruleIds: [7],
+          ruleNames: ['放量观察'],
+          status: 'completed',
+          targetCount: 2,
+          matchCount: 0,
+          eventCount: 0,
+          prewarmOnly: true,
+        },
+      ],
+    });
+
+    render(<BacktestPage mode="live" />);
+
+    expect(await screen.findByText('2 / 2')).toBeInTheDocument();
+    const tenantSelect = screen.getByLabelText('运行租户');
+    expect(tenantSelect).toBeDisabled();
+    expect(tenantSelect).toHaveValue('__all__');
+
+    fireEvent.click(screen.getByLabelText('选择实测规则'));
+    const defaultRuleCheckbox = screen.getByRole('checkbox', { name: /#7 放量观察/ });
+    const quantRuleCheckbox = screen.getByRole('checkbox', { name: /#8 量化私有规则/ });
+    expect(defaultRuleCheckbox).toBeEnabled();
+    expect(quantRuleCheckbox).toBeEnabled();
+    fireEvent.click(quantRuleCheckbox);
+
+    expect(defaultRuleCheckbox).toBeChecked();
+    expect(quantRuleCheckbox).not.toBeChecked();
+    expect(screen.getByText('1 / 2')).toBeInTheDocument();
+
+    const runButton = screen.getByRole('button', { name: '运行实测' });
+    await waitFor(() => {
+      expect(runButton).toBeEnabled();
+    });
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-05-07T00:45:00Z'));
+      fireEvent.click(runButton);
+
+      await act(async () => {
+        await Promise.resolve();
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      const request = vi.mocked(rulesApi.runBatchAsync).mock.calls[0][0];
+      expect(request.ruleIds).toEqual([7]);
+      expect(request.tenantKeys).toEqual(['default', 'quant_team']);
+      expect(request.mode).toBe('latest');
+      fireEvent.click(screen.getByRole('button', { name: '停止实测' }));
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('treats preopen live test response as history prewarm only', async () => {
@@ -786,7 +1043,7 @@ describe('BacktestPage', () => {
         await Promise.resolve();
       });
 
-      expect(rulesApi.getRun).toHaveBeenCalledWith(88);
+      expect(rulesApi.getRun).toHaveBeenCalledWith(88, 'default');
       expect(rulesApi.getRunMatches).not.toHaveBeenCalled();
       expect(rulesApi.notifyRunMatches).not.toHaveBeenCalled();
       expect(screen.getByText(/开盘前历史缓存预热已启动：0\/2/)).toBeInTheDocument();
@@ -885,8 +1142,8 @@ describe('BacktestPage', () => {
       });
 
       expect(rulesApi.runBatchAsync).toHaveBeenCalledTimes(2);
-      expect(rulesApi.getRun).toHaveBeenCalledWith(89);
-      expect(rulesApi.getRunMatches).toHaveBeenCalledWith(89);
+      expect(rulesApi.getRun).toHaveBeenCalledWith(89, 'default');
+      expect(rulesApi.getRunMatches).toHaveBeenCalledWith(89, 'default');
       fireEvent.click(screen.getByRole('button', { name: '停止实测' }));
     } finally {
       vi.useRealTimers();
@@ -939,7 +1196,7 @@ describe('BacktestPage', () => {
       });
 
       expect(rulesApi.getRun).toHaveBeenCalledTimes(2);
-      expect(rulesApi.getRunMatches).toHaveBeenCalledWith(12);
+      expect(rulesApi.getRunMatches).toHaveBeenCalledWith(12, 'default');
       expect(screen.getByRole('tab', { name: /运行结果/ })).toHaveAttribute('aria-selected', 'true');
       fireEvent.click(screen.getByRole('button', { name: '停止实测' }));
     } finally {
@@ -982,7 +1239,7 @@ describe('BacktestPage', () => {
         await Promise.resolve();
       });
 
-      expect(screen.getByText(/命中明细读取暂时超时/)).toBeInTheDocument();
+      expect(screen.getByText(/命中明细读取.*超时/)).toBeInTheDocument();
       expect(screen.queryByText(/实测失败/)).not.toBeInTheDocument();
       expect(rulesApi.runBatchAsync).toHaveBeenCalledTimes(1);
 
@@ -1387,7 +1644,7 @@ describe('BacktestPage', () => {
       expect(screen.queryByRole('button', {
         name: '展开执行时间 2026-05-07 10:55:10，命中 1 条，完成时间 2026-05-07 10:55:10',
       })).not.toBeInTheDocument();
-      expect(rulesApi.notifyRunMatches).toHaveBeenLastCalledWith(13, expect.objectContaining({ compact: true }));
+      expect(rulesApi.notifyRunMatches).toHaveBeenLastCalledWith(13, expect.objectContaining({ compact: true }), 'default');
 
       fireEvent.click(screen.getByRole('button', { name: '停止实测' }));
     } finally {
@@ -1490,7 +1747,7 @@ describe('BacktestPage', () => {
       });
 
       expect(screen.getAllByTestId('live-execution-group')).toHaveLength(2);
-      expect(rulesApi.notifyRunMatches).toHaveBeenLastCalledWith(13, expect.objectContaining({ compact: false }));
+      expect(rulesApi.notifyRunMatches).toHaveBeenLastCalledWith(13, expect.objectContaining({ compact: false }), 'default');
 
       fireEvent.click(screen.getByRole('button', { name: '停止实测' }));
     } finally {
@@ -1980,6 +2237,61 @@ describe('BacktestPage', () => {
     expect(screen.getByText('暂无命中结果')).toBeInTheDocument();
   });
 
+  it('uses tenant keys when reading and deleting an aggregated multi-tenant run', async () => {
+    vi.mocked(rulesApi.listRuns).mockResolvedValue([{
+      id: 101,
+      runIds: [101, 202],
+      tenantRuns: [
+        {
+          tenantKey: 'default',
+          tenantName: '默认租户',
+          runId: 101,
+          ruleId: 7,
+          ruleIds: [7],
+          ruleNames: ['放量观察'],
+        },
+        {
+          tenantKey: 'quant_team',
+          tenantName: '量化组',
+          runId: 202,
+          ruleId: 7,
+          ruleIds: [7],
+          ruleNames: ['放量观察'],
+        },
+      ],
+      ruleId: 7,
+      ruleIds: [7],
+      ruleName: '放量观察',
+      ruleNames: ['放量观察'],
+      status: 'completed',
+      targetCount: 4,
+      matchCount: 2,
+      eventCount: 2,
+      startedAt: '2026-05-03T09:30:00',
+      finishedAt: '2026-05-03T09:31:00',
+      durationMs: 1000,
+    }]);
+    vi.mocked(rulesApi.getRunMatches)
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([]);
+    render(<BacktestPage />);
+
+    expect(await screen.findByText('#101 放量观察')).toBeInTheDocument();
+    await waitFor(() => {
+      expect(rulesApi.getRunMatches).toHaveBeenCalledWith(101, 'default');
+      expect(rulesApi.getRunMatches).toHaveBeenCalledWith(202, 'quant_team');
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: '删除回测记录 #101' }));
+    expect(await screen.findByText('删除回测记录')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '确认删除' }));
+
+    await waitFor(() => {
+      expect(rulesApi.deleteRun).toHaveBeenCalledWith(101, 'default');
+      expect(rulesApi.deleteRun).toHaveBeenCalledWith(202, 'quant_team');
+    });
+  });
+
   it('opens indicator analysis for the clicked hit stock and focuses the hit date', async () => {
     render(<BacktestPage />);
 
@@ -2014,8 +2326,9 @@ describe('BacktestPage', () => {
         dataPolicy: 'db_only',
         target: {
           scope: 'watchlist',
-          stockCodes: ['300274.SZ', '688521.SH'],
+          stockCodes: [],
         },
+        tenantKeys: ['default'],
         startDate: expect.any(String),
         endDate: expect.any(String),
       });

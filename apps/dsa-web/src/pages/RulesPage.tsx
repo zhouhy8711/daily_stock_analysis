@@ -11,8 +11,8 @@ import {
 import { rulesApi } from '../api/rules';
 import { getParsedApiError } from '../api/error';
 import { historyApi } from '../api/history';
-import { systemConfigApi } from '../api/systemConfig';
 import { AppPage, Badge, Button, ConfirmDialog, EmptyState, InlineAlert, Input, PageHeader, Tooltip } from '../components/common';
+import { useTenant } from '../contexts/TenantContext';
 import { useStockIndex } from '../hooks/useStockIndex';
 import type { StockIndexItem } from '../types/stockIndex';
 import type {
@@ -708,7 +708,10 @@ function RuleList({
           >
             <div className="flex items-center justify-between gap-2">
               <span className="min-w-0 truncate text-sm font-semibold">{rule.name}</span>
-              <Badge variant={rule.isActive ? 'success' : 'default'}>{rule.isActive ? '启用' : '停用'}</Badge>
+              <span className="flex shrink-0 items-center gap-1">
+                <Badge variant={rule.isShared ? 'info' : 'history'}>{rule.isShared ? '共享' : '独有'}</Badge>
+                <Badge variant={rule.isActive ? 'success' : 'default'}>{rule.isActive ? '启用' : '停用'}</Badge>
+              </span>
             </div>
             <div className="mt-2 flex flex-wrap items-center gap-2 text-xs">
               <span>命中 {rule.lastMatchCount}</span>
@@ -727,6 +730,7 @@ const RulesPage: React.FC = () => {
   }, []);
 
   const { index: stockIndex } = useStockIndex();
+  const { currentTenant, tenantConfig } = useTenant();
   const [rules, setRules] = useState<RuleItem[]>([]);
   const [metrics, setMetrics] = useState<RuleMetricItem[]>([]);
   const [selectedRuleId, setSelectedRuleId] = useState<number | null>(null);
@@ -744,6 +748,11 @@ const RulesPage: React.FC = () => {
     () => watchlistItems.map((item) => item.code),
     [watchlistItems],
   );
+  const selectedRule = useMemo(
+    () => rules.find((rule) => rule.id === selectedRuleId) ?? null,
+    [rules, selectedRuleId],
+  );
+  const selectedIsShared = Boolean(selectedRule?.isShared);
 
   const metricOptions = useMemo(
     () => metrics.map((metric) => ({ value: metric.key, label: metric.label })),
@@ -758,13 +767,15 @@ const RulesPage: React.FC = () => {
   );
 
   const loadData = useCallback(async () => {
+    if (!currentTenant?.key) {
+      return;
+    }
     setIsLoading(true);
     setError(null);
     try {
-      const [metricItems, ruleItems, config, history] = await Promise.all([
+      const [metricItems, ruleItems, history] = await Promise.all([
         rulesApi.getMetrics(),
         rulesApi.list(),
-        systemConfigApi.getConfig(false),
         historyApi.getList({
           startDate: getRecentStartDate(30),
           endDate: getTodayInShanghai(),
@@ -772,9 +783,7 @@ const RulesPage: React.FC = () => {
           limit: WATCHLIST_HISTORY_LIMIT,
         }),
       ]);
-      const configuredWatchlistCodes = parseWatchlistValue(
-        config.items.find((item) => item.key === 'STOCK_LIST')?.value ?? '',
-      );
+      const configuredWatchlistCodes = parseWatchlistValue((tenantConfig?.stockList ?? []).join(','));
       const nextWatchlistItems = buildCurrentWatchlistItems(
         configuredWatchlistCodes,
         history.items,
@@ -812,7 +821,7 @@ const RulesPage: React.FC = () => {
     } finally {
       setIsLoading(false);
     }
-  }, []);
+  }, [currentTenant?.key, tenantConfig?.stockList]);
 
   useEffect(() => {
     void loadData();
@@ -866,6 +875,10 @@ const RulesPage: React.FC = () => {
   });
 
   const saveRule = async () => {
+    if (selectedIsShared) {
+      setError('共享规则不能直接保存，请先克隆为当前租户独有规则。');
+      return;
+    }
     setIsSaving(true);
     setError(null);
     setFeedback(null);
@@ -885,8 +898,27 @@ const RulesPage: React.FC = () => {
     }
   };
 
-  const confirmDeleteRule = async () => {
+  const cloneSelectedRule = async () => {
     if (!selectedRuleId) return;
+    setIsSaving(true);
+    setError(null);
+    setFeedback(null);
+    try {
+      const cloned = await rulesApi.clone(selectedRuleId);
+      const nextRules = await rulesApi.list();
+      setRules(nextRules);
+      const hydrated = nextRules.find((rule) => rule.id === cloned.id) ?? cloned;
+      selectRule(hydrated);
+      setFeedback('已克隆为当前租户独有规则。');
+    } catch (err) {
+      setError(getParsedApiError(err).message);
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
+  const confirmDeleteRule = async () => {
+    if (!selectedRuleId || selectedIsShared) return;
     setShowDeleteConfirm(false);
     setError(null);
     try {
@@ -916,7 +948,25 @@ const RulesPage: React.FC = () => {
               <CopyPlus className="h-4 w-4" />
               新建规则
             </Button>
-            <Button variant="primary" size="md" onClick={saveRule} isLoading={isSaving}>
+            {selectedIsShared && selectedRuleId ? (
+              <Button variant="secondary" size="md" onClick={() => void cloneSelectedRule()} isLoading={isSaving}>
+                <CopyPlus className="h-4 w-4" />
+                克隆
+              </Button>
+            ) : null}
+            {selectedRuleId && !selectedIsShared ? (
+              <Button variant="ghost" size="md" onClick={() => setShowDeleteConfirm(true)}>
+                <Trash2 className="h-4 w-4" />
+                删除
+              </Button>
+            ) : null}
+            <Button
+              variant="primary"
+              size="md"
+              onClick={saveRule}
+              isLoading={isSaving}
+              disabled={selectedIsShared}
+            >
               <Save className="h-4 w-4" />
               保存
             </Button>
@@ -936,7 +986,11 @@ const RulesPage: React.FC = () => {
           {error ? <InlineAlert variant="danger" title="操作失败" message={error} /> : null}
           {feedback ? <InlineAlert variant="success" message={feedback} /> : null}
           {isLoading ? <InlineAlert variant="info" message="正在加载规则模块..." /> : null}
+          {selectedIsShared ? (
+            <InlineAlert variant="info" message="当前为共享规则，可运行和查看；如需修改，请先克隆到当前租户。" />
+          ) : null}
 
+          <div className={selectedIsShared ? 'pointer-events-none opacity-75' : ''}>
           <section className={PANEL_CLASS}>
             <div className="mb-4 flex items-center justify-between gap-3">
               <div className="flex items-center gap-2">
@@ -1053,6 +1107,7 @@ const RulesPage: React.FC = () => {
               ))}
             </div>
           </section>
+          </div>
 
         </div>
       </div>

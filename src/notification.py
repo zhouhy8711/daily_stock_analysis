@@ -19,7 +19,7 @@ from datetime import datetime
 from typing import List, Dict, Any, Optional, Tuple
 from enum import Enum
 
-from src.config import get_config
+from src.config import Config, get_config
 from src.analyzer import AnalysisResult
 from src.enums import ReportType
 from src.report_language import (
@@ -125,13 +125,13 @@ class NotificationService(
     注意：所有已配置的渠道都会收到推送
     """
     
-    def __init__(self, source_message: Optional[BotMessage] = None):
+    def __init__(self, source_message: Optional[BotMessage] = None, config: Optional[Config] = None):
         """
         初始化通知服务
         
         检测所有已配置的渠道，推送时会向所有渠道发送
         """
-        config = get_config()
+        config = config or get_config()
         self._source_message = source_message
         self._context_channels: List[str] = []
 

@@ -12,7 +12,7 @@ import time
 from contextlib import ExitStack, nullcontext
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import pandas as pd
 from sqlalchemy import select
@@ -31,6 +31,7 @@ from src.rules.engine import (
 )
 from src.rules.metrics import METRIC_BY_KEY, build_metric_frame, get_metric_registry
 from src.services.stock_service import StockService
+from src.services.tenant_service import TenantContext, TenantService
 from src.storage import EARNINGS_GAP_DAILY_METRIC_COLUMNS, StockDaily
 
 logger = logging.getLogger(__name__)
@@ -162,8 +163,19 @@ class RuleDataUnavailable(RuntimeError):
 class RuleService:
     """Rules orchestration service."""
 
-    def __init__(self, repo: Optional[RuleRepository] = None, stock_service: Optional[StockService] = None):
-        self.repo = repo or RuleRepository()
+    def __init__(
+        self,
+        repo: Optional[RuleRepository] = None,
+        stock_service: Optional[StockService] = None,
+        tenant_context: Optional[TenantContext] = None,
+        tenant_service: Optional[TenantService] = None,
+    ):
+        self.tenant_context = tenant_context
+        self.tenant_service = tenant_service or TenantService()
+        self.repo = repo or RuleRepository(
+            tenant_id=tenant_context.id if tenant_context else None,
+            tenant_key=tenant_context.key if tenant_context else None,
+        )
         self.stock_service = stock_service or StockService()
 
     def get_metrics(self) -> List[Dict[str, Any]]:
@@ -183,6 +195,11 @@ class RuleService:
         return self.repo.create_rule(data)
 
     def update_rule(self, rule_id: int, payload: Any) -> Optional[Dict[str, Any]]:
+        existing = self.repo.get_rule(rule_id)
+        if existing is None:
+            return None
+        if existing.get("is_shared"):
+            raise RuleValidationError("共享规则不能在租户工作区直接编辑，请先克隆为租户独有规则")
         data = {key: value for key, value in _model_to_dict(payload).items() if value is not None}
         definition = data.get("definition")
         if definition is not None:
@@ -190,7 +207,18 @@ class RuleService:
         return self.repo.update_rule(rule_id, data)
 
     def delete_rule(self, rule_id: int) -> bool:
+        existing = self.repo.get_rule(rule_id)
+        if existing is None:
+            return False
+        if existing.get("is_shared"):
+            raise RuleValidationError("共享规则不能在租户工作区直接删除，请先克隆为租户独有规则")
         return self.repo.delete_rule(rule_id)
+
+    def clone_rule(self, rule_id: int) -> Optional[Dict[str, Any]]:
+        rule = self.repo.clone_rule(rule_id)
+        if rule is not None:
+            return rule
+        return None
 
     def delete_run(self, run_id: int) -> bool:
         return self.repo.delete_run(run_id)
@@ -525,7 +553,7 @@ class RuleService:
             )
             raise
 
-    def start_run_rules(
+    def prepare_rule_run_plan(
         self,
         rule_ids: List[int],
         mode: str = "history",
@@ -534,15 +562,20 @@ class RuleService:
         end_date: Any = None,
         data_policy: str = "default",
         live_cache_key: Optional[str] = None,
-    ) -> tuple[Dict[str, Any], Optional[Dict[str, Any]]]:
+    ) -> Dict[str, Any]:
         normalized_rule_ids = [int(rule_id) for rule_id in rule_ids if int(rule_id) > 0]
         if not normalized_rule_ids:
             raise RuleValidationError("至少选择一条规则")
 
         run_mode = self._normalize_run_mode(mode)
         run_data_policy = self._normalize_rule_run_data_policy(run_mode, data_policy)
-        live_history_cache_key = (
+        raw_live_cache_key = (
             self._normalize_live_cache_key(live_cache_key)
+            if run_mode == "latest"
+            else None
+        )
+        live_history_cache_key = (
+            self._resolve_live_cache_key(raw_live_cache_key)
             if run_mode == "latest"
             else None
         )
@@ -576,9 +609,69 @@ class RuleService:
             date_to,
             stock_codes,
             snapshot_metadata.get("snapshot_id"),
+            tenant_key=self.tenant_context.key if self.tenant_context else None,
         )
+        batch_metadata = {
+            "run_key": run_key,
+            "mode": run_mode,
+            "data_policy": run_data_policy,
+            "live_cache_key": live_history_cache_key,
+            "raw_live_cache_key": raw_live_cache_key,
+            "tenant_key": self.tenant_context.key if self.tenant_context else None,
+            **snapshot_metadata,
+        }
+        return {
+            "normalized_rule_ids": normalized_rule_ids,
+            "run_mode": run_mode,
+            "data_policy": run_data_policy,
+            "live_cache_key": live_history_cache_key,
+            "date_from": date_from,
+            "date_to": date_to,
+            "prepared": prepared,
+            "primary_rule_id": primary_rule_id,
+            "rule_names": rule_names,
+            "stock_codes": stock_codes,
+            "prewarm_only": prewarm_only,
+            "snapshot_metadata": snapshot_metadata,
+            "definition_fingerprints": self._build_rule_definition_fingerprints(prepared),
+            "logic_fingerprints": [
+                self._build_rule_logic_fingerprint(definition)
+                for _rule_id, _rule, definition, _stock_codes in prepared
+            ],
+            "run_key": run_key,
+            "batch_metadata": batch_metadata,
+            "tenant_id": self.tenant_context.id if self.tenant_context else None,
+            "tenant_key": self.tenant_context.key if self.tenant_context else None,
+            "tenant_name": self.tenant_context.name if self.tenant_context else None,
+            "tenant_is_default": self.tenant_context.is_default if self.tenant_context else False,
+        }
+
+    def create_started_run_from_plan(
+        self,
+        plan: Dict[str, Any],
+        *,
+        allow_reuse: bool = True,
+        metadata_extra: Optional[Dict[str, Any]] = None,
+    ) -> tuple[Dict[str, Any], Optional[Dict[str, Any]]]:
+        normalized_rule_ids = list(plan["normalized_rule_ids"])
+        run_mode = str(plan["run_mode"])
+        run_data_policy = str(plan["data_policy"])
+        live_history_cache_key = plan.get("live_cache_key")
+        date_from = plan.get("date_from")
+        date_to = plan.get("date_to")
+        prepared = list(plan["prepared"])
+        primary_rule_id = int(plan["primary_rule_id"])
+        rule_names = list(plan["rule_names"])
+        stock_codes = list(plan["stock_codes"])
+        prewarm_only = bool(plan.get("prewarm_only"))
+        snapshot_metadata = dict(plan.get("snapshot_metadata") or {})
+        batch_metadata = {
+            **dict(plan.get("batch_metadata") or {}),
+            **dict(metadata_extra or {}),
+        }
+        run_key = str(plan.get("run_key") or "")
         reusable_run_getter = getattr(self.repo, "find_reusable_run_by_key", None)
-        reusable_run = reusable_run_getter(run_key) if callable(reusable_run_getter) else None
+        reusable_run = reusable_run_getter(run_key) if allow_reuse and callable(reusable_run_getter) else None
         if reusable_run is not None:
             response = {
                 "run_id": reusable_run["id"],
@@ -615,13 +708,6 @@ class RuleService:
             )
             return response, None
 
-        batch_metadata = {
-            "run_key": run_key,
-            "mode": run_mode,
-            "data_policy": run_data_policy,
-            "live_cache_key": live_history_cache_key,
-            **snapshot_metadata,
-        }
         run_id = self.repo.create_run(
             primary_rule_id,
             len(stock_codes),
@@ -674,6 +760,7 @@ class RuleService:
             "rule_names": rule_names,
             "prepared": prepared,
             "stock_codes": stock_codes,
+            "target_count": len(stock_codes),
             "run_mode": run_mode,
             "date_from": date_from,
             "date_to": date_to,
@@ -682,8 +769,33 @@ class RuleService:
             "started_at": started_at,
             "batch_metadata": batch_metadata,
             "prewarm_only": prewarm_only,
+            "tenant_id": self.tenant_context.id if self.tenant_context else None,
+            "tenant_key": self.tenant_context.key if self.tenant_context else None,
+            "tenant_name": self.tenant_context.name if self.tenant_context else None,
+            "tenant_is_default": self.tenant_context.is_default if self.tenant_context else False,
         }
         return response, context
+
+    def start_run_rules(
+        self,
+        rule_ids: List[int],
+        mode: str = "history",
+        target_override: Optional[Dict[str, Any]] = None,
+        start_date: Any = None,
+        end_date: Any = None,
+        data_policy: str = "default",
+        live_cache_key: Optional[str] = None,
+    ) -> tuple[Dict[str, Any], Optional[Dict[str, Any]]]:
+        plan = self.prepare_rule_run_plan(
+            rule_ids,
+            mode=mode,
+            target_override=target_override,
+            start_date=start_date,
+            end_date=end_date,
+            data_policy=data_policy,
+            live_cache_key=live_cache_key,
+        )
+        return self.create_started_run_from_plan(plan)
 
     def _cleanup_stale_running_runs(self) -> None:
         orphan_cleanup = getattr(self.repo, "fail_running_runs_started_before", None)
@@ -724,6 +836,11 @@ class RuleService:
         batch_metadata: Optional[Dict[str, Any]] = None,
         live_cache_key: Optional[str] = None,
         prewarm_only: bool = False,
+        target_count: Optional[int] = None,
+        tenant_id: Optional[int] = None,
+        tenant_key: Optional[str] = None,
+        tenant_name: Optional[str] = None,
+        tenant_is_default: bool = False,
     ) -> None:
         if prewarm_only:
             try:
@@ -996,6 +1113,7 @@ class RuleService:
         rule_names: List[str],
         batch_metadata: Optional[Dict[str, Any]] = None,
         live_cache_key: Optional[str] = None,
+        progress_callback: Optional[Callable[[int, Dict[str, Any], List[str]], None]] = None,
     ) -> tuple[List[Dict[str, Any]], List[str]]:
         rule_stock_sets = {
             rule_id: set(rule_stock_codes)
@@ -1075,6 +1193,11 @@ class RuleService:
                 for stock_errors in ordered_errors
                 for error in stock_errors
             ]
+            runtime_metadata = self._build_runtime_scan_metadata(
+                batch_metadata,
+                fast_latest_scan=fast_latest_scan,
+                ordered_skips=ordered_skips,
+            )
             self._update_run_progress_best_effort(
                 run_id=run_id,
                 rule_ids=rule_ids,
@@ -1082,12 +1205,10 @@ class RuleService:
                 completed_count=count,
                 target_count=target_count,
                 errors=current_errors,
-                metadata=self._build_runtime_scan_metadata(
-                    batch_metadata,
-                    fast_latest_scan=fast_latest_scan,
-                    ordered_skips=ordered_skips,
-                ),
+                metadata=runtime_metadata,
             )
+            if progress_callback is not None:
+                progress_callback(count, runtime_metadata, current_errors)
             last_progress_count = count
             last_progress_update_at = time.monotonic()
 
@@ -1545,6 +1666,17 @@ class RuleService:
         )
         return normalized or None
 
+    def _resolve_live_cache_key(self, live_cache_key: Optional[str]) -> Optional[str]:
+        normalized = self._normalize_live_cache_key(live_cache_key)
+        if not normalized or not self.tenant_context:
+            return normalized
+        if normalized.startswith("shared:"):
+            return normalized
+        tenant_prefix = f"tenant:{self.tenant_context.key}:"
+        if normalized.startswith(tenant_prefix):
+            return normalized
+        return f"{tenant_prefix}{normalized}"
+
     @staticmethod
     def _build_empty_live_scan_cache() -> Dict[str, Dict[str, Any]]:
         return {
@@ -1556,7 +1688,7 @@ class RuleService:
         }
 
     def _get_live_rule_scan_cache_extras(self, live_cache_key: Optional[str]) -> Dict[str, Dict[str, Any]]:
-        normalized_key = self._normalize_live_cache_key(live_cache_key)
+        normalized_key = self._resolve_live_cache_key(live_cache_key)
         if not normalized_key:
             return self._build_empty_live_scan_cache()
         with _LIVE_RULE_RUN_HISTORY_CACHE_LOCK:
@@ -1569,35 +1701,81 @@ class RuleService:
             return scan_cache
 
     def clear_live_rule_history_cache(self, live_cache_key: Optional[str] = None) -> Dict[str, Any]:
-        normalized_key = self._normalize_live_cache_key(live_cache_key)
+        raw_key = self._normalize_live_cache_key(live_cache_key)
+        normalized_key = self._resolve_live_cache_key(live_cache_key)
+
+        def scan_entry_count(scan_cache: Optional[Dict[str, Dict[str, Any]]]) -> int:
+            return sum(
+                len(bucket or {})
+                for bucket in (scan_cache or {}).values()
+                if isinstance(bucket, dict)
+            )
+
         with _LIVE_RULE_RUN_HISTORY_CACHE_LOCK:
             if normalized_key:
-                session_cache = _LIVE_RULE_RUN_HISTORY_CACHE.pop(normalized_key, None)
-                scan_cache = _LIVE_RULE_RUN_SCAN_CACHE.pop(normalized_key, None)
-                cleared_entries = len(session_cache or {})
-                cleared_scan_entries = sum(
-                    len(bucket or {})
-                    for bucket in (scan_cache or {}).values()
-                    if isinstance(bucket, dict)
-                )
+                keys_to_clear = {normalized_key}
+                if raw_key and not raw_key.startswith("shared:"):
+                    shared_prefix = f"shared:{raw_key}:"
+                    keys_to_clear.update(
+                        key for key in _LIVE_RULE_RUN_HISTORY_CACHE.keys()
+                        if key.startswith(shared_prefix)
+                    )
+                    keys_to_clear.update(
+                        key for key in _LIVE_RULE_RUN_SCAN_CACHE.keys()
+                        if key.startswith(shared_prefix)
+                    )
+                cleared_entries = 0
+                cleared_scan_entries = 0
+                for key in keys_to_clear:
+                    session_cache = _LIVE_RULE_RUN_HISTORY_CACHE.pop(key, None)
+                    scan_cache = _LIVE_RULE_RUN_SCAN_CACHE.pop(key, None)
+                    cleared_entries += len(session_cache or {})
+                    cleared_scan_entries += scan_entry_count(scan_cache)
                 remaining_sessions = max(
                     len(_LIVE_RULE_RUN_HISTORY_CACHE),
                     len(_LIVE_RULE_RUN_SCAN_CACHE),
                 )
             else:
-                cleared_entries = sum(
-                    len(session_cache or {})
-                    for session_cache in _LIVE_RULE_RUN_HISTORY_CACHE.values()
-                )
-                cleared_scan_entries = sum(
-                    len(bucket or {})
-                    for session_cache in _LIVE_RULE_RUN_SCAN_CACHE.values()
-                    for bucket in (session_cache or {}).values()
-                    if isinstance(bucket, dict)
-                )
-                _LIVE_RULE_RUN_HISTORY_CACHE.clear()
-                _LIVE_RULE_RUN_SCAN_CACHE.clear()
-                remaining_sessions = 0
+                if self.tenant_context:
+                    tenant_prefix = f"tenant:{self.tenant_context.key}:"
+                    history_keys = [
+                        key for key in _LIVE_RULE_RUN_HISTORY_CACHE.keys()
+                        if key.startswith(tenant_prefix)
+                    ]
+                    scan_keys = [
+                        key for key in _LIVE_RULE_RUN_SCAN_CACHE.keys()
+                        if key.startswith(tenant_prefix)
+                    ]
+                    cleared_entries = sum(
+                        len(_LIVE_RULE_RUN_HISTORY_CACHE.get(key) or {})
+                        for key in history_keys
+                    )
+                    cleared_scan_entries = sum(
+                        scan_entry_count(_LIVE_RULE_RUN_SCAN_CACHE.get(key))
+                        for key in scan_keys
+                    )
+                    for key in history_keys:
+                        _LIVE_RULE_RUN_HISTORY_CACHE.pop(key, None)
+                    for key in scan_keys:
+                        _LIVE_RULE_RUN_SCAN_CACHE.pop(key, None)
+                    remaining_sessions = max(
+                        len(_LIVE_RULE_RUN_HISTORY_CACHE),
+                        len(_LIVE_RULE_RUN_SCAN_CACHE),
+                    )
+                else:
+                    cleared_entries = sum(
+                        len(session_cache or {})
+                        for session_cache in _LIVE_RULE_RUN_HISTORY_CACHE.values()
+                    )
+                    cleared_scan_entries = sum(
+                        len(bucket or {})
+                        for session_cache in _LIVE_RULE_RUN_SCAN_CACHE.values()
+                        for bucket in (session_cache or {}).values()
+                        if isinstance(bucket, dict)
+                    )
+                    _LIVE_RULE_RUN_HISTORY_CACHE.clear()
+                    _LIVE_RULE_RUN_SCAN_CACHE.clear()
+                    remaining_sessions = 0
         logger.info(
             "已清理规则实测数据缓存: "
             "live_cache_key=%s history_entries=%s scan_entries=%s remaining_sessions=%s",
@@ -1632,7 +1810,7 @@ class RuleService:
                 for code, payload in (history_by_code or {}).items()
                 if payload
             }, end_before_date)
-        normalized_live_cache_key = self._normalize_live_cache_key(live_cache_key)
+        normalized_live_cache_key = self._resolve_live_cache_key(live_cache_key)
         should_use_shared_cache = (
             bool(normalized_live_cache_key)
             or len(list(dict.fromkeys(str(code or "").strip().upper() for code in stock_codes if str(code or "").strip())))
@@ -2151,13 +2329,19 @@ class RuleService:
         }
 
     @staticmethod
+    def _build_rule_logic_fingerprint(definition: Dict[str, Any]) -> str:
+        logic_definition = dict(definition or {})
+        logic_definition.pop("target", None)
+        raw = json.dumps(logic_definition, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+    @staticmethod
     def _build_rule_definition_fingerprints(
         prepared: List[tuple[int, Dict[str, Any], Dict[str, Any], List[str]]],
     ) -> List[str]:
         fingerprints: List[str] = []
         for rule_id, _rule, definition, _stock_codes in prepared:
-            raw = json.dumps(definition or {}, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
-            fingerprints.append(f"{int(rule_id)}:{hashlib.sha256(raw.encode('utf-8')).hexdigest()}")
+            fingerprints.append(f"{int(rule_id)}:{RuleService._build_rule_logic_fingerprint(definition)}")
         return fingerprints
 
     @staticmethod
@@ -2170,8 +2354,10 @@ class RuleService:
         end_date: Optional[date],
         stock_codes: List[str],
         snapshot_id: Optional[str],
+        tenant_key: Optional[str] = None,
     ) -> str:
         payload = {
+            "tenant_key": tenant_key or "global",
             "rule_ids": [int(rule_id) for rule_id in rule_ids],
             "rule_fingerprints": list(rule_fingerprints or []),
             "mode": run_mode,
@@ -2637,6 +2823,8 @@ class RuleService:
         compact: bool = True,
     ) -> Dict[str, Any]:
         """Push live-test rule matches to every configured notification channel."""
+        run_getter = getattr(self.repo, "get_run", None)
+        run = run_getter(run_id) if callable(run_getter) else None
         matches = self.repo.list_matches(run_id)
         event_count = self._count_notification_events(matches)
         original_event_count = event_count
@@ -2709,7 +2897,15 @@ class RuleService:
         try:
             from src.notification import NotificationService
 
-            notifier = NotificationService()
+            tenant_id = self.tenant_context.id if self.tenant_context else None
+            if tenant_id is None and isinstance(run, dict) and run.get("tenant_id") is not None:
+                tenant_id = int(run["tenant_id"])
+            notifier_config = (
+                self.tenant_service.build_notification_config(tenant_id)
+                if tenant_id is not None
+                else None
+            )
+            notifier = NotificationService(config=notifier_config)
             if not notifier.is_available():
                 logger.warning("通知渠道未配置，实测命中未推送: run_id=%s", run_id)
                 return {
@@ -3877,12 +4073,15 @@ class RuleService:
         if explicit_codes:
             return explicit_codes[:MAX_RULE_TARGET_CODES]
         if scope == "watchlist":
-            config = get_config()
-            try:
-                config.refresh_stock_list()
-            except Exception as exc:
-                logger.debug("刷新 STOCK_LIST 失败，使用当前配置: %s", exc)
-            codes = config.stock_list
+            if self.tenant_context:
+                codes = self.tenant_service.get_stock_list(self.tenant_context.id)
+            else:
+                config = get_config()
+                try:
+                    config.refresh_stock_list()
+                except Exception as exc:
+                    logger.debug("刷新 STOCK_LIST 失败，使用当前配置: %s", exc)
+                codes = config.stock_list
         elif scope == "all_a_shares":
             try:
                 from src.data.stock_index_loader import get_all_a_share_stock_codes
