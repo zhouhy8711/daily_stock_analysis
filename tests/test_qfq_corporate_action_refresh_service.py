@@ -20,12 +20,14 @@ def reset_refresh_state():
 def _config(
     *,
     enabled=True,
+    backup_enabled=True,
     refresh_after="16:30",
     lookback_days=60,
     interval_seconds=1800,
 ):
     return SimpleNamespace(
         qfq_corporate_action_refresh_enabled=enabled,
+        qfq_corporate_action_refresh_backup_enabled=backup_enabled,
         qfq_corporate_action_refresh_after=refresh_after,
         qfq_corporate_action_refresh_lookback_days=lookback_days,
         qfq_corporate_action_refresh_interval_seconds=interval_seconds,
@@ -143,6 +145,39 @@ def test_refresh_service_runs_apply_once_per_trade_date(tmp_path):
     assert after_restart["status"] == "skipped"
     assert after_restart["reason"] == "already_completed_for_trade_date"
     assert len(calls) == 1
+
+
+def test_refresh_service_can_disable_database_backup(tmp_path):
+    calls = []
+    report_path = tmp_path / "report.json"
+
+    def fake_runner(db, **kwargs):
+        calls.append({"db": db, **kwargs})
+        return (
+            {
+                "event_count": 1,
+                "checked_event_count": 1,
+                "triggered_code_count": 1,
+                "triggered_codes": ["688498"],
+                "backup_path": None,
+                "apply_results": [{"code": "688498", "status": "completed"}],
+            },
+            report_path,
+        )
+
+    service = service_module.QfqCorporateActionRefreshService(
+        db=object(),
+        config_provider=lambda: _config(backup_enabled=False),
+        refresh_runner=fake_runner,
+        report_dir=tmp_path,
+    )
+
+    with patch.object(service_module.trading_calendar, "is_market_open", return_value=True):
+        result = service.run_once(current_time=datetime(2026, 6, 5, 16, 31))
+
+    assert result["status"] == "completed"
+    assert len(calls) == 1
+    assert calls[0]["backup"] is False
 
 
 def test_refresh_service_failure_does_not_mark_trade_date_completed(tmp_path):

@@ -90,11 +90,13 @@ flowchart LR
 - 同一交易日成功完成后会写入本地状态文件，服务重启后也不会重复执行；如果刷新过程出现失败或 partial，会在下一轮继续重试。
 - 每次扫描最近 60 个自然日的除权除息/分红事件。
 - 确认触发后自动 `apply`，从该股票本地最早日线重拉 qfq 覆盖 `stock_daily`，并重建 `stock_chip_daily`。
+- 默认在实际写库前创建一份完整 SQLite 回滚备份；大数据库部署可通过配置关闭。
 
 可通过 `.env` 调整：
 
 ```env
 QFQ_CORPORATE_ACTION_REFRESH_ENABLED=true
+QFQ_CORPORATE_ACTION_REFRESH_BACKUP_ENABLED=true
 QFQ_CORPORATE_ACTION_REFRESH_AFTER=16:30
 QFQ_CORPORATE_ACTION_REFRESH_LOOKBACK_DAYS=60
 QFQ_CORPORATE_ACTION_REFRESH_INTERVAL_SECONDS=1800
@@ -109,6 +111,8 @@ outputs/qfq_corporate_action_refresh/scheduled/
 同目录下的 `qfq_corporate_action_refresh_state.json` 会记录最近一次成功完成的交易日，用于避免服务重启后当天重复扫描。
 
 如果不希望自动修复前复权历史，把 `QFQ_CORPORATE_ACTION_REFRESH_ENABLED=false` 写入 `.env` 即可；手动工具仍可继续使用。
+
+如果仍需自动修复、但不需要每次 apply 前的完整数据库备份，可设置 `QFQ_CORPORATE_ACTION_REFRESH_BACKUP_ENABLED=false`。关闭后自动任务仍会生成 JSON 审计报告，但无法再通过该任务的 `.qfq` 副本回滚数据库；手动工具仍默认备份，也可显式传入 `--no-backup` 关闭。
 
 自动任务和分钟热表收盘归档是两个独立后台任务：分钟热表归档负责把盘中临时行情替换为正式日线，除权除息 qfq 刷新负责修正已存在历史日线的复权口径。即使当天没有跑股票分析，只要服务或每日调度进程在运行，数据层也会在收盘后自检。
 
@@ -171,7 +175,7 @@ outputs/qfq_corporate_action_refresh/
 包含：
 
 - `qfq_corporate_action_refresh_*.json`：dry-run 或 apply 报告。
-- `stock_analysis.db.bak.*.qfq`：apply 前 SQLite 备份。
+- `stock_analysis.db.bak.*.qfq`：启用备份时生成的 apply 前 SQLite 副本。
 
 报告关键字段：
 

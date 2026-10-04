@@ -1634,6 +1634,20 @@ _FIELD_DEFINITIONS: Dict[str, Dict[str, Any]] = {
         "validation": {},
         "display_order": 13,
     },
+    "QFQ_CORPORATE_ACTION_REFRESH_BACKUP_ENABLED": {
+        "title": "QFQ Refresh Database Backup",
+        "description": "Create a full SQLite backup before the scheduled qfq refresh applies changes.",
+        "category": "system",
+        "data_type": "boolean",
+        "ui_control": "switch",
+        "is_sensitive": False,
+        "is_required": False,
+        "is_editable": True,
+        "default_value": "true",
+        "options": [],
+        "validation": {},
+        "display_order": 14,
+    },
     "QFQ_CORPORATE_ACTION_REFRESH_AFTER": {
         "title": "QFQ Refresh After",
         "description": "Earliest local China-market time for the daily corporate-action qfq refresh check.",
@@ -1646,7 +1660,7 @@ _FIELD_DEFINITIONS: Dict[str, Dict[str, Any]] = {
         "default_value": "16:30",
         "options": [],
         "validation": {"pattern": r"^([01]\d|2[0-3]):[0-5]\d$"},
-        "display_order": 14,
+        "display_order": 15,
     },
     "QFQ_CORPORATE_ACTION_REFRESH_LOOKBACK_DAYS": {
         "title": "QFQ Event Lookback Days",
@@ -1660,7 +1674,7 @@ _FIELD_DEFINITIONS: Dict[str, Dict[str, Any]] = {
         "default_value": "60",
         "options": [],
         "validation": {"min": 1, "max": 1095},
-        "display_order": 15,
+        "display_order": 16,
     },
     "QFQ_CORPORATE_ACTION_REFRESH_INTERVAL_SECONDS": {
         "title": "QFQ Refresh Poll Interval",
@@ -1674,7 +1688,7 @@ _FIELD_DEFINITIONS: Dict[str, Dict[str, Any]] = {
         "default_value": "1800",
         "options": [],
         "validation": {"min": 30, "max": 86400},
-        "display_order": 16,
+        "display_order": 17,
     },
     "TRADING_DAY_CHECK_ENABLED": {
         "title": "Trading Day Check",
@@ -1688,7 +1702,7 @@ _FIELD_DEFINITIONS: Dict[str, Dict[str, Any]] = {
         "default_value": "true",
         "options": [],
         "validation": {},
-        "display_order": 17,
+        "display_order": 18,
     },
     "REALTIME_QUOTE_CACHE_SECONDS": {
         "title": "Realtime Quote Cache Seconds",

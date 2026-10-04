@@ -696,6 +696,7 @@ class Config:
     schedule_time: str = "18:00"              # 每日推送时间（HH:MM 格式）
     schedule_run_immediately: bool = True     # 启动时是否立即执行一次
     qfq_corporate_action_refresh_enabled: bool = True
+    qfq_corporate_action_refresh_backup_enabled: bool = True
     qfq_corporate_action_refresh_after: str = "16:30"
     qfq_corporate_action_refresh_lookback_days: int = 60
     qfq_corporate_action_refresh_interval_seconds: int = 1800
@@ -1426,6 +1427,10 @@ class Config:
             schedule_run_immediately=schedule_run_immediately,
             qfq_corporate_action_refresh_enabled=parse_env_bool(
                 os.getenv('QFQ_CORPORATE_ACTION_REFRESH_ENABLED'),
+                default=True,
+            ),
+            qfq_corporate_action_refresh_backup_enabled=parse_env_bool(
+                os.getenv('QFQ_CORPORATE_ACTION_REFRESH_BACKUP_ENABLED'),
                 default=True,
             ),
             qfq_corporate_action_refresh_after=(

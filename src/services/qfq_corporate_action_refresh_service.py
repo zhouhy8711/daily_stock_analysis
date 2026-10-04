@@ -178,7 +178,13 @@ class QfqCorporateActionRefreshService:
                 apply=True,
                 skip_chip=False,
                 report_dir=self._report_dir,
-                backup=True,
+                backup=bool(
+                    getattr(
+                        config,
+                        "qfq_corporate_action_refresh_backup_enabled",
+                        True,
+                    )
+                ),
             )
             failed_apply_count = _count_failed_apply_results(report)
             triggered_count = int(report.get("triggered_code_count") or 0)
